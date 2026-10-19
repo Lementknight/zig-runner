@@ -11,15 +11,22 @@ env:
 jobs:
   test:
     name: Format, build and test
-    runs-on: ubuntu-latest
+    # This project's own runner (deploy/, a zig-runner registered to this repository), so every
+    # push exercises it. The runner keeps RUNNER_TOOL_CACHE between jobs, so Zig downloads once.
+    runs-on: [self-hosted, zig]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Zig
         run: |
           arch=$(uname -m)
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${arch}-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C /opt
-          echo "/opt/zig-${arch}-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          dir="$RUNNER_TOOL_CACHE/zig/$ZIG_VERSION/$arch"
+          if [ ! -x "$dir/zig" ]; then
+            mkdir -p "$dir"
+            curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${arch}-linux-${ZIG_VERSION}.tar.xz" \
+              | tar -xJ -C "$dir" --strip-components=1
+          fi
+          echo "$dir" >> "$GITHUB_PATH"
 
       - name: Format check
         working-directory: runner

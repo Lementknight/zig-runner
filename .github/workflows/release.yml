@@ -29,7 +29,8 @@ jobs:
   binaries:
     name: Binaries
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    # This project's own runner. It has no `gh`, so the release is made through the REST API.
+    runs-on: [self-hosted, zig]
     permissions:
       contents: write
     steps:
@@ -38,8 +39,13 @@ jobs:
       - name: Install Zig
         run: |
           arch=$(uname -m)
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${arch}-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C /opt
-          echo "/opt/zig-${arch}-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          dir="$RUNNER_TOOL_CACHE/zig/$ZIG_VERSION/$arch"
+          if [ ! -x "$dir/zig" ]; then
+            mkdir -p "$dir"
+            curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${arch}-linux-${ZIG_VERSION}.tar.xz" \
+              | tar -xJ -C "$dir" --strip-components=1
+          fi
+          echo "$dir" >> "$GITHUB_PATH"
 
       - name: Build
         working-directory: runner
@@ -57,10 +63,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" dist/* --title "$TAG" --generate-notes --verify-tag
+          REPO: ${{ github.repository }}
+        run: |
+          api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$@"; }
+          # The release, with GitHub's generated notes; its upload URL is where the assets go.
+          upload_url=$(api -X POST "https://api.github.com/repos/$REPO/releases" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\",\"generate_release_notes\":true}" \
+            | jq -r '.upload_url' | sed 's/{?name,label}//')
+          for f in dist/*; do
+            api -X POST -H "Content-Type: application/octet-stream" \
+              "$upload_url?name=$(basename "$f")" --data-binary "@$f" > /dev/null
+          done
 
   image:
     name: Image
+    # Stays on GitHub's runner: buildx needs a Docker daemon, which a step in the Dagger engine
+    # does not have. Building the image through the engine itself is the way to bring it over.
     runs-on: ubuntu-latest
     permissions:
       contents: read
