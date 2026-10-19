@@ -1,0 +1,44 @@
+# Scorecard: OpenSSF's checks of how the repository is kept (branch protection, pinned
+# dependencies, token permissions, signed releases and more), weekly and on every change to main or
+# its protection. Results go to the repository's code scanning alerts and the public Scorecard API,
+# which the README's badge reads. https://github.com/ossf/scorecard
+name: scorecard
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 7 * * 1"
+  branch_protection_rule:
+
+# Nothing by default; the job asks for what it needs.
+permissions: {}
+
+# A newer run replaces one still going: only the latest result matters.
+concurrency:
+  group: scorecard
+  cancel-in-progress: true
+
+jobs:
+  analysis:
+    name: Scorecard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # to check out the repository
+      actions: read # to read the workflows' runs
+      security-events: write # to upload the results to code scanning
+      id-token: write # to publish the results to the Scorecard API, signed
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: results.sarif

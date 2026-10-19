@@ -1,0 +1,85 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Keeps every pinned input current, one reviewed pull request at a time (README, \"Pipeline\"). Its branches (renovate/...) bump the patch version.",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    "docker:pinDigests"
+  ],
+  "minimumReleaseAge": "7 days",
+  "labels": [
+    "dependencies"
+  ],
+  "packageRules": [
+    {
+      "description": "Minor, patch and digest updates together; a major version gets a pull request of its own.",
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest",
+        "pin",
+        "pinDigest"
+      ],
+      "groupName": "minor and patch updates"
+    },
+    {
+      "description": "A new Zig changes the language: its own pull request, and its checksums (install-zig.sh, the Dockerfile) are updated by hand from ziglang.org's index.json, which CI enforces by failing until they are.",
+      "matchDepNames": [
+        "ziglang/zig"
+      ],
+      "groupName": "zig",
+      "separateMinorPatch": true
+    }
+  ],
+  "customManagers": [
+    {
+      "description": "Zig: install-zig.sh and the Dockerfile (versions are tags of ziglang/zig).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/scripts/install-zig\\.sh$/",
+        "/^runner/Dockerfile$/"
+      ],
+      "matchStrings": [
+        "(?:\\nversion=|ARG ZIG_VERSION=)(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "ziglang/zig",
+      "datasourceTemplate": "github-tags"
+    },
+    {
+      "description": "changie, pinned by version in version.yml. A new version also needs CHANGIE_SHA256 from its release's checksums.txt.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/version\\.yml$/"
+      ],
+      "matchStrings": [
+        "CHANGIE_VERSION: \"(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "miniscruff/changie",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "description": "GoReleaser, pinned by version in release.yml.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/release\\.yml$/"
+      ],
+      "matchStrings": [
+        "GORELEASER_VERSION: (?<currentValue>v\\S+)"
+      ],
+      "depNameTemplate": "goreleaser/goreleaser",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "description": "Trivy's image, pinned by digest in release.yml.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/release\\.yml$/"
+      ],
+      "matchStrings": [
+        "TRIVY_IMAGE: (?<depName>aquasec/trivy):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ]
+}

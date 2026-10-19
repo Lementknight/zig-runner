@@ -1,0 +1,38 @@
+# GoReleaser: the release's binaries and checksums, built from the tag the version workflow pushed,
+# and the GitHub release that carries them with changie's notes (release.yml, README "Pipeline").
+#
+#   goreleaser release --snapshot --clean   # build everything into dist/, publish nothing
+version: 2
+
+project_name: zig-runner
+
+builds:
+  - id: runner
+    builder: zig
+    dir: runner
+    binary: runner
+    targets:
+      - x86_64-linux-musl
+      - aarch64-linux-musl
+    flags:
+      - -Doptimize=ReleaseSafe
+      - -Dstrip
+      # The tag, not `git describe`: the authoritative name for the build.
+      - -Dversion={{ .Tag }}
+
+# The bare binaries, under the names releases have always used.
+archives:
+  - formats: [binary]
+    name_template: >-
+      zig-runner-linux-{{ if eq .Arch "amd64" }}x86_64{{ else }}aarch64{{ end }}
+
+checksum:
+  name_template: SHA256SUMS
+  algorithm: sha256
+
+# release.yml passes changie's notes for the version; this is for a tag cut without them.
+changelog:
+  use: github-native
+
+release:
+  name_template: "{{ .Tag }}"
