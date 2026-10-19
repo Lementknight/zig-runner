@@ -5,8 +5,13 @@ on:
     branches: [main]
   pull_request:
 
-env:
-  ZIG_VERSION: "0.17.0"
+# Nothing by default; each job asks for what it needs.
+permissions: {}
+
+# A pull request's new push replaces the run of its old one; main's runs all finish.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # The prefix decides the version a merge into main releases (README, "Versioning").
@@ -21,23 +26,46 @@ jobs:
         run: |
           case "$BRANCH" in
             feature/?* | feat/?* | bugfix/?* | hotfix/?* | ci/?* | release/?* | docs/?* | perf/?* | refactor/?*) ;;
+            dependabot/?*) ;;
             *)
               echo "::error::'$BRANCH' needs one of the prefixes feature/, feat/, bugfix/, hotfix/, ci/, release/, docs/, perf/ or refactor/ (README, \"Versioning\")"
               exit 1
               ;;
           esac
 
+  # The workflows themselves: actionlint for mistakes, zizmor for security (README, "Pipeline").
+  workflows:
+    name: Workflows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # to check out the workflows
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # Go's module proxy and checksum database verify what this downloads.
+      - name: actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      - name: zizmor
+        env:
+          # Read-only; zizmor asks GitHub whether the pinned actions' commits are what they say.
+          GH_TOKEN: ${{ github.token }}
+        run: pipx run zizmor==1.31.1 --format github .github/workflows
+
   test:
     name: Format, build and test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # to check out the code
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install Zig
-        run: |
-          arch=$(uname -m)
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${arch}-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C /opt
-          echo "/opt/zig-${arch}-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+        run: .github/scripts/install-zig.sh
 
       - name: Format check
         working-directory: runner

@@ -28,7 +28,7 @@ comes from the branch's prefix, which CI checks:
 
 | Branch | Bumps |
 | --- | --- |
-| `bugfix/*`, `hotfix/*`, `ci/*` | patch: `v1.2.3` → `v1.2.4` |
+| `bugfix/*`, `hotfix/*`, `ci/*`, and Dependabot's `dependabot/*` | patch: `v1.2.3` → `v1.2.4` |
 | `feature/*`, `feat/*`, `release/*`, `docs/*`, `perf/*`, `refactor/*` | minor: `v1.2.3` → `v1.3.0` |
 | any of them, labelled `breaking` | major: `v1.2.3` → `v2.0.0` |
 
@@ -36,6 +36,25 @@ comes from the branch's prefix, which CI checks:
 pull request carries the `breaking` label. A stack of pull requests releases once, when it reaches
 `main`, with the largest bump in it. The release commits the version to `runner/build.zig.zon` and
 the changelog on `main`, and tags that commit.
+
+## Pipeline
+
+`ci` checks every pull request: the branch name, the workflows (actionlint, and
+[zizmor](https://docs.zizmor.sh) for security), and the format, build and tests. A merge into
+`main` then runs `version`, which waits for approval in the `prod` environment, commits and tags
+the release, and the tag runs `release`. The workflows are written to be hard to turn against the
+repository:
+
+- **Least privilege.** Each workflow grants nothing by default; each job asks for only what it
+  needs, with a comment saying why. Checkouts keep no credentials for later steps.
+- **Pinned inputs.** Actions are pinned by commit, not by tag, which their owner (or whoever takes
+  their repository) can move; Dependabot proposes updates a week after their release. Zig and
+  changie are checked against pinned checksums before they run.
+- **One secret, one step.** The deploy key that may push to `main` is the `prod` environment's,
+  which deploys only from `main` and waits for approval; it is loaded only in the step that pushes,
+  and pushes only to GitHub's pinned host key.
+- **No pull request code with secrets.** Nothing runs on `pull_request_target`; the release starts
+  from a push to `main`, which only takes reviewed merges.
 
 ## Changelog
 

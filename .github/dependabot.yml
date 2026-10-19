@@ -1,0 +1,16 @@
+# Dependabot: the actions the workflows pin by commit, kept current. Pins stop a moved tag from
+# changing what runs; these pull requests are how the pins move on, one reviewed change at a time.
+# Its branches (dependabot/...) bump the patch version (README, "Versioning").
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # A release waits a week before it is proposed: a compromised one is usually caught by then.
+    cooldown:
+      default-days: 7
+    groups:
+      # Minor and patch updates together; a new major version gets a pull request of its own.
+      actions:
+        update-types: [minor, patch]
