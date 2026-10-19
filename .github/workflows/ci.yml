@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The merge queue tests each pull request on top of main and those queued before it; without
+  # this its required checks never report.
+  merge_group:
 
 # Nothing by default; each job asks for what it needs.
 permissions: {}
