@@ -35,8 +35,9 @@ comes from the branch's prefix, which CI checks:
 | any of them, labelled `breaking` | major: `v1.2.3` → `v2.0.0` |
 
 `feature/*` is for larger features, `feat/*` for small ones; neither breaks anything unless the
-pull request carries the `breaking` label. A stack of pull requests releases once, when it reaches
-`main`, with the largest bump in it. The release commits the version to `runner/build.zig.zon`
+pull request carries the `breaking` label. In a stack, each pull request merged into `main`
+releases its own version; one merged into another's branch instead counts toward that one's bump
+when it reaches `main`. The release commits the version to `runner/build.zig.zon`
 and the changelog on `main`, and tags that commit.
 
 [semantic-release](https://github.com/semantic-release/semantic-release) and
