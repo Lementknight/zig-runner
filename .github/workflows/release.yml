@@ -67,7 +67,11 @@ jobs:
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$TAG" dist/* --title "$TAG" --generate-notes --verify-tag
+        # The version's changie notes; GitHub's own for a tag cut without them.
+        run: |
+          notes=(--generate-notes)
+          [[ -f ".changes/$TAG.md" ]] && notes=(--notes-file ".changes/$TAG.md")
+          gh release create "$TAG" dist/* --title "$TAG" "${notes[@]}" --verify-tag
 
   image:
     name: Image

@@ -1,8 +1,8 @@
 # Version: after a pull request merges into main, the next version from the merged branches'
 # prefixes and labels (README, "Versioning"), then a release of it.
-# main is protected, so the version goes in build.zig.zon on a commit just off main, which the tag
-# names; only the tag is pushed. A tag pushed with this workflow's token starts no workflow, so
-# this one calls the release itself.
+# The release is a commit on main: the version in build.zig.zon and the changelog batched by
+# changie, tagged. main is protected; GitHub Actions may bypass that to push it. A tag pushed with
+# this workflow's token starts no workflow, so this one calls the release itself.
 name: version
 
 on:
@@ -15,6 +15,9 @@ on:
 concurrency:
   group: version
   cancel-in-progress: false
+
+env:
+  CHANGIE_VERSION: "1.26.0"
 
 jobs:
   tag:
@@ -38,18 +41,29 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: echo "tag=$(.github/scripts/next-version.sh)" >> "$GITHUB_OUTPUT"
 
-      - name: Tag
+      - name: Install changie
+        if: steps.next.outputs.tag
+        run: |
+          curl -fsSL "https://github.com/miniscruff/changie/releases/download/v${CHANGIE_VERSION}/changie_${CHANGIE_VERSION}_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin changie
+
+      # If main moved since the checkout, the push fails; that merge's own run, waiting behind
+      # this one, releases it and this together.
+      - name: Commit, tag and push
         if: steps.next.outputs.tag
         env:
           TAG: ${{ steps.next.outputs.tag }}
         run: |
+          changie batch "$TAG"
+          changie merge
           sed -E -i "s/^([[:space:]]*\.version = )\"[^\"]*\"/\1\"${TAG#v}\"/" runner/build.zig.zon
           grep -q "\.version = \"${TAG#v}\"" runner/build.zig.zon
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "Release $TAG"
+          git add -A
+          git commit -m "Release $TAG"
           git tag -a "$TAG" -m "$TAG"
-          git push origin "$TAG"
+          git push --atomic origin HEAD:main "refs/tags/$TAG"
 
   release:
     name: Release

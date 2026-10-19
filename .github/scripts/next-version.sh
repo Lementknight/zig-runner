@@ -15,8 +15,7 @@ if [[ -z $last ]]; then
 	echo "no version tag to bump from: tag a first release (v0.1.0) by hand" >&2
 	exit 1
 fi
-# A release's tag sits on a commit just off main, the one setting build.zig.zon's version; the
-# main commit it was cut from is where the two meet. An older tag on main itself meets at itself.
+# The release commit is on main; where the tag and main meet also covers a tag cut off main.
 since=$(git merge-base "$last" "$head")
 
 # Each commit main gained since is a pull request's merge (or, rebased, one of its commits).
