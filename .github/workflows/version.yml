@@ -1,12 +1,14 @@
 # Version: after a pull request merges into main, the next version from the merged branches'
 # prefixes and labels (README, "Versioning"), then a release of it.
 # The release is a commit on main: the version in build.zig.zon and the changelog batched by
-# changie, tagged. main is protected; GitHub Actions may bypass that to push it. A tag pushed with
-# this workflow's token starts no workflow, so this one calls the release itself.
+# changie, tagged. main is protected; the RELEASE_DEPLOY_KEY deploy key may bypass that, and a tag
+# it pushes starts the release workflow.
+# pull_request_target, not pull_request: a merged fork's pull request gets no secrets otherwise.
+# This runs main's workflow on main's code; nothing from the pull request is checked out.
 name: version
 
 on:
-  pull_request:
+  pull_request_target:
     types: [closed]
     branches: [main]
 
@@ -25,15 +27,14 @@ jobs:
     if: github.event.pull_request.merged
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       pull-requests: read
-    outputs:
-      tag: ${{ steps.next.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
       - name: Next version
         id: next
@@ -65,13 +66,3 @@ jobs:
           git tag -a "$TAG" -m "$TAG"
           git push --atomic origin HEAD:main "refs/tags/$TAG"
 
-  release:
-    name: Release
-    needs: tag
-    if: needs.tag.outputs.tag
-    uses: ./.github/workflows/release.yml
-    with:
-      tag: ${{ needs.tag.outputs.tag }}
-    permissions:
-      contents: write
-      packages: write

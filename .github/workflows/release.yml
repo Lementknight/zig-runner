@@ -1,6 +1,6 @@
-# Release: on a version tag (cut by the version workflow, which calls this one), static runner
-# binaries (x86_64 and aarch64 Linux) on a GitHub release, and the runner image (linux/amd64 and
-# linux/arm64) on GitHub's container registry.
+# Release: on a version tag (pushed by the version workflow), static runner binaries (x86_64 and
+# aarch64 Linux) on a GitHub release, and the runner image (linux/amd64 and linux/arm64) on
+# GitHub's container registry.
 # On pull requests that touch the runner's packaging, only checks that the image builds.
 # Run by hand with a tag to (re)build and push that tag's image.
 name: release
@@ -8,12 +8,6 @@ name: release
 on:
   push:
     tags: ["v*"]
-  workflow_call:
-    inputs:
-      tag:
-        description: "The version tag to release (v0.1.0)"
-        required: true
-        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -28,23 +22,19 @@ on:
 
 env:
   ZIG_VERSION: "0.17.0"
-  # The tag released: pushed, given by the version workflow, or given by hand.
+  # The tag released: pushed, or given by hand.
   TAG: ${{ inputs.tag || github.ref_name }}
-  PUBLISH: ${{ (startsWith(github.ref, 'refs/tags/') || inputs.tag) && 'true' || 'false' }}
+  PUBLISH: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
 
 jobs:
   binaries:
     name: Binaries
-    # Not by hand: that rebuilds an image, and the tag's release already exists.
-    # (A called workflow sees its caller's event, a pull request.)
-    if: startsWith(github.ref, 'refs/tags/') || (inputs.tag && github.event_name != 'workflow_dispatch')
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Zig
         run: |
