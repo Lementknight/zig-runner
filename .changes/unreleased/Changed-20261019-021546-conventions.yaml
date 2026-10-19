@@ -1,0 +1,3 @@
+kind: Changed
+body: 'The code follows written conventions: no function over 70 lines, no line over 100 columns outside tests; the long functions were split into named helpers'
+time: 2026-10-19T02:15:46.762986-04:00

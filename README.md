@@ -34,12 +34,25 @@ comes from the branch's prefix, which CI checks:
 
 `feature/*` is for larger features, `feat/*` for small ones; neither breaks anything unless the
 pull request carries the `breaking` label. A stack of pull requests releases once, when it reaches
-`main`, with the largest bump in it. The release's `runner/build.zig.zon` carries its version; that
-commit is only on the tag, as `main` is protected.
+`main`, with the largest bump in it. The release commits the version to `runner/build.zig.zon` and
+the changelog on `main`, and tags that commit.
 
-The design, specification, deployment guide, measurements and proofs behind this runner are in
-[Lementknight/zig-actions-runner](https://github.com/Lementknight/zig-actions-runner), where it
-was developed.
+## Changelog
+
+[CHANGELOG.md](CHANGELOG.md) is kept with [changie](https://changie.dev): each change is a file
+under `.changes/unreleased/`, written with `changie new` in the pull request that makes it. The
+release batches them into the version's notes (`changie batch <version> && changie merge`), which
+are also its GitHub release's notes.
+
+## Origin
+
+The runner was developed in
+[Lementknight/zig-actions-runner](https://github.com/Lementknight/zig-actions-runner), together
+with a read API and a frontend by [@philgutowski](https://github.com/philgutowski), the Tiger Data
+schema by [@rafayet-git](https://github.com/rafayet-git), and the design documents, specification,
+deployment guide, measurements and Agda proofs. Releases v0.1.0 and v0.2.0 were made there. This
+repository carries the runner's history from that work and continues it with only what the runner
+needs to build, run and deploy; the rest stays in the original repository.
 
 Licence: see [LICENSE](LICENSE); the vendored third-party code is listed in
 [THIRD_PARTY.md](THIRD_PARTY.md).

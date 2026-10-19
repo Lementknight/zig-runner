@@ -1,0 +1,3 @@
+kind: Changed
+body: Every Dagger GraphQL query is built by a small query builder (`src/dagger/query.zig`), which escapes every argument and closes what it opens; no query text is written by hand
+time: 2026-10-19T02:16:12.379697-04:00
