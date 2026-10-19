@@ -4,35 +4,17 @@ on:
   push:
     branches: [main]
   pull_request:
-  # Runs the database integration tests; see the db-integration job.
-  workflow_dispatch:
 
 env:
   ZIG_VERSION: "0.17.0"
-  # The Agda the proofs are checked with, here and in the hooks (proofs/check.sh reads it from here),
-  # and the checksum of the release binary this pins to. See proofs/README.md.
-  AGDA_VERSION: "2.8.0.2"
-  AGDA_SHA256: "2bcf24bb561b1be859bba841e5d67962d1616b3251bc147f878e4f60a2fbd9f7"
 
 jobs:
-  unit:
-    name: Zig unit tests
+  test:
+    name: Format, build and test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # The first `zig build` of this job takes 80-100 s, and it is not the thing it builds: with
-      # every cache cold, compiling the tool alone (`zig build-exe`) is 4 s against 59 s through
-      # `zig build`, so the cost is compiling the build runner — build.zig against std — for the
-      # host. Whichever step runs `zig build` first pays it; the next one takes seconds.
-      #
-      # Caching it does not work, and this is the record of four attempts so it is not tried a
-      # fifth time: restoring ~/.cache/zig (61 MB, complete), then also the Zig installation, then
-      # also runner/.zig-cache (121 MB in all, restored in 3 s) each left the compile at 1m18-1m38,
-      # with the global cache growing afterwards — Zig rejects the restored manifests and redoes the
-      # work. It is not the runner's CPU either: two runs on the same model, both cache hits, both
-      # recompiled. Whatever identifies that compilation survives neither a tar restore nor a fresh
-      # checkout, which makes it a Zig question rather than a workflow one.
       - name: Install Zig
         run: |
           arch=$(uname -m)
@@ -43,110 +25,7 @@ jobs:
         working-directory: runner
         run: zig fmt --check .
 
-      # SPEC.md §10's function and line length limits, as a ratchet against the committed baseline:
-      # this fails only when something gets worse, so the refactor queue does not make CI red.
-      - name: Conventions
-        working-directory: runner
-        run: zig build conventions
-
-      # The workflow YAML of this repository, with the parser the runner uses (tools/check_workflows.zig).
-      - name: Check workflow YAML
-        working-directory: runner
-        run: zig build check-workflows
-
-      # The git hooks in .githooks/ run these same checks locally (see README.md).
-      - name: Lint the git hooks
-        run: shellcheck -x .githooks/pre-commit .githooks/pre-push .githooks/zig-common.sh
-
-      # Database tests skip themselves here: no PG* variables are set on this job.
+      # The database tests skip themselves: no PG* variables are set here.
       - name: Test
         working-directory: runner
         run: zig build test --summary all
-
-      # The regex matcher is ours, so something else has to agree with it: Python's `re` and perl,
-      # on the five patterns real actions ship, one case per supported construct, and patterns
-      # generated from the grammar the engine claims to accept. Both references found bugs the unit
-      # tests passed — see proofs/README.md, "Why the regex matcher terminates". Several seeds,
-      # because a single one left two semantic bugs unseen.
-      - name: Regex, against Python and perl
-        working-directory: runner
-        run: |
-          zig build regex-diff
-          for seed in 1 2 3 4 5; do
-            python3 tools/regex_diff.py --random 400 --seed "$seed"
-          done
-
-  proofs:
-    name: Agda proofs of the step cache
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # The Agda project's own release binary, pinned by version and checksum, so this and a
-      # developer's machine check the same language: apt's Agda is 2.6.3 and these proofs do not
-      # type-check on it. The Linux build is statically linked, so it needs no packages, and the
-      # proofs import no library, so it needs no data directory (`agda --setup` would make one).
-      - name: Install Agda ${{ env.AGDA_VERSION }}
-        run: |
-          v=${{ env.AGDA_VERSION }}
-          curl -fsSL -o /tmp/agda.tar.xz \
-            "https://github.com/agda/agda/releases/download/v$v/Agda-v$v-linux.tar.xz"
-          echo "${{ env.AGDA_SHA256 }}  /tmp/agda.tar.xz" | sha256sum -c -
-          mkdir -p "$HOME/.local/bin"
-          tar -xJf /tmp/agda.tar.xz -C "$HOME/.local/bin"
-          mv "$HOME/.local/bin/agda" "$HOME/.local/bin/agda-$v"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/agda-$v" --version
-
-      # Every module is --safe, so a clean run is the whole claim; see proofs/README.md.
-      - name: Check the proofs
-        run: ./proofs/check.sh
-
-  db-integration:
-    name: Database integration (Tiger Data)
-    # This project's own runner, so a workflow run exercises it too. Manual only: the job waits for a
-    # runner with these labels, so it must not be triggered by every push.
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, zig]
-    env:
-      # The standard libpq variables; the tests read them. The secrets are the repository's
-      # TIGER_* secrets and never appear in logs (masked).
-      PGHOST: ${{ secrets.TIGER_HOST }}
-      PGPORT: ${{ secrets.TIGER_PORT }}
-      PGDATABASE: ${{ secrets.TIGER_DB_NAME }}
-      PGUSER: ${{ secrets.TIGER_USERNAME }}
-      PGPASSWORD: ${{ secrets.TIGER_PASSWORD }}
-      PGSSLMODE: require
-    steps:
-      - uses: actions/checkout@v4
-
-      # The first `zig build` of this job takes 80-100 s, and it is not the thing it builds: with
-      # every cache cold, compiling the tool alone (`zig build-exe`) is 4 s against 59 s through
-      # `zig build`, so the cost is compiling the build runner — build.zig against std — for the
-      # host. Whichever step runs `zig build` first pays it; the next one takes seconds.
-      #
-      # Caching it does not work, and this is the record of four attempts so it is not tried a
-      # fifth time: restoring ~/.cache/zig (61 MB, complete), then also the Zig installation, then
-      # also runner/.zig-cache (121 MB in all, restored in 3 s) each left the compile at 1m18-1m38,
-      # with the global cache growing afterwards — Zig rejects the restored manifests and redoes the
-      # work. It is not the runner's CPU either: two runs on the same model, both cache hits, both
-      # recompiled. Whatever identifies that compilation survives neither a tar restore nor a fresh
-      # checkout, which makes it a Zig question rather than a workflow one.
-      - name: Install Zig
-        run: |
-          arch=$(uname -m)
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${arch}-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C /opt
-          echo "/opt/zig-${arch}-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
-
-      # Each database test creates a scratch schema ("zig_it_<random>"), applies db/migrations/001_init.sql
-      # inside it, and drops it afterwards, so real tables and data are never touched.
-      # `zig test` (not `zig build test`) so the run is never served from the build cache.
-      - name: Database tests over TLS
-        working-directory: runner
-        run: zig test src/main.zig
-
-      # Proves the tests cleaned up after themselves and shows what the database holds. Prints no
-      # credentials and no host name (this repository's logs are public).
-      - name: Database check
-        working-directory: runner
-        run: zig build run -- --db-check

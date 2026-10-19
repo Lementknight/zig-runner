@@ -1,4 +1,5 @@
-//! HPACK tables, generated from RFC 7541 by tools/gen_hpack_tables.py: the Huffman code
+//! HPACK tables, generated from RFC 7541 (by gen_hpack_tables.py in the zig-actions-runner
+//! repository, where this runner was developed): the Huffman code
 //! (Appendix B, symbols 0-255) and the static table (Appendix A).
 
 pub const huffman_codes = [256]u32{
