@@ -90,6 +90,12 @@ pub const Config = struct {
     output_keys_max_ms: u32 = 10_000,
     /// With output keys: days a stored output may go unused before it is removed.
     output_keys_days: u32 = 7,
+    /// Refs a job must come from to run here, comma-separated, a trailing `*` matching any rest
+    /// (`refs/heads/main,refs/tags/v*`): the run's ref and its workflow file's. Empty runs every
+    /// job. Set on a runner whose machine untrusted workflows must not reach (see `trust.zig`).
+    trusted_refs: []const u8 = "",
+    /// With `trusted_refs`: the events a job may come from.
+    trusted_events: []const u8 = "push,workflow_dispatch",
     dry_run: bool = false,
     /// Stop after one job (or one failed attempt), as an ephemeral runner process. Off by default:
     /// the runner registers again after each job.
@@ -188,6 +194,8 @@ pub const Config = struct {
         if (environ.get("RUNNER_OUTPUT_KEYS_DAYS")) |v| c.output_keys_days = try count(v);
         if (environ.get("RUNNER_ONCE")) |v| c.once = try boolean(v);
         if (environ.get("RUNNER_COUNT")) |v| c.runners = try count(v);
+        if (environ.get("RUNNER_TRUSTED_REFS")) |v| c.trusted_refs = v;
+        if (environ.get("RUNNER_TRUSTED_EVENTS")) |v| c.trusted_events = v;
     }
 
     /// The flags that take no value and choose what the process does. True when `arg` was one.
@@ -232,6 +240,8 @@ pub const Config = struct {
         else if (eq(key, "output-keys")) c.output_keys = try boolean(val) //
         else if (eq(key, "output-keys-days")) c.output_keys_days = try count(val) //
         else if (eq(key, "runners")) c.runners = try count(val) //
+        else if (eq(key, "trusted-refs")) c.trusted_refs = val //
+        else if (eq(key, "trusted-events")) c.trusted_events = val //
         else return error.UnknownFlag;
     }
 
@@ -441,4 +451,21 @@ test "step caching is on by default and can be turned off" {
     try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--step-cache=false" })).step_cache);
     try env.put("RUNNER_STEP_CACHE", "false");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).step_cache);
+}
+
+test "RUNNER_TRUSTED_REFS and RUNNER_TRUSTED_EVENTS" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    const unset = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqualStrings("", unset.trusted_refs);
+    try std.testing.expectEqualStrings("push,workflow_dispatch", unset.trusted_events);
+    try env.put("RUNNER_TRUSTED_REFS", "refs/heads/main,refs/tags/v*");
+    try env.put("RUNNER_TRUSTED_EVENTS", "push");
+    const set = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqualStrings("refs/heads/main,refs/tags/v*", set.trusted_refs);
+    try std.testing.expectEqualStrings("push", set.trusted_events);
+    const flag = try Config.load(&env, &.{ "runner", "--trusted-refs", "refs/heads/main" });
+    try std.testing.expectEqualStrings("refs/heads/main", flag.trusted_refs);
 }
