@@ -1,0 +1,9 @@
+# Trivy findings accepted on purpose, each with why. Remove an entry when its reason goes away.
+misconfigurations:
+  - id: DS-0002
+    paths: ["runner/Dockerfile", "Dockerfile"]
+    statement: >-
+      The runner runs as root in its container because it reaches the Dagger engine through the
+      engine's unix socket, which the engine (privileged, as it must be to run steps) creates as
+      root. A non-root runner needs that socket's ownership arranged in every deployment first;
+      until then root here grants nothing the privileged engine beside it does not already have.
