@@ -9,6 +9,24 @@ env:
   ZIG_VERSION: "0.17.0"
 
 jobs:
+  # The prefix decides the version a merge into main releases (README, "Versioning").
+  branch:
+    name: Branch name
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the prefix
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          case "$BRANCH" in
+            feature/?* | feat/?* | bugfix/?* | hotfix/?* | ci/?* | release/?* | docs/?* | perf/?* | refactor/?*) ;;
+            *)
+              echo "::error::'$BRANCH' needs one of the prefixes feature/, feat/, bugfix/, hotfix/, ci/, release/, docs/, perf/ or refactor/ (README, \"Versioning\")"
+              exit 1
+              ;;
+          esac
+
   test:
     name: Format, build and test
     runs-on: ubuntu-latest

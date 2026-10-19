@@ -20,6 +20,23 @@ zig-out/bin/runner
 
 Or install `deploy/zig-runner.service` and run it under systemd, or `docker compose -f deploy/compose.yaml up`.
 
+## Versioning
+
+Releases follow [semantic versioning](https://semver.org/) and are cut by CI, not by hand: every
+pull request merged into `main` releases a new version, its binaries and its image. What it bumps
+comes from the branch's prefix, which CI checks:
+
+| Branch | Bumps |
+| --- | --- |
+| `bugfix/*`, `hotfix/*`, `ci/*` | patch: `v1.2.3` → `v1.2.4` |
+| `feature/*`, `feat/*`, `release/*`, `docs/*`, `perf/*`, `refactor/*` | minor: `v1.2.3` → `v1.3.0` |
+| any of them, labelled `breaking` | major: `v1.2.3` → `v2.0.0` |
+
+`feature/*` is for larger features, `feat/*` for small ones; neither breaks anything unless the
+pull request carries the `breaking` label. A stack of pull requests releases once, when it reaches
+`main`, with the largest bump in it. The release's `runner/build.zig.zon` carries its version; that
+commit is only on the tag, as `main` is protected.
+
 The design, specification, deployment guide, measurements and proofs behind this runner are in
 [Lementknight/zig-actions-runner](https://github.com/Lementknight/zig-actions-runner), where it
 was developed.
