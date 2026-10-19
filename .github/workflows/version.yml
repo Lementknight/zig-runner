@@ -1,0 +1,92 @@
+# Version: after a pull request merges into main, the next version from the merged branches'
+# prefixes and labels (README, "Versioning"), then a release of it.
+# The release is a commit on main: the version in build.zig.zon and the changelog batched by
+# changie, tagged. main is protected; the RELEASE_DEPLOY_KEY deploy key may bypass that, and a tag
+# it pushes starts the release workflow. The key is the prod environment's: the job waits for the
+# maintainer's approval, and only runs from main (README, "Environments").
+# On a push to main, not on the pull request's closing: main takes nothing but merges, and a push
+# runs main's own workflow with nothing from the pull request (no pull_request_target).
+name: version
+
+on:
+  push:
+    branches: [main]
+
+# Nothing by default; the job asks for what it needs.
+permissions: {}
+
+# One run at a time. GitHub keeps one waiting run and drops any older one; that loses nothing,
+# because each run releases all of main since the last tag, not just its own pull request.
+concurrency:
+  group: version
+  cancel-in-progress: false
+
+env:
+  CHANGIE_VERSION: "1.26.0"
+  # changie_1.26.0_linux_amd64.tar.gz in the release's checksums.txt.
+  CHANGIE_SHA256: eab168c8287a6e91912e1c02e5260911232d945bfd3c89d8a0e1ace6bb7b6161
+  # GitHub's ed25519 host key (`gh api meta`), not whatever answers for github.com.
+  GITHUB_HOST_KEY: github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+
+jobs:
+  tag:
+    name: Tag
+    # Not the release commit this job pushes. Anyone could name a commit's author so; that only
+    # skips a release, which the next merge makes.
+    if: github.event.head_commit.author.name != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      contents: read # to check out main and its tags
+      pull-requests: read # to read the merged pull requests' branches and labels
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Next version
+        id: next
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "tag=$(.github/scripts/next-version.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Install changie
+        if: steps.next.outputs.tag
+        run: |
+          tarball="$RUNNER_TEMP/changie.tar.gz"
+          curl -fsSL -o "$tarball" "https://github.com/miniscruff/changie/releases/download/v${CHANGIE_VERSION}/changie_${CHANGIE_VERSION}_linux_amd64.tar.gz"
+          echo "$CHANGIE_SHA256  $tarball" | sha256sum --check --quiet
+          sudo tar -xzf "$tarball" -C /usr/local/bin changie
+
+      - name: Commit and tag
+        if: steps.next.outputs.tag
+        env:
+          TAG: ${{ steps.next.outputs.tag }}
+        run: |
+          changie batch "$TAG"
+          changie merge
+          sed -E -i "s/^([[:space:]]*\.version = )\"[^\"]*\"/\1\"${TAG#v}\"/" runner/build.zig.zon
+          grep -q "\.version = \"${TAG#v}\"" runner/build.zig.zon
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Release $TAG"
+          git tag -a "$TAG" -m "$TAG"
+
+      # The key exists only in this step, in an agent: nothing run before (changie, the script)
+      # could read it. If main moved since the checkout, the push fails; that merge's own run,
+      # waiting behind this one, releases it and this together.
+      - name: Push
+        if: steps.next.outputs.tag
+        env:
+          TAG: ${{ steps.next.outputs.tag }}
+          DEPLOY_KEY: ${{ secrets.RELEASE_DEPLOY_KEY }}
+        run: |
+          eval "$(ssh-agent -s)" >/dev/null
+          trap 'ssh-agent -k >/dev/null' EXIT
+          ssh-add -q - <<<"$DEPLOY_KEY"
+          echo "$GITHUB_HOST_KEY" >"$RUNNER_TEMP/known_hosts"
+          export GIT_SSH_COMMAND="ssh -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts -o StrictHostKeyChecking=yes"
+          git push --atomic "git@github.com:${GITHUB_REPOSITORY}.git" HEAD:main "refs/tags/$TAG"
