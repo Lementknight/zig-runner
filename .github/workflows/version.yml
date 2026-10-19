@@ -2,7 +2,8 @@
 # prefixes and labels (README, "Versioning"), then a release of it.
 # The release is a commit on main: the version in build.zig.zon and the changelog batched by
 # changie, tagged. main is protected; the RELEASE_DEPLOY_KEY deploy key may bypass that, and a tag
-# it pushes starts the release workflow.
+# it pushes starts the release workflow. The key is the prod environment's: the job waits for the
+# maintainer's approval, and only runs from main (README, "Environments").
 # pull_request_target, not pull_request: a merged fork's pull request gets no secrets otherwise.
 # This runs main's workflow on main's code; nothing from the pull request is checked out.
 name: version
@@ -26,6 +27,7 @@ jobs:
     name: Tag
     if: github.event.pull_request.merged
     runs-on: ubuntu-latest
+    environment: prod
     permissions:
       contents: read
       pull-requests: read
