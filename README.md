@@ -20,9 +20,21 @@ zig-out/bin/runner
 
 Or install `deploy/zig-runner.service` and run it under systemd, or `docker compose -f deploy/compose.yaml up`.
 
-The design, specification, deployment guide, measurements and proofs behind this runner are in
-[Lementknight/zig-actions-runner](https://github.com/Lementknight/zig-actions-runner), where it
-was developed.
+## Origin
+
+The runner was developed in
+[Lementknight/zig-actions-runner](https://github.com/Lementknight/zig-actions-runner), together
+with a read API and a frontend by [@philgutowski](https://github.com/philgutowski), the Tiger Data
+schema by [@rafayet-git](https://github.com/rafayet-git), and the design documents, specification,
+deployment guide, measurements and Agda proofs. Releases v0.1.0 and v0.2.0 were made there. This
+repository carries the runner's history from that work and continues it with only what the runner
+needs to build, run and deploy; the rest stays in the original repository.
+
+## Changelog
+
+[CHANGELOG.md](CHANGELOG.md) is kept with [changie](https://changie.dev): each change is a file
+under `.changes/unreleased/` (`changie new`), and a release batches them into a version
+(`changie batch <version> && changie merge`).
 
 Licence: see [LICENSE](LICENSE); the vendored third-party code is listed in
 [THIRD_PARTY.md](THIRD_PARTY.md).
