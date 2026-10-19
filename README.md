@@ -36,7 +36,13 @@ comes from the branch's prefix, which CI checks:
 
 `feature/*` is for larger features, `feat/*` for small ones; neither breaks anything unless the
 pull request carries the `breaking` label. A stack of pull requests releases once, when it reaches
-`main`, with the largest bump in it. The release commits the version to `runner/build.zig.zon` and
+`main`, with the largest bump in it.
+
+[semantic-release](https://github.com/semantic-release/semantic-release) and
+[release-please](https://github.com/googleapis/release-please) do this job from
+[Conventional Commits](https://www.conventionalcommits.org) in commit messages instead (`feat:`,
+`fix:`, `feat!:`). They are not used here: the version comes from the branch, and either would
+decide the version, write the changelog and tag the release alongside this, disagreeing with it. The release commits the version to `runner/build.zig.zon` and
 the changelog on `main`, and tags that commit.
 
 ## Pipeline
