@@ -115,7 +115,8 @@ GitHub deployment of the version to the `razorbill` environment. On razorbill,
 
 1. downloads the release's binary, checks it against `SHA256SUMS`, and checks its provenance:
    built by `release.yml`, from that tag, on GitHub's own runners (`gh attestation verify`);
-2. installs it and restarts every `zig-runner@*.service`, each finishing its running jobs first;
+2. installs it and restarts every runner instance (`zig-runner.service` and `zig-runner@*.service`,
+   or `UNITS`), each finishing its running jobs first;
 3. reports success once each instance is listening for jobs again, or puts the previous binary
    back and reports failure.
 

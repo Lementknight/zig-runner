@@ -12,7 +12,8 @@
 #   GH_TOKEN      fine-grained token: Deployments read/write, Attestations and Contents read
 #   REPO          the repository releases come from (Open-Blue/zig-runner)
 #   ENVIRONMENT   the GitHub environment this machine deploys (razorbill)
-#   UNITS         the instances to restart; empty for every zig-runner@*.service here
+#   UNITS         the instances to restart; empty for every zig-runner.service and
+#                 zig-runner@*.service here
 #   BIN           the installed binary (/usr/local/bin/zig-runner)
 #   GH_TIMEOUT    seconds any one call to GitHub may take (120)
 #   DRY_RUN       set to check a deployment without reporting, installing or restarting
@@ -55,14 +56,26 @@ handled() { case $1 in success | failure | error | inactive) return 0 ;; *) retu
 
 version_of() { "$1" --version 2>/dev/null | awk '{print $2}'; }
 
+# The instances to restart: UNITS, or every runner unit loaded here, both the plain
+# zig-runner.service (deploy/zig-runner.service) and instances of a zig-runner@.service template.
 instances() {
 	if [[ -n $UNITS ]]; then
 		local listed
 		read -ra listed <<<"$UNITS"
 		printf '%s\n' "${listed[@]}"
 	else
-		systemctl list-units --all --plain --no-legend 'zig-runner@*.service' | awk '{print $1}'
+		systemctl list-units --all --plain --no-legend 'zig-runner.service' 'zig-runner@*.service' |
+			awk '{print $1}'
 	fi
+}
+
+# The instances systemd does not know (a mistyped UNITS): restarting one would fail only after the
+# release is installed, and roll every instance back for nothing.
+unknown_units() {
+	local unit
+	for unit in "$@"; do
+		[[ $(systemctl show -p LoadState --value "$unit") == loaded ]] || echo "$unit"
+	done
 }
 
 # Whether $1 runs the binary installed now: active, and its process's executable is BIN itself. A
@@ -162,6 +175,8 @@ done
 [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "not a version tag: $tag"
 mapfile -t units < <(instances)
 ((${#units[@]} > 0)) || fail "no zig-runner instances on $(hostname)"
+mapfile -t unknown < <(unknown_units "${units[@]}")
+((${#unknown[@]} == 0)) || fail "no unit ${unknown[*]} on $(hostname) (UNITS); nothing installed"
 
 # Installed already: done if every instance runs it; otherwise restart those that do not.
 current=$(version_of "$BIN" || true)
