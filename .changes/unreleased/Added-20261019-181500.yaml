@@ -1,3 +1,0 @@
-kind: Added
-body: 'A prod runner runs only trusted jobs: RUNNER_TRUSTED_REFS and RUNNER_TRUSTED_EVENTS fail every job from another ref or event, or whose workflow file comes from another ref, before any step runs. Pull requests go to a pre-prod runner on a machine of its own (deploy/runner.preprod.env.example)'
-time: 2026-10-19T18:15:00.000000-04:00
