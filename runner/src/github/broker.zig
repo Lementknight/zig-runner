@@ -120,6 +120,9 @@ fn requestOnce(
             .content_type = if (payload != null) .{ .override = opts.content_type } else .default,
         },
         .extra_headers = headers,
+        // A request with a body cannot follow a redirect: its body is already sent, and after a 301
+        // the client would turn a POST into a GET. The caller gets the redirect as it came.
+        .redirect_behavior = if (payload == null) .init(3) else .unhandled,
     });
     defer req.deinit();
     // A connection a request failed on is not given back to the pool: one that failed while writing
@@ -133,7 +136,10 @@ fn requestOnce(
     try send(&req, payload);
     if (trace) std.debug.print("trace: request sent\n", .{});
 
-    var response = try req.receiveHead(&.{});
+    // Where a redirect's location is kept while it is followed. GitHub redirects every request
+    // for a renamed or transferred repository; an empty buffer failed them all with
+    // HttpRedirectLocationOversize, which is how a runner could not remove its registration.
+    var response = try req.receiveHead(try scratch.alloc(u8, redirect_buffer_len));
     if (trace) std.debug.print("trace: head status={d} content_length={?d} chunked={}\n", .{
         @backingInt(response.head.status),
         response.head.content_length,
@@ -151,6 +157,10 @@ fn requestOnce(
     if (trace) std.debug.print("trace: body {d} bytes\n", .{body.len});
     return .{ .status = response.head.status, .body = try arena.dupe(u8, body) };
 }
+
+/// Longer than any location GitHub redirects to (`/repositories/<id>/...` URLs, signed blob
+/// URLs).
+const redirect_buffer_len = 8 * 1024;
 
 /// `Accept: application/json` ahead of the caller's headers.
 fn acceptJsonHeaders(scratch: Allocator, extra: []const std.http.Header) ![]std.http.Header {

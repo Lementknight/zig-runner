@@ -1,6 +1,7 @@
 //! JIT runner registration: `generate-jitconfig` call and `encoded_jit_config` decoding (SPEC §3).
 const std = @import("std");
 const Config = @import("../config.zig").Config;
+const Scope = @import("../config.zig").Scope;
 const broker = @import("broker.zig");
 
 const Allocator = std.mem.Allocator;
@@ -210,4 +211,121 @@ test "bad response" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     try std.testing.expectError(error.BadResponse, parseResponse(arena_state.allocator(), "{}"));
+}
+
+/// The repository's current name when GitHub knows it by another than GH_SCOPE's (it was renamed
+/// or transferred), else null. GitHub redirects requests for the old name, but registering a runner
+/// sends a body, which cannot follow a redirect; so the runner asks once, at start, and uses the
+/// current name. Null too for an organization, or when GitHub could not say: the runner then goes
+/// on with GH_SCOPE as given, and any real problem shows on registering.
+pub fn movedRepo(arena: Allocator, io: std.Io, cfg: *const Config) ?Scope {
+    const r = switch (cfg.scope) {
+        .repo => |r| r,
+        .org => return null,
+    };
+    const url = std.fmt.allocPrint(
+        arena,
+        "https://api.github.com/repos/{s}/{s}",
+        .{ r.owner, r.name },
+    ) catch return null;
+    const resp = broker.request(arena, io, .GET, url, null, .{
+        .token = cfg.gh_token,
+        .extra_headers = &.{.{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" }},
+    }) catch return null;
+    if (resp.status.class() != .success) return null;
+    return currentName(arena, cfg.scope, resp.body);
+}
+
+/// The repository's `full_name` from GitHub's answer, when it is not `scope` (names compare without
+/// case, as GitHub's do).
+fn currentName(arena: Allocator, scope: Scope, body: []const u8) ?Scope {
+    const Repo = struct { full_name: []const u8 };
+    const repo = std.json.parseFromSliceLeaky(Repo, arena, body, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    const now = Scope.parse(repo.full_name) catch return null;
+    const was = scope.repo;
+    if (std.ascii.eqlIgnoreCase(was.owner, now.repo.owner) and
+        std.ascii.eqlIgnoreCase(was.name, now.repo.name)) return null;
+    return now;
+}
+
+/// Removes this instance's registrations that a stopped runner left behind: offline, idle, and
+/// named `<prefix>-<8 hex digits>` as this runner names its own. They were registered for one
+/// just-in-time session each, which cannot be resumed, so none of them can come back. A runner that
+/// could not remove its own on stopping (as when GitHub redirected the request) left them there.
+/// Returns how many were removed; failures are left for the next start.
+pub fn removeStale(arena: Allocator, io: std.Io, cfg: *const Config) u32 {
+    const list_url = std.fmt.allocPrint(
+        arena,
+        "{s}?per_page=100",
+        .{runnersUrl(arena, cfg) catch return 0},
+    ) catch return 0;
+    const resp = broker.request(arena, io, .GET, list_url, null, .{
+        .token = cfg.gh_token,
+        .extra_headers = &.{.{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" }},
+    }) catch return 0;
+    if (resp.status.class() != .success) return 0;
+    const ids = staleIds(arena, resp.body, cfg.name_prefix) catch return 0;
+    var removed: u32 = 0;
+    for (ids) |id| {
+        const status = deleteRunner(arena, io, cfg, id) catch continue;
+        if (status.class() == .success) removed += 1;
+    }
+    return removed;
+}
+
+/// The ids of the stale registrations in a `GET .../actions/runners` answer (see `removeStale`).
+fn staleIds(arena: Allocator, body: []const u8, prefix: []const u8) ![]const u64 {
+    const Runners = struct {
+        runners: []const struct { id: u64, name: []const u8, status: []const u8, busy: bool },
+    };
+    const list = try std.json.parseFromSliceLeaky(Runners, arena, body, .{
+        .ignore_unknown_fields = true,
+    });
+    var ids: std.ArrayList(u64) = .empty;
+    for (list.runners) |r| {
+        if (!std.mem.eql(u8, r.status, "offline") or r.busy) continue;
+        if (!ownName(r.name, prefix)) continue;
+        try ids.append(arena, r.id);
+    }
+    return ids.items;
+}
+
+/// Whether `name` is one this runner gives its registrations: `<prefix>-` and 8 hex digits.
+fn ownName(name: []const u8, prefix: []const u8) bool {
+    if (name.len != prefix.len + 9) return false;
+    if (!std.mem.startsWith(u8, name, prefix) or name[prefix.len] != '-') return false;
+    for (name[prefix.len + 1 ..]) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
+}
+
+test "a moved repository's current name" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const old: Scope = .{ .repo = .{ .owner = "Lementknight", .name = "zig-runner" } };
+    const moved = currentName(a.allocator(), old, "{\"id\":1,\"full_name\":\"Open-Blue/zig-runner\"}").?;
+    try std.testing.expectEqualStrings("Open-Blue", moved.repo.owner);
+    try std.testing.expectEqualStrings("zig-runner", moved.repo.name);
+    // The same name, whatever its case, is not a move; nor is an answer without one.
+    try std.testing.expectEqual(null, currentName(a.allocator(), old, "{\"full_name\":\"lementknight/Zig-Runner\"}"));
+    try std.testing.expectEqual(null, currentName(a.allocator(), old, "{\"message\":\"Not Found\"}"));
+    try std.testing.expectEqual(null, currentName(a.allocator(), old, "<html>"));
+}
+
+test "stale registrations: offline, idle, and named as this runner names its own" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const body =
+        \\{"total_count":6,"runners":[
+        \\ {"id":24,"name":"zig-ci-9216e058","status":"offline","busy":false,"labels":[]},
+        \\ {"id":25,"name":"zig-ci-2f160103","status":"online","busy":false},
+        \\ {"id":26,"name":"zig-ci-41ef27a0","status":"offline","busy":true},
+        \\ {"id":27,"name":"zig-ci-handmade","status":"offline","busy":false},
+        \\ {"id":28,"name":"zig-sandbox-0a1b2c3d","status":"offline","busy":false},
+        \\ {"id":29,"name":"zig-ci-0a1b2c3d4","status":"offline","busy":false}
+        \\]}
+    ;
+    const ids = try staleIds(a.allocator(), body, "zig-ci");
+    try std.testing.expectEqualSlices(u64, &.{24}, ids);
 }
