@@ -29,6 +29,7 @@ comptime {
     _ = @import("github/feed.zig");
     _ = @import("live.zig");
     _ = @import("job.zig");
+    _ = @import("trust.zig");
     _ = @import("dagger.zig");
     _ = @import("engine.zig");
     _ = @import("hpack.zig");

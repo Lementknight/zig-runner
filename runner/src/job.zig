@@ -175,6 +175,9 @@ pub const Github = struct {
     workflow: []const u8 = "",
     event_name: []const u8 = "",
     ref_name: []const u8 = "",
+    /// The workflow file and the ref it was read from
+    /// (`o/r/.github/workflows/ci.yml@refs/heads/main`).
+    workflow_ref: []const u8 = "",
     /// The job's id in the workflow file (`github.job`).
     job: []const u8 = "",
 };
@@ -709,6 +712,7 @@ fn githubContext(arena: Allocator, root: Value) Github {
         else if (std.mem.eql(u8, k.string, "repository")) g.repository = v.string //
         else if (std.mem.eql(u8, k.string, "sha")) g.sha = v.string //
         else if (std.mem.eql(u8, k.string, "ref")) g.ref = v.string //
+        else if (std.mem.eql(u8, k.string, "workflow_ref")) g.workflow_ref = v.string //
         else if (std.mem.eql(
             u8,
             k.string,

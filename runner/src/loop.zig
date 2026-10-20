@@ -8,6 +8,7 @@ const auth = @import("github/auth.zig");
 const broker = @import("github/broker.zig");
 const runservice = @import("github/runservice.zig");
 const job_mod = @import("job.zig");
+const trust = @import("trust.zig");
 const dagger = @import("dagger.zig");
 const engine = @import("engine.zig");
 const results = @import("github/results.zig");
@@ -674,8 +675,9 @@ fn startReporter(c: Context, job: job_mod.Job, job_started_ms: i64) !?Reporter {
     return reporter;
 }
 
-/// The steps, through Dagger — or, for a job whose `container:` or `services:` the runner does not
-/// support, failed up front rather than run in ways that would fail confusingly without them.
+/// The steps, through Dagger — or failed up front: a job this runner does not trust
+/// (`trust.zig`), or one whose `container:` or `services:` it does not support, rather than run
+/// in ways that would fail confusingly without them.
 fn runJobSteps(
     c: Context,
     job: job_mod.Job,
@@ -684,7 +686,10 @@ fn runJobSteps(
     live: *Live,
     reporter: ?*Reporter,
 ) !dagger.Result {
-    const unsupported: ?[]const u8 = job.container_error orelse job.services_error;
+    const cfg = c.cfg;
+    const refused = try trust.refusal(c.arena, cfg.trusted_refs, cfg.trusted_events, job.github);
+    if (refused) |why| try c.err.print("job refused: {s}\n", .{why});
+    const unsupported: ?[]const u8 = refused orelse job.container_error orelse job.services_error;
     if (unsupported) |why| {
         const step_results = try c.arena.alloc(dagger.StepResult, job.steps.len);
         @memset(step_results, .{});
