@@ -90,6 +90,17 @@ trust, and the runner itself enforces it:
   (`runs-on: [self-hosted, pre-prod]`), runs pull requests and anything else: no trusted refs, no
   secrets, and no access to its Dagger engine from steps (`deploy/runner.preprod.env.example`).
 
+CI's tests run on these runners once they exist, so every change exercises the runner: pushes to
+`main` on prod, pull requests and the merge queue on pre-prod. Each is switched on by a repository
+variable holding its `runs-on` labels as JSON, set once its runner is registered with those labels:
+
+```sh
+gh variable set PROD_RUNNER --body '["self-hosted","prod"]'
+gh variable set PREPROD_RUNNER --body '["self-hosted","pre-prod"]'
+```
+
+Unset, GitHub's `ubuntu-latest` runs them instead. The release still builds on GitHub's runners.
+
 Workflows name `prod` or `pre-prod`, never just `zig`, which both runners carry. Workflows from
 outside contributors' pull requests also wait for approval before they run at all.
 

@@ -57,9 +57,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: pipx run zizmor==1.31.1 --format github .github/workflows
 
+  # On this project's own runners when they are set up, so every change exercises the runner
+  # (README, "Environments"): a push to main on prod, pull requests and the merge queue on pre-prod,
+  # which the prod runner would refuse. The repository variables PROD_RUNNER and PREPROD_RUNNER
+  # hold the runs-on labels as JSON (["self-hosted","prod"]); unset, GitHub's runner stands in.
   test:
     name: Format, build and test
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(github.event_name == 'push' && (vars.PROD_RUNNER || '"ubuntu-latest"') || (vars.PREPROD_RUNNER || '"ubuntu-latest"')) }}
     permissions:
       contents: read # to check out the code
     steps:
