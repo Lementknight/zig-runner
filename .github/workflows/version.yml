@@ -1,0 +1,70 @@
+# Version: after a pull request merges into main, the next version from the merged branches'
+# prefixes and labels (README, "Versioning"), then a release of it.
+# The release is a commit on main: the version in build.zig.zon and the changelog batched by
+# changie, tagged. main is protected; the RELEASE_DEPLOY_KEY deploy key may bypass that, and a tag
+# it pushes starts the release workflow. The key is the prod environment's: the job waits for the
+# maintainer's approval, and only runs from main (README, "Environments").
+# pull_request_target, not pull_request: a merged fork's pull request gets no secrets otherwise.
+# This runs main's workflow on main's code; nothing from the pull request is checked out.
+name: version
+
+on:
+  pull_request_target:
+    types: [closed]
+    branches: [main]
+
+# One run at a time. GitHub keeps one waiting run and drops any older one; that loses nothing,
+# because each run releases all of main since the last tag, not just its own pull request.
+concurrency:
+  group: version
+  cancel-in-progress: false
+
+env:
+  CHANGIE_VERSION: "1.26.0"
+
+jobs:
+  tag:
+    name: Tag
+    if: github.event.pull_request.merged
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
+
+      - name: Next version
+        id: next
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "tag=$(.github/scripts/next-version.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Install changie
+        if: steps.next.outputs.tag
+        run: |
+          curl -fsSL "https://github.com/miniscruff/changie/releases/download/v${CHANGIE_VERSION}/changie_${CHANGIE_VERSION}_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin changie
+
+      # If main moved since the checkout, the push fails; that merge's own run, waiting behind
+      # this one, releases it and this together.
+      - name: Commit, tag and push
+        if: steps.next.outputs.tag
+        env:
+          TAG: ${{ steps.next.outputs.tag }}
+        run: |
+          changie batch "$TAG"
+          changie merge
+          sed -E -i "s/^([[:space:]]*\.version = )\"[^\"]*\"/\1\"${TAG#v}\"/" runner/build.zig.zon
+          grep -q "\.version = \"${TAG#v}\"" runner/build.zig.zon
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Release $TAG"
+          git tag -a "$TAG" -m "$TAG"
+          git push --atomic origin HEAD:main "refs/tags/$TAG"
+

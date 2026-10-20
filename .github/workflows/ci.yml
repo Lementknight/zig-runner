@@ -4,11 +4,43 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The merge queue tests each pull request on top of main and those queued before it; without
+  # this its required checks never report.
+  merge_group:
 
 env:
   ZIG_VERSION: "0.17.0"
 
 jobs:
+  # The prefix decides the version a merge into main releases (README, "Versioning").
+  branch:
+    name: Branch name
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the prefix
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          case "$BRANCH" in
+            feature/?* | feat/?* | bugfix/?* | hotfix/?* | ci/?* | release/?* | docs/?* | perf/?* | refactor/?*) ;;
+            *)
+              echo "::error::'$BRANCH' needs one of the prefixes feature/, feat/, bugfix/, hotfix/, ci/, release/, docs/, perf/ or refactor/ (README, \"Versioning\")"
+              exit 1
+              ;;
+          esac
+
+  # The workflows themselves: actionlint for mistakes.
+  workflows:
+    name: Workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Go's module proxy and checksum database verify what this downloads.
+      - name: actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
   test:
     name: Format, build and test
     runs-on: ubuntu-latest
