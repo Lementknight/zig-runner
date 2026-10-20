@@ -107,6 +107,31 @@ Unset, GitHub's `ubuntu-latest` runs them instead. The release still builds on G
 Workflows name `prod` or `pre-prod`, never just `zig`, which both runners carry. Workflows from
 outside contributors' pull requests also wait for approval before they run at all.
 
+## Deploying releases
+
+A release deploys itself to razorbill. Once its binaries and image are built, `release` records a
+GitHub deployment of the version to the `razorbill` environment. On razorbill,
+`zig-runner-deploy.timer` asks every minute; for a new deployment `deploy/zig-runner-deploy`:
+
+1. downloads the release's binary, checks it against `SHA256SUMS`, and checks its provenance:
+   built by `release.yml`, from that tag, on GitHub's own runners (`gh attestation verify`);
+2. installs it and restarts every `zig-runner@*.service`, each finishing its running jobs first;
+3. reports success once each instance is listening for jobs again, or puts the previous binary
+   back and reports failure.
+
+The outcome shows under the repository's Environments, on the deployment. Nothing reaches into the
+machine: it asks GitHub, with a token that can only read and report deployments. To set it up, on
+the machine, with `gh` 2.49 or later from [cli.github.com](https://cli.github.com) (Debian's
+package cannot verify provenance) and a fine-grained token for this repository with Deployments
+read and write, Attestations and Contents read:
+
+```sh
+sudo install -m 0755 deploy/zig-runner-deploy /usr/local/bin/
+sudo install -m 0600 deploy/zig-runner-deploy.env.example /etc/zig-runner-deploy.env   # GH_TOKEN
+sudo cp deploy/zig-runner-deploy.service deploy/zig-runner-deploy.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now zig-runner-deploy.timer
+```
+
 ## Changelog
 
 [CHANGELOG.md](CHANGELOG.md) is kept with [changie](https://changie.dev): each change is a file

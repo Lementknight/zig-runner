@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# zig-runner-deploy: installs the release GitHub last recorded as a deployment to this machine's
+# environment, restarts the runner instances here, and reports back (README, "Deploying releases").
+# zig-runner-deploy.timer runs it every minute; with nothing new to deploy it only asks GitHub.
+#
+# A release is installed only once its binary matches SHA256SUMS and its build provenance says
+# release.yml built it from that tag on GitHub's own runners (gh attestation verify). If an instance
+# does not come back listening for jobs, the previous binary is put back and the deployment is
+# reported failed.
+#
+# Settings, from /etc/zig-runner-deploy.env (deploy/zig-runner-deploy.env.example):
+#   GH_TOKEN      fine-grained token: Deployments read/write, Attestations and Contents read
+#   REPO          the repository releases come from (Open-Blue/zig-runner)
+#   ENVIRONMENT   the GitHub environment this machine deploys (razorbill)
+#   UNITS         the instances to restart; empty for every zig-runner@*.service here
+#   BIN           the installed binary (/usr/local/bin/zig-runner)
+#   DRY_RUN       set to check a deployment without reporting, installing or restarting
+set -euo pipefail
+
+: "${GH_TOKEN:?GH_TOKEN must be set}"
+REPO=${REPO:-Open-Blue/zig-runner}
+ENVIRONMENT=${ENVIRONMENT:-razorbill}
+UNITS=${UNITS:-}
+BIN=${BIN:-/usr/local/bin/zig-runner}
+DRY_RUN=${DRY_RUN:-}
+HEALTH_SECONDS=${HEALTH_SECONDS:-120}
+export GH_TOKEN GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1
+
+log() { echo "zig-runner-deploy: $*" >&2; }
+
+# A deployment's new state, with a description GitHub shows (140 characters at most).
+report() {
+	local id=$1 state=$2 description=$3
+	log "deployment $id: $state: $description"
+	[[ -n $DRY_RUN ]] && return 0
+	gh api -X POST "repos/$REPO/deployments/$id/statuses" \
+		-f state="$state" -f description="${description:0:140}" -F auto_inactive=true >/dev/null
+}
+
+latest_state() {
+	gh api "repos/$REPO/deployments/$1/statuses?per_page=1" --jq '.[0].state // ""'
+}
+
+handled() { case $1 in success | failure | error | inactive) return 0 ;; *) return 1 ;; esac }
+
+version_of() { "$1" --version 2>/dev/null | awk '{print $2}'; }
+
+instances() {
+	if [[ -n $UNITS ]]; then
+		local listed
+		read -ra listed <<<"$UNITS"
+		printf '%s\n' "${listed[@]}"
+	else
+		systemctl list-units --all --plain --no-legend 'zig-runner@*.service' | awk '{print $1}'
+	fi
+}
+
+# Whether $1 is active and has said it is listening since $2 (seconds since the epoch).
+listening_since() {
+	systemctl is-active --quiet "$1" &&
+		journalctl -u "$1" --since "@$2" -o cat --no-pager | grep -q 'listening for jobs'
+}
+
+# Restarts every instance; returns the first that does not come back listening, or nothing.
+restart_all() {
+	local unit since deadline
+	for unit in "${units[@]}"; do
+		since=$(date +%s)
+		# A stop lets running jobs finish first (the unit's TimeoutStopSec).
+		systemctl restart "$unit" || {
+			echo "$unit"
+			return
+		}
+		deadline=$((SECONDS + HEALTH_SECONDS))
+		until listening_since "$unit" "$since"; do
+			if ((SECONDS >= deadline)); then
+				echo "$unit"
+				return
+			fi
+			sleep 3
+		done
+	done
+}
+
+# What this machine needs is checked before any deployment is touched: a deployment reported failed
+# for a missing tool would never be tried again, so this exits and the timer tries next minute.
+attestation_help=$(gh attestation verify --help 2>&1) || true
+for flag in --signer-workflow --source-ref --deny-self-hosted-runners; do
+	if [[ $attestation_help != *"$flag"* ]]; then
+		log "$(gh --version | head -n1) cannot verify provenance (gh attestation verify $flag):" \
+			"install gh from https://cli.github.com (Debian's package is too old)"
+		exit 1
+	fi
+done
+
+mapfile -t ids < <(
+	gh api "repos/$REPO/deployments?environment=$ENVIRONMENT&per_page=10" --jq '.[].id'
+)
+((${#ids[@]} > 0)) || exit 0
+id=${ids[0]}
+handled "$(latest_state "$id")" && exit 0
+
+tag=$(gh api "repos/$REPO/deployments/$id" --jq .ref)
+log "deployment $id: $tag"
+# Older deployments nobody got to: this newer one replaces them.
+for old in "${ids[@]:1}"; do
+	handled "$(latest_state "$old")" || report "$old" inactive "superseded by $tag"
+done
+
+fail() {
+	report "$id" failure "$1"
+	exit 1
+}
+
+[[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "not a version tag: $tag"
+current=$(version_of "$BIN" || true)
+if [[ $current == "$tag" ]]; then
+	report "$id" success "already running $tag"
+	exit 0
+fi
+mapfile -t units < <(instances)
+((${#units[@]} > 0)) || fail "no zig-runner instances to restart on $(hostname)"
+
+report "$id" in_progress "installing $tag on $(hostname) (was ${current:-none})"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+asset="zig-runner-linux-$(uname -m)"
+gh release download "$tag" -R "$REPO" -D "$work" -p "$asset" -p SHA256SUMS ||
+	fail "$tag has no $asset"
+grep -q "  $asset\$" "$work/SHA256SUMS" || fail "$asset is not in $tag's SHA256SUMS"
+(cd "$work" && sha256sum --check --ignore-missing --quiet SHA256SUMS) ||
+	fail "$asset does not match $tag's SHA256SUMS"
+gh attestation verify "$work/$asset" --repo "$REPO" \
+	--signer-workflow "$REPO/.github/workflows/release.yml" \
+	--source-ref "refs/tags/$tag" --deny-self-hosted-runners >/dev/null ||
+	fail "$asset has no provenance from release.yml at $tag"
+chmod 0755 "$work/$asset"
+[[ $(version_of "$work/$asset") == "$tag" ]] || fail "$asset does not say it is $tag"
+
+if [[ -n $DRY_RUN ]]; then
+	log "dry run: $tag checks out; would install it and restart ${units[*]}"
+	exit 0
+fi
+
+cp -p "$BIN" "$BIN.prev"
+install -m 0755 "$work/$asset" "$BIN"
+down=$(restart_all)
+if [[ -z $down ]]; then
+	report "$id" success "running $tag on $(hostname): ${units[*]}"
+	exit 0
+fi
+
+install -m 0755 "$BIN.prev" "$BIN"
+again=$(restart_all)
+fail "$tag did not come up on $down; back on ${current:-the old binary}${again:+, $again down}"
