@@ -1,6 +1,7 @@
 //! JIT runner registration: `generate-jitconfig` call and `encoded_jit_config` decoding (SPEC §3).
 const std = @import("std");
 const Config = @import("../config.zig").Config;
+const Scope = @import("../config.zig").Scope;
 const broker = @import("broker.zig");
 
 const Allocator = std.mem.Allocator;
@@ -210,4 +211,175 @@ test "bad response" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     try std.testing.expectError(error.BadResponse, parseResponse(arena_state.allocator(), "{}"));
+}
+
+/// The repository's current name when GitHub knows it by another than GH_SCOPE's (it was renamed
+/// or transferred), else null. GitHub redirects requests for the old name, but registering a runner
+/// sends a body, which cannot follow a redirect; so the runner asks once, at start, and uses the
+/// current name. Null too for an organization, or when GitHub could not say: the runner then goes
+/// on with GH_SCOPE as given, and any real problem shows on registering.
+pub fn movedRepo(arena: Allocator, io: std.Io, cfg: *const Config) ?Scope {
+    const r = switch (cfg.scope) {
+        .repo => |r| r,
+        .org => return null,
+    };
+    const url = std.fmt.allocPrint(
+        arena,
+        "https://api.github.com/repos/{s}/{s}",
+        .{ r.owner, r.name },
+    ) catch return null;
+    const resp = broker.request(arena, io, .GET, url, null, .{
+        .token = cfg.gh_token,
+        .extra_headers = &.{.{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" }},
+    }) catch return null;
+    if (resp.status.class() != .success) return null;
+    return currentName(arena, cfg.scope, resp.body);
+}
+
+/// The repository's `full_name` from GitHub's answer, when it is not `scope` (names compare without
+/// case, as GitHub's do).
+fn currentName(arena: Allocator, scope: Scope, body: []const u8) ?Scope {
+    const Repo = struct { full_name: []const u8 };
+    const repo = std.json.parseFromSliceLeaky(Repo, arena, body, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    const now = Scope.parse(repo.full_name) catch return null;
+    const was = scope.repo;
+    if (std.ascii.eqlIgnoreCase(was.owner, now.repo.owner) and
+        std.ascii.eqlIgnoreCase(was.name, now.repo.name)) return null;
+    return now;
+}
+
+/// This instance's registrations that look left behind by a stopped runner: offline, idle, and
+/// named `<prefix>-<8 hex digits>` as this runner names its own, from every page of the list. Each
+/// was registered for one just-in-time session, which cannot be resumed. A registration another
+/// process with the same prefix has just made looks the same until its runner connects (seconds),
+/// so these are only candidates: `removeStillStale` removes those still offline a while later.
+pub fn staleRegistrations(arena: Allocator, io: std.Io, cfg: *const Config) ![]const u64 {
+    const base = try runnersUrl(arena, cfg);
+    var ids: std.ArrayList(u64) = .empty;
+    var page: u32 = 1;
+    while (page <= max_pages) : (page += 1) {
+        const url = try std.fmt.allocPrint(
+            arena,
+            "{s}?per_page={d}&page={d}",
+            .{ base, per_page, page },
+        );
+        const resp = try broker.request(arena, io, .GET, url, null, .{
+            .token = cfg.gh_token,
+            .extra_headers = &.{.{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" }},
+        });
+        if (resp.status.class() != .success) return error.GithubRejected;
+        const found = try staleIds(arena, resp.body, cfg.name_prefix);
+        try ids.appendSlice(arena, found.ids);
+        if (found.listed < per_page) break;
+    }
+    return ids.items;
+}
+
+/// How long a stale-looking registration must stay so before it is removed: far longer than a new
+/// one takes to connect.
+pub const stale_confirm_seconds = 60;
+
+const per_page = 100;
+/// 10,000 runners; a list longer than that is not this runner's to page through at every start.
+const max_pages = 100;
+
+/// Removes the registrations in `earlier` that still look left behind (see `staleRegistrations`).
+/// Returns how many were removed; failures are left for the next start.
+pub fn removeStillStale(
+    arena: Allocator,
+    io: std.Io,
+    cfg: *const Config,
+    earlier: []const u64,
+) u32 {
+    const now = staleRegistrations(arena, io, cfg) catch return 0;
+    var removed: u32 = 0;
+    for (stillStale(earlier, now)) |id| {
+        const status = deleteRunner(arena, io, cfg, id) catch continue;
+        if (status.class() == .success) removed += 1;
+    }
+    return removed;
+}
+
+/// The ids in both lists, in `earlier`'s order (ids are few: a quadratic scan is fine). Reuses
+/// `earlier`'s memory, which the caller does not need again.
+fn stillStale(earlier: []const u64, now: []const u64) []const u64 {
+    const out = @constCast(earlier);
+    var n: usize = 0;
+    for (earlier) |id| if (std.mem.indexOfScalar(u64, now, id) != null) {
+        out[n] = id;
+        n += 1;
+    };
+    return out[0..n];
+}
+
+/// The stale-looking registrations in one page of `GET .../actions/runners`, and how many runners
+/// the page listed (fewer than asked for: the last page).
+fn staleIds(
+    arena: Allocator,
+    body: []const u8,
+    prefix: []const u8,
+) !struct { ids: []const u64, listed: usize } {
+    const Runners = struct {
+        runners: []const struct { id: u64, name: []const u8, status: []const u8, busy: bool },
+    };
+    const list = try std.json.parseFromSliceLeaky(Runners, arena, body, .{
+        .ignore_unknown_fields = true,
+    });
+    var ids: std.ArrayList(u64) = .empty;
+    for (list.runners) |r| {
+        if (!std.mem.eql(u8, r.status, "offline") or r.busy) continue;
+        if (!ownName(r.name, prefix)) continue;
+        try ids.append(arena, r.id);
+    }
+    return .{ .ids = ids.items, .listed = list.runners.len };
+}
+
+/// Whether `name` is one this runner gives its registrations: `<prefix>-` and 8 hex digits.
+fn ownName(name: []const u8, prefix: []const u8) bool {
+    if (name.len != prefix.len + 9) return false;
+    if (!std.mem.startsWith(u8, name, prefix) or name[prefix.len] != '-') return false;
+    for (name[prefix.len + 1 ..]) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
+}
+
+test "a moved repository's current name" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const old: Scope = .{ .repo = .{ .owner = "Lementknight", .name = "zig-runner" } };
+    const moved = currentName(a.allocator(), old, "{\"id\":1,\"full_name\":\"Open-Blue/zig-runner\"}").?;
+    try std.testing.expectEqualStrings("Open-Blue", moved.repo.owner);
+    try std.testing.expectEqualStrings("zig-runner", moved.repo.name);
+    // The same name, whatever its case, is not a move; nor is an answer without one.
+    try std.testing.expectEqual(null, currentName(a.allocator(), old, "{\"full_name\":\"lementknight/Zig-Runner\"}"));
+    try std.testing.expectEqual(null, currentName(a.allocator(), old, "{\"message\":\"Not Found\"}"));
+    try std.testing.expectEqual(null, currentName(a.allocator(), old, "<html>"));
+}
+
+test "stale registrations: offline, idle, and named as this runner names its own" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const body =
+        \\{"total_count":6,"runners":[
+        \\ {"id":24,"name":"zig-ci-9216e058","status":"offline","busy":false,"labels":[]},
+        \\ {"id":25,"name":"zig-ci-2f160103","status":"online","busy":false},
+        \\ {"id":26,"name":"zig-ci-41ef27a0","status":"offline","busy":true},
+        \\ {"id":27,"name":"zig-ci-handmade","status":"offline","busy":false},
+        \\ {"id":28,"name":"zig-sandbox-0a1b2c3d","status":"offline","busy":false},
+        \\ {"id":29,"name":"zig-ci-0a1b2c3d4","status":"offline","busy":false}
+        \\]}
+    ;
+    const found = try staleIds(a.allocator(), body, "zig-ci");
+    try std.testing.expectEqualSlices(u64, &.{24}, found.ids);
+    try std.testing.expectEqual(@as(usize, 6), found.listed);
+}
+
+test "only what still looks stale a minute later is removed" {
+    // 24 and 31 stayed offline; 30 connected meanwhile (another process's new registration); 32
+    // appeared since and waits for the next start.
+    var earlier = [_]u64{ 24, 30, 31 };
+    try std.testing.expectEqualSlices(u64, &.{ 24, 31 }, stillStale(&earlier, &.{ 31, 24, 32 }));
+    var none = [_]u64{30};
+    try std.testing.expectEqualSlices(u64, &.{}, stillStale(&none, &.{}));
 }

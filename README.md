@@ -86,7 +86,8 @@ trust, and the runner itself enforces it:
   other job fails before a step runs, with the reason in its log. The `prod` GitHub environment
   holds the release's deploy key, deploys only from `main` and `v*` tags, and waits for the
   maintainer's approval.
-- **pre-prod**, a runner on a machine of its own with nothing worth reaching
+- **pre-prod**, a runner on a 64-bit machine of its own (the Dagger engine is built for
+  `linux/amd64` and `linux/arm64` only) with nothing worth reaching
   (`runs-on: [self-hosted, pre-prod]`), runs pull requests and anything else: no trusted refs, no
   secrets, and no access to its Dagger engine from steps (`deploy/runner.preprod.env.example`).
 

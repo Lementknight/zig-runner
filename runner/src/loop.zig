@@ -442,6 +442,21 @@ const Reporter = struct {
         }) catch |e| r.note(e);
     }
 
+    /// "Set up job" failed after all: the job failed before its steps (refused, unsupported, or an
+    /// action that could not be resolved). `jobStarted` recorded it as a success, as it is for
+    /// every job that reaches its steps; GitHub shows it failed, and so must the database.
+    fn setUpFailed(r: *Reporter, started_ms: i64, now_ms: i64) void {
+        r.store.upsertStep(.{
+            .job_id = r.job_id,
+            .number = 0,
+            .name = "Set up job",
+            .status = "completed",
+            .conclusion = "failure",
+            .started_at = r.iso(started_ms),
+            .completed_at = r.iso(now_ms),
+        }) catch |e| r.note(e);
+    }
+
     fn jobFinished(
         r: *Reporter,
         job: job_mod.Job,
@@ -598,6 +613,7 @@ fn finishReporter(
     job_started_ms: i64,
 ) !void {
     const ended_ms = std.Io.Clock.real.now(c.io).toMilliseconds();
+    if (result.set_up_failed) r.setUpFailed(job_started_ms, ended_ms);
     r.jobFinished(job, c.name, reporterConclusion(result), job_started_ms, ended_ms);
     if (r.failures > 0) try c.err.print(
         "run state: {d} database write(s) failed (last: {s})\n",
@@ -691,10 +707,8 @@ fn runJobSteps(
     if (refused) |why| try c.err.print("job refused: {s}\n", .{why});
     const unsupported: ?[]const u8 = refused orelse job.container_error orelse job.services_error;
     if (unsupported) |why| {
-        const step_results = try c.arena.alloc(dagger.StepResult, job.steps.len);
-        @memset(step_results, .{});
         try log.append(job.check_run_id, 0, .stderr, why);
-        return .{ .steps = step_results, .engine_error = null, .succeeded = false };
+        return failedInSetUp(c.arena, job.steps.len);
     }
     var result = try dagger.run(c.arena, c.io, c.environ, .{
         .dagger_cmd = c.cfg.dagger_cmd,
@@ -727,6 +741,27 @@ fn runJobSteps(
         try log.append(job.check_run_id, 0, .stderr, msg);
     };
     return result;
+}
+
+/// A job failed before any of its steps: "Set up job" failed, as GitHub's runner shows it, and the
+/// steps keep their numbers without running (so "Complete job" does not take the first one's).
+fn failedInSetUp(arena: std.mem.Allocator, steps: usize) !dagger.Result {
+    const step_results = try arena.alloc(dagger.StepResult, steps);
+    @memset(step_results, .{});
+    return .{
+        .steps = step_results,
+        .engine_error = null,
+        .succeeded = false,
+        .set_up_failed = true,
+    };
+}
+
+test "a job failed before its steps fails in Set up job" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const r = try failedInSetUp(a.allocator(), 2);
+    try std.testing.expect(r.set_up_failed and !r.succeeded);
+    try std.testing.expectEqual(@as(usize, 2), r.steps.len);
 }
 
 /// Where "Complete job" sits in the log and when it ran, for `shownSteps`.

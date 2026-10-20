@@ -99,7 +99,7 @@ fn requestOnce(
     var scratch_state: std.heap.ArenaAllocator = .init(if (http.shared) |c| c.allocator else arena);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
-    const bearer: ?[]const u8 = if (opts.token) |t| try std.fmt.allocPrint(
+    var bearer: ?[]const u8 = if (opts.token) |t| try std.fmt.allocPrint(
         scratch,
         "Bearer {s}",
         .{t},
@@ -110,16 +110,64 @@ fn requestOnce(
     defer local.deinit();
     const client = http.client(&local);
 
-    if (trace) std.debug.print(
-        "trace: connecting {s} {s}\n",
-        .{ @tagName(method), url[0 .. std.mem.indexOfScalarPos(u8, url, 8, '/') orelse url.len] },
-    );
-    var req = try client.request(method, try std.Uri.parse(url), .{
+    // Redirects are followed here, not by the client: it would send the token to wherever a
+    // redirect points (it drops only `privileged_headers` across domains, which it never sends at
+    // all). The token goes on only to the same scheme, host and port. GitHub redirects every
+    // request for a renamed or transferred repository, which is how a runner could not remove its
+    // registration while the client had no room for a redirect at all.
+    var target = try std.Uri.parse(url);
+    var current = method;
+    var hops: u32 = 0;
+    while (true) : (hops += 1) {
+        const next = switch (try exchange(.{
+            .arena = arena,
+            .scratch = scratch,
+            .client = client,
+            .method = current,
+            .uri = target,
+            .payload = payload,
+            .bearer = bearer,
+            .headers = headers,
+            .content_type = opts.content_type,
+        })) {
+            .done => |r| return r,
+            .redirect => |r| r,
+        };
+        if (hops == max_redirects) return error.TooManyHttpRedirects;
+        if (!sameOrigin(target, next.uri)) bearer = null;
+        if (next.see_other) current = .GET;
+        target = next.uri;
+    }
+}
+
+/// GitHub's redirects come one at a time; a chain longer than this is a loop.
+const max_redirects = 3;
+
+const Exchange = struct {
+    arena: Allocator,
+    scratch: Allocator,
+    client: *std.http.Client,
+    method: std.http.Method,
+    uri: std.Uri,
+    payload: ?[]const u8,
+    bearer: ?[]const u8,
+    headers: []const std.http.Header,
+    content_type: []const u8,
+};
+
+const Redirect = struct { uri: std.Uri, see_other: bool };
+
+/// One request and its answer, or where a redirect points when the request has no body to resend.
+/// A request with a body gets the redirect as it came: its body is already sent.
+fn exchange(x: Exchange) !union(enum) { done: Response, redirect: Redirect } {
+    if (trace) std.debug.print("trace: connecting {s}\n", .{@tagName(x.method)});
+    var req = try x.client.request(x.method, x.uri, .{
         .headers = .{
-            .authorization = if (bearer) |b| .{ .override = b } else .default,
-            .content_type = if (payload != null) .{ .override = opts.content_type } else .default,
+            .authorization = if (x.bearer) |b| .{ .override = b } else .default,
+            .content_type = if (x.payload != null) .{ .override = x.content_type } else .default,
         },
-        .extra_headers = headers,
+        .extra_headers = x.headers,
+        .redirect_behavior = .unhandled,
     });
     defer req.deinit();
     // A connection a request failed on is not given back to the pool: one that failed while writing
@@ -130,7 +178,7 @@ fn requestOnce(
     };
 
     if (trace) std.debug.print("trace: connected\n", .{});
-    try send(&req, payload);
+    try send(&req, x.payload);
     if (trace) std.debug.print("trace: request sent\n", .{});
 
     var response = try req.receiveHead(&.{});
@@ -140,17 +188,55 @@ fn requestOnce(
         response.head.transfer_encoding == .chunked,
     });
 
+    if (x.payload == null and response.head.status.class() == .redirect) {
+        if (response.head.location) |location| {
+            // The location is copied out first: reading past the head (the body) overwrites it.
+            const buf = try x.scratch.alloc(u8, redirect_buffer_len);
+            if (location.len > buf.len) return error.HttpRedirectLocationOversize;
+            @memcpy(buf[0..location.len], location);
+            const see_other = response.head.status == .see_other;
+            _ = response.reader(&.{}).discardRemaining() catch {
+                req.connection.?.closing = true;
+            };
+            var aux: []u8 = buf;
+            const next = x.uri.resolveInPlace(location.len, &aux) catch
+                return error.HttpRedirectLocationInvalid;
+            return .{ .redirect = .{ .uri = next, .see_other = see_other } };
+        }
+    }
+
     // 204/304 carry no body. Without Content-Length, Request.deinit would wait on the socket for
     // one, so mark the connection closing (deinit then skips draining it).
     if (response.head.status == .no_content or response.head.status == .not_modified) {
         req.connection.?.closing = true;
-        return .{ .status = response.head.status, .body = "" };
+        return .{ .done = .{ .status = response.head.status, .body = "" } };
     }
 
-    const body = try readBody(scratch, &response);
+    const body = try readBody(x.scratch, &response);
     if (trace) std.debug.print("trace: body {d} bytes\n", .{body.len});
-    return .{ .status = response.head.status, .body = try arena.dupe(u8, body) };
+    return .{ .done = .{ .status = response.head.status, .body = try x.arena.dupe(u8, body) } };
 }
+
+/// Whether a redirect stays where the token may go: the same scheme, host and port.
+fn sameOrigin(a: std.Uri, b: std.Uri) bool {
+    if (!std.ascii.eqlIgnoreCase(a.scheme, b.scheme)) return false;
+    var a_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    var b_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const a_host = std.Io.net.HostName.fromUri(a, &a_buf) catch return false;
+    const b_host = std.Io.net.HostName.fromUri(b, &b_buf) catch return false;
+    if (!std.ascii.eqlIgnoreCase(a_host.bytes, b_host.bytes)) return false;
+    return (a.port orelse defaultPort(a.scheme)) == (b.port orelse defaultPort(b.scheme));
+}
+
+fn defaultPort(scheme: []const u8) ?u16 {
+    if (std.ascii.eqlIgnoreCase(scheme, "https")) return 443;
+    if (std.ascii.eqlIgnoreCase(scheme, "http")) return 80;
+    return null;
+}
+
+/// Longer than any location GitHub redirects to (`/repositories/<id>/...` URLs, signed blob
+/// URLs); and the room the resolved location may need.
+const redirect_buffer_len = 8 * 1024;
 
 /// `Accept: application/json` ahead of the caller's headers.
 fn acceptJsonHeaders(scratch: Allocator, extra: []const std.http.Header) ![]std.http.Header {
@@ -219,6 +305,16 @@ pub fn sessionBody(arena: Allocator, s: Settings, owner: []const u8) ![]const u8
             "\"useFipsEncryption\":false}}",
         .{ owner, s.agent_id, s.agent_name, version },
     );
+}
+
+test "the token goes on only to the same scheme, host and port" {
+    const api = try std.Uri.parse("https://api.github.com/repos/o/r");
+    try std.testing.expect(sameOrigin(api, try std.Uri.parse("https://API.github.com/repositories/1")));
+    try std.testing.expect(sameOrigin(api, try std.Uri.parse("https://api.github.com:443/x")));
+    try std.testing.expect(!sameOrigin(api, try std.Uri.parse("https://objects.githubusercontent.com/x")));
+    try std.testing.expect(!sameOrigin(api, try std.Uri.parse("https://evil.api.github.com/x")));
+    try std.testing.expect(!sameOrigin(api, try std.Uri.parse("http://api.github.com/x")));
+    try std.testing.expect(!sameOrigin(api, try std.Uri.parse("https://api.github.com:8443/x")));
 }
 
 test "parseSettings" {

@@ -10,6 +10,7 @@ const redact = @import("redact.zig");
 const sink = @import("sink.zig");
 const http = @import("github/http.zig");
 const broker = @import("github/broker.zig");
+const jitconfig = @import("github/jitconfig.zig");
 const engine = @import("engine.zig");
 const build_version = @import("version.zig");
 
@@ -60,7 +61,7 @@ pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(arena);
     if (try printVersionIfAsked(io, args)) return @backingInt(Exit.done);
 
-    const cfg = Config.load(init.environ_map, args) catch |e| {
+    var cfg = Config.load(init.environ_map, args) catch |e| {
         try err.print("config error: {s}\n", .{@errorName(e)});
         return @backingInt(Exit.config);
     };
@@ -106,6 +107,7 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer client.deinit();
     http.shared = &client;
+    try settleRegistrations(arena, io, &cfg, log);
     installStopSignals();
     return runPool(init, &cfg, log, err, secrets, name, if (store) |*st| st else null);
 }
@@ -211,6 +213,41 @@ fn runnerName(arena: std.mem.Allocator, io: std.Io, prefix: []const u8) ![]const
     var suffix: [4]u8 = undefined;
     io.random(&suffix);
     return std.fmt.allocPrint(arena, "{s}-{x}", .{ prefix, suffix });
+}
+
+/// Before registering: the repository's current name if it moved (GitHub's redirects for the old
+/// name cannot carry a registration), and none of this instance's registrations that a stopped
+/// runner could not remove (see `jitconfig.staleRegistrations`).
+fn settleRegistrations(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    cfg: *Config,
+    log: *sink.LogSink,
+) !void {
+    if (jitconfig.movedRepo(arena, io, cfg)) |now| {
+        const was = cfg.scope.repo;
+        try log.append(0, 0, .stderr, try std.fmt.allocPrint(
+            arena,
+            "GH_SCOPE {s}/{s} moved to {s}/{s}: registering there (set GH_SCOPE to it)",
+            .{ was.owner, was.name, now.repo.owner, now.repo.name },
+        ));
+        cfg.scope = now;
+    }
+    const candidates = jitconfig.staleRegistrations(arena, io, cfg) catch &.{};
+    if (candidates.len == 0) return;
+    try log.append(0, 0, .stderr, try std.fmt.allocPrint(
+        arena,
+        "{d} offline registration(s) named {s}-* look left behind; removing those still offline " ++
+            "in {d} s",
+        .{ candidates.len, cfg.name_prefix, jitconfig.stale_confirm_seconds },
+    ));
+    io.sleep(.fromSeconds(jitconfig.stale_confirm_seconds), .awake) catch {};
+    const removed = jitconfig.removeStillStale(arena, io, cfg, candidates);
+    try log.append(0, 0, .stderr, try std.fmt.allocPrint(
+        arena,
+        "removed {d} stale registration(s) named {s}-*, which a stopped runner left behind",
+        .{ removed, cfg.name_prefix },
+    ));
 }
 
 /// `--dry-run`: the configuration was valid; say what would have been registered, and stop.
