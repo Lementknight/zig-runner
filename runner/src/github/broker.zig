@@ -317,6 +317,40 @@ test "the token goes on only to the same scheme, host and port" {
     try std.testing.expect(!sameOrigin(api, try std.Uri.parse("https://api.github.com:8443/x")));
 }
 
+test "over real connections: the token stays on its host, and only bodiless requests follow" {
+    const TestServer = @import("testserver.zig").Server;
+    var server: TestServer = undefined;
+    try server.start();
+    defer server.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = std.testing.io;
+    const t: RequestOptions = .{ .token = "t0k" };
+    var buf: [64]u8 = undefined;
+
+    // Sent without a redirect, kept on one to the same host (absolute or relative).
+    for ([_][]const u8{ "/echo", "/same", "/relative" }) |path| {
+        const r = try request(a, io, .GET, server.url(&buf, "127.0.0.1", path), null, t);
+        try std.testing.expectEqual(std.http.Status.ok, r.status);
+        try std.testing.expectEqualStrings("GET Bearer t0k", r.body);
+    }
+    // Dropped on a redirect to another host: the same server, by another name.
+    const other = try request(a, io, .GET, server.url(&buf, "127.0.0.1", "/other"), null, t);
+    try std.testing.expectEqualStrings("GET -", other.body);
+    // A 303 continues as a GET.
+    const seen = try request(a, io, .DELETE, server.url(&buf, "127.0.0.1", "/see-other"), null, t);
+    try std.testing.expectEqualStrings("GET Bearer t0k", seen.body);
+    // A request with a body gets the redirect as it came.
+    const posted = try request(a, io, .POST, server.url(&buf, "127.0.0.1", "/same"), "{}", t);
+    try std.testing.expectEqual(std.http.Status.found, posted.status);
+    // A loop ends.
+    try std.testing.expectError(
+        error.TooManyHttpRedirects,
+        request(a, io, .GET, server.url(&buf, "127.0.0.1", "/loop"), null, t),
+    );
+}
+
 test "parseSettings" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();

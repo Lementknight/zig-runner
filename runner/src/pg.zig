@@ -850,12 +850,12 @@ test "SCRAM-SHA-256 matches the RFC 7677 test vector" {
     try std.testing.expectError(error.BadNonce, s.clientFinal(arena, "pencil", "r=someoneelse,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"));
 }
 
-/// Integration tests run only when PG* variables (or ZIG_TEST_PG_URL) point at a database; the
-/// local development container and the CI workflow set them. Otherwise they are skipped.
+/// Integration tests run only when PG* variables (or ZIG_TEST_PG_URL) point at a database; CI's
+/// database job sets them. Otherwise they are skipped (or fail, with ZIG_TEST_REQUIRE_DB).
 fn testConfig(arena: Allocator) !Config {
     var env = try std.testing.environ.createMap(arena);
     if (env.get("ZIG_TEST_PG_URL")) |url| return parseUrl(arena, url);
-    return (try fromEnv(&env)) orelse error.SkipZigTest;
+    return (try fromEnv(&env)) orelse @import("dbtest.zig").unavailable(&env);
 }
 
 test "integration: connect, query, error recovery, COPY (needs a database)" {

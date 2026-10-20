@@ -57,6 +57,46 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: pipx run zizmor==1.31.1 --format github .github/workflows
 
+  # The database tests, which skip themselves without a database: here against TimescaleDB, as
+  # deployments use, and required to run (ZIG_TEST_REQUIRE_DB), so this job cannot pass by skipping
+  # them. On GitHub's runner, which runs service containers.
+  database:
+    name: Database tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # to check out the code
+    services:
+      postgres:
+        image: timescale/timescaledb:latest-pg17@sha256:b56a3f51991df1f79d0c1a0841cad5c5fa8058fdd6a3ee6886394a6d4c174538
+        env:
+          POSTGRES_PASSWORD: ci-only
+          POSTGRES_DB: tsdb
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: ci-only
+      PGDATABASE: tsdb
+      PGSSLMODE: disable
+      ZIG_TEST_REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      - name: Test, with the database
+        working-directory: runner
+        run: zig build test --summary all
+
   # On this project's own runners when they are set up, so every change exercises the runner
   # (README, "Environments"): a push to main on prod, pull requests and the merge queue on pre-prod,
   # which the prod runner would refuse. The repository variables PROD_RUNNER and PREPROD_RUNNER
@@ -78,7 +118,7 @@ jobs:
         working-directory: runner
         run: zig fmt --check .
 
-      # The database tests skip themselves: no PG* variables are set here.
+      # The database tests skip themselves here: the Database tests job runs them.
       - name: Test
         working-directory: runner
         run: zig build test --summary all

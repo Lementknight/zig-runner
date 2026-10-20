@@ -613,12 +613,55 @@ fn finishReporter(
     job_started_ms: i64,
 ) !void {
     const ended_ms = std.Io.Clock.real.now(c.io).toMilliseconds();
-    if (result.set_up_failed) r.setUpFailed(job_started_ms, ended_ms);
-    r.jobFinished(job, c.name, reporterConclusion(result), job_started_ms, ended_ms);
+    recordFinished(r, job, c.name, result, job_started_ms, ended_ms);
     if (r.failures > 0) try c.err.print(
         "run state: {d} database write(s) failed (last: {s})\n",
         .{ r.failures, r.last_error },
     );
+}
+
+/// The job's end in the run-state database: its conclusion, and "Set up job" failed when the job
+/// failed before its steps.
+fn recordFinished(
+    r: *Reporter,
+    job: job_mod.Job,
+    runner_name: []const u8,
+    result: dagger.Result,
+    started_ms: i64,
+    ended_ms: i64,
+) void {
+    if (result.set_up_failed) r.setUpFailed(started_ms, ended_ms);
+    r.jobFinished(job, runner_name, reporterConclusion(result), started_ms, ended_ms);
+}
+
+test "integration: a job failed before its steps is recorded with Set up job failed" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var sc = try @import("dbtest.zig").Scratch.create(arena);
+    defer sc.destroy();
+    var store = try db.Store.open(std.testing.allocator, std.testing.io, sc.cfg, sc.schema);
+    defer store.close();
+
+    const job: job_mod.Job = .{
+        .plan_id = "p",
+        .job_id = "j",
+        .job_token = "t",
+        .check_run_id = 7,
+        .secrets = &.{},
+        .steps = &.{},
+        .github = .{ .repository = "o/r", .run_id = "42", .workflow = "ci", .event_name = "pull_request" },
+    };
+    var r: Reporter = .{ .store = &store, .arena = arena, .io = std.testing.io, .job_id = 7, .run_id = 42 };
+    const started: i64 = 1_760_000_000_000;
+    r.jobStarted(job, "zig-1", started);
+    // Recorded as a success when the job starts, as for every job that reaches its steps.
+    try std.testing.expectEqualStrings("success", try sc.scalar("select conclusion from steps where job_id = 7 and number = 0"));
+
+    recordFinished(&r, job, "zig-1", try failedInSetUp(arena, 0), started, started + 500);
+    try std.testing.expectEqual(@as(usize, 0), r.failures);
+    try std.testing.expectEqualStrings("failure", try sc.scalar("select conclusion from steps where job_id = 7 and number = 0"));
+    try std.testing.expectEqualStrings("completed/failure", try sc.scalar("select status || '/' || conclusion from jobs where id = 7"));
 }
 
 /// What completejob is told: cancelled first, then whether every step that had to succeed did.

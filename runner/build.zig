@@ -30,7 +30,11 @@ pub fn build(b: *std.Build) void {
 
     const tests = b.addTest(.{ .root_module = exe.root_module });
     const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&b.addRunArtifact(tests).step);
+    const run_tests = b.addRunArtifact(tests);
+    // Which tests run depends on the environment (PG*, ZIG_TEST_PG_URL, ZIG_TEST_REQUIRE_DB), which
+    // the cache does not see: a run without a database would otherwise be replayed as the run with.
+    run_tests.has_side_effects = true;
+    test_step.dependOn(&run_tests.step);
 }
 
 /// A file holding the version, for `src/version.zig` to `@embedFile`: `v0.2.0-118-g5063ae36`, with
