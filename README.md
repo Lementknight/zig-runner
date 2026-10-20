@@ -49,7 +49,9 @@ decide the version, write the changelog and tag the release alongside this, disa
 ## Pipeline
 
 `ci` checks every pull request: the branch name, the workflows (actionlint, and
-[zizmor](https://docs.zizmor.sh) for security), and the format, build and tests. A merge into
+[zizmor](https://docs.zizmor.sh) for security), the format, build and tests, and the database tests
+against TimescaleDB. The GitHub client's tests run over real connections to a local server
+(`src/github/testserver.zig`), so how it handles redirects and tokens is tested, not described. A merge into
 `main` goes through the merge queue, which runs `ci` again on top of `main`; the merge then runs
 `version`, which waits for approval in the `prod` environment, commits and tags the release, and
 the tag runs `release`: the binaries with [GoReleaser](https://goreleaser.com), the image after a

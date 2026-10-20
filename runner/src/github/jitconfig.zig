@@ -256,21 +256,41 @@ fn currentName(arena: Allocator, scope: Scope, body: []const u8) ?Scope {
 /// process with the same prefix has just made looks the same until its runner connects (seconds),
 /// so these are only candidates: `removeStillStale` removes those still offline a while later.
 pub fn staleRegistrations(arena: Allocator, io: std.Io, cfg: *const Config) ![]const u64 {
-    const base = try runnersUrl(arena, cfg);
+    const GitHub = struct {
+        arena: Allocator,
+        io: std.Io,
+        cfg: *const Config,
+        base: []const u8,
+
+        fn page(g: @This(), n: u32) ![]const u8 {
+            const url = try std.fmt.allocPrint(
+                g.arena,
+                "{s}?per_page={d}&page={d}",
+                .{ g.base, per_page, n },
+            );
+            const resp = try broker.request(g.arena, g.io, .GET, url, null, .{
+                .token = g.cfg.gh_token,
+                .extra_headers = &.{.{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" }},
+            });
+            if (resp.status.class() != .success) return error.GithubRejected;
+            return resp.body;
+        }
+    };
+    return collectStale(arena, cfg.name_prefix, GitHub{
+        .arena = arena,
+        .io = io,
+        .cfg = cfg,
+        .base = try runnersUrl(arena, cfg),
+    });
+}
+
+/// The stale-looking registrations from `pages.page(1)`, `pages.page(2)`, ... up to the first page
+/// with fewer than `per_page` runners (a full last page costs one more, empty, request).
+fn collectStale(arena: Allocator, prefix: []const u8, pages: anytype) ![]const u64 {
     var ids: std.ArrayList(u64) = .empty;
-    var page: u32 = 1;
-    while (page <= max_pages) : (page += 1) {
-        const url = try std.fmt.allocPrint(
-            arena,
-            "{s}?per_page={d}&page={d}",
-            .{ base, per_page, page },
-        );
-        const resp = try broker.request(arena, io, .GET, url, null, .{
-            .token = cfg.gh_token,
-            .extra_headers = &.{.{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" }},
-        });
-        if (resp.status.class() != .success) return error.GithubRejected;
-        const found = try staleIds(arena, resp.body, cfg.name_prefix);
+    var n: u32 = 1;
+    while (n <= max_pages) : (n += 1) {
+        const found = try staleIds(arena, try pages.page(n), prefix);
         try ids.appendSlice(arena, found.ids);
         if (found.listed < per_page) break;
     }
@@ -382,4 +402,46 @@ test "only what still looks stale a minute later is removed" {
     try std.testing.expectEqualSlices(u64, &.{ 24, 31 }, stillStale(&earlier, &.{ 31, 24, 32 }));
     var none = [_]u64{30};
     try std.testing.expectEqualSlices(u64, &.{}, stillStale(&none, &.{}));
+}
+
+test "stale registrations come from every page" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Pages of `sizes[n - 1]` runners: the first is a stale registration of this instance's
+    // (id 1000 + n), the rest online runners named by hand.
+    const Fake = struct {
+        arena: Allocator,
+        sizes: []const usize,
+        asked: *u32,
+
+        fn page(f: @This(), n: u32) ![]const u8 {
+            f.asked.* += 1;
+            var out: std.Io.Writer.Allocating = .init(f.arena);
+            const w = &out.writer;
+            try w.writeAll("{\"runners\":[");
+            const size = if (n <= f.sizes.len) f.sizes[n - 1] else 0;
+            for (0..size) |i| {
+                if (i > 0) try w.writeAll(",");
+                if (i == 0) {
+                    try w.print("{{\"id\":{d},\"name\":\"zig-ci-0000000{d}\",\"status\":\"offline\",\"busy\":false}}", .{ 1000 + n, n });
+                } else {
+                    try w.print("{{\"id\":{d},\"name\":\"other-{d}\",\"status\":\"online\",\"busy\":false}}", .{ n * 1000 + i, i });
+                }
+            }
+            try w.writeAll("]}");
+            return out.written();
+        }
+    };
+    var asked: u32 = 0;
+    // A full first page and a short second: both stale registrations, and no third request.
+    const two = Fake{ .arena = arena, .sizes = &.{ 100, 3 }, .asked = &asked };
+    const found = try collectStale(arena, "zig-ci", two);
+    try std.testing.expectEqualSlices(u64, &.{ 1001, 1002 }, found);
+    try std.testing.expectEqual(@as(u32, 2), asked);
+    // Two full pages: a third, empty, request ends it.
+    asked = 0;
+    const full = Fake{ .arena = arena, .sizes = &.{ 100, 100 }, .asked = &asked };
+    try std.testing.expectEqualSlices(u64, &.{ 1001, 1002 }, try collectStale(arena, "zig-ci", full));
+    try std.testing.expectEqual(@as(u32, 3), asked);
 }

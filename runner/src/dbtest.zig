@@ -1,10 +1,19 @@
 //! Test support: a scratch schema holding the real migration, so database tests never touch real
 //! data. Used only from tests. Skipped (error.SkipZigTest) unless PG* variables or ZIG_TEST_PG_URL
-//! are set.
+//! are set; with ZIG_TEST_REQUIRE_DB set, as in CI's database job, a test that cannot reach its
+//! database fails instead, so a misconfigured job cannot pass by skipping them all.
 const std = @import("std");
 const pg = @import("pg.zig");
 
 const Allocator = std.mem.Allocator;
+
+/// Why a database test cannot run: skipped, unless ZIG_TEST_REQUIRE_DB says it must.
+pub fn unavailable(
+    env: *const std.process.Environ.Map,
+) error{ SkipZigTest, TestDatabaseRequired } {
+    if (env.get("ZIG_TEST_REQUIRE_DB") != null) return error.TestDatabaseRequired;
+    return error.SkipZigTest;
+}
 
 pub const Scratch = struct {
     arena: Allocator,
@@ -17,7 +26,7 @@ pub const Scratch = struct {
         const cfg = if (env.get("ZIG_TEST_PG_URL")) |url|
             try pg.parseUrl(arena, url)
         else
-            (try pg.fromEnv(&env)) orelse return error.SkipZigTest;
+            (try pg.fromEnv(&env)) orelse return unavailable(&env);
 
         // The migrations live in the repository; a test run outside it (or before db/ landed)
         // skips. Every one of them, in file-name order, because a scratch schema built from the
@@ -27,7 +36,7 @@ pub const Scratch = struct {
             std.testing.io,
             "../db/migrations",
             .{ .iterate = true },
-        ) catch return error.SkipZigTest;
+        ) catch return unavailable(&env);
         defer dir.close(std.testing.io);
         var names: std.ArrayList([]const u8) = .empty;
         var it = dir.iterate();
@@ -35,7 +44,7 @@ pub const Scratch = struct {
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".sql")) continue;
             try names.append(arena, try arena.dupe(u8, entry.name));
         }
-        if (names.items.len == 0) return error.SkipZigTest;
+        if (names.items.len == 0) return unavailable(&env);
         std.mem.sort([]const u8, names.items, {}, struct {
             fn lt(_: void, a: []const u8, b: []const u8) bool {
                 return std.mem.lessThan(u8, a, b);
@@ -49,7 +58,7 @@ pub const Scratch = struct {
                 path,
                 arena,
                 .limited(1 << 20),
-            ) catch return error.SkipZigTest;
+            ) catch return unavailable(&env);
             const up_start = (std.mem.indexOf(u8, text, "-- migrate:up") orelse
                 continue) + "-- migrate:up".len;
             const up_end = std.mem.indexOf(u8, text, "-- migrate:down") orelse text.len;
