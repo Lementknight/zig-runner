@@ -1,0 +1,10 @@
+name: refusal-test
+on: pull_request
+permissions: {}
+jobs:
+  untrusted:
+    name: Untrusted job on a test runner
+    runs-on: [localtest-only-do-not-use]
+    steps:
+      - name: Must never run
+        run: echo "REFUSAL FAILED - this step ran"
