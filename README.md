@@ -1,5 +1,7 @@
 # zig-runner
 
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Open-Blue/zig-runner/badge)](https://scorecard.dev/viewer/?uri=github.com/Open-Blue/zig-runner)
+
 A self-hosted GitHub Actions runner in Zig. One small process runs many runners; each job's
 steps run in a [Dagger](https://dagger.io) engine, which caches them across runs.
 
@@ -28,28 +30,45 @@ comes from the branch's prefix, which CI checks:
 
 | Branch | Bumps |
 | --- | --- |
-| `bugfix/*`, `hotfix/*`, `ci/*`, and Dependabot's `dependabot/*` | patch: `v1.2.3` → `v1.2.4` |
+| `bugfix/*`, `hotfix/*`, `ci/*`, and Renovate's `renovate/*` | patch: `v1.2.3` → `v1.2.4` |
 | `feature/*`, `feat/*`, `release/*`, `docs/*`, `perf/*`, `refactor/*` | minor: `v1.2.3` → `v1.3.0` |
 | any of them, labelled `breaking` | major: `v1.2.3` → `v2.0.0` |
 
 `feature/*` is for larger features, `feat/*` for small ones; neither breaks anything unless the
-pull request carries the `breaking` label. A stack of pull requests releases once, when it reaches
-`main`, with the largest bump in it. The release commits the version to `runner/build.zig.zon` and
-the changelog on `main`, and tags that commit.
+pull request carries the `breaking` label. In a stack, each pull request merged into `main`
+releases its own version; one merged into another's branch instead counts toward that one's bump
+when it reaches `main`. The release commits the version to `runner/build.zig.zon`
+and the changelog on `main`, and tags that commit.
+
+[semantic-release](https://github.com/semantic-release/semantic-release) and
+[release-please](https://github.com/googleapis/release-please) do this job from
+[Conventional Commits](https://www.conventionalcommits.org) in commit messages instead (`feat:`,
+`fix:`, `feat!:`). They are not used here: the version comes from the branch, and either would
+decide the version, write the changelog and tag the release alongside this, disagreeing with it.
 
 ## Pipeline
 
 `ci` checks every pull request: the branch name, the workflows (actionlint, and
 [zizmor](https://docs.zizmor.sh) for security), and the format, build and tests. A merge into
-`main` then runs `version`, which waits for approval in the `prod` environment, commits and tags
-the release, and the tag runs `release`. The workflows are written to be hard to turn against the
+`main` goes through the merge queue, which runs `ci` again on top of `main`; the merge then runs
+`version`, which waits for approval in the `prod` environment, commits and tags the release, and
+the tag runs `release`: the binaries with [GoReleaser](https://goreleaser.com), the image after a
+[Trivy](https://trivy.dev) scan, each with signed build provenance. `scorecard` grades the
+repository weekly with [OpenSSF Scorecard](https://scorecard.dev). The workflows are written to be hard to turn against the
 repository:
 
 - **Least privilege.** Each workflow grants nothing by default; each job asks for only what it
   needs, with a comment saying why. Checkouts keep no credentials for later steps.
-- **Pinned inputs.** Actions are pinned by commit, not by tag, which their owner (or whoever takes
-  their repository) can move; Dependabot proposes updates a week after their release. Zig and
-  changie are checked against pinned checksums before they run.
+- **Pinned inputs.** Actions are pinned by commit and images by digest, not by tag, which their
+  owner (or whoever takes their repository) can move; [Renovate](https://docs.renovatebot.com)
+  proposes updates a week after their release. Zig and changie are checked against pinned checksums
+  before they run; a Renovate pull request for a new one fails until its checksums are updated.
+- **Verifiable releases.** Every binary and image has a signed provenance attestation saying which
+  workflow built it from which commit:
+  `gh attestation verify zig-runner-linux-x86_64 --repo Open-Blue/zig-runner`, or
+  `gh attestation verify oci://ghcr.io/open-blue/zig-runner:<tag> --repo Open-Blue/zig-runner`.
+- **Scanned.** Trivy checks the Dockerfile and the image before a push; accepted findings are in
+  `.trivyignore.yaml`, each with why. GitHub's secret scanning blocks pushes carrying credentials.
 - **One secret, one step.** The deploy key that may push to `main` is the `prod` environment's,
   which deploys only from `main` and waits for approval; it is loaded only in the step that pushes,
   and pushes only to GitHub's pinned host key.
