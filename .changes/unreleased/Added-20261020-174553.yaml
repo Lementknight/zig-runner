@@ -1,3 +1,0 @@
-kind: Added
-body: CI runs the database tests against TimescaleDB, and they fail rather than skip when CI requires a database (ZIG_TEST_REQUIRE_DB); the GitHub client is tested over real connections to a local HTTP server, including that its token never follows a redirect to another host; and the stale-registration cleanup is tested across pages
-time: 2026-10-20T17:45:53.338332-04:00

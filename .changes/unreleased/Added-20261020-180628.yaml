@@ -1,3 +1,0 @@
-kind: Added
-body: 'Releases deploy themselves to razorbill: the release workflow records a GitHub deployment, and zig-runner-deploy on the machine (a systemd timer) installs it once its checksum and provenance check out (built by release.yml from that tag on GitHub''s runners), restarts every runner instance, and reports success, or puts the previous binary back and reports failure'
-time: 2026-10-20T18:06:28.868688-04:00

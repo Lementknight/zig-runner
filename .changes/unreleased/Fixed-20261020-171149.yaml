@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A runner whose repository was renamed or transferred registers under its current name, with a warning to update GH_SCOPE, and follows GitHub''s redirects for requests without a body (it could not remove its registration: HttpRedirectLocationOversize); a runner removes the registrations a stopped runner of its own left behind; and a job failed before its steps (refused, or an unsupported container or services) fails in "Set up job", with "Complete job" keeping its own log'
-time: 2026-10-20T17:11:49.601002-04:00
