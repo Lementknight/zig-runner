@@ -1,0 +1,28 @@
+# Installs the zig-runner release deployed to this machine, run by zig-runner-deploy.timer
+# (README, "Deploying releases"). Install:
+#
+#   sudo install -m 0755 zig-runner-deploy /usr/local/bin/
+#   sudo install -m 0600 zig-runner-deploy.env /etc/zig-runner-deploy.env
+#   sudo cp zig-runner-deploy.service zig-runner-deploy.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now zig-runner-deploy.timer
+[Unit]
+Description=Install the zig-runner release deployed to this machine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/zig-runner-deploy.env
+ExecStart=/usr/local/bin/zig-runner-deploy
+# No limit for the whole run: restarting each instance waits for its running jobs (up to the unit's
+# TimeoutStopSec), twice over on a rollback, and a run cut short would leave its deployment
+# unreported. Each call to GitHub has its own limit instead (GH_TIMEOUT).
+TimeoutStartSec=infinity
+# gh keeps its state and the Sigstore trust root under HOME.
+StateDirectory=zig-runner-deploy
+Environment=HOME=/var/lib/zig-runner-deploy
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/usr/local/bin
+ProtectHome=yes
+PrivateTmp=yes

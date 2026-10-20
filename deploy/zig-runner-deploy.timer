@@ -1,0 +1,11 @@
+# Asks GitHub every minute whether a release was deployed to this machine
+# (zig-runner-deploy.service). A run still going (restarts wait for jobs) is not started again.
+[Unit]
+Description=Check for a zig-runner release deployed to this machine
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+
+[Install]
+WantedBy=timers.target

@@ -173,3 +173,25 @@ jobs:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+
+  # The release, recorded as a deployment to razorbill: the agent there (deploy/zig-runner-deploy)
+  # installs it once its checksum and provenance check out, restarts the runners, and reports back
+  # to the deployment (README, "Deploying releases"). Not on a run by hand, which rebuilds an image.
+  deploy:
+    name: Deploy to razorbill
+    needs: [binaries, image]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      deployments: write # to record the deployment
+    steps:
+      - name: Record the deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # required_contexts: none: the release's checks already passed, before its tag existed.
+        run: |
+          jq -n --arg ref "$TAG" '{
+            ref: $ref, environment: "razorbill", auto_merge: false, required_contexts: [],
+            description: ("zig-runner " + $ref)
+          }' | gh api -X POST "repos/$GITHUB_REPOSITORY/deployments" --input - \
+            --jq '"deployment \(.id): \(.ref) to \(.environment)"'
