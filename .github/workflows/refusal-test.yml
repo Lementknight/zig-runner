@@ -1,0 +1,11 @@
+# Throwaway: a pull request's job aimed at the prod runner, which must refuse it before any step.
+name: refusal-test
+on: pull_request
+permissions: {}
+jobs:
+  untrusted:
+    name: Untrusted job on prod
+    runs-on: [self-hosted, prod]
+    steps:
+      - name: Must never run
+        run: echo "REFUSAL FAILED - this step ran on the prod runner"
