@@ -121,7 +121,7 @@ GitHub deployment of the version to the `razorbill` environment. On razorbill,
 
 The outcome shows under the repository's Environments, on the deployment. Nothing reaches into the
 machine: it asks GitHub, with a token that can only read and report deployments. To set it up, on
-the machine, with `gh` 2.49 or later from [cli.github.com](https://cli.github.com) (Debian's
+the machine, with `gh` 2.68 or later from [cli.github.com](https://cli.github.com) (Debian's
 package cannot verify provenance) and a fine-grained token for this repository with Deployments
 read and write, Attestations and Contents read:
 

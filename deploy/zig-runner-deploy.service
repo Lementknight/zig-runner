@@ -14,8 +14,10 @@ Wants=network-online.target
 Type=oneshot
 EnvironmentFile=/etc/zig-runner-deploy.env
 ExecStart=/usr/local/bin/zig-runner-deploy
-# Restarting an instance waits for its running jobs (TimeoutStopSec=60min each).
-TimeoutStartSec=3h
+# No limit for the whole run: restarting each instance waits for its running jobs (up to the unit's
+# TimeoutStopSec), twice over on a rollback, and a run cut short would leave its deployment
+# unreported. Each call to GitHub has its own limit instead (GH_TIMEOUT).
+TimeoutStartSec=infinity
 # gh keeps its state and the Sigstore trust root under HOME.
 StateDirectory=zig-runner-deploy
 Environment=HOME=/var/lib/zig-runner-deploy

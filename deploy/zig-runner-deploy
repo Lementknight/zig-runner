@@ -14,6 +14,7 @@
 #   ENVIRONMENT   the GitHub environment this machine deploys (razorbill)
 #   UNITS         the instances to restart; empty for every zig-runner@*.service here
 #   BIN           the installed binary (/usr/local/bin/zig-runner)
+#   GH_TIMEOUT    seconds any one call to GitHub may take (120)
 #   DRY_RUN       set to check a deployment without reporting, installing or restarting
 set -euo pipefail
 
@@ -24,7 +25,16 @@ UNITS=${UNITS:-}
 BIN=${BIN:-/usr/local/bin/zig-runner}
 DRY_RUN=${DRY_RUN:-}
 HEALTH_SECONDS=${HEALTH_SECONDS:-120}
+GH_TIMEOUT=${GH_TIMEOUT:-120}
 export GH_TOKEN GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1
+
+# Every call to GitHub has a time limit: the service has none of its own (an instance's restart
+# waits for its jobs, for up to an hour), and a call that never answered would hold it forever.
+GH=$(command -v gh) || {
+	echo "zig-runner-deploy: gh is not installed" >&2
+	exit 1
+}
+gh() { timeout "$GH_TIMEOUT" "$GH" "$@"; }
 
 log() { echo "zig-runner-deploy: $*" >&2; }
 
@@ -55,24 +65,35 @@ instances() {
 	fi
 }
 
-# Whether $1 is active and has said it is listening since $2 (seconds since the epoch).
-listening_since() {
-	systemctl is-active --quiet "$1" &&
-		journalctl -u "$1" --since "@$2" -o cat --no-pager | grep -q 'listening for jobs'
+# Whether $1 runs the binary installed now: active, and its process's executable is BIN itself. A
+# process started from a binary since replaced shows it as "BIN (deleted)": the file on disk alone
+# does not say the instances restarted (the agent may have stopped between installing and that).
+runs_installed() {
+	local pid
+	systemctl is-active --quiet "$1" || return 1
+	pid=$(systemctl show -p MainPID --value "$1")
+	[[ $pid != 0 && $(readlink "/proc/$pid/exe") == "$BIN" ]]
 }
 
-# Restarts every instance; returns the first that does not come back listening, or nothing.
+# Whether the process systemd started as invocation $2 of $1 has said it is listening. The runner
+# says so after every job too, and a stopping process may still say it: only this invocation counts.
+listening() {
+	systemctl is-active --quiet "$1" &&
+		journalctl "_SYSTEMD_INVOCATION_ID=$2" -o cat --no-pager | grep -q 'listening for jobs'
+}
+
+# Restarts the instances given; prints the first that does not come back listening, or nothing.
 restart_all() {
-	local unit since deadline
-	for unit in "${units[@]}"; do
-		since=$(date +%s)
+	local unit invocation deadline
+	for unit in "$@"; do
 		# A stop lets running jobs finish first (the unit's TimeoutStopSec).
-		systemctl restart "$unit" || {
+		if ! systemctl restart "$unit"; then
 			echo "$unit"
 			return
-		}
+		fi
+		invocation=$(systemctl show -p InvocationID --value "$unit")
 		deadline=$((SECONDS + HEALTH_SECONDS))
-		until listening_since "$unit" "$since"; do
+		until listening "$unit" "$invocation"; do
 			if ((SECONDS >= deadline)); then
 				echo "$unit"
 				return
@@ -82,13 +103,44 @@ restart_all() {
 	done
 }
 
+# Puts $1 at BIN in one step: written beside it, then renamed over it, so BIN is never missing or
+# half written.
+put() {
+	install -m 0755 "$1" "$BIN.new" && mv -f "$BIN.new" "$BIN"
+}
+
+# Restarts the instances given onto the installed binary, and reports. If one does not come back,
+# the previous binary goes back and every instance is restarted onto it.
+finish() {
+	local down again
+	if [[ -n $DRY_RUN ]]; then
+		log "dry run: would restart $* onto $tag"
+		exit 0
+	fi
+	down=$(restart_all "$@")
+	if [[ -z $down ]]; then
+		report "$id" success "running $tag on $(hostname): $*"
+		exit 0
+	fi
+	if [[ -x $BIN.prev && $(version_of "$BIN.prev") != "$tag" ]] && put "$BIN.prev"; then
+		again=$(restart_all "${units[@]}")
+		fail "$tag did not come up on $down; back on $(version_of "$BIN")${again:+, $again down}"
+	fi
+	fail "$tag did not come up on $down, and there is no other binary to go back to"
+}
+
+fail() {
+	report "$id" failure "$1"
+	exit 1
+}
+
 # What this machine needs is checked before any deployment is touched: a deployment reported failed
 # for a missing tool would never be tried again, so this exits and the timer tries next minute.
 attestation_help=$(gh attestation verify --help 2>&1) || true
 for flag in --signer-workflow --source-ref --deny-self-hosted-runners; do
 	if [[ $attestation_help != *"$flag"* ]]; then
 		log "$(gh --version | head -n1) cannot verify provenance (gh attestation verify $flag):" \
-			"install gh from https://cli.github.com (Debian's package is too old)"
+			"install gh 2.68 or later from https://cli.github.com (Debian's package is too old)"
 		exit 1
 	fi
 done
@@ -107,19 +159,22 @@ for old in "${ids[@]:1}"; do
 	handled "$(latest_state "$old")" || report "$old" inactive "superseded by $tag"
 done
 
-fail() {
-	report "$id" failure "$1"
-	exit 1
-}
-
 [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "not a version tag: $tag"
+mapfile -t units < <(instances)
+((${#units[@]} > 0)) || fail "no zig-runner instances on $(hostname)"
+
+# Installed already: done if every instance runs it; otherwise restart those that do not.
 current=$(version_of "$BIN" || true)
 if [[ $current == "$tag" ]]; then
-	report "$id" success "already running $tag"
-	exit 0
+	stale=()
+	for unit in "${units[@]}"; do runs_installed "$unit" || stale+=("$unit"); done
+	if ((${#stale[@]} == 0)); then
+		report "$id" success "already running $tag"
+		exit 0
+	fi
+	report "$id" in_progress "$tag is installed; restarting ${stale[*]} onto it"
+	finish "${stale[@]}"
 fi
-mapfile -t units < <(instances)
-((${#units[@]} > 0)) || fail "no zig-runner instances to restart on $(hostname)"
 
 report "$id" in_progress "installing $tag on $(hostname) (was ${current:-none})"
 work=$(mktemp -d)
@@ -137,19 +192,8 @@ gh attestation verify "$work/$asset" --repo "$REPO" \
 chmod 0755 "$work/$asset"
 [[ $(version_of "$work/$asset") == "$tag" ]] || fail "$asset does not say it is $tag"
 
-if [[ -n $DRY_RUN ]]; then
-	log "dry run: $tag checks out; would install it and restart ${units[*]}"
-	exit 0
+if [[ -z $DRY_RUN ]]; then
+	if [[ -e $BIN ]]; then cp -p "$BIN" "$BIN.prev" || fail "could not keep the previous binary"; fi
+	put "$work/$asset" || fail "could not install $tag at $BIN (it is unchanged)"
 fi
-
-cp -p "$BIN" "$BIN.prev"
-install -m 0755 "$work/$asset" "$BIN"
-down=$(restart_all)
-if [[ -z $down ]]; then
-	report "$id" success "running $tag on $(hostname): ${units[*]}"
-	exit 0
-fi
-
-install -m 0755 "$BIN.prev" "$BIN"
-again=$(restart_all)
-fail "$tag did not come up on $down; back on ${current:-the old binary}${again:+, $again down}"
+finish "${units[@]}"
