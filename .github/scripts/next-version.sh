@@ -42,7 +42,7 @@ while ((${#queue[@]})); do
 		b=3
 	else
 		case $branch in
-		bugfix/* | hotfix/* | ci/*) b=1 ;;
+		bugfix/* | hotfix/* | ci/* | dependabot/*) b=1 ;;
 		*) b=2 ;;
 		esac
 	fi
