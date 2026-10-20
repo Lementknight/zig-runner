@@ -442,6 +442,21 @@ const Reporter = struct {
         }) catch |e| r.note(e);
     }
 
+    /// "Set up job" failed after all: the job failed before its steps (refused, unsupported, or an
+    /// action that could not be resolved). `jobStarted` recorded it as a success, as it is for
+    /// every job that reaches its steps; GitHub shows it failed, and so must the database.
+    fn setUpFailed(r: *Reporter, started_ms: i64, now_ms: i64) void {
+        r.store.upsertStep(.{
+            .job_id = r.job_id,
+            .number = 0,
+            .name = "Set up job",
+            .status = "completed",
+            .conclusion = "failure",
+            .started_at = r.iso(started_ms),
+            .completed_at = r.iso(now_ms),
+        }) catch |e| r.note(e);
+    }
+
     fn jobFinished(
         r: *Reporter,
         job: job_mod.Job,
@@ -598,6 +613,7 @@ fn finishReporter(
     job_started_ms: i64,
 ) !void {
     const ended_ms = std.Io.Clock.real.now(c.io).toMilliseconds();
+    if (result.set_up_failed) r.setUpFailed(job_started_ms, ended_ms);
     r.jobFinished(job, c.name, reporterConclusion(result), job_started_ms, ended_ms);
     if (r.failures > 0) try c.err.print(
         "run state: {d} database write(s) failed (last: {s})\n",

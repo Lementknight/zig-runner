@@ -217,7 +217,7 @@ fn runnerName(arena: std.mem.Allocator, io: std.Io, prefix: []const u8) ![]const
 
 /// Before registering: the repository's current name if it moved (GitHub's redirects for the old
 /// name cannot carry a registration), and none of this instance's registrations that a stopped
-/// runner could not remove (see `jitconfig.removeStale`).
+/// runner could not remove (see `jitconfig.staleRegistrations`).
 fn settleRegistrations(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -233,8 +233,17 @@ fn settleRegistrations(
         ));
         cfg.scope = now;
     }
-    const removed = jitconfig.removeStale(arena, io, cfg);
-    if (removed > 0) try log.append(0, 0, .stderr, try std.fmt.allocPrint(
+    const candidates = jitconfig.staleRegistrations(arena, io, cfg) catch &.{};
+    if (candidates.len == 0) return;
+    try log.append(0, 0, .stderr, try std.fmt.allocPrint(
+        arena,
+        "{d} offline registration(s) named {s}-* look left behind; removing those still offline " ++
+            "in {d} s",
+        .{ candidates.len, cfg.name_prefix, jitconfig.stale_confirm_seconds },
+    ));
+    io.sleep(.fromSeconds(jitconfig.stale_confirm_seconds), .awake) catch {};
+    const removed = jitconfig.removeStillStale(arena, io, cfg, candidates);
+    try log.append(0, 0, .stderr, try std.fmt.allocPrint(
         arena,
         "removed {d} stale registration(s) named {s}-*, which a stopped runner left behind",
         .{ removed, cfg.name_prefix },
