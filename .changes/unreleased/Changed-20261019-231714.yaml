@@ -1,3 +1,0 @@
-kind: Changed
-body: CI tests on the project's own runners once their repository variables are set (PROD_RUNNER for pushes to main, PREPROD_RUNNER for pull requests and the merge queue), on GitHub's runner until then; Zig is cached between jobs in RUNNER_TOOL_CACHE and checked against its checksum every time
-time: 2026-10-19T23:17:14.941997-04:00
