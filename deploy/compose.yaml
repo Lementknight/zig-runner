@@ -24,8 +24,13 @@ services:
       # to about three quarters of the disk.
       - ./engine.json:/etc/dagger/engine.json:ro
     restart: unless-stopped
-    # The runner speaks one engine version's protocol, and restarting the engine empties its step
-    # cache: keep image updaters away (WUD would also move it to the next Dagger release).
+    # Docker kills a container 10 s after asking it to stop. The engine needs longer (22 s on a
+    # Raspberry Pi), and one killed before it marks its cache clean wipes the whole cache when it
+    # next starts: 21 GB on razorbill, so a 56 s job took 249 s after a reboot. Under 90 s, after
+    # which systemd kills Docker itself during a shutdown.
+    stop_grace_period: 80s
+    # The runner speaks one engine version's protocol: keep image updaters away (WUD would move it
+    # to the next Dagger release, and replacing the engine empties its cache).
     labels:
       wud.watch: "false"
       com.centurylinklabs.watchtower.enable: "false"
