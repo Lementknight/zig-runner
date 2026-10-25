@@ -1,3 +1,0 @@
-kind: Changed
-body: 'CI keeps Zig unpacked in the tool cache and checks the tree against a pinned digest instead of unpacking it every job: Install Zig takes 2-10 s instead of 9-16 s on razorbill and no longer writes 588 MB to its SD card.'
-time: 2026-10-25T15:49:42.464775-04:00

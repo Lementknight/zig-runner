@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'The Dagger engine gets 80 s to stop instead of Docker''s 10 s, so a reboot or restart no longer wipes its cache: on razorbill the next job went from 56 s to 249 s.'
-time: 2026-10-25T15:30:45.550004-04:00
