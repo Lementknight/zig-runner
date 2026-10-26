@@ -10,6 +10,9 @@ pub fn build(b: *std.Build) void {
     // binary is on that machine?" by comparing file sizes and timestamps is how an hour went
     // missing once; `git describe` answers it exactly.
     const version = b.createModule(.{ .root_source_file = versionFile(b) });
+    // TLS to the database (`src/pg.zig`): std's client cannot answer a server that asks for a
+    // client certificate, which Tiger Data does.
+    const tls = b.dependency("tls", .{}).module("tls");
 
     const exe = b.addExecutable(.{
         .name = "runner",
@@ -18,7 +21,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .strip = strip,
-            .imports = &.{.{ .name = "build_version", .module = version }},
+            .imports = &.{
+                .{ .name = "build_version", .module = version },
+                .{ .name = "tls", .module = tls },
+            },
         }),
     });
     b.installArtifact(exe);

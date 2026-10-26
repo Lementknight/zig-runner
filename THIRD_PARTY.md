@@ -7,8 +7,15 @@ time. The project's own license is in [LICENSE](LICENSE).
 
 | File | Origin | License |
 |---|---|---|
-| `runner/src/vendor/tls_client.zig` | A copy of Zig 0.17.0's `std.crypto.tls.Client`, with one change (it answers a TLS 1.3 CertificateRequest; see the file's header) | MIT, Copyright (c) Zig contributors; [`runner/src/vendor/LICENSE-zig`](runner/src/vendor/LICENSE-zig) |
 | `runner/src/hpack_tables.zig` | The HPACK Huffman code and static table from [RFC 7541](https://www.rfc-editor.org/rfc/rfc7541) (Appendix A and B), generated from the RFC's text by `runner/tools/gen_hpack_tables.py` | Protocol constants from the RFC |
+
+## Dependencies
+
+Fetched at build time from `runner/build.zig.zon`, pinned by hash, and compiled into the runner:
+
+| Package | Used for | License |
+|---|---|---|
+| [ianic/tls.zig](https://github.com/ianic/tls.zig) | TLS to the database (`runner/src/pg.zig`): unlike std's client, it answers a server that asks for a client certificate, which Tiger Data does | MIT |
 
 ## Followed, not copied
 

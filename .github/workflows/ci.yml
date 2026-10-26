@@ -115,9 +115,10 @@ jobs:
       - name: Install Zig
         run: .github/scripts/install-zig.sh
 
+      # Named, not `.`: zig-pkg/ holds the dependencies once anything has built, in their own style.
       - name: Format check
         working-directory: runner
-        run: zig fmt --check .
+        run: zig fmt --check build.zig build.zig.zon src
 
       # The database tests skip themselves here: the Database tests job runs them. On GitHub's
       # runners, whose cache always starts empty, without `zig build` (zig-test.sh); on the

@@ -1,0 +1,3 @@
+kind: Changed
+body: 'TLS to the database uses the [tls.zig](https://github.com/ianic/tls.zig) package (MIT, pinned in `build.zig.zon`) instead of a patched copy of Zig 0.17''s TLS client, which had to be copied again with every Zig release. It answers a server that asks for a client certificate, as Tiger Data does, which std''s client still cannot. Verification is unchanged: tested against TimescaleDB requesting client certificates, the full test suite passes over TLS, and an untrusted CA or a wrong host name is still refused.'
+time: 2026-10-26T18:54:18.000000-04:00
