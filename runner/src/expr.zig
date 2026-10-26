@@ -311,6 +311,8 @@ const Parser = struct {
     lex: Lexer,
     cur: Tok,
     prev_value: bool = false,
+    /// The contexts the expression may name, when known: any other name is refused (`check`).
+    contexts: ?[]const Value.Entry = null,
     /// How deep the parser itself has recursed (`!`, parentheses, arguments, indexes): `!!!...`
     /// recurses before it makes a single node.
     nesting: u32 = 0,
@@ -457,6 +459,14 @@ const Parser = struct {
                 },
                 .lbracket => {
                     try p.advance();
+                    // `a[*]` is `a.*`.
+                    if (p.cur == .star) {
+                        try p.advance();
+                        if (p.cur != .rbracket) return p.lex.bad("expected ']' after '[*'", .{});
+                        try p.advance();
+                        n = try p.node(.{ .star = n });
+                        continue;
+                    }
                     try p.enter();
                     defer p.nesting -= 1;
                     const idx = try p.parseOr();
@@ -520,6 +530,8 @@ const Parser = struct {
                     return p.node(.{ .literal = .{ .number = std.math.nan(f64) } });
                 if (std.ascii.eqlIgnoreCase(name, "infinity"))
                     return p.node(.{ .literal = .{ .number = std.math.inf(f64) } });
+                if (p.contexts) |known| if (lookupEntry(known, name) == null and !isGithubContext(name))
+                    return p.lex.bad("unrecognized context '{s}'", .{name});
                 return p.node(.{ .ident = name });
             },
             else => return p.lex.bad("unexpected token", .{}),
@@ -527,8 +539,27 @@ const Parser = struct {
     }
 };
 
-fn parse(arena: Allocator, src: []const u8, diag: ?*[]const u8) Error!*Node {
+/// GitHub's contexts. A name that is neither one of these nor a context the caller supplied is
+/// refused when parsing, as GitHub refuses it; one of these the runner does not supply is null.
+const github_contexts = [_][]const u8{
+    "github", "env",   "vars",   "secrets",  "inputs", "job",
+    "jobs",   "steps", "runner", "strategy", "matrix", "needs",
+};
+
+fn isGithubContext(name: []const u8) bool {
+    for (github_contexts) |c| if (std.ascii.eqlIgnoreCase(c, name)) return true;
+    return false;
+}
+
+/// `contexts`: what the expression may name (see `Parser.contexts`); null to accept any name.
+fn parse(
+    arena: Allocator,
+    src: []const u8,
+    diag: ?*[]const u8,
+    contexts: ?[]const Value.Entry,
+) Error!*Node {
     var p = try Parser.init(arena, src, diag);
+    p.contexts = contexts;
     const n = try p.parseOr();
     try p.expectEnd();
     return n;
@@ -696,11 +727,13 @@ fn lookupEntry(entries: []const Value.Entry, name: []const u8) ?Value {
 fn deref(v: Value, key: Value, arena: Allocator) Allocator.Error!Value {
     switch (v) {
         .object => |o| {
+            if (key == .array or key == .object) return .null;
             const k = try toStr(arena, key);
             return lookupEntry(o, k) orelse .null;
         },
         .array => |a| {
-            if (key != .number and key != .string) return .null;
+            // null, booleans and strings index as numbers (`a[true]` is `a[1]`).
+            if (key == .array or key == .object) return .null;
             const n = toNumber(key);
             // Bounded before the conversion, which panics on a number no usize holds (`foo[1e30]`,
             // `foo[Infinity]`) and would take the whole runner down with it.
@@ -731,24 +764,47 @@ fn starValues(arena: Allocator, v: Value) Error![]const Value {
 /// This is what makes `labels.*.name` an array of names while `labels.name` stays null: the filter
 /// is recognised from the shape of the expression rather than from the shape of the value, so
 /// property access maps over a filtered collection and dereferences anything else. It recurses, so
-/// `a.*.b.c` filters at both levels. Indexing needs nothing here — `a.*.b[0]` evaluates the filter
-/// to an array and then indexes it like any other.
+/// `a.*.b.c` filters at both levels. An index after a filter applies to each element too
+/// (`a[*][1]`, `a.*['b']`), and a filter after a filter flattens (`a.*.*`: the elements' elements).
 fn filteredValues(arena: Allocator, n: *const Node, scope: Scope) Error!?[]const Value {
     switch (n.*) {
-        .star => |inner| return try starValues(arena, try eval(arena, inner, scope)),
-        .prop => |p| {
-            const items = (try filteredValues(arena, p.obj, scope)) orelse return null;
+        .star => |inner| {
+            const items = (try filteredValues(arena, inner, scope)) orelse
+                return try starValues(arena, try eval(arena, inner, scope));
             var out: std.ArrayList(Value) = .empty;
-            for (items) |it| {
-                const got = try deref(it, .{ .string = p.name }, arena);
-                // An element without the property contributes nothing, rather than a null: this is
-                // what makes `contains(labels.*.name, 'bug')` safe on a mixed array.
-                if (got != .null) try out.append(arena, got);
-            }
+            for (items) |it| try out.appendSlice(arena, try starValues(arena, it));
             return out.items;
+        },
+        .prop => |p| return try mapFiltered(arena, p.obj, .{ .string = p.name }, scope),
+        .index => |ix| {
+            if (!isFilter(ix.obj)) return null;
+            return try mapFiltered(arena, ix.obj, try eval(arena, ix.idx, scope), scope);
         },
         else => return null,
     }
+}
+
+/// Whether `n` selects through a `*` filter.
+fn isFilter(n: *const Node) bool {
+    return switch (n.*) {
+        .star => true,
+        .prop => |p| isFilter(p.obj),
+        .index => |ix| isFilter(ix.obj),
+        else => false,
+    };
+}
+
+/// `key` looked up in each value `obj` selects, when `obj` is a filter.
+fn mapFiltered(arena: Allocator, obj: *const Node, key: Value, scope: Scope) Error!?[]const Value {
+    const items = (try filteredValues(arena, obj, scope)) orelse return null;
+    var out: std.ArrayList(Value) = .empty;
+    for (items) |it| {
+        const got = try deref(it, key, arena);
+        // An element without the property contributes nothing, rather than a null: this is
+        // what makes `contains(labels.*.name, 'bug')` safe on a mixed array.
+        if (got != .null) try out.append(arena, got);
+    }
+    return out.items;
 }
 
 /// A chain of `&&` (or of `||`), operand by operand from the left, without recursing down it: a
@@ -792,10 +848,11 @@ fn eval(arena: Allocator, n: *const Node, scope: Scope) Error!Value {
             return deref(try eval(arena, p.obj, scope), .{ .string = p.name }, arena);
         },
         .index => |ix| {
+            if (try filteredValues(arena, n, scope)) |items| return .{ .array = items };
             const o = try eval(arena, ix.obj, scope);
             return deref(o, try eval(arena, ix.idx, scope), arena);
         },
-        .star => |inner| return .{ .array = try starValues(arena, try eval(arena, inner, scope)) },
+        .star => return .{ .array = (try filteredValues(arena, n, scope)).? },
         .not => |inner| return .{ .boolean = !toBool(try eval(arena, inner, scope)) },
         .bin => |b| {
             if (b.op == .and_ or b.op == .or_) return evalChain(arena, n, scope);
@@ -904,8 +961,13 @@ fn callContains(arena: Allocator, args: []const Value, scope: Scope) Error!Value
 fn callJoin(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
     if (args.len < 1 or args.len > 2)
         return scope.fail("join() takes 1 or 2 arguments", .{}, arena);
-    const sep = if (args.len == 2) try toStr(arena, args[1]) else ",";
+    // An array or object as the separator is no separator, so the default.
+    const sep = if (args.len == 2 and args[1] != .array and args[1] != .object)
+        try toStr(arena, args[1])
+    else
+        ",";
     switch (args[0]) {
+        .object => return .{ .string = "" },
         .array => |a| {
             var out: std.ArrayList(u8) = .empty;
             for (a, 0..) |e, i| {
@@ -1050,13 +1112,15 @@ pub fn fromJsonValue(arena: Allocator, j: std.json.Value) Allocator.Error!Value 
         .number_string => |s| return .{ .number = std.fmt.parseFloat(f64, s) catch
             std.math.nan(f64) },
         .string => |s| return .{ .string = s },
+        // Allocated even when empty, so that two empty ones are two values: arrays and objects
+        // only equal themselves, and zero-length slices could share an address.
         .array => |a| {
-            const out = try arena.alloc(Value, a.items.len);
+            const out = (try arena.alloc(Value, @max(a.items.len, 1)))[0..a.items.len];
             for (a.items, out) |e, *o| o.* = try fromJsonValue(arena, e);
             return .{ .array = out };
         },
         .object => |o| {
-            const out = try arena.alloc(Value.Entry, o.count());
+            const out = (try arena.alloc(Value.Entry, @max(o.count(), 1)))[0..o.count()];
             var it = o.iterator();
             var i: usize = 0;
             while (it.next()) |e| : (i += 1) out[i] = .{
@@ -1072,7 +1136,9 @@ pub fn fromJsonValue(arena: Allocator, j: std.json.Value) Allocator.Error!Value 
 
 /// Evaluates one expression (the text inside `${{ }}`).
 pub fn evaluate(arena: Allocator, text: []const u8, scope: Scope) Error!Value {
-    const n = try parse(arena, text, scope.diag);
+    // GitHub evaluates an empty expression to null.
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return .null;
+    const n = try parse(arena, text, scope.diag, scope.contexts);
     var used: usize = 0;
     var s = scope;
     if (s.memory == null) s.memory = &used;
@@ -1133,7 +1199,7 @@ fn expressionEnd(text: []const u8, from: usize) ?usize {
 
 /// Whether an `if:` expression calls success(), always(), failure() or cancelled().
 pub fn hasStatusFunction(arena: Allocator, text: []const u8) bool {
-    const n = parse(arena, text, null) catch return false;
+    const n = parse(arena, text, null, null) catch return false;
     return nodeHasStatus(n);
 }
 
@@ -1241,7 +1307,10 @@ test "contexts, properties and indexing" {
     try std.testing.expectEqualStrings("", try evalStr(ar, "github.list[1e30]", s));
     try std.testing.expectEqualStrings("", try evalStr(ar, "github.list[Infinity]", s));
     try std.testing.expectEqualStrings("", try evalStr(ar, "github.missing.deeper.still", s)); // null propagates
-    try std.testing.expectEqualStrings("", try evalStr(ar, "nosuchcontext.x", s));
+    // A GitHub context the caller did not supply is null; a name that is no context is refused.
+    try std.testing.expectEqualStrings("", try evalStr(ar, "matrix.x", s));
+    try std.testing.expectError(error.ParseError, evaluate(ar, "nosuchcontext.x", s));
+    try std.testing.expectEqualStrings("", try evalStr(ar, "", s));
     try std.testing.expect(try evalCondition(ar, "github.repository == 'O/R' && matrix.os == 'linux'", s));
 }
 
@@ -1284,12 +1353,14 @@ test "the * object filter selects from arrays and objects, and maps through prop
     // The filter is recognised from the expression's shape, not the value's: a property of a plain
     // array is still null, which is what it is on GitHub.
     try std.testing.expectEqualStrings("", try evalStr(ar, "labels.name", s));
-    // Indexing a filtered result indexes the array it produced.
-    try std.testing.expectEqualStrings("docs", try evalStr(ar, "labels.*.name[1]", s));
+    // An index after a filter applies to each element, as GitHub's cases have it (`foo[*][1]`):
+    // here to each name, and a string has no elements.
+    try std.testing.expectEqualStrings("[]", try evalStr(ar, "toJSON(labels.*.name[1])", s));
+    try std.testing.expectEqualStrings("bug docs", try evalStr(ar, "join(labels[*]['name'], ' ')", s));
     // Filtering something that is neither an array nor an object selects nothing.
     try std.testing.expectEqualStrings("[]", try evalStr(ar, "toJSON(plain.*.anything)", s));
     try std.testing.expectEqualStrings("[]", try evalStr(ar, "toJSON(plain.*)", s));
-    try std.testing.expectEqualStrings("[]", try evalStr(ar, "toJSON(nosuchcontext.*.x)", s));
+    try std.testing.expectEqualStrings("[]", try evalStr(ar, "toJSON(needs.*.x)", s));
 }
 
 test "functions" {
@@ -1467,7 +1538,7 @@ test "a long chain of && or || is one node to GitHub, and evaluates without recu
     text.clearRetainingCapacity();
     for (0..20_000) |i| try text.print(ar, "{s}{d}", .{ if (i > 0) " || " else "", i });
     try std.testing.expectEqualStrings("1", try evalStr(ar, text.items, s));
-    try std.testing.expectEqualStrings("0", try evalStr(ar, "1 && 0 && x.y", s));
+    try std.testing.expectEqualStrings("0", try evalStr(ar, "1 && 0 && fromJSON('{')", s));
     try std.testing.expectEqualStrings("2", try evalStr(ar, "1 && 2 || 3 && 4", s));
 }
 
@@ -1525,4 +1596,23 @@ test "strings compare as their upper-case forms, beyond ASCII, as GitHub compare
         "'ı' != 'I' && 'İ' != 'i'",
         "'\xff' == '\xff' && '\xff' != '\xfe'", // not UTF-8: compared as bytes
     }) |e| try std.testing.expectEqualStrings("true", try evalStr(ar, e, s));
+}
+
+test "a[*] is a.*, and what follows a filter applies to each element" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const json = try std.json.parseFromSliceLeaky(std.json.Value, ar,
+        \\{"m": [[1, 2], [3, 4], "x"], "o": {"a": [5], "b": {"k": 6}}, "sep": [], "obj": {}, "obj2": {}}
+    , .{});
+    const s: Scope = .{ .contexts = (try fromJsonValue(ar, json)).object };
+    try std.testing.expectEqualStrings("2,4", try evalStr(ar, "join(m[*][1])", s));
+    try std.testing.expectEqualStrings("1,2,3,4", try evalStr(ar, "join(m.*.*)", s));
+    try std.testing.expectEqualStrings("5,6", try evalStr(ar, "join(o.*.*)", s));
+    try std.testing.expectEqualStrings("4", try evalStr(ar, "m[true][true]", s)); // m[1][1]
+    try std.testing.expectEqualStrings("", try evalStr(ar, "o[obj]", s));
+    try std.testing.expectEqualStrings("1,2", try evalStr(ar, "join(m[0], sep)", s));
+    try std.testing.expectEqualStrings("", try evalStr(ar, "join(o)", s));
+    // Arrays and objects equal only themselves, empty ones too.
+    try std.testing.expectEqualStrings("true", try evalStr(ar, "obj == obj && obj != obj2", s));
 }
