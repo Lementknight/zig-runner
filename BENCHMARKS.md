@@ -29,8 +29,10 @@ The runner process accounts for 0.05% of the job's CPU. With no jobs, both runne
 machine together used 21 s of CPU in almost 12 hours, under 0.05% of one core, in 5-10 MB of memory
 each (14 MB peak).
 
-**So rewriting the runner, in Rust or anything else, cannot speed a job up:** it could save at most
-the 0.11 s. Jobs are made faster by the engine doing less, by its caches surviving, and by the disk.
+**So rewriting the runner, in Rust or anything else, cannot speed a job up.** The runner's own work
+is 0.11 s of CPU, so a faster language could save at most that. The rest of its share of a job is
+waiting on GitHub and the engine, which no rewrite changes. Jobs are made faster by the engine doing
+less, by its caches surviving, and by the disk.
 
 ## Restarting the engine keeps its cache, if it is allowed to stop
 
