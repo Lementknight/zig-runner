@@ -1,6 +1,7 @@
 # Benchmarks
 
-Everything here was measured on the reference machine, **razorbill**:
+Everything here was measured on the reference machine, **razorbill**, except where a section says
+otherwise:
 
 - a Raspberry Pi 5 with 8 GB of memory and a 117 GB SD card, which also runs other home services
 - the Dagger engine v0.21.10 in Docker, capped at 3 CPUs and 4 GB, with its cache capped at 20 GB
@@ -66,6 +67,34 @@ Hashing the tree's 19,505 files takes 0.3-0.9 s when they are in memory. When th
 check is limited by reading 309 MB from the SD card, so the gain depends on how recently the last
 job ran. The check stays: without it the script would trust a tree that another job may have
 changed.
+
+## Zig compiles its build runner first, on one core
+
+*2026-10-26, Zig 0.17.0, on a laptop rather than razorbill: a Ryzen 5 PRO 4650U, 12 threads, on
+battery.* Zig's build summary accounts for 7 s of a cold `test` job's Test step (compile 2 s, tests
+5 s), but the step took 110 s, and `zig build test` itself 109 s real against 104 s user: one core,
+the whole time. Sampling the host's processes every second shows where it goes. Before building
+anything, `zig build` compiles Zig's own build runner (`maker`), and only then runs it.
+
+| `zig build --help`, which only compiles the build runner | Time | CPU |
+| --- | --- | --- |
+| This repository, empty global cache | 121 s | one core (116 s user) |
+| The same, warm | 0.02 s | |
+| After a comment-only change to `build.zig` | 1.8 s | |
+| A three-line `build.zig`, empty global cache | 108 s | one core |
+| The same with `-fincremental` | 105 s | one core |
+| Zig 0.14.1, the three-line `build.zig` | 12 s | |
+
+A cold hello world takes 5-10 s on 0.17.0 and 3-4 s on 0.14.1, so it is the build runner, not
+compiling in general.
+
+**So the cost belongs to Zig, not to this project or the runner**, and it is paid once per Zig
+version per global cache. In a job that cache is the `zig` cache volume, keyed by repository, by
+whether the pull request comes from a fork and by the step user, so each of those pays it once per
+Zig version, and again whenever the engine's cache is lost: it is part of the 249 s after the reboot
+above. On razorbill's slower cores it is likely most of the 185 s Test phase in the first table,
+though that run was not split this way. GitHub's runners start with no cache, so CI's fallback and
+the release jobs probably pay it on every run; that was not measured.
 
 ## Earlier measurements
 
