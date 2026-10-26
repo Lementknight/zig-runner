@@ -10,6 +10,7 @@
 //!   /relative    302 to /echo
 //!   /see-other   303 to /echo
 //!   /loop        302 to /loop
+//!   /unavailable/...  503
 //!   anything else 404
 const std = @import("std");
 const Io = std.Io;
@@ -110,6 +111,8 @@ fn answer(port: u16, conn: Io.net.Stream) bool {
         respond(out, "303 See Other", "/echo", "");
     } else if (std.mem.eql(u8, path, "/loop")) {
         respond(out, "302 Found", "/loop", "");
+    } else if (std.mem.startsWith(u8, path, "/unavailable/")) {
+        respond(out, "503 Service Unavailable", null, "");
     } else {
         respond(out, "404 Not Found", null, "");
     }
