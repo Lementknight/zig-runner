@@ -93,9 +93,10 @@ jobs:
       - name: Install Zig
         run: .github/scripts/install-zig.sh
 
+      # Without `zig build`, whose first step here would be compiling Zig's build system (about
+      # 100 s): this job's cache always starts empty (zig-test.sh).
       - name: Test, with the database
-        working-directory: runner
-        run: zig build test --summary all
+        run: .github/scripts/zig-test.sh
 
   # On this project's own runners when they are set up, so every change exercises the runner
   # (README, "Environments"): a push to main on prod, pull requests and the merge queue on pre-prod,
@@ -118,7 +119,14 @@ jobs:
         working-directory: runner
         run: zig fmt --check .
 
-      # The database tests skip themselves here: the Database tests job runs them.
+      # The database tests skip themselves here: the Database tests job runs them. On GitHub's
+      # runners, whose cache always starts empty, without `zig build` (zig-test.sh); on the
+      # project's own, whose cache is kept, through it, as developers build.
       - name: Test
         working-directory: runner
-        run: zig build test --summary all
+        run: |
+          if [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
+            ../.github/scripts/zig-test.sh
+          else
+            zig build test --summary all
+          fi
