@@ -1,3 +1,0 @@
-kind: Changed
-body: 'Runners start at once after a restart that finds stale registrations: those are removed in the background, still only once they have stayed offline for 60 s. The first runner listened after 3 s instead of 81 s.'
-time: 2026-10-26T17:50:17.422825-04:00

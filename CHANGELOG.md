@@ -10,6 +10,12 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.8.0 - 2026-10-26
+### Changed
+* Runners start at once after a restart that finds stale registrations: those are removed in the background, still only once they have stayed offline for 60 s. The first runner listened after 3 s instead of 81 s.
+### Fixed
+* A request no longer fails after meeting 8 kept-alive connections the server had closed: it tries past every idle connection the pool keeps (33 tries, not 8). 16 runners registering at once left 16 such connections to GitHub a minute later, and the next request failed.
+
 ## v0.7.0 - 2026-10-26
 ### Added
 * `RUNNER_ZIG_LOCAL_CACHE=true` (or `--zig-local-cache`) keeps Zig's local cache between jobs, in a cache volume of its own: about 1.2 s off each `zig build test` of zig-runner itself (10%), and 4-6 s when the repository's previous build had the same source. Off by default, because Zig never removes anything from that cache: it grows by about 50 MB per source version built, until the engine collects it.
