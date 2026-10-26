@@ -391,6 +391,9 @@ pub const Client = struct {
         const host: Io.net.HostName = try .init(cfg.host);
         const stream = try host.connect(io, cfg.port, .{ .mode = .stream });
         errdefer stream.close(io);
+        // A database host that went away is then noticed (in about 90 s) by a query that is only
+        // waiting for its answer, which would otherwise wait for good.
+        @import("github/http.zig").keepAlive(stream.socket.handle);
 
         const tls_len = TlsClient.min_buffer_len;
         const total = 2 * tls_len + (tls_len + plain_buf_len) + tls_len + 2 * plain_buf_len;

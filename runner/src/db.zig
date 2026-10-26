@@ -151,6 +151,25 @@ pub const Store = struct {
     /// The most recent failure, for `Reporter` to report when the job ends.
     last_error: [256]u8 = undefined,
     last_error_len: usize = 0,
+    /// Writes that failed, for the life of the process. `Reporter` reports those made while its
+    /// job ran: with a writer, a row's failure comes after the call that queued it has returned.
+    failed: std.atomic.Value(u64) = .init(0),
+
+    /// Set by `startWriter`: rows are queued, and a task of their own writes them in order, so a
+    /// database that is slow or has stopped answering never holds up a job. They were written by
+    /// the job's own steps as they started and finished, under `mu`, which every runner shares: one
+    /// write that hung held up every runner's next step. Without a writer (tests, `--db-check`),
+    /// rows are written as they come.
+    writer: ?Io.Future(void) = null,
+    queue_mu: Io.Mutex = .init,
+    queue: std.ArrayList([]u8) = .empty,
+    /// Past this many waiting rows (a database down for long), the oldest are dropped and counted.
+    max_queued: usize = 10_000,
+    dropped: u64 = 0,
+    stop: std.atomic.Value(bool) = .init(false),
+    writer_stopped: std.atomic.Value(bool) = .init(false),
+    /// What `close` gives the writer to write what is left before cutting it short.
+    close_wait_ms: u32 = 5000,
 
     const retry_ms = 2000;
 
@@ -170,13 +189,69 @@ pub const Store = struct {
     }
 
     pub fn close(s: *Store) void {
+        s.stop.store(true, .release);
+        if (s.writer) |*f| {
+            var waited: u32 = 0;
+            while (!s.writer_stopped.load(.acquire) and waited < s.close_wait_ms) : (waited += 50)
+                s.io.sleep(.fromMilliseconds(50), .awake) catch break;
+            f.cancel(s.io);
+            s.writer = null;
+        }
+        for (s.queue.items) |q| s.gpa.free(q);
+        s.queue.deinit(s.gpa);
         if (s.client) |c| c.close();
         s.client = null;
     }
 
-    /// What went wrong most recently, empty if nothing has.
-    pub fn lastError(s: *const Store) []const u8 {
-        return s.last_error[0..s.last_error_len];
+    /// Starts the task that writes queued rows (see `writer`).
+    pub fn startWriter(s: *Store) !void {
+        s.writer = try s.io.concurrent(writerMain, .{s});
+    }
+
+    fn writerMain(s: *Store) void {
+        defer s.writer_stopped.store(true, .release);
+        while (true) {
+            const sql = s.next() orelse {
+                if (s.stop.load(.acquire)) return;
+                s.io.sleep(.fromMilliseconds(20), .awake) catch return;
+                continue;
+            };
+            defer s.gpa.free(sql);
+            s.mu.lockUncancelable(s.io);
+            defer s.mu.unlock(s.io);
+            s.execLocked(sql) catch {};
+        }
+    }
+
+    /// The oldest queued row, if any.
+    fn next(s: *Store) ?[]u8 {
+        s.queue_mu.lockUncancelable(s.io);
+        defer s.queue_mu.unlock(s.io);
+        if (s.queue.items.len == 0) return null;
+        return s.queue.orderedRemove(0);
+    }
+
+    fn enqueue(s: *Store, sql: []const u8) pg.Error!void {
+        const owned = s.gpa.dupe(u8, sql) catch return error.OutOfMemory;
+        s.queue_mu.lockUncancelable(s.io);
+        defer s.queue_mu.unlock(s.io);
+        s.queue.append(s.gpa, owned) catch {
+            s.gpa.free(owned);
+            return error.OutOfMemory;
+        };
+        if (s.queue.items.len > s.max_queued) {
+            s.gpa.free(s.queue.orderedRemove(0));
+            s.dropped += 1;
+            _ = s.failed.fetchAdd(1, .monotonic);
+        }
+    }
+
+    /// What went wrong most recently, empty if nothing has. Copied, under `mu`: the writer may be
+    /// recording a newer failure.
+    pub fn lastError(s: *Store, arena: Allocator) []const u8 {
+        s.mu.lockUncancelable(s.io);
+        defer s.mu.unlock(s.io);
+        return arena.dupe(u8, s.last_error[0..s.last_error_len]) catch "";
     }
 
     fn remember(s: *Store, what: []const u8, detail: []const u8) void {
@@ -223,14 +298,24 @@ pub const Store = struct {
         comptime build: fn (*Io.Writer, T) Io.Writer.Error!void,
         row: T,
     ) pg.Error!void {
-        s.mu.lockUncancelable(s.io);
-        defer s.mu.unlock(s.io);
-        const c = try s.ensure();
         var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena_state.deinit();
         var aw: Io.Writer.Allocating = .init(arena_state.allocator());
         build(&aw.writer, row) catch return error.OutOfMemory;
-        c.exec(aw.written()) catch |e| {
+        if (s.writer != null) return s.enqueue(aw.written());
+        s.mu.lockUncancelable(s.io);
+        defer s.mu.unlock(s.io);
+        return s.execLocked(aw.written());
+    }
+
+    /// One statement, on the connection (dialled if need be). Called with `mu` held.
+    fn execLocked(s: *Store, sql: []const u8) pg.Error!void {
+        const c = s.ensure() catch |e| {
+            _ = s.failed.fetchAdd(1, .monotonic);
+            return e;
+        };
+        c.exec(sql) catch |e| {
+            _ = s.failed.fetchAdd(1, .monotonic);
             s.remember(
                 "write failed",
                 if (c.lastErrorText().len > 0) c.lastErrorText() else @errorName(e),
@@ -280,10 +365,12 @@ test "a store whose database is down describes itself, writes nothing, and never
     var store: Store = .init(std.testing.allocator, std.testing.io, down, null);
     defer store.close();
 
-    // A write reports the failure and keeps the process going. `Reporter.note` counts these and
-    // reports them when the job ends; nothing here propagates to the job's result.
+    // A write reports the failure and keeps the process going. The store counts these, and
+    // `Reporter` reports them when the job ends; nothing here propagates to the job's result.
     try std.testing.expectError(error.ConnectionClosed, store.upsertRun(.{ .id = 1, .repo = "o/r", .workflow = "ci", .status = "in_progress" }));
-    try std.testing.expect(std.mem.indexOf(u8, store.lastError(), "connect failed") != null);
+    const last = store.lastError(std.testing.allocator);
+    defer std.testing.allocator.free(last);
+    try std.testing.expect(std.mem.indexOf(u8, last, "connect failed") != null);
 
     // The second write inside the backoff window does not dial again — a job of forty steps must
     // not cost forty connection attempts to a database that is down.
@@ -350,4 +437,33 @@ test "integration: state upserts are idempotent, keep created_at and started_at,
     try std.testing.expectEqualStrings("2", try sc.scalar("select count(*) from steps"));
     try std.testing.expectEqualStrings("completed/failure", try sc.scalar("select status || '/' || conclusion from steps where number = 1"));
     try std.testing.expectEqualStrings("2026-10-11 17:00:01+00", try sc.scalar("select started_at::text from steps where number = 1")); // kept
+}
+
+test "with its writer, a row is queued at once though the database does not answer" {
+    const io = std.testing.io;
+    // Connections complete in the listener's backlog and are never answered.
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const cfg: pg.Config = .{
+        .host = "127.0.0.1",
+        .port = listener.socket.address.getPort(),
+        .user = "u",
+        .database = "d",
+        .sslmode = .disable,
+    };
+    var store: Store = .init(std.testing.allocator, io, cfg, null);
+    store.close_wait_ms = 300;
+    try store.startWriter();
+    defer store.close();
+
+    // The writer is stuck dialling; each step's start and end would have waited on it.
+    const started = Io.Clock.awake.now(io).toMilliseconds();
+    for (0..20) |i| try store.upsertStep(.{
+        .job_id = 1,
+        .number = @intCast(i),
+        .name = "step",
+        .status = "in_progress",
+    });
+    try std.testing.expect(Io.Clock.awake.now(io).toMilliseconds() - started < 500);
 }

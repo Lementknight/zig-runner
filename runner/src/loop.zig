@@ -471,8 +471,10 @@ const Reporter = struct {
     io: std.Io,
     job_id: u64,
     run_id: u64,
-    failures: usize = 0,
-    last_error: []const u8 = "",
+    /// A write that fails is not reported where it is made (`catch {}` below): the store counts
+    /// it, since with its writer a row fails after the call that queued it has returned, and
+    /// `finishReporter` reports how many failed since this count, taken when the job started.
+    failed_before: u64 = 0,
 
     fn observer(r: *Reporter) dagger.Observer {
         return .{ .ptr = r, .startedFn = stepStartedFn, .finishedFn = stepFinishedFn };
@@ -483,9 +485,9 @@ const Reporter = struct {
         return timefmt.isoTime(r.arena, ms) catch null;
     }
 
-    fn note(r: *Reporter, e: anyerror) void {
-        r.failures += 1;
-        r.last_error = if (r.store.lastError().len > 0) r.store.lastError() else @errorName(e);
+    /// Writes that failed since the job started (any runner's: they share the database).
+    fn failures(r: *Reporter) u64 {
+        return r.store.failed.load(.monotonic) -| r.failed_before;
     }
 
     fn stepStartedFn(ptr: *anyopaque, number: u32, name: []const u8, started_ms: i64) void {
@@ -496,7 +498,7 @@ const Reporter = struct {
             .name = name,
             .status = "in_progress",
             .started_at = r.iso(started_ms),
-        }) catch |e| r.note(e);
+        }) catch {};
     }
 
     fn stepFinishedFn(ptr: *anyopaque, number: u32, res: dagger.StepResult) void {
@@ -509,7 +511,7 @@ const Reporter = struct {
             .conclusion = stepConclusion(res),
             .started_at = r.iso(res.started_ms),
             .completed_at = r.iso(res.completed_ms),
-        }) catch |e| r.note(e);
+        }) catch {};
     }
 
     fn jobStarted(r: *Reporter, job: job_mod.Job, runner_name: []const u8, now_ms: i64) void {
@@ -522,7 +524,7 @@ const Reporter = struct {
             .branch = nonEmpty(g.ref_name),
             .sha = nonEmpty(g.sha),
             .status = "in_progress",
-        }) catch |e| r.note(e);
+        }) catch {};
         r.store.upsertJob(.{
             .id = r.job_id,
             .run_id = r.run_id,
@@ -530,7 +532,7 @@ const Reporter = struct {
             .runner_name = runner_name,
             .status = "in_progress",
             .started_at = r.iso(now_ms),
-        }) catch |e| r.note(e);
+        }) catch {};
         // Step 0 is "Set up job" (db/migrations/001_init.sql): registration, acquiring and parsing.
         r.store.upsertStep(.{
             .job_id = r.job_id,
@@ -540,7 +542,7 @@ const Reporter = struct {
             .conclusion = "success",
             .started_at = r.iso(now_ms),
             .completed_at = r.iso(now_ms),
-        }) catch |e| r.note(e);
+        }) catch {};
     }
 
     /// "Set up job" failed after all: the job failed before its steps (refused, unsupported, or an
@@ -555,7 +557,7 @@ const Reporter = struct {
             .conclusion = "failure",
             .started_at = r.iso(started_ms),
             .completed_at = r.iso(now_ms),
-        }) catch |e| r.note(e);
+        }) catch {};
     }
 
     fn jobFinished(
@@ -575,7 +577,7 @@ const Reporter = struct {
             .conclusion = conclusion,
             .started_at = r.iso(started_ms),
             .completed_at = r.iso(now_ms),
-        }) catch |e| r.note(e);
+        }) catch {};
         // One runner handles one job, so the run's state follows this job (SPEC §5.2).
         const g = job.github;
         r.store.upsertRun(.{
@@ -588,7 +590,7 @@ const Reporter = struct {
             .status = "completed",
             .conclusion = conclusion,
             .completed_at = r.iso(now_ms),
-        }) catch |e| r.note(e);
+        }) catch {};
     }
 };
 
@@ -744,9 +746,10 @@ fn finishReporter(
 ) !void {
     const ended_ms = std.Io.Clock.real.now(c.io).toMilliseconds();
     recordFinished(r, job, c.name, result, job_started_ms, ended_ms);
-    if (r.failures > 0) try c.err.print(
-        "run state: {d} database write(s) failed (last: {s})\n",
-        .{ r.failures, r.last_error },
+    const failed = r.failures();
+    if (failed > 0) try c.err.print(
+        "run state: {d} database write(s) failed while this job ran (last: {s})\n",
+        .{ failed, r.store.lastError(c.arena) },
     );
 }
 
@@ -789,7 +792,7 @@ test "integration: a job failed before its steps is recorded with Set up job fai
     try std.testing.expectEqualStrings("success", try sc.scalar("select conclusion from steps where job_id = 7 and number = 0"));
 
     recordFinished(&r, job, "zig-1", try failedInSetUp(arena, 0), started, started + 500);
-    try std.testing.expectEqual(@as(usize, 0), r.failures);
+    try std.testing.expectEqual(@as(u64, 0), r.failures());
     try std.testing.expectEqualStrings("failure", try sc.scalar("select conclusion from steps where job_id = 7 and number = 0"));
     try std.testing.expectEqualStrings("completed/failure", try sc.scalar("select status || '/' || conclusion from jobs where id = 7"));
 }
@@ -859,6 +862,7 @@ fn startReporter(c: Context, job: job_mod.Job, job_started_ms: i64) !?Reporter {
         .io = c.io,
         .job_id = job.check_run_id,
         .run_id = run_id,
+        .failed_before = st.failed.load(.monotonic),
     };
     reporter.jobStarted(job, c.name, job_started_ms);
     return reporter;

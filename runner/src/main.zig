@@ -206,6 +206,9 @@ fn openDatabase(
         .flush_ms = cfg.log_flush_ms,
     } };
     try db_sink.postgres.startFlusher();
+    // Rows are written in the background from here on: neither a slow database nor one that has
+    // stopped answering holds up a job (`Store.writer`).
+    try store.*.?.startWriter();
 }
 
 /// The registration name: the configured prefix and a random suffix, new for every process.
