@@ -56,12 +56,35 @@ pub const Scope = struct {
     diag: ?*[]const u8 = null,
     /// What `hashFiles()` reads files with; without it, `hashFiles()` is unsupported.
     hash_files: ?HashFiles = null,
+    /// Bytes the functions that build strings have made so far; `evaluate` sets it.
+    memory: ?*usize = null,
 
     fn fail(s: Scope, comptime fmt: []const u8, args: anytype, arena: Allocator) Error {
         if (s.diag) |d| d.* = std.fmt.allocPrint(arena, fmt, args) catch "expression error";
         return error.EvalError;
     }
+
+    /// Counts `n` more bytes against the evaluation's memory limit (`max_memory`).
+    fn charge(s: Scope, n: usize, arena: Allocator) Error!void {
+        const used = s.memory orelse return;
+        used.* += n;
+        if (used.* > max_memory) return s.fail(
+            "the expression needs more than {d} MiB of memory",
+            .{max_memory >> 20},
+            arena,
+        );
+    }
 };
+
+/// What one evaluation's string-building functions (`format`, `join`, `toJSON`, `fromJSON`) may
+/// make in all. GitHub refuses at about 1 MB, counted its own way; this is looser, to never refuse
+/// what GitHub runs, and is here so that `format('{0}{0}{0}{0}', format('{0}{0}{0}{0}', ...))`
+/// fails instead of growing until the runner runs out of memory.
+const max_memory = 10 << 20;
+
+/// How deeply `fromJSON` input may nest. Its result is converted (and compared, and written back)
+/// recursively, so `fromJSON('[[[[...]]]]')` would otherwise overflow the stack.
+const max_json_nesting = 1000;
 
 // --- tokens ---
 
@@ -210,10 +233,27 @@ const Node = union(enum) {
     bin: struct { op: BinOp, l: *Node, r: *Node },
 };
 
+/// GitHub refuses an expression nested deeper than this ("Exceeded max expression depth 50"). It
+/// also keeps the parser's and the evaluator's recursion bounded: `action.yml` files are read as
+/// written, with no check of GitHub's in between, and 100000 nested `!` overflowed the stack.
+const max_depth = 50;
+
+/// Every node is allocated with the depth of the tree under it, so the parser can refuse what is
+/// too deep as it builds it.
+const Slot = struct { node: Node, depth: u32 };
+
+fn depthOf(n: *const Node) u32 {
+    const slot: *const Slot = @fieldParentPtr("node", n);
+    return slot.depth;
+}
+
 const Parser = struct {
     lex: Lexer,
     cur: Tok,
     prev_value: bool = false,
+    /// How deep the parser itself has recursed (`!`, parentheses, arguments, indexes): `!!!...`
+    /// recurses before it makes a single node.
+    nesting: u32 = 0,
 
     fn init(arena: Allocator, src: []const u8, diag: ?*[]const u8) Error!Parser {
         var p: Parser = .{ .lex = .{ .src = src, .arena = arena, .diag = diag }, .cur = .eof };
@@ -230,9 +270,40 @@ const Parser = struct {
     }
 
     fn node(p: *Parser, n: Node) Error!*Node {
-        const ptr = try p.lex.arena.create(Node);
-        ptr.* = n;
-        return ptr;
+        const below: u32 = switch (n) {
+            .literal, .ident => 0,
+            .prop => |x| depthOf(x.obj),
+            .index => |x| @max(depthOf(x.obj), depthOf(x.idx)),
+            .star, .not => |x| depthOf(x),
+            .call => |c| blk: {
+                var d: u32 = 0;
+                for (c.args) |a| d = @max(d, depthOf(a));
+                break :blk d;
+            },
+            // GitHub's `&&` and `||` take any number of operands: a chain of one of them is one
+            // node, as deep as its deepest operand plus one, however long it is.
+            .bin => |b| if ((b.op == .and_ or b.op == .or_) and b.l.* == .bin and b.l.bin.op == b.op)
+                return p.slot(n, @max(depthOf(b.l), depthOf(b.r) + 1))
+            else
+                @max(depthOf(b.l), depthOf(b.r)),
+        };
+        return p.slot(n, below + 1);
+    }
+
+    fn slot(p: *Parser, n: Node, depth: u32) Error!*Node {
+        if (depth > max_depth) return p.tooDeep();
+        const s = try p.lex.arena.create(Slot);
+        s.* = .{ .node = n, .depth = depth };
+        return &s.node;
+    }
+
+    fn tooDeep(p: *Parser) Error {
+        return p.lex.bad("the expression is nested more than {d} deep", .{max_depth});
+    }
+
+    fn enter(p: *Parser) Error!void {
+        p.nesting += 1;
+        if (p.nesting > max_depth) return p.tooDeep();
     }
 
     fn expectEnd(p: *Parser) Error!void {
@@ -286,6 +357,8 @@ const Parser = struct {
     fn parseUnary(p: *Parser) Error!*Node {
         if (p.cur == .not) {
             try p.advance();
+            try p.enter();
+            defer p.nesting -= 1;
             return p.node(.{ .not = try p.parseUnary() });
         }
         return p.parsePostfix();
@@ -311,6 +384,8 @@ const Parser = struct {
                 },
                 .lbracket => {
                     try p.advance();
+                    try p.enter();
+                    defer p.nesting -= 1;
                     const idx = try p.parseOr();
                     if (p.cur != .rbracket) return p.lex.bad("expected ']'", .{});
                     try p.advance();
@@ -333,6 +408,8 @@ const Parser = struct {
             },
             .lparen => {
                 try p.advance();
+                try p.enter();
+                defer p.nesting -= 1;
                 const inner = try p.parseOr();
                 if (p.cur != .rparen) return p.lex.bad("expected ')'", .{});
                 try p.advance();
@@ -342,6 +419,8 @@ const Parser = struct {
                 try p.advance();
                 if (p.cur == .lparen) {
                     try p.advance();
+                    try p.enter();
+                    defer p.nesting -= 1;
                     var args: std.ArrayList(*Node) = .empty;
                     if (p.cur != .rparen) {
                         while (true) {
@@ -472,9 +551,11 @@ fn deref(v: Value, key: Value, arena: Allocator) Allocator.Error!Value {
         .array => |a| {
             if (key != .number and key != .string) return .null;
             const n = toNumber(key);
-            if (std.math.isNan(n) or n < 0 or @floor(n) != n) return .null;
-            const i: usize = @intFromFloat(n);
-            return if (i < a.len) a[i] else .null;
+            // Bounded before the conversion, which panics on a number no usize holds (`foo[1e30]`,
+            // `foo[Infinity]`) and would take the whole runner down with it.
+            const len: f64 = @floatFromInt(a.len);
+            if (std.math.isNan(n) or n < 0 or @floor(n) != n or n >= len) return .null;
+            return a[@intFromFloat(n)];
         },
         else => return .null,
     }
@@ -519,6 +600,25 @@ fn filteredValues(arena: Allocator, n: *const Node, scope: Scope) Error!?[]const
     }
 }
 
+/// A chain of `&&` (or of `||`), operand by operand from the left, without recursing down it: a
+/// chain of any length is depth 2 to GitHub, but `a || b || c` is parsed as `(a || b) || c`.
+/// `&&` returns the first falsy operand or the last; `||` the first truthy one or the last.
+fn evalChain(arena: Allocator, n: *const Node, scope: Scope) Error!Value {
+    const op = n.bin.op;
+    var rights: std.ArrayList(*const Node) = .empty;
+    var left = n;
+    while (left.* == .bin and left.bin.op == op) : (left = left.bin.l)
+        try rights.append(arena, left.bin.r);
+    var v = try eval(arena, left, scope);
+    var i = rights.items.len;
+    while (i > 0) {
+        if (toBool(v) == (op == .or_)) return v;
+        i -= 1;
+        v = try eval(arena, rights.items[i], scope);
+    }
+    return v;
+}
+
 fn eval(arena: Allocator, n: *const Node, scope: Scope) Error!Value {
     switch (n.*) {
         .literal => |v| return v,
@@ -547,12 +647,8 @@ fn eval(arena: Allocator, n: *const Node, scope: Scope) Error!Value {
         .star => |inner| return .{ .array = try starValues(arena, try eval(arena, inner, scope)) },
         .not => |inner| return .{ .boolean = !toBool(try eval(arena, inner, scope)) },
         .bin => |b| {
+            if (b.op == .and_ or b.op == .or_) return evalChain(arena, n, scope);
             const l = try eval(arena, b.l, scope);
-            switch (b.op) {
-                .and_ => return if (!toBool(l)) l else try eval(arena, b.r, scope),
-                .or_ => return if (toBool(l)) l else try eval(arena, b.r, scope),
-                else => {},
-            }
             const r = try eval(arena, b.r, scope);
             return .{ .boolean = switch (b.op) {
                 .eq => looseEquals(l, r),
@@ -648,8 +744,10 @@ fn callJoin(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
         .array => |a| {
             var out: std.ArrayList(u8) = .empty;
             for (a, 0..) |e, i| {
+                const item = try toStr(arena, e);
+                try scope.charge(item.len + if (i > 0) sep.len else 0, arena);
                 if (i > 0) try out.appendSlice(arena, sep);
-                try out.appendSlice(arena, try toStr(arena, e));
+                try out.appendSlice(arena, item);
             }
             return .{ .string = out.items };
         },
@@ -661,15 +759,43 @@ fn callToJson(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
     if (args.len != 1) return scope.fail("toJSON() takes 1 argument", .{}, arena);
     var aw: std.Io.Writer.Allocating = .init(arena);
     writeJson(&aw.writer, args[0], 0) catch return error.OutOfMemory; // Allocating writer: only OOM
+    try scope.charge(aw.written().len, arena);
     return .{ .string = aw.written() };
 }
 
 fn callFromJson(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
     if (args.len != 1) return scope.fail("fromJSON() takes 1 argument", .{}, arena);
     const text = try toStr(arena, args[0]);
+    try scope.charge(text.len, arena);
+    if (jsonNesting(text) > max_json_nesting)
+        return scope.fail("fromJSON(): nested more than {d} deep", .{max_json_nesting}, arena);
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch
         return scope.fail("fromJSON(): invalid JSON", .{}, arena);
     return fromJsonValue(arena, parsed);
+}
+
+/// The deepest nesting of arrays and objects in JSON text (outside strings), without parsing it.
+fn jsonNesting(text: []const u8) usize {
+    var depth: usize = 0;
+    var deepest: usize = 0;
+    var in_string = false;
+    var escaped = false;
+    for (text) |c| {
+        if (in_string) {
+            if (escaped) escaped = false else if (c == '\\') escaped = true else if (c == '"') in_string = false;
+            continue;
+        }
+        switch (c) {
+            '"' => in_string = true,
+            '[', '{' => {
+                depth += 1;
+                deepest = @max(deepest, depth);
+            },
+            ']', '}' => depth -|= 1,
+            else => {},
+        }
+    }
+    return deepest;
 }
 
 fn formatString(
@@ -695,7 +821,9 @@ fn formatString(
                 return scope.fail("format(): invalid placeholder '{s}'", .{placeholder}, arena);
             if (idx >= args.len)
                 return scope.fail("format(): placeholder {{{d}}} has no argument", .{idx}, arena);
-            try out.appendSlice(arena, try toStr(arena, args[idx]));
+            const arg = try toStr(arena, args[idx]);
+            try scope.charge(arg.len, arena);
+            try out.appendSlice(arena, arg);
             i = close + 1;
         } else if (c == '}') {
             if (i + 1 < fmt.len and fmt[i + 1] == '}') {
@@ -780,7 +908,10 @@ pub fn fromJsonValue(arena: Allocator, j: std.json.Value) Allocator.Error!Value 
 /// Evaluates one expression (the text inside `${{ }}`).
 pub fn evaluate(arena: Allocator, text: []const u8, scope: Scope) Error!Value {
     const n = try parse(arena, text, scope.diag);
-    return eval(arena, n, scope) catch |e| switch (e) {
+    var used: usize = 0;
+    var s = scope;
+    if (s.memory == null) s.memory = &used;
+    return eval(arena, n, s) catch |e| switch (e) {
         error.Unsupported => {
             if (scope.diag) |d| if (d.*.len == 0) {
                 d.* = "the '*' object filter is not supported yet";
@@ -941,6 +1072,9 @@ test "contexts, properties and indexing" {
     try std.testing.expectEqualStrings("20", try evalStr(ar, "matrix['node']", s));
     try std.testing.expectEqualStrings("b", try evalStr(ar, "github.list[1]", s));
     try std.testing.expectEqualStrings("", try evalStr(ar, "github.list[5]", s));
+    // Numbers no index can be: once a panic that stopped the runner.
+    try std.testing.expectEqualStrings("", try evalStr(ar, "github.list[1e30]", s));
+    try std.testing.expectEqualStrings("", try evalStr(ar, "github.list[Infinity]", s));
     try std.testing.expectEqualStrings("", try evalStr(ar, "github.missing.deeper.still", s)); // null propagates
     try std.testing.expectEqualStrings("", try evalStr(ar, "nosuchcontext.x", s));
     try std.testing.expect(try evalCondition(ar, "github.repository == 'O/R' && matrix.os == 'linux'", s));
@@ -1119,4 +1253,57 @@ test "interpolate replaces each ${{ }} and leaves the rest alone" {
     try std.testing.expectEqualStrings("it's", try interpolate(ar, "${{ 'it''s' }}", s));
     try std.testing.expectError(error.ParseError, interpolate(ar, "x ${{ inputs.version", s));
     try std.testing.expectEqualStrings("'${{' is never closed with '}}'", diag);
+}
+
+/// `parts` joined, each `{ text, times }` repeated `times` times.
+fn repeated(arena: Allocator, parts: []const struct { []const u8, usize }) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (parts) |p| for (0..p[1]) |_| try out.appendSlice(arena, p[0]);
+    return out.items;
+}
+
+test "nesting deeper than GitHub's 50 is refused, however it is written, and never overflows" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const s: Scope = .{};
+    // GitHub's own cases: 49 `!` evaluate, 50 do not (the literal is a level too).
+    try std.testing.expectEqualStrings("true", try evalStr(ar, try repeated(ar, &.{ .{ "!", 49 }, .{ "false", 1 } }), s));
+    try std.testing.expectError(error.ParseError, evaluate(ar, try repeated(ar, &.{ .{ "!", 50 }, .{ "false", 1 } }), s));
+    try std.testing.expectError(error.ParseError, evaluate(ar, try repeated(ar, &.{ .{ "(", 60 }, .{ "1", 1 }, .{ ")", 60 } }), s));
+    try std.testing.expectError(error.ParseError, evaluate(ar, try repeated(ar, &.{ .{ "x", 1 }, .{ ".a", 50 } }), s));
+    // Far past the limit: refused, not a stack overflow (this took the runner down).
+    try std.testing.expectError(error.ParseError, evaluate(ar, try repeated(ar, &.{.{ "!", 100_000 }}), s));
+}
+
+test "a long chain of && or || is one node to GitHub, and evaluates without recursing" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const s: Scope = .{};
+    var text: std.ArrayList(u8) = .empty;
+    for (1..20_001) |i| try text.print(ar, "{s}{d}", .{ if (i > 1) " && " else "", i });
+    try std.testing.expectEqualStrings("20000", try evalStr(ar, text.items, s));
+    text.clearRetainingCapacity();
+    for (0..20_000) |i| try text.print(ar, "{s}{d}", .{ if (i > 0) " || " else "", i });
+    try std.testing.expectEqualStrings("1", try evalStr(ar, text.items, s));
+    try std.testing.expectEqualStrings("0", try evalStr(ar, "1 && 0 && x.y", s));
+    try std.testing.expectEqualStrings("2", try evalStr(ar, "1 && 2 || 3 && 4", s));
+}
+
+test "string building has a memory limit, and fromJSON a nesting limit" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const s: Scope = .{};
+    const f = "format('{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}', ";
+    // 16^6 = 16 Mi characters: refused once past the limit, without building them all.
+    const huge = try repeated(ar, &.{ .{ f, 6 }, .{ "'x'", 1 }, .{ ")", 6 } });
+    try std.testing.expectError(error.EvalError, evaluate(ar, huge, s));
+    const fine = try repeated(ar, &.{ .{ f, 3 }, .{ "'x'", 1 }, .{ ")", 3 } });
+    try std.testing.expectEqual(@as(usize, 16 * 16 * 16), (try evalStr(ar, fine, s)).len);
+    const deep = try repeated(ar, &.{ .{ "fromJSON('", 1 }, .{ "[", 1001 }, .{ "]", 1001 }, .{ "')", 1 } });
+    try std.testing.expectError(error.EvalError, evaluate(ar, deep, s));
+    // Brackets inside strings do not count.
+    try std.testing.expectEqualStrings("]]]]", try evalStr(ar, "fromJSON('[[\"]]]]\"]]')[0][0]", s));
 }

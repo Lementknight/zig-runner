@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'Workflow and action input can no longer crash the runner: indexing an array with a number no index can be (`foo[1e30]`, `foo[Infinity]`), a `timeout-minutes` too large to hold (`1e300`, `inf`), and an expression nested 100000 deep (`!!!…`, possible in an `action.yml`, which GitHub does not check) each stopped the whole runner. Expressions nested deeper than GitHub''s limit of 50 are refused as GitHub refuses them, a long `&&`/`||` chain is evaluated without recursing, `fromJSON` refuses input nested more than 1000 deep, and the string-building functions stop at 10 MiB per expression instead of growing until memory runs out.'
+time: 2026-10-26T19:30:00.000000-04:00
