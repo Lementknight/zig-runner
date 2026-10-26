@@ -308,6 +308,8 @@ fn execJobFile(
         .gpa = init.gpa,
         .nesting = cfg.dagger_nesting,
         .package_caches = cfg.package_caches,
+        .uv_env_in_cache = cfg.uv_env_in_cache,
+        .zig_local_cache = cfg.zig_local_cache,
         .step_cache = cfg.step_cache,
         .step_user = cfg.step_user,
         .output_keys = cfg.output_keys,

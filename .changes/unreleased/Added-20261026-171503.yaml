@@ -1,0 +1,3 @@
+kind: Added
+body: '`RUNNER_ZIG_LOCAL_CACHE=true` (or `--zig-local-cache`) keeps Zig''s local cache between jobs, in a cache volume of its own: about 1.2 s off each `zig build test` of zig-runner itself (10%), and 4-6 s when the repository''s previous build had the same source. Off by default, because Zig never removes anything from that cache: it grows by about 50 MB per source version built, until the engine collects it.'
+time: 2026-10-26T17:15:03.483998-04:00
