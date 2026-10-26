@@ -1322,6 +1322,9 @@ pub fn timeSpanMs(text: []const u8) ?i64 {
     const m = std.fmt.parseInt(i64, parts.next() orelse return null, 10) catch return null;
     const sec = std.fmt.parseFloat(f64, parts.next() orelse return null) catch return null;
     if (parts.next() != null) return null;
+    // Out of range is not a time span, and would overflow (or, for `inf`, panic in the conversion).
+    if (days < 0 or days > 1_000_000 or h < 0 or h >= 24 or m < 0 or m >= 60) return null;
+    if (!(sec >= 0 and sec < 60)) return null;
     return ((days * 24 + h) * 60 + m) * 60_000 + @as(i64, @intFromFloat(sec * 1000));
 }
 
@@ -1396,6 +1399,8 @@ test "timeSpanMs reads GitHub's cancel timeout" {
     try std.testing.expectEqual(@as(?i64, 90_500), timeSpanMs("00:01:30.5"));
     try std.testing.expectEqual(@as(?i64, 86_400_000 + 60_000), timeSpanMs("1.00:01:00"));
     try std.testing.expectEqual(@as(?i64, null), timeSpanMs("soon"));
+    try std.testing.expectEqual(@as(?i64, null), timeSpanMs("00:00:inf"));
+    try std.testing.expectEqual(@as(?i64, null), timeSpanMs("9223372036854775807.00:00:00"));
 }
 
 /// The steps GitHub shows for a job, in its runner's order and numbering: "Set up job", the

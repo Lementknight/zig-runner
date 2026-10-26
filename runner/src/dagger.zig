@@ -3139,11 +3139,23 @@ const StepRun = struct {
     scope: expr.Scope,
 };
 
-/// `timeout-minutes` as written, in milliseconds; 0 when absent, unparsable or not positive.
+/// `timeout-minutes` as written, in milliseconds; 0 when absent, unparsable or not positive. At
+/// most a year: a larger number (`1e300`, `inf`) would not fit, and converting it panics.
 fn timeoutMs(timeout: ?[]const u8) i64 {
     const t = timeout orelse return 0;
     const minutes = std.fmt.parseFloat(f64, std.mem.trim(u8, t, " ")) catch return 0;
-    return if (minutes > 0) @intFromFloat(minutes * 60_000) else 0;
+    if (!(minutes > 0)) return 0;
+    return @intFromFloat(@min(minutes, 366 * 24 * 60) * 60_000);
+}
+
+test "timeoutMs reads timeout-minutes, and a number too large to hold is a year" {
+    try std.testing.expectEqual(@as(i64, 0), timeoutMs(null));
+    try std.testing.expectEqual(@as(i64, 90_000), timeoutMs(" 1.5 "));
+    try std.testing.expectEqual(@as(i64, 0), timeoutMs("-1"));
+    try std.testing.expectEqual(@as(i64, 0), timeoutMs("nan"));
+    const year: i64 = 366 * 24 * 60 * 60_000;
+    try std.testing.expectEqual(year, timeoutMs("1e300"));
+    try std.testing.expectEqual(year, timeoutMs("inf"));
 }
 
 /// The step's name and condition, evaluated with the job env visible. Returns the scope the rest of

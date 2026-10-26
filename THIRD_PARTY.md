@@ -27,6 +27,8 @@ The Dagger engine pulls these images when jobs run; none of them is part of this
 
 The optional `api/` and `web/` depend on npm packages listed in their `package-lock.json` files, all under open-source licenses (MIT, Apache-2.0, BSD, ISC, MPL-2.0 and similar).
 
+CI also fetches GitHub's expression test cases from [actions/languageservices](https://github.com/actions/languageservices) (`expressions/testdata`, MIT, Copyright GitHub) at a pinned commit, to check `runner/src/expr.zig` against them (`.github/scripts/expr-conformance.sh`); only case names are kept here, in `runner/tools/exprcorpus-failing.txt`.
+
 CI downloads one more tool, which is in no build: the [Agda](https://github.com/agda/agda) release binary of the pinned version (`AGDA_VERSION` in `.github/workflows/ci.yml`, by checksum), to type-check `proofs/`. Agda is under BSD-style terms, and its statically linked build carries the notices of what it links (GMP under LGPL-3.0 among them). `proofs/` is this project's own code and uses no Agda library.
 
 ## actions/runner's license

@@ -119,6 +119,11 @@ jobs:
         working-directory: runner
         run: zig fmt --check .
 
+      # runner/src/expr.zig against GitHub's own expression test cases (actions/languageservices):
+      # fails on a case that broke, or on one that now passes and is still listed as failing.
+      - name: Expressions against GitHub's test cases
+        run: .github/scripts/expr-conformance.sh
+
       # The database tests skip themselves here: the Database tests job runs them. On GitHub's
       # runners, whose cache always starts empty, without `zig build` (zig-test.sh); on the
       # project's own, whose cache is kept, through it, as developers build.
