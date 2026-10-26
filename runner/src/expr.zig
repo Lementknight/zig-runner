@@ -583,12 +583,92 @@ fn sameKind(a: Value, b: Value) bool {
     return std.meta.activeTag(a) == std.meta.activeTag(b);
 }
 
+// --- case-insensitive strings ---
+//
+// GitHub compares strings as their upper-case forms, code point by code point: 'ü' == 'Ü', all
+// three Greek sigmas are equal, and 'a' < '[' (because 'A' < '['). Zig's std has no Unicode case
+// mapping, so `upperRune` maps the letters of Latin-1, Latin Extended-A, Greek and Cyrillic; other
+// scripts compare as written.
+
+/// The upper-case form of `c`, for the scripts listed above. Only letters that pair one to one:
+/// GitHub keeps the dotless ı apart from I, and İ apart from i.
+fn upperRune(c: u21) u21 {
+    return switch (c) {
+        'a'...'z' => c - 32,
+        0xE0...0xF6, 0xF8...0xFE => c - 0x20,
+        0xFF => 0x178,
+        // Latin Extended-A: pairs, upper case first...
+        0x100...0x12F, 0x132...0x137, 0x14A...0x177 => c & ~@as(u21, 1),
+        // ...or upper case second.
+        0x139...0x148, 0x179...0x17E => if (c % 2 == 0) c - 1 else c,
+        0x3AC => 0x386,
+        0x3AD...0x3AF => c - 37,
+        0x3CC => 0x38C,
+        0x3CD, 0x3CE => c - 63,
+        0x3B1...0x3C1, 0x3C3...0x3CB => c - 0x20,
+        0x3C2 => 0x3A3, // final sigma
+        0x430...0x44F => c - 0x20,
+        0x450...0x45F => c - 0x50,
+        0x460...0x481, 0x48A...0x4BF, 0x4D0...0x52F => c & ~@as(u21, 1),
+        0x4C1...0x4CE => if (c % 2 == 0) c - 1 else c,
+        0x4CF => 0x4C0,
+        else => c,
+    };
+}
+
+/// The code point at `s[i.*]`, upper-cased, advancing `i`. A byte that does not start valid UTF-8
+/// stands for itself, above every code point, so that it compares equal only to the same byte.
+fn nextUpper(s: []const u8, i: *usize) u32 {
+    const len = std.unicode.utf8ByteSequenceLength(s[i.*]) catch 0;
+    if (len > 0 and i.* + len <= s.len) {
+        if (std.unicode.utf8Decode(s[i.* .. i.* + len])) |c| {
+            i.* += len;
+            return upperRune(c);
+        } else |_| {}
+    }
+    i.* += 1;
+    return 0x110000 + @as(u32, s[i.* - 1]);
+}
+
+fn orderFold(a: []const u8, b: []const u8) std.math.Order {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < a.len and j < b.len) {
+        const x = nextUpper(a, &i);
+        const y = nextUpper(b, &j);
+        if (x != y) return std.math.order(x, y);
+    }
+    return std.math.order(a.len - i, b.len - j);
+}
+
+fn eqlFold(a: []const u8, b: []const u8) bool {
+    return orderFold(a, b) == .eq;
+}
+
+/// `s` upper-cased, for searching it case-insensitively.
+fn upperAlloc(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = try .initCapacity(arena, s.len);
+    var i: usize = 0;
+    while (i < s.len) {
+        const start = i;
+        const c = nextUpper(s, &i);
+        if (c >= 0x110000) {
+            try out.append(arena, s[start]);
+            continue;
+        }
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(@intCast(c), &buf) catch unreachable;
+        try out.appendSlice(arena, buf[0..n]);
+    }
+    return out.items;
+}
+
 fn looseEquals(a: Value, b: Value) bool {
     if (sameKind(a, b)) return switch (a) {
         .null => true,
         .boolean => |x| x == b.boolean,
         .number => |x| x == b.number,
-        .string => |x| std.ascii.eqlIgnoreCase(x, b.string),
+        .string => |x| eqlFold(x, b.string),
         // Arrays and objects only equal themselves.
         .array => |x| x.ptr == b.array.ptr and x.len == b.array.len,
         .object => |x| x.ptr == b.object.ptr and x.len == b.object.len,
@@ -599,7 +679,7 @@ fn looseEquals(a: Value, b: Value) bool {
 }
 
 fn compare(a: Value, b: Value) ?std.math.Order {
-    if (a == .string and b == .string) return std.ascii.orderIgnoreCase(a.string, b.string);
+    if (a == .string and b == .string) return orderFold(a.string, b.string);
     const x = toNumber(a);
     const y = toNumber(b);
     if (std.math.isNan(x) or std.math.isNan(y)) return null;
@@ -751,12 +831,12 @@ fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: S
     if (eql(name, "contains")) return callContains(arena, args, scope);
     if (eql(name, "startsWith") or eql(name, "endsWith")) {
         if (args.len != 2) return scope.fail("{s}() takes 2 arguments", .{name}, arena);
-        const s = try toStr(arena, args[0]);
-        const t = try toStr(arena, args[1]);
-        return .{ .boolean = if (eql(name, "startsWith")) std.ascii.startsWithIgnoreCase(
-            s,
-            t,
-        ) else std.ascii.endsWithIgnoreCase(s, t) };
+        const s = try upperAlloc(arena, try toStr(arena, args[0]));
+        const t = try upperAlloc(arena, try toStr(arena, args[1]));
+        return .{ .boolean = if (eql(name, "startsWith"))
+            std.mem.startsWith(u8, s, t)
+        else
+            std.mem.endsWith(u8, s, t) };
     }
     if (eql(name, "format")) {
         if (args.len < 1) return scope.fail("format() needs a format string", .{}, arena);
@@ -814,9 +894,9 @@ fn callContains(arena: Allocator, args: []const Value, scope: Scope) Error!Value
             return .{ .boolean = false };
         },
         else => {
-            const hay = try toStr(arena, args[0]);
-            const needle = try toStr(arena, args[1]);
-            return .{ .boolean = std.ascii.findIgnoreCase(hay, needle) != null };
+            const hay = try upperAlloc(arena, try toStr(arena, args[0]));
+            const needle = try upperAlloc(arena, try toStr(arena, args[1]));
+            return .{ .boolean = std.mem.indexOf(u8, hay, needle) != null };
         },
     }
 }
@@ -1428,4 +1508,21 @@ test "numbers are read as JavaScript's Number() reads them, as GitHub does" {
     try std.testing.expect(std.math.isNan(jsNumber("1_000")));
     try std.testing.expect(std.math.isNan(jsNumber("nan")));
     try std.testing.expectEqual(@as(f64, 0), jsNumber("  "));
+}
+
+test "strings compare as their upper-case forms, beyond ASCII, as GitHub compares them" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const s: Scope = .{};
+    for ([_][]const u8{
+        "'ü' == 'Ü'",
+        "'ς' == 'Σ' && 'σ' == 'Σ'",
+        "'a' < '[' && 'A' < '['", // 'A' (65) is before '[' (91); 'a' (97) is not
+        "startsWith('Привет, мир', 'ПРИВЕТ')",
+        "endsWith('façade', 'ÇADE')",
+        "contains('Grüße', 'RÜ')",
+        "'ı' != 'I' && 'İ' != 'i'",
+        "'\xff' == '\xff' && '\xff' != '\xfe'", // not UTF-8: compared as bytes
+    }) |e| try std.testing.expectEqualStrings("true", try evalStr(ar, e, s));
 }
