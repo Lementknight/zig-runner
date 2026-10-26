@@ -107,8 +107,12 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer client.deinit();
     http.shared.store(&client, .release);
-    try settleRegistrations(arena, io, &cfg, log);
+    const stale = try settleRegistrations(arena, io, &cfg, log);
     installStopSignals();
+    // Removed while the runners start, not before: that wait was 60 s every restart that found any.
+    var sweep: StaleSweep = .{ .gpa = init.gpa, .io = io, .cfg = &cfg, .log = log };
+    sweep.start(stale);
+    defer sweep.stop();
     return runPool(init, &cfg, log, err, secrets, name, if (store) |*st| st else null);
 }
 
@@ -219,14 +223,14 @@ fn runnerName(arena: std.mem.Allocator, io: std.Io, prefix: []const u8) ![]const
 }
 
 /// Before registering: the repository's current name if it moved (GitHub's redirects for the old
-/// name cannot carry a registration), and none of this instance's registrations that a stopped
-/// runner could not remove (see `jitconfig.staleRegistrations`).
+/// name cannot carry a registration). Returns the registrations a stopped runner could not remove
+/// (see `jitconfig.staleRegistrations`), for `StaleSweep` to remove while the runners start.
 fn settleRegistrations(
     arena: std.mem.Allocator,
     io: std.Io,
     cfg: *Config,
     log: *sink.LogSink,
-) !void {
+) ![]const u64 {
     if (jitconfig.movedRepo(arena, io, cfg)) |now| {
         const was = cfg.scope.repo;
         try log.append(0, 0, .stderr, try std.fmt.allocPrint(
@@ -237,21 +241,58 @@ fn settleRegistrations(
         cfg.scope = now;
     }
     const candidates = jitconfig.staleRegistrations(arena, io, cfg) catch &.{};
-    if (candidates.len == 0) return;
-    try log.append(0, 0, .stderr, try std.fmt.allocPrint(
+    if (candidates.len > 0) try log.append(0, 0, .stderr, try std.fmt.allocPrint(
         arena,
         "{d} offline registration(s) named {s}-* look left behind; removing those still offline " ++
             "in {d} s",
         .{ candidates.len, cfg.name_prefix, jitconfig.stale_confirm_seconds },
     ));
-    io.sleep(.fromSeconds(jitconfig.stale_confirm_seconds), .awake) catch {};
-    const removed = jitconfig.removeStillStale(arena, io, cfg, candidates);
-    try log.append(0, 0, .stderr, try std.fmt.allocPrint(
-        arena,
-        "removed {d} stale registration(s) named {s}-*, which a stopped runner left behind",
-        .{ removed, cfg.name_prefix },
-    ));
+    return candidates;
 }
+
+/// Removes the registrations `settleRegistrations` found, those still offline once
+/// `stale_confirm_seconds` have passed, while the runners start. It only removes ids from that
+/// list, and the runners' own registrations are made after it, so it never touches theirs.
+const StaleSweep = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cfg: *const Config,
+    log: *sink.LogSink,
+    /// Its own: the process's arena is not for use from another task.
+    arena: std.heap.ArenaAllocator = undefined,
+    candidates: []const u64 = &.{},
+    task: ?std.Io.Future(void) = null,
+
+    fn start(s: *StaleSweep, candidates: []const u64) void {
+        if (candidates.len == 0) return;
+        s.arena = .init(s.gpa);
+        s.candidates = s.arena.allocator().dupe(u64, candidates) catch return s.arena.deinit();
+        s.task = s.io.concurrent(run, .{s}) catch {
+            s.arena.deinit();
+            return;
+        };
+    }
+
+    /// A stop before the wait is over leaves them for the next start.
+    fn stop(s: *StaleSweep) void {
+        if (s.task) |*t| {
+            t.cancel(s.io);
+            s.arena.deinit();
+        }
+    }
+
+    fn run(s: *StaleSweep) void {
+        s.io.sleep(.fromSeconds(jitconfig.stale_confirm_seconds), .awake) catch return;
+        const arena = s.arena.allocator();
+        const removed = jitconfig.removeStillStale(arena, s.io, s.cfg, s.candidates);
+        const line = std.fmt.allocPrint(
+            arena,
+            "removed {d} stale registration(s) named {s}-*, which a stopped runner left behind",
+            .{ removed, s.cfg.name_prefix },
+        ) catch return;
+        s.log.append(0, 0, .stderr, line) catch {};
+    }
+};
 
 /// `--dry-run`: the configuration was valid; say what would have been registered, and stop.
 fn dryRun(arena: std.mem.Allocator, log: *sink.LogSink, name: []const u8, labels: []const u8) !u8 {
