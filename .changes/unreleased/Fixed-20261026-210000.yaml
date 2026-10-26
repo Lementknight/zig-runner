@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'Expressions evaluate as on GitHub where they differed: number literals and string-to-number coercion follow JavaScript''s `Number()` (`.5`, `+1`, `-Infinity`, `0o17`, `0b101`; `-0xFF` is an error), numbers print with 15 significant digits, `NaN` is falsy, `case()` is supported, strings compare by their upper-case forms beyond ASCII (`''ü'' == ''Ü''`, and `''a'' < ''[''`), `a[*]` works and an index after a filter applies to each element, `a[true]` indexes like `a[1]`, `join()` of an object is empty, an empty expression is null, and an unknown function, a wrong number of arguments, or a name that is no context is an error when parsing, as GitHub reports them.'
+time: 2026-10-26T21:00:00.000000-04:00

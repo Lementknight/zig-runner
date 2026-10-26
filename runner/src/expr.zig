@@ -58,6 +58,8 @@ pub const Scope = struct {
     hash_files: ?HashFiles = null,
     /// Bytes the functions that build strings have made so far; `evaluate` sets it.
     memory: ?*usize = null,
+    /// The arrays `*` filters have made (see `access`); `evaluate` sets it.
+    filtered: ?*Filtered = null,
 
     fn fail(s: Scope, comptime fmt: []const u8, args: anytype, arena: Allocator) Error {
         if (s.diag) |d| d.* = std.fmt.allocPrint(arena, fmt, args) catch "expression error";
@@ -111,12 +113,63 @@ const Tok = union(enum) {
     eof,
 };
 
-/// A character of a decimal number literal at `i`: digits, the point, an exponent, and the sign
-/// right after an exponent.
-fn isNumberChar(src: []const u8, i: usize) bool {
-    const c = src[i];
-    if (std.ascii.isDigit(c) or c == '.' or c == 'e' or c == 'E') return true;
-    return (c == '+' or c == '-') and (src[i - 1] == 'e' or src[i - 1] == 'E');
+/// Whether `c` continues a number token. As GitHub's lexer: anything up to a boundary (whitespace,
+/// brackets, parentheses, a comma, an operator), a point included. So `1E-2` is one token and
+/// `1-2` is one invalid token; what a token means is up to `jsNumber`.
+fn isNumberChar(c: u8) bool {
+    return switch (c) {
+        '(', '[', ')', ']', ',', '!', '>', '<', '=', '&', '|' => false,
+        else => !std.ascii.isWhitespace(c),
+    };
+}
+
+/// What JavaScript's `Number()` makes of a string, which is what GitHub's expressions follow, both
+/// for number literals and for a string compared with a number: whitespace around it ignored, ""
+/// is 0, a decimal with an optional sign, point and exponent (`-.5`, `1E+2`), `Infinity` with an
+/// optional sign, and unsigned `0x`, `0o` and `0b` integers. Anything else is NaN. Stricter than
+/// `std.fmt.parseFloat`, which also takes `inf`, `nan`, underscores and hex floats.
+pub fn jsNumber(text: []const u8) f64 {
+    const t = std.mem.trim(u8, text, " \t\r\n\x0b\x0c");
+    if (t.len == 0) return 0;
+    const nan = std.math.nan(f64);
+    if (t.len > 2 and t[0] == '0') {
+        const radix: ?u8 = switch (t[1]) {
+            'x', 'X' => 16,
+            'o', 'O' => 8,
+            'b', 'B' => 2,
+            else => null,
+        };
+        if (radix) |r| {
+            var v: f64 = 0;
+            for (t[2..]) |c| {
+                const d = std.fmt.charToDigit(c, r) catch return nan;
+                v = v * @as(f64, @floatFromInt(r)) + @as(f64, @floatFromInt(d));
+            }
+            return v;
+        }
+    }
+    const neg = t[0] == '-';
+    const body = if (t[0] == '-' or t[0] == '+') t[1..] else t;
+    if (std.mem.eql(u8, body, "Infinity")) return if (neg) -std.math.inf(f64) else std.math.inf(f64);
+    // digits [. digits] [e [sign] digits], with a digit somewhere before the exponent.
+    var i: usize = 0;
+    var digits: usize = 0;
+    while (i < body.len and std.ascii.isDigit(body[i])) : (i += 1) digits += 1;
+    if (i < body.len and body[i] == '.') {
+        i += 1;
+        while (i < body.len and std.ascii.isDigit(body[i])) : (i += 1) digits += 1;
+    }
+    if (digits == 0) return nan;
+    if (i < body.len and (body[i] == 'e' or body[i] == 'E')) {
+        i += 1;
+        if (i < body.len and (body[i] == '+' or body[i] == '-')) i += 1;
+        const start = i;
+        while (i < body.len and std.ascii.isDigit(body[i])) i += 1;
+        if (i == start) return nan;
+    }
+    if (i != body.len) return nan;
+    const v = std.fmt.parseFloat(f64, body) catch return nan;
+    return if (neg) -v else v;
 }
 
 const Lexer = struct {
@@ -150,7 +203,9 @@ const Lexer = struct {
             ')' => return l.adv(1, .rparen),
             '[' => return l.adv(1, .lbracket),
             ']' => return l.adv(1, .rbracket),
-            '.' => return l.adv(1, .dot),
+            // `.5` is a number; any other point is a property access (`foo.*.bar`).
+            '.' => if (prev_is_value or l.i + 1 >= l.src.len or !std.ascii.isDigit(l.src[l.i + 1]))
+                return l.adv(1, .dot),
             ',' => return l.adv(1, .comma),
             '*' => return l.adv(1, .star),
             '!' => return l.adv(1, .not),
@@ -159,8 +214,10 @@ const Lexer = struct {
             '\'' => return l.string(),
             else => {},
         }
-        if (std.ascii.isDigit(c) or (c == '-' and !prev_is_value and l.i + 1 < l.src.len and
-            std.ascii.isDigit(l.src[l.i + 1]))) return l.number();
+        // A sign or a point starts a number only where a value can start: after a value, `.` is a
+        // property access.
+        if (std.ascii.isDigit(c) or (!prev_is_value and (c == '-' or c == '+' or c == '.')))
+            return l.number();
         if (std.ascii.isAlphabetic(c) or c == '_') {
             const start = l.i;
             while (l.i < l.src.len and (std.ascii.isAlphanumeric(l.src[l.i]) or l.src[l.i] == '_' or
@@ -197,24 +254,12 @@ const Lexer = struct {
 
     fn number(l: *Lexer) Error!Tok {
         const start = l.i;
-        if (l.src[l.i] == '-') l.i += 1;
-        if (l.i + 1 < l.src.len and l.src[l.i] == '0' and
-            (l.src[l.i + 1] == 'x' or l.src[l.i + 1] == 'X'))
-        {
-            l.i += 2;
-            while (l.i < l.src.len and std.ascii.isHex(l.src[l.i])) l.i += 1;
-        } else {
-            while (l.i < l.src.len and isNumberChar(l.src, l.i)) l.i += 1;
-        }
+        l.i += 1;
+        while (l.i < l.src.len and isNumberChar(l.src[l.i])) l.i += 1;
         const text = l.src[start..l.i];
-        const neg = text[0] == '-';
-        const body = if (neg) text[1..] else text;
-        const v: f64 = if (body.len > 2 and (body[1] == 'x' or body[1] == 'X'))
-            @floatFromInt(std.fmt.parseInt(i64, body[2..], 16) catch
-                return l.bad("invalid number '{s}'", .{text}))
-        else
-            std.fmt.parseFloat(f64, body) catch return l.bad("invalid number '{s}'", .{text});
-        return .{ .number = if (neg) -v else v };
+        const v = jsNumber(text);
+        if (std.math.isNan(v)) return l.bad("invalid number '{s}'", .{text});
+        return .{ .number = v };
     }
 };
 
@@ -231,6 +276,23 @@ const Node = union(enum) {
     call: struct { name: []const u8, args: []*Node },
     not: *Node,
     bin: struct { op: BinOp, l: *Node, r: *Node },
+};
+
+/// The functions there are, with how many arguments each takes.
+const functions = [_]struct { name: []const u8, min: usize, max: usize }{
+    .{ .name = "contains", .min = 2, .max = 2 },
+    .{ .name = "startsWith", .min = 2, .max = 2 },
+    .{ .name = "endsWith", .min = 2, .max = 2 },
+    .{ .name = "format", .min = 1, .max = std.math.maxInt(usize) },
+    .{ .name = "join", .min = 1, .max = 2 },
+    .{ .name = "toJSON", .min = 1, .max = 1 },
+    .{ .name = "fromJSON", .min = 1, .max = 1 },
+    .{ .name = "hashFiles", .min = 1, .max = std.math.maxInt(usize) },
+    .{ .name = "case", .min = 3, .max = std.math.maxInt(usize) },
+    .{ .name = "success", .min = 0, .max = 0 },
+    .{ .name = "always", .min = 0, .max = 0 },
+    .{ .name = "cancelled", .min = 0, .max = 0 },
+    .{ .name = "failure", .min = 0, .max = 0 },
 };
 
 /// GitHub refuses an expression nested deeper than this ("Exceeded max expression depth 50"). It
@@ -251,6 +313,8 @@ const Parser = struct {
     lex: Lexer,
     cur: Tok,
     prev_value: bool = false,
+    /// The contexts the expression may name, when known: any other name is refused (`check`).
+    contexts: ?[]const Value.Entry = null,
     /// How deep the parser itself has recursed (`!`, parentheses, arguments, indexes): `!!!...`
     /// recurses before it makes a single node.
     nesting: u32 = 0,
@@ -299,6 +363,19 @@ const Parser = struct {
 
     fn tooDeep(p: *Parser) Error {
         return p.lex.bad("the expression is nested more than {d} deep", .{max_depth});
+    }
+
+    /// GitHub refuses an unknown function, or one given the wrong number of arguments, when it
+    /// parses the expression, so even where it would never be called (`false && nope()`).
+    fn checkCall(p: *Parser, name: []const u8, n: usize) Error!void {
+        for (functions) |f| if (std.ascii.eqlIgnoreCase(f.name, name)) {
+            if (n < f.min) return p.lex.bad("too few arguments to {s}()", .{name});
+            if (n > f.max) return p.lex.bad("too many arguments to {s}()", .{name});
+            if (std.ascii.eqlIgnoreCase(name, "case") and n % 2 == 0)
+                return p.lex.bad("case() takes an odd number of arguments", .{});
+            return;
+        };
+        return p.lex.bad("unknown function '{s}'", .{name});
     }
 
     fn enter(p: *Parser) Error!void {
@@ -365,7 +442,12 @@ const Parser = struct {
     }
 
     fn parsePostfix(p: *Parser) Error!*Node {
+        const grouped = p.cur == .lparen;
         var n = try p.parsePrimary();
+        // GitHub indexes only a context, a function's result or a parenthesised expression:
+        // `'abc'[0]` and `null.x` are refused, `(x)[0]` and `fromJSON(x).y` are not.
+        if (!grouped and n.* != .ident and n.* != .call and (p.cur == .dot or p.cur == .lbracket))
+            return p.lex.bad("unexpected '{s}' after a literal", .{if (p.cur == .dot) "." else "["});
         while (true) {
             switch (p.cur) {
                 .dot => {
@@ -384,6 +466,14 @@ const Parser = struct {
                 },
                 .lbracket => {
                     try p.advance();
+                    // `a[*]` is `a.*`.
+                    if (p.cur == .star) {
+                        try p.advance();
+                        if (p.cur != .rbracket) return p.lex.bad("expected ']' after '[*'", .{});
+                        try p.advance();
+                        n = try p.node(.{ .star = n });
+                        continue;
+                    }
                     try p.enter();
                     defer p.nesting -= 1;
                     const idx = try p.parseOr();
@@ -435,17 +525,20 @@ const Parser = struct {
                     if (p.cur != .rparen)
                         return p.lex.bad("expected ')' after the arguments of {s}()", .{name});
                     try p.advance();
+                    try p.checkCall(name, args.items.len);
                     return p.node(.{ .call = .{ .name = name, .args = args.items } });
                 }
-                if (std.ascii.eqlIgnoreCase(name, "true"))
-                    return p.node(.{ .literal = .{ .boolean = true } });
-                if (std.ascii.eqlIgnoreCase(name, "false"))
-                    return p.node(.{ .literal = .{ .boolean = false } });
-                if (std.ascii.eqlIgnoreCase(name, "null")) return p.node(.{ .literal = .null });
-                if (std.ascii.eqlIgnoreCase(name, "nan"))
+                // Spelled exactly so, as GitHub has them: `TRUE` is a name, and no context.
+                const eql = std.mem.eql;
+                if (eql(u8, name, "true")) return p.node(.{ .literal = .{ .boolean = true } });
+                if (eql(u8, name, "false")) return p.node(.{ .literal = .{ .boolean = false } });
+                if (eql(u8, name, "null")) return p.node(.{ .literal = .null });
+                if (eql(u8, name, "NaN"))
                     return p.node(.{ .literal = .{ .number = std.math.nan(f64) } });
-                if (std.ascii.eqlIgnoreCase(name, "infinity"))
+                if (eql(u8, name, "Infinity"))
                     return p.node(.{ .literal = .{ .number = std.math.inf(f64) } });
+                if (p.contexts) |known| if (lookupEntry(known, name) == null and !isGithubContext(name))
+                    return p.lex.bad("unrecognized context '{s}'", .{name});
                 return p.node(.{ .ident = name });
             },
             else => return p.lex.bad("unexpected token", .{}),
@@ -453,8 +546,27 @@ const Parser = struct {
     }
 };
 
-fn parse(arena: Allocator, src: []const u8, diag: ?*[]const u8) Error!*Node {
+/// GitHub's contexts. A name that is neither one of these nor a context the caller supplied is
+/// refused when parsing, as GitHub refuses it; one of these the runner does not supply is null.
+const github_contexts = [_][]const u8{
+    "github", "env",   "vars",   "secrets",  "inputs", "job",
+    "jobs",   "steps", "runner", "strategy", "matrix", "needs",
+};
+
+fn isGithubContext(name: []const u8) bool {
+    for (github_contexts) |c| if (std.ascii.eqlIgnoreCase(c, name)) return true;
+    return false;
+}
+
+/// `contexts`: what the expression may name (see `Parser.contexts`); null to accept any name.
+fn parse(
+    arena: Allocator,
+    src: []const u8,
+    diag: ?*[]const u8,
+    contexts: ?[]const Value.Entry,
+) Error!*Node {
     var p = try Parser.init(arena, src, diag);
+    p.contexts = contexts;
     const n = try p.parseOr();
     try p.expectEnd();
     return n;
@@ -466,7 +578,7 @@ pub fn toBool(v: Value) bool {
     return switch (v) {
         .null => false,
         .boolean => |b| b,
-        .number => |n| !(n == 0),
+        .number => |n| n != 0 and !std.math.isNan(n),
         .string => |s| s.len > 0,
         .array, .object => true,
     };
@@ -477,14 +589,7 @@ pub fn toNumber(v: Value) f64 {
         .null => 0,
         .boolean => |b| if (b) 1 else 0,
         .number => |n| n,
-        .string => |s| blk: {
-            const t = std.mem.trim(u8, s, " \t\r\n");
-            if (t.len == 0) break :blk 0;
-            if (t.len > 2 and t[0] == '0' and (t[1] == 'x' or t[1] == 'X'))
-                break :blk @floatFromInt(std.fmt.parseInt(i64, t[2..], 16) catch
-                    break :blk std.math.nan(f64));
-            break :blk std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
-        },
+        .string => |s| jsNumber(s),
         .array, .object => std.math.nan(f64),
     };
 }
@@ -505,11 +610,95 @@ fn numberToString(arena: Allocator, n: f64) Allocator.Error![]const u8 {
     if (std.math.isInf(n)) return if (n > 0) "Infinity" else "-Infinity";
     if (@floor(n) == n and @abs(n) < 1e15)
         return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))});
-    return std.fmt.allocPrint(arena, "{d}", .{n});
+    // 15 significant digits, as GitHub prints them: 0.84551240822557006 is "0.84551240822557".
+    var buf: [64]u8 = undefined;
+    const rounded = std.fmt.parseFloat(f64, std.fmt.bufPrint(&buf, "{e:.14}", .{n}) catch
+        unreachable) catch n;
+    return std.fmt.allocPrint(arena, "{d}", .{rounded});
 }
 
 fn sameKind(a: Value, b: Value) bool {
     return std.meta.activeTag(a) == std.meta.activeTag(b);
+}
+
+// --- case-insensitive strings ---
+//
+// GitHub compares strings as their upper-case forms, code point by code point: 'ü' == 'Ü', all
+// three Greek sigmas are equal, and 'a' < '[' (because 'A' < '['). Zig's std has no Unicode case
+// mapping, so `upperRune` maps the letters of Latin-1, Latin Extended-A, Greek and Cyrillic; other
+// scripts compare as written.
+
+/// The upper-case form of `c`, for the scripts listed above. Only letters that pair one to one:
+/// GitHub keeps the dotless ı apart from I, and İ apart from i.
+fn upperRune(c: u21) u21 {
+    return switch (c) {
+        'a'...'z' => c - 32,
+        0xE0...0xF6, 0xF8...0xFE => c - 0x20,
+        0xFF => 0x178,
+        // Latin Extended-A: pairs, upper case first...
+        0x100...0x12F, 0x132...0x137, 0x14A...0x177 => c & ~@as(u21, 1),
+        // ...or upper case second.
+        0x139...0x148, 0x179...0x17E => if (c % 2 == 0) c - 1 else c,
+        0x3AC => 0x386,
+        0x3AD...0x3AF => c - 37,
+        0x3CC => 0x38C,
+        0x3CD, 0x3CE => c - 63,
+        0x3B1...0x3C1, 0x3C3...0x3CB => c - 0x20,
+        0x3C2 => 0x3A3, // final sigma
+        0x430...0x44F => c - 0x20,
+        0x450...0x45F => c - 0x50,
+        0x460...0x481, 0x48A...0x4BF, 0x4D0...0x52F => c & ~@as(u21, 1),
+        0x4C1...0x4CE => if (c % 2 == 0) c - 1 else c,
+        0x4CF => 0x4C0,
+        else => c,
+    };
+}
+
+/// The code point at `s[i.*]`, upper-cased, advancing `i`. A byte that does not start valid UTF-8
+/// stands for itself, above every code point, so that it compares equal only to the same byte.
+fn nextUpper(s: []const u8, i: *usize) u32 {
+    const len = std.unicode.utf8ByteSequenceLength(s[i.*]) catch 0;
+    if (len > 0 and i.* + len <= s.len) {
+        if (std.unicode.utf8Decode(s[i.* .. i.* + len])) |c| {
+            i.* += len;
+            return upperRune(c);
+        } else |_| {}
+    }
+    i.* += 1;
+    return 0x110000 + @as(u32, s[i.* - 1]);
+}
+
+fn orderFold(a: []const u8, b: []const u8) std.math.Order {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < a.len and j < b.len) {
+        const x = nextUpper(a, &i);
+        const y = nextUpper(b, &j);
+        if (x != y) return std.math.order(x, y);
+    }
+    return std.math.order(a.len - i, b.len - j);
+}
+
+fn eqlFold(a: []const u8, b: []const u8) bool {
+    return orderFold(a, b) == .eq;
+}
+
+/// `s` upper-cased, for searching it case-insensitively.
+fn upperAlloc(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = try .initCapacity(arena, s.len);
+    var i: usize = 0;
+    while (i < s.len) {
+        const start = i;
+        const c = nextUpper(s, &i);
+        if (c >= 0x110000) {
+            try out.append(arena, s[start]);
+            continue;
+        }
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(@intCast(c), &buf) catch unreachable;
+        try out.appendSlice(arena, buf[0..n]);
+    }
+    return out.items;
 }
 
 fn looseEquals(a: Value, b: Value) bool {
@@ -517,7 +706,7 @@ fn looseEquals(a: Value, b: Value) bool {
         .null => true,
         .boolean => |x| x == b.boolean,
         .number => |x| x == b.number,
-        .string => |x| std.ascii.eqlIgnoreCase(x, b.string),
+        .string => |x| eqlFold(x, b.string),
         // Arrays and objects only equal themselves.
         .array => |x| x.ptr == b.array.ptr and x.len == b.array.len,
         .object => |x| x.ptr == b.object.ptr and x.len == b.object.len,
@@ -528,7 +717,7 @@ fn looseEquals(a: Value, b: Value) bool {
 }
 
 fn compare(a: Value, b: Value) ?std.math.Order {
-    if (a == .string and b == .string) return std.ascii.orderIgnoreCase(a.string, b.string);
+    if (a == .string and b == .string) return orderFold(a.string, b.string);
     const x = toNumber(a);
     const y = toNumber(b);
     if (std.math.isNan(x) or std.math.isNan(y)) return null;
@@ -545,24 +734,28 @@ fn lookupEntry(entries: []const Value.Entry, name: []const u8) ?Value {
 fn deref(v: Value, key: Value, arena: Allocator) Allocator.Error!Value {
     switch (v) {
         .object => |o| {
+            if (key == .array or key == .object) return .null;
             const k = try toStr(arena, key);
             return lookupEntry(o, k) orelse .null;
         },
-        .array => |a| {
-            if (key != .number and key != .string) return .null;
-            const n = toNumber(key);
-            // Bounded before the conversion, which panics on a number no usize holds (`foo[1e30]`,
-            // `foo[Infinity]`) and would take the whole runner down with it.
-            const len: f64 = @floatFromInt(a.len);
-            if (std.math.isNan(n) or n < 0 or @floor(n) != n or n >= len) return .null;
-            return a[@intFromFloat(n)];
-        },
+        .array => |a| return if (arrayIndex(key, a.len)) |i| a[i] else .null,
         else => return .null,
     }
 }
 
+/// `key` as an index into an array of `len`, if it is one. null, booleans and strings index as
+/// numbers (`a[true]` is `a[1]`), and a fraction is rounded down (`a[1.5]` is `a[1]`), as GitHub
+/// does. Bounded before the conversion, which panics on a number no usize holds (`foo[1e30]`,
+/// `foo[Infinity]`) and would take the whole runner down with it.
+fn arrayIndex(key: Value, len: usize) ?usize {
+    if (key == .array or key == .object) return null;
+    const n = toNumber(key);
+    if (std.math.isNan(n) or n < 0 or @floor(n) >= @as(f64, @floatFromInt(len))) return null;
+    return @intFromFloat(@floor(n));
+}
+
 /// What a `*` object filter selects: an array's elements, or an object's values. GitHub gives an
-/// array either way, and anything else selects nothing.
+/// array either way, and anything else selects nothing. (`filteredArray` copies it.)
 fn starValues(arena: Allocator, v: Value) Error![]const Value {
     switch (v) {
         .array => |a| return a,
@@ -575,29 +768,51 @@ fn starValues(arena: Allocator, v: Value) Error![]const Value {
     }
 }
 
-/// The values selected by `n`, when `n` is a `*` filter or a property reached through one.
-///
-/// This is what makes `labels.*.name` an array of names while `labels.name` stays null: the filter
-/// is recognised from the shape of the expression rather than from the shape of the value, so
-/// property access maps over a filtered collection and dereferences anything else. It recurses, so
-/// `a.*.b.c` filters at both levels. Indexing needs nothing here — `a.*.b[0]` evaluates the filter
-/// to an array and then indexes it like any other.
-fn filteredValues(arena: Allocator, n: *const Node, scope: Scope) Error!?[]const Value {
-    switch (n.*) {
-        .star => |inner| return try starValues(arena, try eval(arena, inner, scope)),
-        .prop => |p| {
-            const items = (try filteredValues(arena, p.obj, scope)) orelse return null;
-            var out: std.ArrayList(Value) = .empty;
-            for (items) |it| {
-                const got = try deref(it, .{ .string = p.name }, arena);
-                // An element without the property contributes nothing, rather than a null: this is
-                // what makes `contains(labels.*.name, 'bug')` safe on a mixed array.
-                if (got != .null) try out.append(arena, got);
-            }
-            return out.items;
+/// What `.k`, `[k]` or `.*` selects from `o`. A `*` filter's result is marked (`filteredArray`),
+/// and whatever follows applies to each of its elements, as GitHub's FilteredArray does:
+/// `labels.*.name` is every label's name, `a[*][1]` every element's second, `a.*.*` the elements'
+/// elements, also when the filtered array has come through a function (`case(c, a.*, b.*)[0]`).
+/// An element that is neither an array nor an object contributes nothing, and neither does one
+/// without the key.
+fn access(arena: Allocator, o: Value, idx: Index, scope: Scope) Error!Value {
+    if (!isFiltered(scope, o)) return switch (idx) {
+        .star => filteredArray(arena, scope, try starValues(arena, o)),
+        .key => |k| try deref(o, k, arena),
+    };
+    var out: std.ArrayList(Value) = .empty;
+    for (o.array) |item| switch (item) {
+        .object => |entries| switch (idx) {
+            .star => for (entries) |e| try out.append(arena, e.value),
+            .key => |k| if (isPrimitive(k)) {
+                if (lookupEntry(entries, try toStr(arena, k))) |v| try out.append(arena, v);
+            },
         },
-        else => return null,
-    }
+        .array => |a| switch (idx) {
+            .star => try out.appendSlice(arena, a),
+            .key => |k| if (arrayIndex(k, a.len)) |i| try out.append(arena, a[i]),
+        },
+        else => {},
+    };
+    return filteredArray(arena, scope, out.items);
+}
+
+const Index = union(enum) { star, key: Value };
+
+/// The arrays this evaluation's filters made, by address.
+const Filtered = std.AutoHashMapUnmanaged(usize, void);
+
+/// `items` as a filter's result: copied into an allocation of its own (empty ones too, so that
+/// the address is its own) and remembered as filtered.
+fn filteredArray(arena: Allocator, scope: Scope, items: []const Value) Error!Value {
+    const out = (try arena.alloc(Value, @max(items.len, 1)))[0..items.len];
+    @memcpy(out, items);
+    if (scope.filtered) |f| try f.put(arena, @intFromPtr(out.ptr), {});
+    return .{ .array = out };
+}
+
+fn isFiltered(scope: Scope, v: Value) bool {
+    const f = scope.filtered orelse return false;
+    return v == .array and f.contains(@intFromPtr(v.array.ptr));
 }
 
 /// A chain of `&&` (or of `||`), operand by operand from the left, without recursing down it: a
@@ -633,32 +848,30 @@ fn eval(arena: Allocator, n: *const Node, scope: Scope) Error!Value {
             };
             return lookupEntry(scope.contexts, name) orelse .null;
         },
-        .prop => |p| {
-            // `n`, not `p.obj`: `filteredValues` applies this property to the filtered collection,
-            // and returns null when the chain is not a filter at all so that ordinary property
-            // access still goes through `deref`.
-            if (try filteredValues(arena, n, scope)) |items| return .{ .array = items };
-            return deref(try eval(arena, p.obj, scope), .{ .string = p.name }, arena);
-        },
+        .prop => |p| return access(arena, try eval(arena, p.obj, scope), .{ .key = .{ .string = p.name } }, scope),
         .index => |ix| {
-            const o = try eval(arena, ix.obj, scope);
-            return deref(o, try eval(arena, ix.idx, scope), arena);
+            // The index first, as GitHub evaluates it.
+            const k = try eval(arena, ix.idx, scope);
+            return access(arena, try eval(arena, ix.obj, scope), .{ .key = k }, scope);
         },
-        .star => |inner| return .{ .array = try starValues(arena, try eval(arena, inner, scope)) },
+        .star => |inner| return access(arena, try eval(arena, inner, scope), .star, scope),
         .not => |inner| return .{ .boolean = !toBool(try eval(arena, inner, scope)) },
         .bin => |b| {
             if (b.op == .and_ or b.op == .or_) return evalChain(arena, n, scope);
             const l = try eval(arena, b.l, scope);
             const r = try eval(arena, b.r, scope);
-            return .{ .boolean = switch (b.op) {
-                .eq => looseEquals(l, r),
-                .ne => !looseEquals(l, r),
-                .lt => if (compare(l, r)) |o| o == .lt else false,
-                .le => if (compare(l, r)) |o| o != .gt else false,
-                .gt => if (compare(l, r)) |o| o == .gt else false,
-                .ge => if (compare(l, r)) |o| o != .lt else false,
-                else => unreachable,
-            } };
+            return .{
+                .boolean = switch (b.op) {
+                    .eq => looseEquals(l, r),
+                    .ne => !looseEquals(l, r),
+                    .lt => if (compare(l, r)) |o| o == .lt else false,
+                    // `a <= b` is `a == b || a < b` to GitHub: an array is <= itself.
+                    .le => looseEquals(l, r) or if (compare(l, r)) |o| o == .lt else false,
+                    .gt => if (compare(l, r)) |o| o == .gt else false,
+                    .ge => looseEquals(l, r) or if (compare(l, r)) |o| o == .gt else false,
+                    else => unreachable,
+                },
+            };
         },
         .call => |c| return callFunction(arena, c.name, c.args, scope),
     }
@@ -676,15 +889,17 @@ fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: S
     for (arg_nodes, args) |an, *out| out.* = try eval(arena, an, scope);
 
     if (eql(name, "hashFiles")) return callHashFiles(arena, args, scope);
+    if (eql(name, "case")) return callCase(arena, args, scope);
     if (eql(name, "contains")) return callContains(arena, args, scope);
     if (eql(name, "startsWith") or eql(name, "endsWith")) {
         if (args.len != 2) return scope.fail("{s}() takes 2 arguments", .{name}, arena);
-        const s = try toStr(arena, args[0]);
-        const t = try toStr(arena, args[1]);
-        return .{ .boolean = if (eql(name, "startsWith")) std.ascii.startsWithIgnoreCase(
-            s,
-            t,
-        ) else std.ascii.endsWithIgnoreCase(s, t) };
+        if (!isPrimitive(args[0]) or !isPrimitive(args[1])) return .{ .boolean = false };
+        const s = try upperAlloc(arena, try toStr(arena, args[0]));
+        const t = try upperAlloc(arena, try toStr(arena, args[1]));
+        return .{ .boolean = if (eql(name, "startsWith"))
+            std.mem.startsWith(u8, s, t)
+        else
+            std.mem.endsWith(u8, s, t) };
     }
     if (eql(name, "format")) {
         if (args.len < 1) return scope.fail("format() needs a format string", .{}, arena);
@@ -694,6 +909,20 @@ fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: S
     if (eql(name, "toJSON")) return callToJson(arena, args, scope);
     if (eql(name, "fromJSON")) return callFromJson(arena, args, scope);
     return scope.fail("unknown function '{s}'", .{name}, arena);
+}
+
+/// `case(pred1, value1, pred2, value2, ..., default)`: the value after the first true predicate,
+/// else the default. A predicate up to the first true one must be a boolean. Every argument is
+/// evaluated first, as for any function on GitHub, so an error in any of them is an error.
+fn callCase(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
+    var i: usize = 0;
+    while (i + 1 < args.len) : (i += 2) {
+        switch (args[i]) {
+            .boolean => |b| if (b) return args[i + 1],
+            else => return scope.fail("case(): a predicate must be true or false", .{}, arena),
+        }
+    }
+    return args[args.len - 1];
 }
 
 /// `success()`, `always()`, `cancelled()`, `failure()`: the job's state, no arguments evaluated.
@@ -721,6 +950,11 @@ fn callHashFiles(arena: Allocator, args: []const Value, scope: Scope) Error!Valu
     };
 }
 
+/// Not an array or an object. The string functions are false for anything else, as GitHub's are.
+fn isPrimitive(v: Value) bool {
+    return v != .array and v != .object;
+}
+
 fn callContains(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
     if (args.len != 2) return scope.fail("contains() takes 2 arguments", .{}, arena);
     switch (args[0]) {
@@ -728,10 +962,12 @@ fn callContains(arena: Allocator, args: []const Value, scope: Scope) Error!Value
             for (a) |e| if (looseEquals(e, args[1])) return .{ .boolean = true };
             return .{ .boolean = false };
         },
+        .object => return .{ .boolean = false },
         else => {
-            const hay = try toStr(arena, args[0]);
-            const needle = try toStr(arena, args[1]);
-            return .{ .boolean = std.ascii.findIgnoreCase(hay, needle) != null };
+            if (!isPrimitive(args[1])) return .{ .boolean = false };
+            const hay = try upperAlloc(arena, try toStr(arena, args[0]));
+            const needle = try upperAlloc(arena, try toStr(arena, args[1]));
+            return .{ .boolean = std.mem.indexOf(u8, hay, needle) != null };
         },
     }
 }
@@ -739,8 +975,13 @@ fn callContains(arena: Allocator, args: []const Value, scope: Scope) Error!Value
 fn callJoin(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
     if (args.len < 1 or args.len > 2)
         return scope.fail("join() takes 1 or 2 arguments", .{}, arena);
-    const sep = if (args.len == 2) try toStr(arena, args[1]) else ",";
+    // An array or object as the separator is no separator, so the default.
+    const sep = if (args.len == 2 and args[1] != .array and args[1] != .object)
+        try toStr(arena, args[1])
+    else
+        ",";
     switch (args[0]) {
+        .object => return .{ .string = "" },
         .array => |a| {
             var out: std.ArrayList(u8) = .empty;
             for (a, 0..) |e, i| {
@@ -844,7 +1085,8 @@ fn writeJson(w: *std.Io.Writer, v: Value, depth: usize) !void {
     switch (v) {
         .null => try w.writeAll("null"),
         .boolean => |b| try w.writeAll(if (b) "true" else "false"),
-        .number => |n| if (@floor(n) == n and @abs(n) < 1e15) try w.print(
+        // JSON has no NaN or Infinity; GitHub writes null, as JavaScript's JSON.stringify does.
+        .number => |n| if (!std.math.isFinite(n)) try w.writeAll("null") else if (@floor(n) == n and @abs(n) < 1e15) try w.print(
             "{d}",
             .{@as(i64, @intFromFloat(n))},
         ) else try w.print("{d}", .{n}),
@@ -885,13 +1127,15 @@ pub fn fromJsonValue(arena: Allocator, j: std.json.Value) Allocator.Error!Value 
         .number_string => |s| return .{ .number = std.fmt.parseFloat(f64, s) catch
             std.math.nan(f64) },
         .string => |s| return .{ .string = s },
+        // Allocated even when empty, so that two empty ones are two values: arrays and objects
+        // only equal themselves, and zero-length slices could share an address.
         .array => |a| {
-            const out = try arena.alloc(Value, a.items.len);
+            const out = (try arena.alloc(Value, @max(a.items.len, 1)))[0..a.items.len];
             for (a.items, out) |e, *o| o.* = try fromJsonValue(arena, e);
             return .{ .array = out };
         },
         .object => |o| {
-            const out = try arena.alloc(Value.Entry, o.count());
+            const out = (try arena.alloc(Value.Entry, @max(o.count(), 1)))[0..o.count()];
             var it = o.iterator();
             var i: usize = 0;
             while (it.next()) |e| : (i += 1) out[i] = .{
@@ -907,10 +1151,14 @@ pub fn fromJsonValue(arena: Allocator, j: std.json.Value) Allocator.Error!Value 
 
 /// Evaluates one expression (the text inside `${{ }}`).
 pub fn evaluate(arena: Allocator, text: []const u8, scope: Scope) Error!Value {
-    const n = try parse(arena, text, scope.diag);
+    // GitHub evaluates an empty expression to null.
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return .null;
+    const n = try parse(arena, text, scope.diag, scope.contexts);
     var used: usize = 0;
+    var filtered: Filtered = .empty;
     var s = scope;
     if (s.memory == null) s.memory = &used;
+    if (s.filtered == null) s.filtered = &filtered;
     return eval(arena, n, s) catch |e| switch (e) {
         error.Unsupported => {
             if (scope.diag) |d| if (d.*.len == 0) {
@@ -968,7 +1216,7 @@ fn expressionEnd(text: []const u8, from: usize) ?usize {
 
 /// Whether an `if:` expression calls success(), always(), failure() or cancelled().
 pub fn hasStatusFunction(arena: Allocator, text: []const u8) bool {
-    const n = parse(arena, text, null) catch return false;
+    const n = parse(arena, text, null, null) catch return false;
     return nodeHasStatus(n);
 }
 
@@ -1020,7 +1268,9 @@ test "literals and coercion" {
     try std.testing.expectEqualStrings("42", try evalStr(a.allocator(), "42", s));
     try std.testing.expectEqualStrings("-3.5", try evalStr(a.allocator(), "-3.5", s));
     try std.testing.expectEqualStrings("255", try evalStr(a.allocator(), "0xff", s));
-    try std.testing.expectEqualStrings("true", try evalStr(a.allocator(), "TRUE", s));
+    try std.testing.expectEqualStrings("true", try evalStr(a.allocator(), "true", s));
+    // Keywords are spelled exactly so: `TRUE` is a name, and no context.
+    try std.testing.expectError(error.ParseError, evaluate(a.allocator(), "TRUE", s));
     try std.testing.expectEqualStrings("", try evalStr(a.allocator(), "null", s));
 }
 
@@ -1054,7 +1304,7 @@ test "&& and || return operands" {
     try std.testing.expectEqualStrings("0", try evalStr(ar, "0 && 'x'", s));
     try std.testing.expectEqualStrings("", try evalStr(ar, "null || null", s));
     // short-circuit: the right side would be an error
-    try std.testing.expectEqualStrings("ok", try evalStr(ar, "'ok' || nosuchfunction()", s));
+    try std.testing.expectEqualStrings("ok", try evalStr(ar, "'ok' || fromJSON('{')", s));
 }
 
 test "contexts, properties and indexing" {
@@ -1076,7 +1326,10 @@ test "contexts, properties and indexing" {
     try std.testing.expectEqualStrings("", try evalStr(ar, "github.list[1e30]", s));
     try std.testing.expectEqualStrings("", try evalStr(ar, "github.list[Infinity]", s));
     try std.testing.expectEqualStrings("", try evalStr(ar, "github.missing.deeper.still", s)); // null propagates
-    try std.testing.expectEqualStrings("", try evalStr(ar, "nosuchcontext.x", s));
+    // A GitHub context the caller did not supply is null; a name that is no context is refused.
+    try std.testing.expectEqualStrings("", try evalStr(ar, "matrix.x", s));
+    try std.testing.expectError(error.ParseError, evaluate(ar, "nosuchcontext.x", s));
+    try std.testing.expectEqualStrings("", try evalStr(ar, "", s));
     try std.testing.expect(try evalCondition(ar, "github.repository == 'O/R' && matrix.os == 'linux'", s));
 }
 
@@ -1119,12 +1372,14 @@ test "the * object filter selects from arrays and objects, and maps through prop
     // The filter is recognised from the expression's shape, not the value's: a property of a plain
     // array is still null, which is what it is on GitHub.
     try std.testing.expectEqualStrings("", try evalStr(ar, "labels.name", s));
-    // Indexing a filtered result indexes the array it produced.
-    try std.testing.expectEqualStrings("docs", try evalStr(ar, "labels.*.name[1]", s));
+    // An index after a filter applies to each element, as GitHub's cases have it (`foo[*][1]`):
+    // here to each name, and a string has no elements.
+    try std.testing.expectEqualStrings("[]", try evalStr(ar, "toJSON(labels.*.name[1])", s));
+    try std.testing.expectEqualStrings("bug docs", try evalStr(ar, "join(labels[*]['name'], ' ')", s));
     // Filtering something that is neither an array nor an object selects nothing.
     try std.testing.expectEqualStrings("[]", try evalStr(ar, "toJSON(plain.*.anything)", s));
     try std.testing.expectEqualStrings("[]", try evalStr(ar, "toJSON(plain.*)", s));
-    try std.testing.expectEqualStrings("[]", try evalStr(ar, "toJSON(nosuchcontext.*.x)", s));
+    try std.testing.expectEqualStrings("[]", try evalStr(ar, "toJSON(needs.*.x)", s));
 }
 
 test "functions" {
@@ -1185,8 +1440,11 @@ test "errors say what is wrong" {
     try std.testing.expectError(error.ParseError, evaluate(ar, "'unterminated", s));
     try std.testing.expectError(error.ParseError, evaluate(ar, "(1 == 1", s));
     try std.testing.expect(std.mem.indexOf(u8, diag, "(1 == 1") != null);
-    try std.testing.expectError(error.EvalError, evaluate(ar, "nosuch('x')", s));
-    try std.testing.expectEqualStrings("unknown function 'nosuch'", diag);
+    // As GitHub: when parsing, so even where it would never be called.
+    try std.testing.expectError(error.ParseError, evaluate(ar, "false && nosuch('x')", s));
+    try std.testing.expect(std.mem.startsWith(u8, diag, "unknown function 'nosuch'"));
+    try std.testing.expectError(error.ParseError, evaluate(ar, "join()", s));
+    try std.testing.expectError(error.ParseError, evaluate(ar, "case(true, 1)", s));
     try std.testing.expectError(error.EvalError, evaluate(ar, "format('{3}', 'a')", s));
     try std.testing.expectError(error.Unsupported, evaluate(ar, "hashFiles('**/*.zig')", s));
     try std.testing.expectEqualStrings("hashFiles() is not supported here", diag);
@@ -1212,7 +1470,21 @@ test "hashFiles calls the scope's hook with its patterns" {
     try std.testing.expectEqualStrings("**/go.sum|!x/**", (try evaluate(ar, "hashFiles('**/go.sum', '!x/**')", s)).string);
     try std.testing.expectError(error.EvalError, evaluate(ar, "hashFiles('bad')", s));
     try std.testing.expectEqualStrings("hashFiles(bad) failed: no", diag);
-    try std.testing.expectError(error.EvalError, evaluate(ar, "hashFiles()", s));
+    try std.testing.expectError(error.ParseError, evaluate(ar, "hashFiles()", s));
+}
+
+test "case() picks the value after the first true predicate" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const s: Scope = .{};
+    try std.testing.expectEqualStrings("b", try evalStr(ar, "case(false, 'a', 1 == 1, 'b', 'c')", s));
+    try std.testing.expectEqualStrings("c", try evalStr(ar, "case(false, 'a', false, 'b', 'c')", s));
+    // Every argument is evaluated, as on GitHub: an error after the first true predicate is one.
+    try std.testing.expectError(error.EvalError, evaluate(ar, "case(true, 'a', fromJSON('{'), 'b', 'c')", s));
+    // A predicate after the first true one is not looked at.
+    try std.testing.expectEqualStrings("a", try evalStr(ar, "case(true, 'a', 1, 'b', 'c')", s));
+    try std.testing.expectError(error.EvalError, evaluate(ar, "case(1, 'a', 'b')", s));
 }
 
 test "unsupported contexts fail loudly" {
@@ -1287,7 +1559,7 @@ test "a long chain of && or || is one node to GitHub, and evaluates without recu
     text.clearRetainingCapacity();
     for (0..20_000) |i| try text.print(ar, "{s}{d}", .{ if (i > 0) " || " else "", i });
     try std.testing.expectEqualStrings("1", try evalStr(ar, text.items, s));
-    try std.testing.expectEqualStrings("0", try evalStr(ar, "1 && 0 && x.y", s));
+    try std.testing.expectEqualStrings("0", try evalStr(ar, "1 && 0 && fromJSON('{')", s));
     try std.testing.expectEqualStrings("2", try evalStr(ar, "1 && 2 || 3 && 4", s));
 }
 
@@ -1306,4 +1578,94 @@ test "string building has a memory limit, and fromJSON a nesting limit" {
     try std.testing.expectError(error.EvalError, evaluate(ar, deep, s));
     // Brackets inside strings do not count.
     try std.testing.expectEqualStrings("]]]]", try evalStr(ar, "fromJSON('[[\"]]]]\"]]')[0][0]", s));
+}
+
+test "numbers are read as JavaScript's Number() reads them, as GitHub does" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const s: Scope = .{};
+    for ([_][2][]const u8{
+        .{ ".5", "0.5" },                               .{ "-.5", "-0.5" },            .{ "+1", "1" },
+        .{ "0o17", "15" },                              .{ "0b101", "5" },             .{ "0xfF", "255" },
+        .{ "1E+2", "100" },                             .{ "-Infinity", "-Infinity" }, .{ "-0", "0" },
+        .{ "0.84551240822557006", "0.84551240822557" },
+    }) |c| try std.testing.expectEqualStrings(c[1], try evalStr(ar, c[0], s));
+    // Hex takes no sign; a point after a value is a property access.
+    try std.testing.expectError(error.ParseError, evaluate(ar, "-0xFF", s));
+    try std.testing.expectError(error.ParseError, evaluate(ar, "1_000", s));
+    try std.testing.expectEqualStrings("true", try evalStr(ar, "' 0o10 ' == 8", s));
+    try std.testing.expectEqualStrings("false", try evalStr(ar, "'inf' == Infinity", s));
+    try std.testing.expectEqualStrings("false", try evalStr(ar, "!!NaN", s));
+    try std.testing.expect(std.math.isNan(jsNumber("1_000")));
+    try std.testing.expect(std.math.isNan(jsNumber("nan")));
+    try std.testing.expectEqual(@as(f64, 0), jsNumber("  "));
+}
+
+test "strings compare as their upper-case forms, beyond ASCII, as GitHub compares them" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const s: Scope = .{};
+    for ([_][]const u8{
+        "'ü' == 'Ü'",
+        "'ς' == 'Σ' && 'σ' == 'Σ'",
+        "'a' < '[' && 'A' < '['", // 'A' (65) is before '[' (91); 'a' (97) is not
+        "startsWith('Привет, мир', 'ПРИВЕТ')",
+        "endsWith('façade', 'ÇADE')",
+        "contains('Grüße', 'RÜ')",
+        "'ı' != 'I' && 'İ' != 'i'",
+        "'\xff' == '\xff' && '\xff' != '\xfe'", // not UTF-8: compared as bytes
+    }) |e| try std.testing.expectEqualStrings("true", try evalStr(ar, e, s));
+}
+
+test "a[*] is a.*, and what follows a filter applies to each element" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const json = try std.json.parseFromSliceLeaky(std.json.Value, ar,
+        \\{"m": [[1, 2], [3, 4], "x"], "o": {"a": [5], "b": {"k": 6}}, "sep": [], "obj": {}, "obj2": {}}
+    , .{});
+    const s: Scope = .{ .contexts = (try fromJsonValue(ar, json)).object };
+    try std.testing.expectEqualStrings("2,4", try evalStr(ar, "join(m[*][1])", s));
+    try std.testing.expectEqualStrings("1,2,3,4", try evalStr(ar, "join(m.*.*)", s));
+    try std.testing.expectEqualStrings("5,6", try evalStr(ar, "join(o.*.*)", s));
+    try std.testing.expectEqualStrings("4", try evalStr(ar, "m[true][true]", s)); // m[1][1]
+    try std.testing.expectEqualStrings("", try evalStr(ar, "o[obj]", s));
+    try std.testing.expectEqualStrings("1,2", try evalStr(ar, "join(m[0], sep)", s));
+    try std.testing.expectEqualStrings("", try evalStr(ar, "join(o)", s));
+    // Arrays and objects equal only themselves, empty ones too.
+    try std.testing.expectEqualStrings("true", try evalStr(ar, "obj == obj && obj != obj2", s));
+}
+
+test "what random expressions against Gitea's evaluator turned up, settled by GitHub's source" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const json = try std.json.parseFromSliceLeaky(std.json.Value, ar,
+        \\{"l": [10, 20, 30], "objs": [{"n": "a"}, {"n": "b"}], "o": {"k": "v"}}
+    , .{});
+    const s: Scope = .{ .contexts = (try fromJsonValue(ar, json)).object };
+    // Only a context, a function's result or a parenthesised expression can be indexed.
+    try std.testing.expectError(error.ParseError, evaluate(ar, "'abc'[0]", s));
+    try std.testing.expectError(error.ParseError, evaluate(ar, "null.x", s));
+    try std.testing.expectEqualStrings("20", try evalStr(ar, "(l)[1]", s));
+    // A number token runs to a boundary: `1E-2` is one number, `1-2` no number.
+    try std.testing.expectEqualStrings("10", try evalStr(ar, "l[1E-2]", s));
+    try std.testing.expectError(error.ParseError, evaluate(ar, "1-2", s));
+    // A fraction indexes as its floor.
+    try std.testing.expectEqualStrings("20", try evalStr(ar, "l[1.5]", s));
+    // `>=` and `<=` include equality, so an array is >= itself.
+    try std.testing.expectEqualStrings("true", try evalStr(ar, "l >= l && l <= l", s));
+    try std.testing.expectEqualStrings("false", try evalStr(ar, "l > l", s));
+    // The string functions are false for an array or object, either side.
+    for ([_][]const u8{ "contains(o, 'v')", "contains('Object', o)", "startsWith(l, 'A')", "endsWith('x', l)" }) |e|
+        try std.testing.expectEqualStrings("false", try evalStr(ar, e, s));
+    try std.testing.expectEqualStrings("true", try evalStr(ar, "contains(l, 20)", s));
+    // JSON has no NaN or Infinity: null, as JSON.stringify writes them.
+    try std.testing.expectEqualStrings("null", try evalStr(ar, "toJSON(NaN)", s));
+    try std.testing.expectEqualStrings("null", try evalStr(ar, "toJSON(-Infinity)", s));
+    // A filter's result stays one through a function, and is a new array.
+    try std.testing.expectEqualStrings("a,b", try evalStr(ar, "join(case(true, objs.*, l).n)", s));
+    try std.testing.expectEqualStrings("false", try evalStr(ar, "l.* == l", s));
 }
