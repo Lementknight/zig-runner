@@ -1,0 +1,3 @@
+kind: Changed
+body: '`zig build test` also compiles the runner, so CI fails on a compile error in code the tests never reach (the runner''s main loop), where it passed before.'
+time: 2026-10-26T15:53:39.831134-04:00
