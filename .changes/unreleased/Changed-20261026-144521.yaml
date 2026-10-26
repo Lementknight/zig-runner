@@ -1,3 +1,0 @@
-kind: Changed
-body: 'A runner starts its next job about 6 s sooner: 3-4 s between two jobs instead of 9 s, measured on a laptop with 4 runners. The end of a job no longer waits out a 5 s sleep in the cancel watch, uploads its step logs at once instead of one after another, and leaves deleting its session and registration to the background.'
-time: 2026-10-26T14:45:21.181468-04:00
