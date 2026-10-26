@@ -262,9 +262,15 @@ pub const Live = struct {
         };
     }
 
+    /// Sends every 500 ms, sleeping in short steps: `finish` waits for this to see `stop`, and
+    /// waited out the rest of a 500 ms sleep (250 ms a job on average) before the job could end.
     fn run(l: *Live) void {
         while (!l.stop.load(.acquire)) {
-            l.io.sleep(.fromMilliseconds(500), .awake) catch return;
+            var waited: u32 = 0;
+            while (waited < 10 and !l.stop.load(.acquire)) : (waited += 1) {
+                l.io.sleep(.fromMilliseconds(50), .awake) catch return;
+            }
+            if (l.stop.load(.acquire)) return;
             l.sendPending();
         }
     }

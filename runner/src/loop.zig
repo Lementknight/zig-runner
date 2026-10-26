@@ -49,6 +49,9 @@ pub const Context = struct {
     store: ?*db.Store = null,
     /// Shared by the pool: repositories whose output-key work ran over the limit.
     slow_outputs: ?*SlowOutputs = null,
+    /// Where `serve` keeps the previous cycle's ending, running in the background (`endCycle`);
+    /// null ends a cycle in place, as tests and one-off commands do.
+    ending: ?*?std.Io.Future(void) = null,
 };
 
 /// Output keys cost two walks of the job's filesystem whatever the step changed, so they are cheap
@@ -155,12 +158,15 @@ const Slot = struct {
 /// unless GitHub rejected the registration itself (bad token or scope), which retrying cannot fix.
 /// With `--once`, returns after the first cycle: 0 if its job succeeded.
 pub fn serve(c: Context) !Exit {
+    var ending: ?std.Io.Future(void) = null;
+    defer if (ending) |*f| f.await(c.io);
     var failures: u32 = 0;
     while (true) {
         var cycle_arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer cycle_arena.deinit();
         var cc = c;
         cc.arena = cycle_arena.allocator();
+        cc.ending = &ending;
         var suffix: [4]u8 = undefined;
         c.io.random(&suffix);
         cc.name = try std.fmt.allocPrint(cc.arena, "{s}-{x}", .{ c.cfg.name_prefix, suffix });
@@ -256,12 +262,76 @@ fn removeRegistration(c: Context, id: u64, name: []const u8) void {
             if (code != 422 and status.class() != .server_error) break;
         } else |e| last = @errorName(e);
     }
-    c.err.print(
+    // Through the log, not `c.err`: this can run in the background while the runner's next cycle
+    // writes to its own buffer.
+    say(
+        c,
         "could not remove runner registration '{s}' (id {d}): {s}; " ++
-            "delete it in the repository's runner settings\n",
+            "delete it in the repository's runner settings",
         .{ name, id, last },
     ) catch {};
 }
+
+/// What a cycle leaves behind: its registration and, once it had one, its broker session.
+const Ending = struct {
+    id: u64,
+    name: []const u8,
+    session: ?struct { base: []const u8, sid: []const u8 } = null,
+    token: []const u8 = "",
+
+    fn now(e: Ending, c: Context) void {
+        if (e.session) |s| deleteSession(c, s.base, s.sid, e.token);
+        removeRegistration(c, e.id, e.name);
+    }
+};
+
+/// Ends a cycle: deletes its session, then its registration (GitHub removes an ephemeral runner
+/// once its job completes; an idle one must be removed). In a pool this runs in the background, so
+/// the next cycle registers at once instead of after both answer (0.65 s between jobs). The previous
+/// cycle's ending, long finished by then, is awaited first, and `serve` awaits the last.
+fn endCycle(c: Context, e: Ending) void {
+    const slot = c.ending orelse return e.now(c);
+    if (slot.*) |*f| f.await(c.io);
+    slot.* = null;
+    slot.* = EndingTask.start(c, e) catch return e.now(c);
+}
+
+/// An `Ending` run in a task of its own. It outlives the cycle, whose arena `serve` frees, so it
+/// keeps copies of what it needs in memory of its own, freed when it is done.
+const EndingTask = struct {
+    arena: std.heap.ArenaAllocator,
+    c: Context,
+    e: Ending,
+
+    fn start(c: Context, e: Ending) !std.Io.Future(void) {
+        const t = try c.gpa.create(EndingTask);
+        errdefer c.gpa.destroy(t);
+        t.arena = .init(c.gpa);
+        errdefer t.arena.deinit();
+        const a = t.arena.allocator();
+        t.e = .{
+            .id = e.id,
+            .name = try a.dupe(u8, e.name),
+            .token = try a.dupe(u8, e.token),
+            .session = if (e.session) |s|
+                .{ .base = try a.dupe(u8, s.base), .sid = try a.dupe(u8, s.sid) }
+            else
+                null,
+        };
+        t.c = c;
+        t.c.arena = a;
+        t.c.name = t.e.name;
+        t.c.ending = null;
+        return c.io.concurrent(run, .{t});
+    }
+
+    fn run(t: *EndingTask) void {
+        const gpa = t.c.gpa;
+        t.e.now(t.c);
+        t.arena.deinit();
+        gpa.destroy(t);
+    }
+};
 
 /// One registration and at most one job.
 pub fn cycle(c: Context) !Cycle {
@@ -269,15 +339,22 @@ pub fn cycle(c: Context) !Cycle {
     var message: []const u8 = "";
     const jit = jitconfig.generate(c.arena, c.io, c.cfg, c.name, &status, &message) catch |e|
         return registrationFailed(c, e, status, message);
-    // GitHub removes ephemeral runners once their job completes; an idle one must be removed.
-    defer removeRegistration(c, jit.runner_id, jit.runner_name);
+    // Read when the cycle ends: the session once there is one, and the latest token.
+    var token: []const u8 = "";
+    var session: @FieldType(Ending, "session") = null;
+    defer endCycle(c, .{
+        .id = jit.runner_id,
+        .name = jit.runner_name,
+        .session = session,
+        .token = token,
+    });
     try say(c, "registered runner '{s}' (id {d})", .{ jit.runner_name, jit.runner_id });
 
     const creds = auth.parseCredentials(c.arena, jit.files) catch |e|
         return fail(c, "credentials", e);
     const settings = broker.parseSettings(c.arena, jit.files) catch |e|
         return fail(c, "runner settings", e);
-    var token = mintToken(c, creds, &status) catch |e| return failHttp(c, "oauth token", e, status);
+    token = mintToken(c, creds, &status) catch |e| return failHttp(c, "oauth token", e, status);
     var token_at = std.Io.Clock.real.now(c.io).toSeconds();
 
     const base = try withSlash(c.arena, settings.broker_url);
@@ -288,7 +365,7 @@ pub fn cycle(c: Context) !Cycle {
     if (created.status.class() != .success) return failBody(c, "create session", created);
     const sid = jsonString(c.arena, created.body, "sessionId") orelse
         return fail(c, "create session", error.BadResponse);
-    defer deleteSession(c, base, sid, token);
+    session = .{ .base = base, .sid = sid };
     try say(c, "'{s}' listening for jobs (labels: {s})", .{ c.name, c.cfg.labels });
 
     while (true) {
@@ -1035,9 +1112,10 @@ const Renewer = struct {
     fn run(r: *Renewer) void {
         var reported = false;
         while (true) {
+            // In short steps: the job's end waits for this to see `stop`.
             var waited: u32 = 0;
-            while (waited < interval_secs * 5 and !r.stop.load(.acquire)) : (waited += 1) {
-                r.c.io.sleep(.fromMilliseconds(200), .awake) catch return;
+            while (waited < interval_secs * 20 and !r.stop.load(.acquire)) : (waited += 1) {
+                r.c.io.sleep(.fromMilliseconds(50), .awake) catch return;
             }
             if (r.stop.load(.acquire)) return;
             var call: std.heap.ArenaAllocator = .init(r.c.gpa);
@@ -1129,11 +1207,15 @@ const CancelWatch = struct {
                     token_at = now;
                 } else |_| {}
             }
+            // Stopped at the job's end by cancelling this poll, which the HTTP client can report as
+            // an error other than Canceled. Without the `stop` check the watch then slept 5 s that
+            // nothing interrupted, and the job's end waited it out: 5.1 s between every two jobs.
             const m = broker.call(cc.arena, cc.io, .GET, w.session.url, token, null) catch |e| {
-                if (e == error.Canceled) return;
+                if (e == error.Canceled or w.stop.load(.acquire)) return;
                 cc.io.sleep(.fromSeconds(5), .awake) catch return;
                 continue;
             };
+            if (w.stop.load(.acquire)) return;
             if (m.status.class() != .success or m.body.len == 0) {
                 if (m.status != .accepted and m.status.class() != .success)
                     cc.io.sleep(.fromSeconds(5), .awake) catch return;
@@ -1384,13 +1466,13 @@ fn uploadLogs(
     summaries: []const []const u8,
     secrets: []const []const u8,
 ) !void {
+    var uploads: std.ArrayList(Upload) = .empty;
     for (shown) |s| {
         const blob = try results.formatBlob(c.arena, lines, s.log_step);
         if (blob.line_count == 0) continue;
-        const r = results.upload(c.arena, c.io, job, .{ .step = s.id }, blob);
-        try c.err.print(
-            "job {d}: log upload '{s}': {s}{s}\n",
-            .{ job.check_run_id, s.name, if (r.ok) "ok, " else "FAILED: ", r.detail },
+        try uploads.append(
+            c.arena,
+            .{ .what = .{ .log = .{ .step = s.id } }, .name = s.name, .blob = blob },
         );
     }
     // Step summaries, masked as the logs are.
@@ -1400,21 +1482,66 @@ fn uploadLogs(
         if (md.len == 0) continue;
         var masked: std.Io.Writer.Allocating = .init(c.arena);
         try redact.write(&masked.writer, md, secrets);
-        const r = results.uploadSummary(c.arena, c.io, job, s.id, masked.written());
-        try c.err.print(
-            "job {d}: summary upload '{s}': {s}{s}\n",
-            .{ job.check_run_id, s.name, if (r.ok) "ok, " else "FAILED: ", r.detail },
-        );
+        try uploads.append(c.arena, .{
+            .what = .{ .summary = s.id },
+            .name = s.name,
+            .markdown = masked.written(),
+        });
     }
     const all = try results.formatBlob(c.arena, lines, null);
-    if (all.line_count > 0) {
-        const r = results.upload(c.arena, c.io, job, .job, all);
-        try c.err.print(
-            "job {d}: log upload job: {s}{s}\n",
-            .{ job.check_run_id, if (r.ok) "ok, " else "FAILED: ", r.detail },
-        );
+    if (all.line_count > 0) try uploads.append(c.arena, .{ .what = .{ .log = .job }, .blob = all });
+
+    // Each upload is three requests one after another (a signed URL, the blob, its metadata), and
+    // they were made one upload after another too: 30 round trips, 1.5 s, before the job could end.
+    // Now they run at once, each with its own memory; what one failed to start runs here instead.
+    var group: std.Io.Group = .init;
+    for (uploads.items) |*u| {
+        group.concurrent(c.io, Upload.run, .{ u, c.gpa, c.io, job }) catch
+            Upload.run(u, c.gpa, c.io, job);
+    }
+    group.await(c.io) catch {};
+    defer for (uploads.items) |*u| u.arena.deinit();
+    for (uploads.items) |*u| {
+        const r = u.result;
+        const outcome = if (r.ok) "ok, " else "FAILED: ";
+        switch (u.what) {
+            .log => |w| switch (w) {
+                .step => try c.err.print(
+                    "job {d}: log upload '{s}': {s}{s}\n",
+                    .{ job.check_run_id, u.name, outcome, r.detail },
+                ),
+                .job => try c.err.print(
+                    "job {d}: log upload job: {s}{s}\n",
+                    .{ job.check_run_id, outcome, r.detail },
+                ),
+            },
+            .summary => try c.err.print(
+                "job {d}: summary upload '{s}': {s}{s}\n",
+                .{ job.check_run_id, u.name, outcome, r.detail },
+            ),
+        }
     }
 }
+
+/// One upload of `uploadLogs`, made in a task of its own. The blob and the markdown are only read;
+/// what the requests allocate, the result's detail included, lives in `arena` until it is reported.
+const Upload = struct {
+    what: union(enum) { log: results.Which, summary: []const u8 },
+    name: []const u8 = "",
+    blob: results.Blob = undefined,
+    markdown: []const u8 = "",
+    arena: std.heap.ArenaAllocator = undefined,
+    result: results.Result = .{ .ok = false, .detail = "not run" },
+
+    fn run(u: *Upload, gpa: Allocator, io: std.Io, job: job_mod.Job) void {
+        u.arena = .init(gpa);
+        const arena = u.arena.allocator();
+        u.result = switch (u.what) {
+            .log => |w| results.upload(arena, io, job, w, u.blob),
+            .summary => |id| results.uploadSummary(arena, io, job, id, u.markdown),
+        };
+    }
+};
 
 /// `stepResults` for completejob. Field names follow `actions/runner`'s StepResult; verified live
 /// by checking the steps GitHub reports for the job.
@@ -1557,6 +1684,67 @@ fn failBody(c: Context, what: []const u8, r: broker.Response) !Cycle {
         .{ what, @backingInt(r.status), r.body[0..@min(r.body.len, 400)] },
     );
     return github_failure;
+}
+
+test "a job's cancel watch stops at once when the job ends, mid-poll" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    // Connections complete in the listener's backlog and are never answered, so the watch is in
+    // the middle of its poll when the job ends, as it always is.
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const url = try std.fmt.allocPrint(
+        arena,
+        "http://127.0.0.1:{d}/message",
+        .{listener.socket.address.getPort()},
+    );
+
+    var out_buf: [1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var err_buf: [1024]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+    var cfg: Config = .{ .gh_token = "", .scope = undefined };
+    const c: Context = .{
+        .arena = arena,
+        .gpa = std.testing.allocator,
+        .io = io,
+        .environ = undefined,
+        .cfg = &cfg,
+        .log = &log,
+        .err = &err,
+        .secrets = &.{},
+        .name = "t",
+    };
+    const job: job_mod.Job = .{
+        .plan_id = "p",
+        .job_id = "j",
+        .job_token = "t",
+        .check_run_id = 7,
+        .secrets = &.{},
+        .steps = &.{},
+    };
+    var cancel: dagger.Cancel = .{};
+    // No token refresh is due, so the credentials are never read.
+    var watcher = CancelWatch.init(c, .{
+        .creds = undefined,
+        .token = "token",
+        .token_at = std.Io.Clock.real.now(io).toSeconds(),
+        .url = url,
+    }, job, &cancel);
+    var watching = try io.concurrent(CancelWatch.run, .{&watcher});
+    try io.sleep(.fromMilliseconds(200), .awake);
+
+    // As handleJob ends it: stop, then cancel the poll.
+    const started = std.Io.Clock.awake.now(io).toMilliseconds();
+    watcher.stop.store(true, .release);
+    watching.cancel(io);
+    const took = std.Io.Clock.awake.now(io).toMilliseconds() - started;
+    try std.testing.expect(took < 1000);
+    try std.testing.expect(!cancel.requested.load(.acquire));
 }
 
 test "backoffSecs doubles from 5s up to 5 minutes" {
