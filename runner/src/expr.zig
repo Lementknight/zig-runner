@@ -111,12 +111,63 @@ const Tok = union(enum) {
     eof,
 };
 
-/// A character of a decimal number literal at `i`: digits, the point, an exponent, and the sign
-/// right after an exponent.
+/// A character that continues a number token at `i`: letters, digits and points (`0x1F`, `0o17`,
+/// `1.5`, `Infinity`), and a sign right after an exponent's `e`. What the token means is up to
+/// `jsNumber`; this only says where it ends.
 fn isNumberChar(src: []const u8, i: usize) bool {
     const c = src[i];
-    if (std.ascii.isDigit(c) or c == '.' or c == 'e' or c == 'E') return true;
-    return (c == '+' or c == '-') and (src[i - 1] == 'e' or src[i - 1] == 'E');
+    if (std.ascii.isAlphanumeric(c) or c == '_' or c == '.') return true;
+    return (c == '+' or c == '-') and (src[i - 1] == 'e' or src[i - 1] == 'E') and
+        !std.mem.startsWith(u8, std.mem.trimStart(u8, src[0..i], "+-"), "0x");
+}
+
+/// What JavaScript's `Number()` makes of a string, which is what GitHub's expressions follow, both
+/// for number literals and for a string compared with a number: whitespace around it ignored, ""
+/// is 0, a decimal with an optional sign, point and exponent (`-.5`, `1E+2`), `Infinity` with an
+/// optional sign, and unsigned `0x`, `0o` and `0b` integers. Anything else is NaN. Stricter than
+/// `std.fmt.parseFloat`, which also takes `inf`, `nan`, underscores and hex floats.
+pub fn jsNumber(text: []const u8) f64 {
+    const t = std.mem.trim(u8, text, " \t\r\n\x0b\x0c");
+    if (t.len == 0) return 0;
+    const nan = std.math.nan(f64);
+    if (t.len > 2 and t[0] == '0') {
+        const radix: ?u8 = switch (t[1]) {
+            'x', 'X' => 16,
+            'o', 'O' => 8,
+            'b', 'B' => 2,
+            else => null,
+        };
+        if (radix) |r| {
+            var v: f64 = 0;
+            for (t[2..]) |c| {
+                const d = std.fmt.charToDigit(c, r) catch return nan;
+                v = v * @as(f64, @floatFromInt(r)) + @as(f64, @floatFromInt(d));
+            }
+            return v;
+        }
+    }
+    const neg = t[0] == '-';
+    const body = if (t[0] == '-' or t[0] == '+') t[1..] else t;
+    if (std.mem.eql(u8, body, "Infinity")) return if (neg) -std.math.inf(f64) else std.math.inf(f64);
+    // digits [. digits] [e [sign] digits], with a digit somewhere before the exponent.
+    var i: usize = 0;
+    var digits: usize = 0;
+    while (i < body.len and std.ascii.isDigit(body[i])) : (i += 1) digits += 1;
+    if (i < body.len and body[i] == '.') {
+        i += 1;
+        while (i < body.len and std.ascii.isDigit(body[i])) : (i += 1) digits += 1;
+    }
+    if (digits == 0) return nan;
+    if (i < body.len and (body[i] == 'e' or body[i] == 'E')) {
+        i += 1;
+        if (i < body.len and (body[i] == '+' or body[i] == '-')) i += 1;
+        const start = i;
+        while (i < body.len and std.ascii.isDigit(body[i])) i += 1;
+        if (i == start) return nan;
+    }
+    if (i != body.len) return nan;
+    const v = std.fmt.parseFloat(f64, body) catch return nan;
+    return if (neg) -v else v;
 }
 
 const Lexer = struct {
@@ -150,7 +201,9 @@ const Lexer = struct {
             ')' => return l.adv(1, .rparen),
             '[' => return l.adv(1, .lbracket),
             ']' => return l.adv(1, .rbracket),
-            '.' => return l.adv(1, .dot),
+            // `.5` is a number; any other point is a property access (`foo.*.bar`).
+            '.' => if (prev_is_value or l.i + 1 >= l.src.len or !std.ascii.isDigit(l.src[l.i + 1]))
+                return l.adv(1, .dot),
             ',' => return l.adv(1, .comma),
             '*' => return l.adv(1, .star),
             '!' => return l.adv(1, .not),
@@ -159,8 +212,10 @@ const Lexer = struct {
             '\'' => return l.string(),
             else => {},
         }
-        if (std.ascii.isDigit(c) or (c == '-' and !prev_is_value and l.i + 1 < l.src.len and
-            std.ascii.isDigit(l.src[l.i + 1]))) return l.number();
+        // A sign or a point starts a number only where a value can start: after a value, `.` is a
+        // property access.
+        if (std.ascii.isDigit(c) or (!prev_is_value and (c == '-' or c == '+' or c == '.')))
+            return l.number();
         if (std.ascii.isAlphabetic(c) or c == '_') {
             const start = l.i;
             while (l.i < l.src.len and (std.ascii.isAlphanumeric(l.src[l.i]) or l.src[l.i] == '_' or
@@ -197,24 +252,12 @@ const Lexer = struct {
 
     fn number(l: *Lexer) Error!Tok {
         const start = l.i;
-        if (l.src[l.i] == '-') l.i += 1;
-        if (l.i + 1 < l.src.len and l.src[l.i] == '0' and
-            (l.src[l.i + 1] == 'x' or l.src[l.i + 1] == 'X'))
-        {
-            l.i += 2;
-            while (l.i < l.src.len and std.ascii.isHex(l.src[l.i])) l.i += 1;
-        } else {
-            while (l.i < l.src.len and isNumberChar(l.src, l.i)) l.i += 1;
-        }
+        l.i += 1;
+        while (l.i < l.src.len and isNumberChar(l.src, l.i)) l.i += 1;
         const text = l.src[start..l.i];
-        const neg = text[0] == '-';
-        const body = if (neg) text[1..] else text;
-        const v: f64 = if (body.len > 2 and (body[1] == 'x' or body[1] == 'X'))
-            @floatFromInt(std.fmt.parseInt(i64, body[2..], 16) catch
-                return l.bad("invalid number '{s}'", .{text}))
-        else
-            std.fmt.parseFloat(f64, body) catch return l.bad("invalid number '{s}'", .{text});
-        return .{ .number = if (neg) -v else v };
+        const v = jsNumber(text);
+        if (std.math.isNan(v)) return l.bad("invalid number '{s}'", .{text});
+        return .{ .number = v };
     }
 };
 
@@ -466,7 +509,7 @@ pub fn toBool(v: Value) bool {
     return switch (v) {
         .null => false,
         .boolean => |b| b,
-        .number => |n| !(n == 0),
+        .number => |n| n != 0 and !std.math.isNan(n),
         .string => |s| s.len > 0,
         .array, .object => true,
     };
@@ -477,14 +520,7 @@ pub fn toNumber(v: Value) f64 {
         .null => 0,
         .boolean => |b| if (b) 1 else 0,
         .number => |n| n,
-        .string => |s| blk: {
-            const t = std.mem.trim(u8, s, " \t\r\n");
-            if (t.len == 0) break :blk 0;
-            if (t.len > 2 and t[0] == '0' and (t[1] == 'x' or t[1] == 'X'))
-                break :blk @floatFromInt(std.fmt.parseInt(i64, t[2..], 16) catch
-                    break :blk std.math.nan(f64));
-            break :blk std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
-        },
+        .string => |s| jsNumber(s),
         .array, .object => std.math.nan(f64),
     };
 }
@@ -505,7 +541,11 @@ fn numberToString(arena: Allocator, n: f64) Allocator.Error![]const u8 {
     if (std.math.isInf(n)) return if (n > 0) "Infinity" else "-Infinity";
     if (@floor(n) == n and @abs(n) < 1e15)
         return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))});
-    return std.fmt.allocPrint(arena, "{d}", .{n});
+    // 15 significant digits, as GitHub prints them: 0.84551240822557006 is "0.84551240822557".
+    var buf: [64]u8 = undefined;
+    const rounded = std.fmt.parseFloat(f64, std.fmt.bufPrint(&buf, "{e:.14}", .{n}) catch
+        unreachable) catch n;
+    return std.fmt.allocPrint(arena, "{d}", .{rounded});
 }
 
 fn sameKind(a: Value, b: Value) bool {
@@ -1306,4 +1346,26 @@ test "string building has a memory limit, and fromJSON a nesting limit" {
     try std.testing.expectError(error.EvalError, evaluate(ar, deep, s));
     // Brackets inside strings do not count.
     try std.testing.expectEqualStrings("]]]]", try evalStr(ar, "fromJSON('[[\"]]]]\"]]')[0][0]", s));
+}
+
+test "numbers are read as JavaScript's Number() reads them, as GitHub does" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const s: Scope = .{};
+    for ([_][2][]const u8{
+        .{ ".5", "0.5" },                               .{ "-.5", "-0.5" },            .{ "+1", "1" },
+        .{ "0o17", "15" },                              .{ "0b101", "5" },             .{ "0xfF", "255" },
+        .{ "1E+2", "100" },                             .{ "-Infinity", "-Infinity" }, .{ "-0", "0" },
+        .{ "0.84551240822557006", "0.84551240822557" },
+    }) |c| try std.testing.expectEqualStrings(c[1], try evalStr(ar, c[0], s));
+    // Hex takes no sign; a point after a value is a property access.
+    try std.testing.expectError(error.ParseError, evaluate(ar, "-0xFF", s));
+    try std.testing.expectError(error.ParseError, evaluate(ar, "1_000", s));
+    try std.testing.expectEqualStrings("true", try evalStr(ar, "' 0o10 ' == 8", s));
+    try std.testing.expectEqualStrings("false", try evalStr(ar, "'inf' == Infinity", s));
+    try std.testing.expectEqualStrings("false", try evalStr(ar, "!!NaN", s));
+    try std.testing.expect(std.math.isNan(jsNumber("1_000")));
+    try std.testing.expect(std.math.isNan(jsNumber("nan")));
+    try std.testing.expectEqual(@as(f64, 0), jsNumber("  "));
 }
