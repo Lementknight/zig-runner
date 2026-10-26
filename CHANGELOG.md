@@ -10,6 +10,14 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.7.0 - 2026-10-26
+### Added
+* `RUNNER_ZIG_LOCAL_CACHE=true` (or `--zig-local-cache`) keeps Zig's local cache between jobs, in a cache volume of its own: about 1.2 s off each `zig build test` of zig-runner itself (10%), and 4-6 s when the repository's previous build had the same source. Off by default, because Zig never removes anything from that cache: it grows by about 50 MB per source version built, until the engine collects it.
+### Changed
+* `zig build test` also compiles the runner, so CI fails on a compile error in code the tests never reach (the runner's main loop), where it passed before.
+### Fixed
+* `RUNNER_UV_ENV_IN_CACHE` (and `--uv-env-in-cache`) takes effect: it was read but never passed on, so uv's environment always went in its cache volume.
+
 ## v0.6.2 - 2026-10-26
 ### Fixed
 * A database that is slow or stops answering no longer holds up jobs: log lines and run-state rows are written by background tasks, never on a job's path. With the database paused for 60 s, jobs on 4 runners took 69-70 s instead of 17-19 s; now 16-17 s, and every line and row still reaches it.
