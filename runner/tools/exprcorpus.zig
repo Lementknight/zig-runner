@@ -44,7 +44,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var totals: Counts = .{};
     for (names.items) |name| {
-        const text = try dir.readFileAlloc(io, name, arena, .limited(16 << 20));
+        const text = try dir.readFileAlloc(io, name, arena, .limited(1 << 30));
         const root = try std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
         var counts: Counts = .{};
         var suites = root.object.iterator();

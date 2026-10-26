@@ -58,6 +58,8 @@ pub const Scope = struct {
     hash_files: ?HashFiles = null,
     /// Bytes the functions that build strings have made so far; `evaluate` sets it.
     memory: ?*usize = null,
+    /// The arrays `*` filters have made (see `access`); `evaluate` sets it.
+    filtered: ?*Filtered = null,
 
     fn fail(s: Scope, comptime fmt: []const u8, args: anytype, arena: Allocator) Error {
         if (s.diag) |d| d.* = std.fmt.allocPrint(arena, fmt, args) catch "expression error";
@@ -111,14 +113,14 @@ const Tok = union(enum) {
     eof,
 };
 
-/// A character that continues a number token at `i`: letters, digits and points (`0x1F`, `0o17`,
-/// `1.5`, `Infinity`), and a sign right after an exponent's `e`. What the token means is up to
-/// `jsNumber`; this only says where it ends.
-fn isNumberChar(src: []const u8, i: usize) bool {
-    const c = src[i];
-    if (std.ascii.isAlphanumeric(c) or c == '_' or c == '.') return true;
-    return (c == '+' or c == '-') and (src[i - 1] == 'e' or src[i - 1] == 'E') and
-        !std.mem.startsWith(u8, std.mem.trimStart(u8, src[0..i], "+-"), "0x");
+/// Whether `c` continues a number token. As GitHub's lexer: anything up to a boundary (whitespace,
+/// brackets, parentheses, a comma, an operator), a point included. So `1E-2` is one token and
+/// `1-2` is one invalid token; what a token means is up to `jsNumber`.
+fn isNumberChar(c: u8) bool {
+    return switch (c) {
+        '(', '[', ')', ']', ',', '!', '>', '<', '=', '&', '|' => false,
+        else => !std.ascii.isWhitespace(c),
+    };
 }
 
 /// What JavaScript's `Number()` makes of a string, which is what GitHub's expressions follow, both
@@ -253,7 +255,7 @@ const Lexer = struct {
     fn number(l: *Lexer) Error!Tok {
         const start = l.i;
         l.i += 1;
-        while (l.i < l.src.len and isNumberChar(l.src, l.i)) l.i += 1;
+        while (l.i < l.src.len and isNumberChar(l.src[l.i])) l.i += 1;
         const text = l.src[start..l.i];
         const v = jsNumber(text);
         if (std.math.isNan(v)) return l.bad("invalid number '{s}'", .{text});
@@ -440,7 +442,12 @@ const Parser = struct {
     }
 
     fn parsePostfix(p: *Parser) Error!*Node {
+        const grouped = p.cur == .lparen;
         var n = try p.parsePrimary();
+        // GitHub indexes only a context, a function's result or a parenthesised expression:
+        // `'abc'[0]` and `null.x` are refused, `(x)[0]` and `fromJSON(x).y` are not.
+        if (!grouped and n.* != .ident and n.* != .call and (p.cur == .dot or p.cur == .lbracket))
+            return p.lex.bad("unexpected '{s}' after a literal", .{if (p.cur == .dot) "." else "["});
         while (true) {
             switch (p.cur) {
                 .dot => {
@@ -521,14 +528,14 @@ const Parser = struct {
                     try p.checkCall(name, args.items.len);
                     return p.node(.{ .call = .{ .name = name, .args = args.items } });
                 }
-                if (std.ascii.eqlIgnoreCase(name, "true"))
-                    return p.node(.{ .literal = .{ .boolean = true } });
-                if (std.ascii.eqlIgnoreCase(name, "false"))
-                    return p.node(.{ .literal = .{ .boolean = false } });
-                if (std.ascii.eqlIgnoreCase(name, "null")) return p.node(.{ .literal = .null });
-                if (std.ascii.eqlIgnoreCase(name, "nan"))
+                // Spelled exactly so, as GitHub has them: `TRUE` is a name, and no context.
+                const eql = std.mem.eql;
+                if (eql(u8, name, "true")) return p.node(.{ .literal = .{ .boolean = true } });
+                if (eql(u8, name, "false")) return p.node(.{ .literal = .{ .boolean = false } });
+                if (eql(u8, name, "null")) return p.node(.{ .literal = .null });
+                if (eql(u8, name, "NaN"))
                     return p.node(.{ .literal = .{ .number = std.math.nan(f64) } });
-                if (std.ascii.eqlIgnoreCase(name, "infinity"))
+                if (eql(u8, name, "Infinity"))
                     return p.node(.{ .literal = .{ .number = std.math.inf(f64) } });
                 if (p.contexts) |known| if (lookupEntry(known, name) == null and !isGithubContext(name))
                     return p.lex.bad("unrecognized context '{s}'", .{name});
@@ -731,22 +738,24 @@ fn deref(v: Value, key: Value, arena: Allocator) Allocator.Error!Value {
             const k = try toStr(arena, key);
             return lookupEntry(o, k) orelse .null;
         },
-        .array => |a| {
-            // null, booleans and strings index as numbers (`a[true]` is `a[1]`).
-            if (key == .array or key == .object) return .null;
-            const n = toNumber(key);
-            // Bounded before the conversion, which panics on a number no usize holds (`foo[1e30]`,
-            // `foo[Infinity]`) and would take the whole runner down with it.
-            const len: f64 = @floatFromInt(a.len);
-            if (std.math.isNan(n) or n < 0 or @floor(n) != n or n >= len) return .null;
-            return a[@intFromFloat(n)];
-        },
+        .array => |a| return if (arrayIndex(key, a.len)) |i| a[i] else .null,
         else => return .null,
     }
 }
 
+/// `key` as an index into an array of `len`, if it is one. null, booleans and strings index as
+/// numbers (`a[true]` is `a[1]`), and a fraction is rounded down (`a[1.5]` is `a[1]`), as GitHub
+/// does. Bounded before the conversion, which panics on a number no usize holds (`foo[1e30]`,
+/// `foo[Infinity]`) and would take the whole runner down with it.
+fn arrayIndex(key: Value, len: usize) ?usize {
+    if (key == .array or key == .object) return null;
+    const n = toNumber(key);
+    if (std.math.isNan(n) or n < 0 or @floor(n) >= @as(f64, @floatFromInt(len))) return null;
+    return @intFromFloat(@floor(n));
+}
+
 /// What a `*` object filter selects: an array's elements, or an object's values. GitHub gives an
-/// array either way, and anything else selects nothing.
+/// array either way, and anything else selects nothing. (`filteredArray` copies it.)
 fn starValues(arena: Allocator, v: Value) Error![]const Value {
     switch (v) {
         .array => |a| return a,
@@ -759,52 +768,51 @@ fn starValues(arena: Allocator, v: Value) Error![]const Value {
     }
 }
 
-/// The values selected by `n`, when `n` is a `*` filter or a property reached through one.
-///
-/// This is what makes `labels.*.name` an array of names while `labels.name` stays null: the filter
-/// is recognised from the shape of the expression rather than from the shape of the value, so
-/// property access maps over a filtered collection and dereferences anything else. It recurses, so
-/// `a.*.b.c` filters at both levels. An index after a filter applies to each element too
-/// (`a[*][1]`, `a.*['b']`), and a filter after a filter flattens (`a.*.*`: the elements' elements).
-fn filteredValues(arena: Allocator, n: *const Node, scope: Scope) Error!?[]const Value {
-    switch (n.*) {
-        .star => |inner| {
-            const items = (try filteredValues(arena, inner, scope)) orelse
-                return try starValues(arena, try eval(arena, inner, scope));
-            var out: std.ArrayList(Value) = .empty;
-            for (items) |it| try out.appendSlice(arena, try starValues(arena, it));
-            return out.items;
-        },
-        .prop => |p| return try mapFiltered(arena, p.obj, .{ .string = p.name }, scope),
-        .index => |ix| {
-            if (!isFilter(ix.obj)) return null;
-            return try mapFiltered(arena, ix.obj, try eval(arena, ix.idx, scope), scope);
-        },
-        else => return null,
-    }
-}
-
-/// Whether `n` selects through a `*` filter.
-fn isFilter(n: *const Node) bool {
-    return switch (n.*) {
-        .star => true,
-        .prop => |p| isFilter(p.obj),
-        .index => |ix| isFilter(ix.obj),
-        else => false,
+/// What `.k`, `[k]` or `.*` selects from `o`. A `*` filter's result is marked (`filteredArray`),
+/// and whatever follows applies to each of its elements, as GitHub's FilteredArray does:
+/// `labels.*.name` is every label's name, `a[*][1]` every element's second, `a.*.*` the elements'
+/// elements, also when the filtered array has come through a function (`case(c, a.*, b.*)[0]`).
+/// An element that is neither an array nor an object contributes nothing, and neither does one
+/// without the key.
+fn access(arena: Allocator, o: Value, idx: Index, scope: Scope) Error!Value {
+    if (!isFiltered(scope, o)) return switch (idx) {
+        .star => filteredArray(arena, scope, try starValues(arena, o)),
+        .key => |k| try deref(o, k, arena),
     };
+    var out: std.ArrayList(Value) = .empty;
+    for (o.array) |item| switch (item) {
+        .object => |entries| switch (idx) {
+            .star => for (entries) |e| try out.append(arena, e.value),
+            .key => |k| if (isPrimitive(k)) {
+                if (lookupEntry(entries, try toStr(arena, k))) |v| try out.append(arena, v);
+            },
+        },
+        .array => |a| switch (idx) {
+            .star => try out.appendSlice(arena, a),
+            .key => |k| if (arrayIndex(k, a.len)) |i| try out.append(arena, a[i]),
+        },
+        else => {},
+    };
+    return filteredArray(arena, scope, out.items);
 }
 
-/// `key` looked up in each value `obj` selects, when `obj` is a filter.
-fn mapFiltered(arena: Allocator, obj: *const Node, key: Value, scope: Scope) Error!?[]const Value {
-    const items = (try filteredValues(arena, obj, scope)) orelse return null;
-    var out: std.ArrayList(Value) = .empty;
-    for (items) |it| {
-        const got = try deref(it, key, arena);
-        // An element without the property contributes nothing, rather than a null: this is
-        // what makes `contains(labels.*.name, 'bug')` safe on a mixed array.
-        if (got != .null) try out.append(arena, got);
-    }
-    return out.items;
+const Index = union(enum) { star, key: Value };
+
+/// The arrays this evaluation's filters made, by address.
+const Filtered = std.AutoHashMapUnmanaged(usize, void);
+
+/// `items` as a filter's result: copied into an allocation of its own (empty ones too, so that
+/// the address is its own) and remembered as filtered.
+fn filteredArray(arena: Allocator, scope: Scope, items: []const Value) Error!Value {
+    const out = (try arena.alloc(Value, @max(items.len, 1)))[0..items.len];
+    @memcpy(out, items);
+    if (scope.filtered) |f| try f.put(arena, @intFromPtr(out.ptr), {});
+    return .{ .array = out };
+}
+
+fn isFiltered(scope: Scope, v: Value) bool {
+    const f = scope.filtered orelse return false;
+    return v == .array and f.contains(@intFromPtr(v.array.ptr));
 }
 
 /// A chain of `&&` (or of `||`), operand by operand from the left, without recursing down it: a
@@ -840,33 +848,30 @@ fn eval(arena: Allocator, n: *const Node, scope: Scope) Error!Value {
             };
             return lookupEntry(scope.contexts, name) orelse .null;
         },
-        .prop => |p| {
-            // `n`, not `p.obj`: `filteredValues` applies this property to the filtered collection,
-            // and returns null when the chain is not a filter at all so that ordinary property
-            // access still goes through `deref`.
-            if (try filteredValues(arena, n, scope)) |items| return .{ .array = items };
-            return deref(try eval(arena, p.obj, scope), .{ .string = p.name }, arena);
-        },
+        .prop => |p| return access(arena, try eval(arena, p.obj, scope), .{ .key = .{ .string = p.name } }, scope),
         .index => |ix| {
-            if (try filteredValues(arena, n, scope)) |items| return .{ .array = items };
-            const o = try eval(arena, ix.obj, scope);
-            return deref(o, try eval(arena, ix.idx, scope), arena);
+            // The index first, as GitHub evaluates it.
+            const k = try eval(arena, ix.idx, scope);
+            return access(arena, try eval(arena, ix.obj, scope), .{ .key = k }, scope);
         },
-        .star => return .{ .array = (try filteredValues(arena, n, scope)).? },
+        .star => |inner| return access(arena, try eval(arena, inner, scope), .star, scope),
         .not => |inner| return .{ .boolean = !toBool(try eval(arena, inner, scope)) },
         .bin => |b| {
             if (b.op == .and_ or b.op == .or_) return evalChain(arena, n, scope);
             const l = try eval(arena, b.l, scope);
             const r = try eval(arena, b.r, scope);
-            return .{ .boolean = switch (b.op) {
-                .eq => looseEquals(l, r),
-                .ne => !looseEquals(l, r),
-                .lt => if (compare(l, r)) |o| o == .lt else false,
-                .le => if (compare(l, r)) |o| o != .gt else false,
-                .gt => if (compare(l, r)) |o| o == .gt else false,
-                .ge => if (compare(l, r)) |o| o != .lt else false,
-                else => unreachable,
-            } };
+            return .{
+                .boolean = switch (b.op) {
+                    .eq => looseEquals(l, r),
+                    .ne => !looseEquals(l, r),
+                    .lt => if (compare(l, r)) |o| o == .lt else false,
+                    // `a <= b` is `a == b || a < b` to GitHub: an array is <= itself.
+                    .le => looseEquals(l, r) or if (compare(l, r)) |o| o == .lt else false,
+                    .gt => if (compare(l, r)) |o| o == .gt else false,
+                    .ge => looseEquals(l, r) or if (compare(l, r)) |o| o == .gt else false,
+                    else => unreachable,
+                },
+            };
         },
         .call => |c| return callFunction(arena, c.name, c.args, scope),
     }
@@ -875,7 +880,6 @@ fn eval(arena: Allocator, n: *const Node, scope: Scope) Error!Value {
 fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: Scope) Error!Value {
     const eql = std.ascii.eqlIgnoreCase;
     if (statusFunction(name, scope)) |v| return v;
-    if (eql(name, "case")) return callCase(arena, arg_nodes, scope);
     if (eql(name, "hashFiles") and scope.hash_files == null) {
         if (scope.diag) |d| d.* = "hashFiles() is not supported here";
         return error.Unsupported;
@@ -885,9 +889,11 @@ fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: S
     for (arg_nodes, args) |an, *out| out.* = try eval(arena, an, scope);
 
     if (eql(name, "hashFiles")) return callHashFiles(arena, args, scope);
+    if (eql(name, "case")) return callCase(arena, args, scope);
     if (eql(name, "contains")) return callContains(arena, args, scope);
     if (eql(name, "startsWith") or eql(name, "endsWith")) {
         if (args.len != 2) return scope.fail("{s}() takes 2 arguments", .{name}, arena);
+        if (!isPrimitive(args[0]) or !isPrimitive(args[1])) return .{ .boolean = false };
         const s = try upperAlloc(arena, try toStr(arena, args[0]));
         const t = try upperAlloc(arena, try toStr(arena, args[1]));
         return .{ .boolean = if (eql(name, "startsWith"))
@@ -906,16 +912,17 @@ fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: S
 }
 
 /// `case(pred1, value1, pred2, value2, ..., default)`: the value after the first true predicate,
-/// else the default. Only what is needed is evaluated, and a predicate must be a boolean.
-fn callCase(arena: Allocator, args: []*Node, scope: Scope) Error!Value {
+/// else the default. A predicate up to the first true one must be a boolean. Every argument is
+/// evaluated first, as for any function on GitHub, so an error in any of them is an error.
+fn callCase(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
     var i: usize = 0;
     while (i + 1 < args.len) : (i += 2) {
-        switch (try eval(arena, args[i], scope)) {
-            .boolean => |b| if (b) return eval(arena, args[i + 1], scope),
+        switch (args[i]) {
+            .boolean => |b| if (b) return args[i + 1],
             else => return scope.fail("case(): a predicate must be true or false", .{}, arena),
         }
     }
-    return eval(arena, args[args.len - 1], scope);
+    return args[args.len - 1];
 }
 
 /// `success()`, `always()`, `cancelled()`, `failure()`: the job's state, no arguments evaluated.
@@ -943,6 +950,11 @@ fn callHashFiles(arena: Allocator, args: []const Value, scope: Scope) Error!Valu
     };
 }
 
+/// Not an array or an object. The string functions are false for anything else, as GitHub's are.
+fn isPrimitive(v: Value) bool {
+    return v != .array and v != .object;
+}
+
 fn callContains(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
     if (args.len != 2) return scope.fail("contains() takes 2 arguments", .{}, arena);
     switch (args[0]) {
@@ -950,7 +962,9 @@ fn callContains(arena: Allocator, args: []const Value, scope: Scope) Error!Value
             for (a) |e| if (looseEquals(e, args[1])) return .{ .boolean = true };
             return .{ .boolean = false };
         },
+        .object => return .{ .boolean = false },
         else => {
+            if (!isPrimitive(args[1])) return .{ .boolean = false };
             const hay = try upperAlloc(arena, try toStr(arena, args[0]));
             const needle = try upperAlloc(arena, try toStr(arena, args[1]));
             return .{ .boolean = std.mem.indexOf(u8, hay, needle) != null };
@@ -1071,7 +1085,8 @@ fn writeJson(w: *std.Io.Writer, v: Value, depth: usize) !void {
     switch (v) {
         .null => try w.writeAll("null"),
         .boolean => |b| try w.writeAll(if (b) "true" else "false"),
-        .number => |n| if (@floor(n) == n and @abs(n) < 1e15) try w.print(
+        // JSON has no NaN or Infinity; GitHub writes null, as JavaScript's JSON.stringify does.
+        .number => |n| if (!std.math.isFinite(n)) try w.writeAll("null") else if (@floor(n) == n and @abs(n) < 1e15) try w.print(
             "{d}",
             .{@as(i64, @intFromFloat(n))},
         ) else try w.print("{d}", .{n}),
@@ -1140,8 +1155,10 @@ pub fn evaluate(arena: Allocator, text: []const u8, scope: Scope) Error!Value {
     if (std.mem.trim(u8, text, " \t\r\n").len == 0) return .null;
     const n = try parse(arena, text, scope.diag, scope.contexts);
     var used: usize = 0;
+    var filtered: Filtered = .empty;
     var s = scope;
     if (s.memory == null) s.memory = &used;
+    if (s.filtered == null) s.filtered = &filtered;
     return eval(arena, n, s) catch |e| switch (e) {
         error.Unsupported => {
             if (scope.diag) |d| if (d.*.len == 0) {
@@ -1251,7 +1268,9 @@ test "literals and coercion" {
     try std.testing.expectEqualStrings("42", try evalStr(a.allocator(), "42", s));
     try std.testing.expectEqualStrings("-3.5", try evalStr(a.allocator(), "-3.5", s));
     try std.testing.expectEqualStrings("255", try evalStr(a.allocator(), "0xff", s));
-    try std.testing.expectEqualStrings("true", try evalStr(a.allocator(), "TRUE", s));
+    try std.testing.expectEqualStrings("true", try evalStr(a.allocator(), "true", s));
+    // Keywords are spelled exactly so: `TRUE` is a name, and no context.
+    try std.testing.expectError(error.ParseError, evaluate(a.allocator(), "TRUE", s));
     try std.testing.expectEqualStrings("", try evalStr(a.allocator(), "null", s));
 }
 
@@ -1454,15 +1473,17 @@ test "hashFiles calls the scope's hook with its patterns" {
     try std.testing.expectError(error.ParseError, evaluate(ar, "hashFiles()", s));
 }
 
-test "case() picks the value after the first true predicate, evaluating only what it needs" {
+test "case() picks the value after the first true predicate" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const ar = a.allocator();
     const s: Scope = .{};
     try std.testing.expectEqualStrings("b", try evalStr(ar, "case(false, 'a', 1 == 1, 'b', 'c')", s));
     try std.testing.expectEqualStrings("c", try evalStr(ar, "case(false, 'a', false, 'b', 'c')", s));
-    // The rest is never evaluated: fromJSON('{') would be an error.
-    try std.testing.expectEqualStrings("a", try evalStr(ar, "case(true, 'a', fromJSON('{'), 'b', 'c')", s));
+    // Every argument is evaluated, as on GitHub: an error after the first true predicate is one.
+    try std.testing.expectError(error.EvalError, evaluate(ar, "case(true, 'a', fromJSON('{'), 'b', 'c')", s));
+    // A predicate after the first true one is not looked at.
+    try std.testing.expectEqualStrings("a", try evalStr(ar, "case(true, 'a', 1, 'b', 'c')", s));
     try std.testing.expectError(error.EvalError, evaluate(ar, "case(1, 'a', 'b')", s));
 }
 
@@ -1615,4 +1636,36 @@ test "a[*] is a.*, and what follows a filter applies to each element" {
     try std.testing.expectEqualStrings("", try evalStr(ar, "join(o)", s));
     // Arrays and objects equal only themselves, empty ones too.
     try std.testing.expectEqualStrings("true", try evalStr(ar, "obj == obj && obj != obj2", s));
+}
+
+test "what random expressions against Gitea's evaluator turned up, settled by GitHub's source" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const json = try std.json.parseFromSliceLeaky(std.json.Value, ar,
+        \\{"l": [10, 20, 30], "objs": [{"n": "a"}, {"n": "b"}], "o": {"k": "v"}}
+    , .{});
+    const s: Scope = .{ .contexts = (try fromJsonValue(ar, json)).object };
+    // Only a context, a function's result or a parenthesised expression can be indexed.
+    try std.testing.expectError(error.ParseError, evaluate(ar, "'abc'[0]", s));
+    try std.testing.expectError(error.ParseError, evaluate(ar, "null.x", s));
+    try std.testing.expectEqualStrings("20", try evalStr(ar, "(l)[1]", s));
+    // A number token runs to a boundary: `1E-2` is one number, `1-2` no number.
+    try std.testing.expectEqualStrings("10", try evalStr(ar, "l[1E-2]", s));
+    try std.testing.expectError(error.ParseError, evaluate(ar, "1-2", s));
+    // A fraction indexes as its floor.
+    try std.testing.expectEqualStrings("20", try evalStr(ar, "l[1.5]", s));
+    // `>=` and `<=` include equality, so an array is >= itself.
+    try std.testing.expectEqualStrings("true", try evalStr(ar, "l >= l && l <= l", s));
+    try std.testing.expectEqualStrings("false", try evalStr(ar, "l > l", s));
+    // The string functions are false for an array or object, either side.
+    for ([_][]const u8{ "contains(o, 'v')", "contains('Object', o)", "startsWith(l, 'A')", "endsWith('x', l)" }) |e|
+        try std.testing.expectEqualStrings("false", try evalStr(ar, e, s));
+    try std.testing.expectEqualStrings("true", try evalStr(ar, "contains(l, 20)", s));
+    // JSON has no NaN or Infinity: null, as JSON.stringify writes them.
+    try std.testing.expectEqualStrings("null", try evalStr(ar, "toJSON(NaN)", s));
+    try std.testing.expectEqualStrings("null", try evalStr(ar, "toJSON(-Infinity)", s));
+    // A filter's result stays one through a function, and is a new array.
+    try std.testing.expectEqualStrings("a,b", try evalStr(ar, "join(case(true, objs.*, l).n)", s));
+    try std.testing.expectEqualStrings("false", try evalStr(ar, "l.* == l", s));
 }
