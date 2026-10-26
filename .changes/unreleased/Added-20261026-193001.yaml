@@ -1,3 +1,0 @@
-kind: Added
-body: 'CI checks the expression evaluator against GitHub''s own expression test cases (from actions/languageservices): all but 1 of 1020 pass (GitHub''s memory limit, which the runner keeps looser on purpose). Failures are listed in `runner/tools/exprcorpus-failing.txt`, and CI fails when a case breaks or when a listed one starts passing. `.github/scripts/expr-conformance.sh --report` shows what GitHub expects for each.'
-time: 2026-10-26T19:30:01.000000-04:00
