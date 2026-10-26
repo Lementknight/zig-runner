@@ -1,0 +1,3 @@
+kind: Changed
+body: 'CI''s test jobs on GitHub''s runners call the compiler directly instead of through `zig build`, skipping the cold compile of Zig''s build system: 15 s instead of 119 s on a laptop, where those steps took 81-116 s. The project''s own runners still use `zig build test`.'
+time: 2026-10-26T18:11:17.656741-04:00
