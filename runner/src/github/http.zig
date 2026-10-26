@@ -27,6 +27,16 @@ pub fn renew(stale: *std.http.Client) void {
     if (shared.cmpxchgStrong(stale, fresh, .acq_rel, .acquire) != null) gpa.destroy(fresh);
 }
 
+/// How many times a request may meet a kept-alive connection the server has closed (nothing was
+/// processed) before it gives up: one more than the idle connections the pool keeps, so it always
+/// gets past all of them to a new one. It was 8, and 16 runners registering at once leave 16 idle
+/// connections to api.github.com, all closed by GitHub a minute later: the next request found 8
+/// dead ones in a row and failed (the stale-registration sweep's listing, every time).
+pub fn staleRetries(c: ?*std.http.Client) u32 {
+    const kept: usize = if (c) |cl| cl.connection_pool.free_size else 32;
+    return @intCast(kept + 1);
+}
+
 /// Whether `err` is a certificate judged by a client's stale clock (see `renew`).
 pub fn staleClock(err: anyerror) bool {
     return err == error.CertificateNotYetValid or err == error.CertificateExpired;
@@ -43,7 +53,7 @@ pub fn fetch(
     var renewed = false;
     while (true) : (attempt += 1) {
         return cl.fetch(options) catch |err| switch (err) {
-            error.HttpConnectionClosing => if (attempt < 8) continue else err,
+            error.HttpConnectionClosing => if (attempt < staleRetries(cl)) continue else err,
             else => if (!renewed and staleClock(err) and shared.load(.acquire) == cl) {
                 renew(cl);
                 cl = shared.load(.acquire).?;
@@ -124,4 +134,14 @@ test "renew replaces the shared client once, however many saw it go stale" {
     // A second runner that saw the same stale client finds it already replaced.
     renew(&first);
     try std.testing.expectEqual(second, shared.load(.acquire).?);
+}
+
+test "a request can get past every idle connection the pool keeps" {
+    var c: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer c.deinit();
+    const kept: u32 = @intCast(c.connection_pool.free_size);
+    try std.testing.expectEqual(kept + 1, staleRetries(&c));
+    // 16 runners, each leaving a connection behind: more than the 8 tries there used to be.
+    try std.testing.expect(staleRetries(&c) > 16);
+    try std.testing.expectEqual(@as(u32, 33), staleRetries(null));
 }
