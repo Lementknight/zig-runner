@@ -31,7 +31,7 @@ pub const Socket = struct {
         defer gpa.free(bearer);
 
         var local: ?*std.http.Client = null;
-        const client = http.shared orelse blk: {
+        const client = http.shared.load(.acquire) orelse blk: {
             const c = try gpa.create(std.http.Client);
             c.* = .{ .allocator = gpa, .io = io, .write_buffer_size = 16 * 1024 };
             local = c;
@@ -57,6 +57,8 @@ pub const Socket = struct {
             .redirect_behavior = .unhandled,
         });
         errdefer req.deinit();
+        // Open for the whole job and mostly idle: keepalive notices a peer that went away.
+        if (req.connection) |conn| http.keepAlive(conn.stream_reader.stream.socket.handle);
         try req.sendBodiless();
         const resp = try req.receiveHead(&.{});
         if (resp.head.status != .switching_protocols) return error.WebSocketRefused;
