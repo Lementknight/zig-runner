@@ -133,6 +133,12 @@ sudo cp deploy/zig-runner-deploy.service deploy/zig-runner-deploy.timer /etc/sys
 sudo systemctl daemon-reload && sudo systemctl enable --now zig-runner-deploy.timer
 ```
 
+## Benchmarks
+
+[BENCHMARKS.md](BENCHMARKS.md) has what was measured on the reference machine, a Raspberry Pi 5:
+where a job's time goes (the engine, not the runner), what an engine restart does to its cache, what
+installing Zig costs, and the earlier study's results with their verdicts.
+
 ## Changelog
 
 [CHANGELOG.md](CHANGELOG.md) is kept with [changie](https://changie.dev): each change is a file
