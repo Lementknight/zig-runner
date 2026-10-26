@@ -1,28 +1,5 @@
 basic/empty_expression/0
 basic/unknown context/0
-case/case/0
-case/case/1
-case/case/10
-case/case/11
-case/case/12
-case/case/13
-case/case/14
-case/case/15
-case/case/16
-case/case/17
-case/case/18
-case/case/19
-case/case/2
-case/case/20
-case/case/21
-case/case/27
-case/case/3
-case/case/4
-case/case/5
-case/case/6
-case/case/7
-case/case/8
-case/case/9
 endsWith/case-insensitive-ç-Ç/0
 endsWith/case-insensitive-ç-Ç/1
 endsWith/case-insensitive-ü-Ü/0
@@ -36,8 +13,6 @@ endsWith/case-insensitive-ς-(final-lowercase-sigma)-Σ-(capital-sigma)-σ-(non-
 endsWith/cyrillic-letters/0
 join/join/13
 join/join/14
-join/join/15
-join/join/16
 join/join/6
 join/join/7
 op_dot/property-basics/9
@@ -117,8 +92,6 @@ operators_case_insensitive/case-insensitive-ς-(final-lowercase-sigma)-Σ-(capit
 operators_case_insensitive/case-insensitive-ς-(final-lowercase-sigma)-Σ-(capital-sigma)-σ-(non-final-sigma)/7
 operators_case_insensitive/case-insensitive-ς-(final-lowercase-sigma)-Σ-(capital-sigma)-σ-(non-final-sigma)/8
 operators_case_insensitive/cyrillic-letters/0
-startsWith/basics/10
-startsWith/basics/9
 startsWith/case-insensitive-ç-Ç/0
 startsWith/case-insensitive-ç-Ç/1
 startsWith/case-insensitive-ü-Ü/0
@@ -132,9 +105,3 @@ startsWith/case-insensitive-ς-(final-lowercase-sigma)-Σ-(capital-sigma)-σ-(no
 startsWith/cyrillic-letters/0
 syntax-errors/depth-errors/9
 syntax-errors/memory-errors/0
-syntax-errors/parsing-errors/12
-syntax-errors/parsing-errors/13
-syntax-errors/parsing-errors/25
-syntax-errors/parsing-errors/26
-syntax-errors/parsing-errors/27
-syntax-errors/parsing-errors/28

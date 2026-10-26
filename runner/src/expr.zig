@@ -276,6 +276,23 @@ const Node = union(enum) {
     bin: struct { op: BinOp, l: *Node, r: *Node },
 };
 
+/// The functions there are, with how many arguments each takes.
+const functions = [_]struct { name: []const u8, min: usize, max: usize }{
+    .{ .name = "contains", .min = 2, .max = 2 },
+    .{ .name = "startsWith", .min = 2, .max = 2 },
+    .{ .name = "endsWith", .min = 2, .max = 2 },
+    .{ .name = "format", .min = 1, .max = std.math.maxInt(usize) },
+    .{ .name = "join", .min = 1, .max = 2 },
+    .{ .name = "toJSON", .min = 1, .max = 1 },
+    .{ .name = "fromJSON", .min = 1, .max = 1 },
+    .{ .name = "hashFiles", .min = 1, .max = std.math.maxInt(usize) },
+    .{ .name = "case", .min = 3, .max = std.math.maxInt(usize) },
+    .{ .name = "success", .min = 0, .max = 0 },
+    .{ .name = "always", .min = 0, .max = 0 },
+    .{ .name = "cancelled", .min = 0, .max = 0 },
+    .{ .name = "failure", .min = 0, .max = 0 },
+};
+
 /// GitHub refuses an expression nested deeper than this ("Exceeded max expression depth 50"). It
 /// also keeps the parser's and the evaluator's recursion bounded: `action.yml` files are read as
 /// written, with no check of GitHub's in between, and 100000 nested `!` overflowed the stack.
@@ -342,6 +359,19 @@ const Parser = struct {
 
     fn tooDeep(p: *Parser) Error {
         return p.lex.bad("the expression is nested more than {d} deep", .{max_depth});
+    }
+
+    /// GitHub refuses an unknown function, or one given the wrong number of arguments, when it
+    /// parses the expression, so even where it would never be called (`false && nope()`).
+    fn checkCall(p: *Parser, name: []const u8, n: usize) Error!void {
+        for (functions) |f| if (std.ascii.eqlIgnoreCase(f.name, name)) {
+            if (n < f.min) return p.lex.bad("too few arguments to {s}()", .{name});
+            if (n > f.max) return p.lex.bad("too many arguments to {s}()", .{name});
+            if (std.ascii.eqlIgnoreCase(name, "case") and n % 2 == 0)
+                return p.lex.bad("case() takes an odd number of arguments", .{});
+            return;
+        };
+        return p.lex.bad("unknown function '{s}'", .{name});
     }
 
     fn enter(p: *Parser) Error!void {
@@ -478,6 +508,7 @@ const Parser = struct {
                     if (p.cur != .rparen)
                         return p.lex.bad("expected ')' after the arguments of {s}()", .{name});
                     try p.advance();
+                    try p.checkCall(name, args.items.len);
                     return p.node(.{ .call = .{ .name = name, .args = args.items } });
                 }
                 if (std.ascii.eqlIgnoreCase(name, "true"))
@@ -707,6 +738,7 @@ fn eval(arena: Allocator, n: *const Node, scope: Scope) Error!Value {
 fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: Scope) Error!Value {
     const eql = std.ascii.eqlIgnoreCase;
     if (statusFunction(name, scope)) |v| return v;
+    if (eql(name, "case")) return callCase(arena, arg_nodes, scope);
     if (eql(name, "hashFiles") and scope.hash_files == null) {
         if (scope.diag) |d| d.* = "hashFiles() is not supported here";
         return error.Unsupported;
@@ -734,6 +766,19 @@ fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: S
     if (eql(name, "toJSON")) return callToJson(arena, args, scope);
     if (eql(name, "fromJSON")) return callFromJson(arena, args, scope);
     return scope.fail("unknown function '{s}'", .{name}, arena);
+}
+
+/// `case(pred1, value1, pred2, value2, ..., default)`: the value after the first true predicate,
+/// else the default. Only what is needed is evaluated, and a predicate must be a boolean.
+fn callCase(arena: Allocator, args: []*Node, scope: Scope) Error!Value {
+    var i: usize = 0;
+    while (i + 1 < args.len) : (i += 2) {
+        switch (try eval(arena, args[i], scope)) {
+            .boolean => |b| if (b) return eval(arena, args[i + 1], scope),
+            else => return scope.fail("case(): a predicate must be true or false", .{}, arena),
+        }
+    }
+    return eval(arena, args[args.len - 1], scope);
 }
 
 /// `success()`, `always()`, `cancelled()`, `failure()`: the job's state, no arguments evaluated.
@@ -1094,7 +1139,7 @@ test "&& and || return operands" {
     try std.testing.expectEqualStrings("0", try evalStr(ar, "0 && 'x'", s));
     try std.testing.expectEqualStrings("", try evalStr(ar, "null || null", s));
     // short-circuit: the right side would be an error
-    try std.testing.expectEqualStrings("ok", try evalStr(ar, "'ok' || nosuchfunction()", s));
+    try std.testing.expectEqualStrings("ok", try evalStr(ar, "'ok' || fromJSON('{')", s));
 }
 
 test "contexts, properties and indexing" {
@@ -1225,8 +1270,11 @@ test "errors say what is wrong" {
     try std.testing.expectError(error.ParseError, evaluate(ar, "'unterminated", s));
     try std.testing.expectError(error.ParseError, evaluate(ar, "(1 == 1", s));
     try std.testing.expect(std.mem.indexOf(u8, diag, "(1 == 1") != null);
-    try std.testing.expectError(error.EvalError, evaluate(ar, "nosuch('x')", s));
-    try std.testing.expectEqualStrings("unknown function 'nosuch'", diag);
+    // As GitHub: when parsing, so even where it would never be called.
+    try std.testing.expectError(error.ParseError, evaluate(ar, "false && nosuch('x')", s));
+    try std.testing.expect(std.mem.startsWith(u8, diag, "unknown function 'nosuch'"));
+    try std.testing.expectError(error.ParseError, evaluate(ar, "join()", s));
+    try std.testing.expectError(error.ParseError, evaluate(ar, "case(true, 1)", s));
     try std.testing.expectError(error.EvalError, evaluate(ar, "format('{3}', 'a')", s));
     try std.testing.expectError(error.Unsupported, evaluate(ar, "hashFiles('**/*.zig')", s));
     try std.testing.expectEqualStrings("hashFiles() is not supported here", diag);
@@ -1252,7 +1300,19 @@ test "hashFiles calls the scope's hook with its patterns" {
     try std.testing.expectEqualStrings("**/go.sum|!x/**", (try evaluate(ar, "hashFiles('**/go.sum', '!x/**')", s)).string);
     try std.testing.expectError(error.EvalError, evaluate(ar, "hashFiles('bad')", s));
     try std.testing.expectEqualStrings("hashFiles(bad) failed: no", diag);
-    try std.testing.expectError(error.EvalError, evaluate(ar, "hashFiles()", s));
+    try std.testing.expectError(error.ParseError, evaluate(ar, "hashFiles()", s));
+}
+
+test "case() picks the value after the first true predicate, evaluating only what it needs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const s: Scope = .{};
+    try std.testing.expectEqualStrings("b", try evalStr(ar, "case(false, 'a', 1 == 1, 'b', 'c')", s));
+    try std.testing.expectEqualStrings("c", try evalStr(ar, "case(false, 'a', false, 'b', 'c')", s));
+    // The rest is never evaluated: fromJSON('{') would be an error.
+    try std.testing.expectEqualStrings("a", try evalStr(ar, "case(true, 'a', fromJSON('{'), 'b', 'c')", s));
+    try std.testing.expectError(error.EvalError, evaluate(ar, "case(1, 'a', 'b')", s));
 }
 
 test "unsupported contexts fail loudly" {
