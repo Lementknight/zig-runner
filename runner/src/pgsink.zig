@@ -5,10 +5,16 @@
 //! when `flush_ms` has passed since the last write (checked on append and by a background flusher,
 //! so a quiet job's last line is not stuck), and on `flush()`/`close()` (step and job end).
 //!
-//! The database must never fail a job. If a write fails, the lines stay buffered and the next flush
-//! reconnects and retries (not more often than every 2 s); if the buffer outgrows `max_buffered`,
-//! the oldest lines are dropped and counted, which is the only way a `seq` gap can appear. Every
-//! line is also passed to `inner` (the console) first.
+//! The database must never fail a job, nor hold one up. If a write fails, the lines stay buffered and
+//! the next flush reconnects and retries (not more often than every 2 s); if the buffer outgrows
+//! `max_buffered`, the oldest lines are dropped and counted, which is the only way a `seq` gap can
+//! appear. Every line is also passed to `inner` (the console) first.
+//!
+//! Once `startFlusher` has run, only the flusher talks to the database, and never with `mu` held:
+//! a line is only buffered, and `flush` waits a bounded time. Before, whoever appended the line that
+//! made a batch due wrote it while holding `mu`, which every runner's lines go through, so a
+//! database that stopped answering stopped every runner: paused for 60 s, it added 52 s to every job
+//! that started meanwhile. Without a flusher (tests, one-off commands) lines are written inline.
 const std = @import("std");
 const pg = @import("pg.zig");
 const sink = @import("sink.zig");
@@ -58,6 +64,20 @@ pub const PgSink = struct {
 
     stop: std.atomic.Value(bool) = .init(false),
     flusher: ?Io.Future(void) = null,
+    /// `flush` asks for a write (`flush_asked`) and waits until the flusher has made one since
+    /// (`flush_done`), or `flush_wait_ms` have passed.
+    flush_asked: std.atomic.Value(u64) = .init(0),
+    flush_done: std.atomic.Value(u64) = .init(0),
+    flush_wait_ms: u32 = 1000,
+    /// When the flusher's current write began, 0 while it is not writing. `flush` does not wait on
+    /// a write that has taken longer than `stuck_ms`: the database is not answering, and waiting
+    /// out `flush_wait_ms` at the end of every step added 6 s to each job while it was paused.
+    writing_since: std.atomic.Value(i64) = .init(0),
+    stuck_ms: i64 = 250,
+    flusher_started: bool = false,
+    flusher_stopped: std.atomic.Value(bool) = .init(false),
+    /// What `close` gives the flusher to write what is left before cutting it short.
+    close_wait_ms: u32 = 5000,
 
     pub fn append(
         s: *PgSink,
@@ -105,13 +125,22 @@ pub const PgSink = struct {
             .stream = stream,
             .text = owned,
         });
-        if (s.rows.items.len >= s.flush_lines or now(s.io) - s.last_flush_ms >= s.flush_ms)
+        if (s.flusher == null and
+            (s.rows.items.len >= s.flush_lines or now(s.io) - s.last_flush_ms >= s.flush_ms))
             s.flushLocked();
         s.enforceCap();
     }
 
     pub fn flush(s: *PgSink) sink.Error!void {
         try s.inner.flush();
+        if (s.flusher != null) {
+            const want = s.flush_asked.fetchAdd(1, .acq_rel) + 1;
+            var waited: u32 = 0;
+            while (s.flush_done.load(.acquire) < want and waited < s.flush_wait_ms and
+                !s.stuck()) : (waited += 10)
+                s.io.sleep(.fromMilliseconds(10), .awake) catch return;
+            return;
+        }
         s.mu.lockUncancelable(s.io);
         defer s.mu.unlock(s.io);
         s.flushLocked();
@@ -119,10 +148,18 @@ pub const PgSink = struct {
 
     pub fn close(s: *PgSink) void {
         s.stop.store(true, .release);
-        if (s.flusher) |*f| f.await(s.io);
+        if (s.flusher) |*f| {
+            // The flusher writes what is left as it stops. A database that does not answer gets
+            // `close_wait_ms`; then the write is cancelled, and what it held is dropped below.
+            var waited: u32 = 0;
+            while (!s.flusher_stopped.load(.acquire) and waited < s.close_wait_ms) : (waited += 50)
+                s.io.sleep(.fromMilliseconds(50), .awake) catch break;
+            f.cancel(s.io);
+        }
         s.flusher = null;
         s.mu.lockUncancelable(s.io);
-        s.flushLocked();
+        // With a flusher, it wrote what it could; without one, this is the last write.
+        if (!s.flusher_started) s.flushLocked();
         if (s.client) |c| c.close();
         s.client = null;
         s.mu.unlock(s.io);
@@ -131,19 +168,84 @@ pub const PgSink = struct {
         s.next_seq.deinit(s.gpa);
     }
 
-    /// Starts the task that writes a quiet job's pending lines on time.
+    /// Starts the task that writes buffered lines: on time for a quiet job, at once when a batch is
+    /// full or `flush` asks, and the rest when the sink closes.
     pub fn startFlusher(s: *PgSink) !void {
+        s.flusher_started = true;
         s.flusher = try s.io.concurrent(flusherMain, .{s});
     }
 
     fn flusherMain(s: *PgSink) void {
-        const tick: i64 = @max(50, @divFloor(@as(i64, s.flush_ms), 2));
-        while (!s.stop.load(.acquire)) {
-            s.io.sleep(.fromMilliseconds(tick), .awake) catch return;
-            s.mu.lockUncancelable(s.io);
-            if (s.rows.items.len > 0 and now(s.io) - s.last_flush_ms >= s.flush_ms) s.flushLocked();
-            s.mu.unlock(s.io);
+        defer s.flusher_stopped.store(true, .release);
+        while (true) {
+            // In short steps, so a full batch or a `flush` is written within 20 ms.
+            const asked = s.flush_asked.load(.acquire);
+            const stopping = s.stop.load(.acquire);
+            if (stopping or asked > s.flush_done.load(.acquire) or s.due()) {
+                s.writePending();
+                s.flush_done.store(asked, .release);
+                if (stopping) return;
+            }
+            s.io.sleep(.fromMilliseconds(20), .awake) catch return;
         }
+    }
+
+    /// Whether the flusher's current write has gone on too long to be worth waiting for.
+    fn stuck(s: *PgSink) bool {
+        const since = s.writing_since.load(.acquire);
+        return since != 0 and now(s.io) - since > s.stuck_ms;
+    }
+
+    /// Whether the buffered lines should be written now: a full batch, or the oldest waiting too long.
+    fn due(s: *PgSink) bool {
+        s.mu.lockUncancelable(s.io);
+        defer s.mu.unlock(s.io);
+        if (s.rows.items.len == 0) return false;
+        return s.rows.items.len >= s.flush_lines or now(s.io) - s.last_flush_ms >= s.flush_ms;
+    }
+
+    /// The flusher's write: the buffered lines are taken under `mu` and written without it, so lines
+    /// keep arriving while the database is slow. A failed batch goes back in front of what came
+    /// meanwhile, so the order (and `seq`) is kept.
+    fn writePending(s: *PgSink) void {
+        var batch: std.ArrayList(Row) = .empty;
+        {
+            s.mu.lockUncancelable(s.io);
+            defer s.mu.unlock(s.io);
+            if (s.rows.items.len == 0 or now(s.io) < s.retry_after_ms) return;
+            batch = s.rows;
+            s.rows = .empty;
+        }
+        const t = now(s.io);
+        s.writing_since.store(t, .release);
+        defer s.writing_since.store(0, .release);
+        const n = s.writeRows(batch.items) catch |e| {
+            const detail = if (s.client) |c| c.lastErrorText() else "";
+            s.mu.lockUncancelable(s.io);
+            defer s.mu.unlock(s.io);
+            s.remember("log write failed", if (detail.len > 0) detail else @errorName(e));
+            if (s.client) |c| c.close();
+            s.client = null;
+            s.retry_after_ms = t + 2000;
+            // Put back, in front: the batch, then what arrived while it was being written.
+            batch.appendSlice(s.gpa, s.rows.items) catch {
+                // No memory to put it back: the failed batch is lost, and counted as dropped.
+                s.dropped += batch.items.len;
+                for (batch.items) |r| s.gpa.free(r.text);
+                batch.deinit(s.gpa);
+                return;
+            };
+            s.rows.deinit(s.gpa);
+            s.rows = batch;
+            s.enforceCap();
+            return;
+        };
+        for (batch.items) |r| s.gpa.free(r.text);
+        batch.deinit(s.gpa);
+        s.mu.lockUncancelable(s.io);
+        defer s.mu.unlock(s.io);
+        s.written += n;
+        s.last_flush_ms = t;
     }
 
     pub fn errorText(s: *const PgSink) []const u8 {
@@ -160,12 +262,13 @@ pub const PgSink = struct {
         s.last_error_len = t.len;
     }
 
-    /// Writes the buffered rows; on failure keeps them and backs off. Called with `mu` held.
+    /// Writes the buffered rows; on failure keeps them and backs off. Called with `mu` held, and
+    /// only without a flusher.
     fn flushLocked(s: *PgSink) void {
         if (s.rows.items.len == 0) return;
         const t = now(s.io);
         if (t < s.retry_after_ms) return;
-        s.writeBatch() catch |e| {
+        const n = s.writeRows(s.rows.items) catch |e| {
             const detail = if (s.client) |c| c.lastErrorText() else "";
             s.remember("log write failed", if (detail.len > 0) detail else @errorName(e));
             if (s.client) |c| c.close();
@@ -173,10 +276,15 @@ pub const PgSink = struct {
             s.retry_after_ms = t + 2000;
             return;
         };
+        s.written += n;
+        for (s.rows.items) |r| s.gpa.free(r.text);
+        s.rows.clearRetainingCapacity();
         s.last_flush_ms = t;
     }
 
-    fn writeBatch(s: *PgSink) !void {
+    /// One COPY of `rows`, connecting first if there is no connection. Only one caller at a time:
+    /// the flusher, or `flushLocked` under `mu` when there is none.
+    fn writeRows(s: *PgSink, rows: []const Row) !u64 {
         if (s.client == null) {
             const c = try pg.Client.connect(s.gpa, s.io, s.cfg);
             s.client = c;
@@ -192,7 +300,7 @@ pub const PgSink = struct {
         defer arena_state.deinit();
         var data: Io.Writer.Allocating = .init(arena_state.allocator());
         const w = &data.writer;
-        for (s.rows.items) |r| {
+        for (rows) |r| {
             try w.writeAll(try timefmt.isoTime(arena_state.allocator(), r.ts_ms));
             try w.print("\t{d}\t{d}\t{d}\t{s}\t", .{ r.job_id, r.step, r.seq, @tagName(r.stream) });
             try pg.copyField(w, r.text);
@@ -204,10 +312,8 @@ pub const PgSink = struct {
             "COPY job_logs (ts, job_id, step_number, seq, stream, line, step_seq) FROM STDIN",
             data.written(),
         );
-        if (n != s.rows.items.len) return error.ShortCopy;
-        s.written += n;
-        for (s.rows.items) |r| s.gpa.free(r.text);
-        s.rows.clearRetainingCapacity();
+        if (n != rows.len) return error.ShortCopy;
+        return n;
     }
 
     /// If the database stays down, drop the oldest lines rather than grow without bound.
@@ -387,4 +493,50 @@ test "integration: a line's number in its step reaches the database, and a runne
     // The one with no step has no number: null, not zero, so a reader cannot mistake it for a line.
     try std.testing.expectEqualStrings("1", try sc.scalar("select count(*) from job_logs where job_id = 7 and step_seq is null"));
     try std.testing.expectEqualStrings("job succeeded", try sc.scalar("select line from job_logs where job_id = 7 and step_seq is null"));
+}
+
+test "a database that stops answering holds up no line, flush or close" {
+    const io = std.testing.io;
+    // Connections complete in the listener's backlog and are never answered: a database that has
+    // stopped answering, as a paused one does.
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    var console_out: Io.Writer.Allocating = .init(arena_state.allocator());
+    var console: sink.LogSink = .{ .stdout = .{ .writer = &console_out.writer } };
+    var pgs: PgSink = .{
+        .gpa = std.testing.allocator,
+        .io = io,
+        .cfg = .{
+            .host = "127.0.0.1",
+            .port = listener.socket.address.getPort(),
+            .user = "u",
+            .database = "d",
+            .sslmode = .disable,
+        },
+        .inner = &console,
+        .flush_lines = 10,
+        .flush_ms = 50,
+        .close_wait_ms = 300,
+    };
+    try pgs.startFlusher();
+
+    // Batches fall due all along, and the flusher is stuck on the first one: the lines still go
+    // straight in, and the flush gives up after its bounded wait.
+    const started = PgSink.now(io);
+    for (0..200) |_| try pgs.append(1, 1, .stdout, "line");
+    try pgs.flush();
+    try std.testing.expect(PgSink.now(io) - started < 3000);
+    // Once the write is plainly stuck, a step's end does not wait on it at all.
+    try io.sleep(.fromMilliseconds(300), .awake);
+    const flushing = PgSink.now(io);
+    for (0..5) |_| try pgs.flush();
+    try std.testing.expect(PgSink.now(io) - flushing < 200);
+
+    const closing = PgSink.now(io);
+    pgs.close();
+    try std.testing.expect(PgSink.now(io) - closing < 3000);
+    try std.testing.expectEqual(@as(u64, 0), pgs.written);
 }
