@@ -71,14 +71,21 @@ pub fn request(
     // the connection is dropped (see `requestOnce`). The pool can hold several such connections to
     // the same host (six jobs finishing at once after minutes of quiet), so try again until a live
     // or new connection answers.
+    // A certificate judged by the shared client's stale clock: once, with a new client (`renew`).
     var attempt: u32 = 0;
+    var renewed = false;
     while (true) : (attempt += 1) {
+        const used = http.shared.load(.acquire);
         return requestOnce(arena, io, method, url, payload, opts) catch |err| switch (err) {
             error.HttpConnectionClosing, error.WriteFailed => if (attempt < max_stale_retries)
                 continue
             else
                 err,
-            else => err,
+            else => if (!renewed and http.staleClock(err) and used != null) {
+                http.renew(used.?);
+                renewed = true;
+                continue;
+            } else err,
         };
     }
 }
@@ -96,7 +103,8 @@ fn requestOnce(
 ) !Response {
     // What the request needs only while it runs (headers, the decompression window) is freed with
     // it; only the response body goes to `arena`, which a waiting runner keeps until its next job.
-    var scratch_state: std.heap.ArenaAllocator = .init(if (http.shared) |c| c.allocator else arena);
+    const shared = http.shared.load(.acquire);
+    var scratch_state: std.heap.ArenaAllocator = .init(if (shared) |c| c.allocator else arena);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
     var bearer: ?[]const u8 = if (opts.token) |t| try std.fmt.allocPrint(
@@ -170,6 +178,7 @@ fn exchange(x: Exchange) !union(enum) { done: Response, redirect: Redirect } {
         .redirect_behavior = .unhandled,
     });
     defer req.deinit();
+    if (req.connection) |conn| http.keepAlive(conn.stream_reader.stream.socket.handle);
     // A connection a request failed on is not given back to the pool: one that failed while writing
     // (the server had closed it) would otherwise fail every later request to that host, which is
     // how every log upload of a runner failed from one moment on.

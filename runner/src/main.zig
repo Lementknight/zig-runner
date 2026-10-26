@@ -106,7 +106,7 @@ pub fn main(init: std.process.Init) !u8 {
         .write_buffer_size = 16 * 1024,
     };
     defer client.deinit();
-    http.shared = &client;
+    http.shared.store(&client, .release);
     try settleRegistrations(arena, io, &cfg, log);
     installStopSignals();
     return runPool(init, &cfg, log, err, secrets, name, if (store) |*st| st else null);

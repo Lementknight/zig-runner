@@ -67,6 +67,8 @@ pub const Spool = struct {
     w: ?std.Io.File.Writer = null,
     /// Bytes written, for the same cap the in-memory path has.
     bytes: usize = 0,
+    /// The file's length: `bytes` and each record's header, which is what `read` reads back.
+    file_bytes: usize = 0,
     /// Set when a write failed: the sink then keeps lines in memory instead.
     broken: bool = false,
 
@@ -86,6 +88,10 @@ pub const Spool = struct {
             return;
         };
         sp.bytes += line.text.len;
+        sp.file_bytes += std.fmt.count(
+            "{d} {d} {d} {d}\n",
+            .{ line.step, line.seq, line.ts_ms, line.text.len },
+        ) + line.text.len + 1;
     }
 
     /// Every record, in the order they were written. The caller owns the result.
@@ -95,7 +101,10 @@ pub const Spool = struct {
         // not disturb it.
         var buf: [64 * 1024]u8 = undefined;
         var r = sp.file.reader(sp.io, &buf);
-        const all = r.interface.allocRemaining(arena, .limited(CollectSink.max_bytes)) catch
+        // The whole file. It was read up to `max_bytes`, the cap on the lines' text alone, so a log
+        // near the cap had a file past it (its headers on top), the read failed, and the job's log
+        // was uploaded empty.
+        const all = r.interface.allocRemaining(arena, .limited(sp.file_bytes + 1)) catch
             return out.items;
         var rest = all;
         while (rest.len > 0) {
@@ -377,6 +386,29 @@ test "a spooled job's lines come back from disk, in order, with their numbers" {
     try std.testing.expectEqual(@as(u64, 1), back[1].seq);
     try std.testing.expectEqual(@as(u64, 2), back[2].seq);
     try std.testing.expectEqualStrings("two\nlines", back[2].text);
+}
+
+test "a spool whose lines are near the cap comes back whole, headers and all" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "spool", .{ .read = true });
+    defer file.close(std.testing.io);
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var spool: Spool = .{ .file = file, .io = std.testing.io };
+
+    // 64 lines just under 1 MiB: their text is under the cap, the file with its headers is over it.
+    const text = try a.allocator().alloc(u8, 1024 * 1024 - 8);
+    @memset(text, 'x');
+    for (0..64) |i| spool.write(.{ .step = 1, .seq = i + 1, .ts_ms = 0, .text = text });
+    try std.testing.expect(!spool.broken);
+    try std.testing.expect(spool.bytes <= CollectSink.max_bytes);
+    try std.testing.expect(spool.file_bytes > CollectSink.max_bytes);
+
+    const back = try spool.read(a.allocator());
+    try std.testing.expectEqual(@as(usize, 64), back.len);
+    try std.testing.expectEqual(@as(u64, 64), back[63].seq);
+    try std.testing.expectEqual(text.len, back[63].text.len);
 }
 
 test "a spool that breaks falls back to memory, and both halves come back" {
