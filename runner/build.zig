@@ -35,6 +35,10 @@ pub fn build(b: *std.Build) void {
     // the cache does not see: a run without a database would otherwise be replayed as the run with.
     run_tests.has_side_effects = true;
     test_step.dependOn(&run_tests.step);
+    // The runner itself too. Zig compiles only what is reached, and the tests never reach the
+    // runner's main loop (`loop.cycle`): a type error there passed `zig build test`, and CI with
+    // it, and turned up only when the release image was built.
+    test_step.dependOn(&exe.step);
 }
 
 /// A file holding the version, for `src/version.zig` to `@embedFile`: `v0.2.0-118-g5063ae36`, with
