@@ -83,6 +83,11 @@ pub const Config = struct {
     /// copying every file (28.6 s against 0.2 s on a Raspberry Pi; see SPEC Â§6 "Package caches").
     /// The workspace gets a `.venv` symlink to it, so paths into `.venv` still work.
     uv_env_in_cache: bool = true,
+    /// Keep Zig's local cache (`.zig-cache`) between jobs, in a cache volume of its own: about 1.2 s
+    /// off every `zig build test` of zig-runner itself, and 4-6 s when the previous build of the
+    /// repository had the same source. Off by default: Zig never removes anything from that cache,
+    /// so it grows by about 50 MB for every source version built, until the engine collects it.
+    zig_local_cache: bool = false,
     /// Output keys cost two walks of the job's filesystem, whatever the step changed: 25 s on a
     /// large checkout against 1 s on a small one (STUDY.md Â§3.6). When a job spends longer than
     /// this on them, later jobs for that repository skip them until the runner restarts. 0 never
@@ -190,6 +195,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_ENFORCE_VOLATILE")) |v| c.enforce_volatile = try boolean(v);
         if (environ.get("RUNNER_LOG_SPOOL_DIR")) |v| c.log_spool_dir = v;
         if (environ.get("RUNNER_UV_ENV_IN_CACHE")) |v| c.uv_env_in_cache = try boolean(v);
+        if (environ.get("RUNNER_ZIG_LOCAL_CACHE")) |v| c.zig_local_cache = try boolean(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_MAX_MS")) |v| c.output_keys_max_ms = try millis(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_DAYS")) |v| c.output_keys_days = try count(v);
         if (environ.get("RUNNER_ONCE")) |v| c.once = try boolean(v);
@@ -234,6 +240,7 @@ pub const Config = struct {
         else if (eq(key, "step-cache")) c.step_cache = try boolean(val) //
         else if (eq(key, "step-user")) c.step_user = try stepUser(val) //
         else if (eq(key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
+        else if (eq(key, "zig-local-cache")) c.zig_local_cache = try boolean(val) //
         else if (eq(key, "output-keys-max-ms")) c.output_keys_max_ms = try millis(val) //
         else if (eq(key, "log-spool-dir")) c.log_spool_dir = val //
         else if (eq(key, "enforce-volatile")) c.enforce_volatile = try boolean(val) //
@@ -440,6 +447,19 @@ test "package caches are on by default and can be turned off" {
     try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--package-caches=false" })).package_caches);
     try env.put("RUNNER_PACKAGE_CACHES", "0");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).package_caches);
+}
+
+test "Zig's local cache is kept only when asked for, and uv's setting is read" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).zig_local_cache);
+    try std.testing.expect((try Config.load(&env, &.{ "runner", "--zig-local-cache=true" })).zig_local_cache);
+    try env.put("RUNNER_ZIG_LOCAL_CACHE", "1");
+    try std.testing.expect((try Config.load(&env, &.{"runner"})).zig_local_cache);
+    try env.put("RUNNER_UV_ENV_IN_CACHE", "false");
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).uv_env_in_cache);
 }
 
 test "step caching is on by default and can be turned off" {

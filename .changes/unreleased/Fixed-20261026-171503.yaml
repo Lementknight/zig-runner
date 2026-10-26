@@ -1,0 +1,3 @@
+kind: Fixed
+body: '`RUNNER_UV_ENV_IN_CACHE` (and `--uv-env-in-cache`) takes effect: it was read but never passed on, so uv''s environment always went in its cache volume.'
+time: 2026-10-26T17:15:03.499028-04:00

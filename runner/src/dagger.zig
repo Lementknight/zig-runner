@@ -123,6 +123,13 @@ fn runnerCachePath(arena: Allocator, i: usize) ![]const u8 {
     return p;
 }
 
+/// Where Zig's local cache (`.zig-cache`) is mounted with `zig_local_cache`, instead of the workspace,
+/// which goes with the job. The volume is per repository (and apart for forks' pull requests), and
+/// Zig locks its cache entries, so jobs running at once share it safely.
+fn zigLocalCacheDir(as_runner: bool) []const u8 {
+    return if (as_runner) runner_home ++ "/.cache/zig-local" else "/root/.cache/zig-local";
+}
+
 /// Where uv's project environment goes with `uv_env_in_cache`: inside its own cache volume, the
 /// only place a hardlink from that cache can reach (every mount is its own device, even two of one
 /// volume). Keyed by the ref, so jobs on different branches do not reconcile one environment to
@@ -1020,6 +1027,8 @@ pub const Options = struct {
     output_keys: bool = false,
     /// `Config.uv_env_in_cache`: uv's project environment goes inside its cache volume.
     uv_env_in_cache: bool = true,
+    /// `Config.zig_local_cache`: Zig's local cache goes in a cache volume of its own.
+    zig_local_cache: bool = false,
     /// Stored outputs not produced again for this many days are removed
     /// (`RUNNER_OUTPUT_KEYS_DAYS`).
     output_keys_days: u32 = 7,
@@ -2710,6 +2719,8 @@ const BasePlan = struct {
     step_cache: bool,
     uv_env: ?[]const u8,
     cache_ids: []const []const u8,
+    /// The volume for Zig's local cache, with `zig_local_cache`.
+    zig_local: ?[]const u8 = null,
     ran_marker: []const u8,
 };
 
@@ -2769,6 +2780,11 @@ fn writeImage(
         } else if (err_msg.len > 0) return error.BaseContainerFailed;
     }
     try q.call("from", .{ .address = plan.job_image });
+    // Before the container's env too, so its value (or the workflow's) wins.
+    if (plan.zig_local != null) try q.call(
+        "withEnvVariable",
+        .{ .name = "ZIG_LOCAL_CACHE_DIR", .value = zigLocalCacheDir(plan.as_runner) },
+    );
     if (job.container != null) for (plan.cache_ids, 0..) |_, i| {
         // Before the container's env, so its own value wins.
         if (package_cache_dirs[i].env.len == 0) continue;
@@ -2840,6 +2856,11 @@ fn writeCacheMounts(q: *Query, arena: Allocator, plan: BasePlan) !void {
         const owner: ?[]const u8 = if (plan.as_runner) runner_user else null;
         try q.call("withMountedCache", .{ .path = path, .cache = id, .owner = owner });
     }
+    if (plan.zig_local) |id| try q.call("withMountedCache", .{
+        .path = zigLocalCacheDir(plan.as_runner),
+        .cache = id,
+        .owner = if (plan.as_runner) runner_user else null,
+    });
 }
 
 /// Run-specific values do not take part in exec cache keys under step caching, so unchanged steps
@@ -3424,22 +3445,24 @@ fn basePlan(
         io.random(&raw);
         break :ran try arena.dupe(u8, &std.fmt.bytesToHex(raw, .lower));
     };
+    const volumes = try cacheVolumeIds(
+        arena,
+        transport,
+        ev,
+        job,
+        opts,
+        job_image,
+        as_runner,
+        err_msg,
+    );
     return .{
         .job_image = job_image,
         .provision = provision,
         .as_runner = as_runner,
         .step_cache = step_cache,
         .uv_env = try uvEnvFor(arena, opts, job, as_runner),
-        .cache_ids = try cacheVolumeIds(
-            arena,
-            transport,
-            ev,
-            job,
-            opts,
-            job_image,
-            as_runner,
-            err_msg,
-        ),
+        .cache_ids = volumes.ids,
+        .zig_local = volumes.zig_local,
         .ran_marker = ran_marker,
     };
 }
@@ -3462,9 +3485,11 @@ fn uvEnvFor(arena: Allocator, opts: Options, job: job_mod.Job, as_runner: bool) 
     return try uvEnvPath(arena, path, job.github.ref);
 }
 
+const CacheVolumes = struct { ids: []const []const u8 = &.{}, zig_local: ?[]const u8 = null };
+
 /// Package managers' caches persist across jobs in Dagger cache volumes (see `package_cache_dirs`):
-/// one query asks for every volume's id. Empty when caches are off or there is no repository to key
-/// them by.
+/// one query asks for every volume's id, and for Zig's local cache's with `zig_local_cache`. None
+/// when caches are off or there is no repository to key them by.
 fn cacheVolumeIds(
     arena: Allocator,
     transport: Transport,
@@ -3474,10 +3499,21 @@ fn cacheVolumeIds(
     job_image: []const u8,
     as_runner: bool,
     err_msg: *[]const u8,
-) ![]const []const u8 {
-    if (!opts.package_caches or job.github.repository.len == 0) return &.{};
+) !CacheVolumes {
+    if (!opts.package_caches or job.github.repository.len == 0) return .{};
     const scope = try packageCacheScope(arena, ev, job.github.repository);
     var q: Query = .init(arena);
+    // Its own volume, so the engine can collect it (it only grows) without the global cache.
+    if (opts.zig_local_cache) {
+        const key = try std.fmt.allocPrint(
+            arena,
+            "zig-runner/{s}/{s}/zig-local{s}",
+            .{ job.github.repository, scope, if (as_runner) "/" ++ runner_user else "" },
+        );
+        try q.callAs("czl", "cacheVolume", .{ .key = key });
+        try q.leaf("id");
+        try q.close(1);
+    }
     for (package_cache_dirs, 0..) |d, i| {
         // The tool cache holds binaries built for one image (glibc or musl, its libraries), so
         // each image has its own.
@@ -3521,7 +3557,14 @@ fn cacheVolumeIds(
             return error.BaseContainerFailed;
         };
     }
-    return ids;
+    const zig_local = if (opts.zig_local_cache)
+        (if (jsonFind(data, "czl")) |v| jsonFindString(v, "id") else null) orelse {
+            err_msg.* = "Dagger returned no cache volume";
+            return error.BaseContainerFailed;
+        }
+    else
+        null;
+    return .{ .ids = ids, .zig_local = zig_local };
 }
 
 /// The Exec a job's steps run through, from everything decided before the first step.
@@ -9515,11 +9558,47 @@ test "package caches: one volume per tool, keyed by repository, separate for for
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/opt/hostedtoolcache\",cache:\"V0\")") != null);
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.npm\",cache:\"V1\")") != null);
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.cache/zig\",cache:\"V11\")") != null);
+        // Zig's local cache stays in the workspace unless `zig_local_cache` is on.
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "zig-local") == null);
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "ZIG_LOCAL_CACHE_DIR") == null);
         // State tools rewrite on every run stays out of the container's filesystem.
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/tmp/node-compile-cache\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.config/go/telemetry\"") != null);
         try std.testing.expect(braceBalanced(fake.seen.items[1]));
     }
+}
+
+test "with zig_local_cache, Zig's local cache gets a volume of its own, outside the workspace" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("zig build test")};
+    const job = testJob(&steps);
+    var vols: std.Io.Writer.Allocating = .init(arena);
+    try vols.writer.writeAll("{\"data\":{\"czl\":{\"id\":\"VZL\"}");
+    for (package_cache_dirs, 0..) |_, i| try vols.writer.print(",\"c{d}\":{{\"id\":\"V{d}\"}}", .{ i, i });
+    try vols.writer.writeAll("}}");
+    const answers = [_][]const u8{ vols.written(), base_answer, try exec(arena, "C1", 0, "") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{
+        .package_caches = true,
+        .zig_local_cache = true,
+        .step_user = .runner,
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+    }, job, &log);
+    try std.testing.expect(res.succeeded);
+    const keys = fake.seen.items[0];
+    const base = fake.seen.items[1];
+    try std.testing.expect(braceBalanced(base));
+    // Apart from the global cache's volume, so the engine can collect it alone.
+    try std.testing.expect(std.mem.indexOf(u8, keys, "czl: cacheVolume(key:\"zig-runner/o/r/repo/zig-local/runner\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base, "withEnvVariable(name:\"ZIG_LOCAL_CACHE_DIR\",value:\"/home/runner/.cache/zig-local\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base, "withMountedCache(path:\"/home/runner/.cache/zig-local\",cache:\"VZL\",owner:\"runner\")") != null);
 }
 
 test "steps run as runner in the default image, as on GitHub, with their own package caches" {

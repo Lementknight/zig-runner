@@ -895,6 +895,8 @@ fn runJobSteps(
         .gpa = c.gpa,
         .nesting = c.cfg.dagger_nesting,
         .package_caches = c.cfg.package_caches,
+        .uv_env_in_cache = c.cfg.uv_env_in_cache,
+        .zig_local_cache = c.cfg.zig_local_cache,
         .step_cache = c.cfg.step_cache,
         .step_user = c.cfg.step_user,
         // Skipped for a repository whose jobs spend too long on them (see `SlowOutputs`).
