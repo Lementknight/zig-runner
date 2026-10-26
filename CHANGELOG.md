@@ -10,6 +10,10 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.6.2 - 2026-10-26
+### Fixed
+* A database that is slow or stops answering no longer holds up jobs: log lines and run-state rows are written by background tasks, never on a job's path. With the database paused for 60 s, jobs on 4 runners took 69-70 s instead of 17-19 s; now 16-17 s, and every line and row still reaches it.
+
 ## v0.6.1 - 2026-10-26
 ### Fixed
 * Long-running runners: every connection to GitHub uses TCP keepalive, so one whose peer went away fails within about 90 s instead of waiting forever; a certificate rejected because the HTTP client still judged it by the time the process started gets a fresh client and is tried again; and a job log near the 64 MiB cap is uploaded whole, where its headers took the file past the cap and the upload was empty.
