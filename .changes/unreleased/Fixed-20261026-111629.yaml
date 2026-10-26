@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'Runners recover from a dropped network: a poll unanswered for 90 s is given up and sent again, where a laptop that slept left every runner offline until restarted. A failed acquirejob (connection error or 5xx) is tried again for up to 15.5 s instead of leaving the job for GitHub to reassign 70 s later.'
+time: 2026-10-26T11:16:34.418907-04:00

@@ -203,19 +203,33 @@ pub fn backoffSecs(failures: u32) u32 {
     return @min(@as(u32, 5) << shift, 300);
 }
 
-const Polled = union(enum) { poll: anyerror!broker.Response, stop: void };
+const Polled = union(enum) { poll: anyerror!broker.Response, stop: void, timeout: void };
 
-/// One long poll for a message (it can take about 50 s), given up as soon as a stop is requested:
-/// the poll runs next to a watcher, and whichever ends first cancels the other (a blocked read is
-/// interrupted). The cycle's cleanup then deletes the session and the registration.
-fn poll(c: Context, url: []const u8, token: []const u8) !Polled {
-    var buf: [2]Polled = undefined;
+/// How long a poll may go unanswered. The broker answers within about 50 s, with a message or
+/// without one; a connection that died under the poll is never answered at all. A laptop that slept
+/// for 40 minutes woke with every runner waiting on such a connection, listening as far as it knew
+/// and offline as far as GitHub knew, until the runner was restarted.
+pub const poll_timeout: std.Io.Duration = .fromSeconds(90);
+
+/// One long poll for a message (it can take about 50 s), given up as soon as a stop is requested or
+/// `timeout` passes: the poll runs next to a watcher and a timer, and whichever ends first cancels
+/// the others (a blocked read is interrupted, and its connection is not reused). The cycle's
+/// cleanup then deletes the session and the registration.
+fn poll(c: Context, url: []const u8, token: []const u8, timeout: std.Io.Duration) !Polled {
+    var buf: [3]Polled = undefined;
     var sel: std.Io.Select(Polled) = .init(c.io, &buf);
+    // A task that could not start must not leave the ones that did running on `buf`.
+    errdefer while (sel.cancel()) |_| {};
     try sel.concurrent(.poll, pollOnce, .{ c.arena, c.io, url, token });
     try sel.concurrent(.stop, waitForStop, .{c});
+    try sel.concurrent(.timeout, waitFor, .{ c.io, timeout });
     const first = sel.await() catch Polled{ .stop = {} };
     while (sel.cancel()) |_| {}
     return first;
+}
+
+fn waitFor(io: std.Io, timeout: std.Io.Duration) void {
+    io.sleep(timeout, .awake) catch {};
 }
 
 fn pollOnce(
@@ -299,8 +313,18 @@ pub fn cycle(c: Context) !Cycle {
                 return failHttp(c, "oauth token refresh", e, status);
             token_at = now;
         }
-        const m = switch (try poll(c, try broker.messageUrl(c.arena, base, sid, "Online"), token)) {
+        const url = try broker.messageUrl(c.arena, base, sid, "Online");
+        const m = switch (try poll(c, url, token, poll_timeout)) {
             .stop => return .stopped,
+            .timeout => {
+                // Not a failure: the next poll goes out on a new connection. If the session did
+                // not survive what killed this one, that poll fails and the cycle starts afresh.
+                try say(c, "'{s}': no answer to a poll in {d} s; polling again", .{
+                    c.name,
+                    @divTrunc(poll_timeout.nanoseconds, std.time.ns_per_s),
+                });
+                continue;
+            },
             .poll => |r| r catch |e| return fail(c, "poll", e),
         };
         if (m.status == .accepted or (m.status.class() == .success and m.body.len == 0)) continue;
@@ -526,10 +550,39 @@ fn slowOutputs(c: Context, repo: []const u8) bool {
     return so.spent(repo) != null;
 }
 
+/// Waits before each further acquire, in milliseconds: 15.5 s in all.
+const acquire_retry_ms = [_]i64{ 500, 1000, 2000, 4000, 8000 };
+
+/// Acquires the job, trying again while the request fails or GitHub answers 5xx. A job whose
+/// acquire failed stays assigned to this runner until GitHub gives it to another, about 70 s later:
+/// three jobs whose acquires failed at once with HostUnreachable started 72 s after the rest.
+fn acquire(
+    c: Context,
+    jr: runservice.JobRequest,
+    token: []const u8,
+    retry_ms: []const i64,
+) !broker.Response {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        const last = attempt == retry_ms.len or stopRequested();
+        if (runservice.acquire(c.arena, c.io, jr, token)) |r| {
+            if (last or r.status.class() != .server_error) return r;
+            try say(c, "'{s}': acquirejob answered HTTP {d}; trying again", .{
+                c.name,
+                @backingInt(r.status),
+            });
+        } else |e| {
+            if (last or e == error.OutOfMemory) return e;
+            try say(c, "'{s}': acquirejob failed ({s}); trying again", .{ c.name, @errorName(e) });
+        }
+        c.io.sleep(.fromMilliseconds(retry_ms[attempt]), .awake) catch {};
+    }
+}
+
 fn handleJob(c: Context, session: Listening, body: []const u8) !Cycle {
     const runner_token = session.token;
     const jr = runservice.parseJobRequest(c.arena, body) catch |e| return fail(c, "job request", e);
-    const acq = runservice.acquire(c.arena, c.io, jr, runner_token) catch |e|
+    const acq = acquire(c, jr, runner_token, &acquire_retry_ms) catch |e|
         return fail(c, "acquirejob", e);
     if (acq.status.class() != .success) return failBody(c, "acquirejob", acq);
 
@@ -1565,6 +1618,119 @@ test "backoffSecs doubles from 5s up to 5 minutes" {
     try std.testing.expectEqual(@as(u32, 160), backoffSecs(6));
     try std.testing.expectEqual(@as(u32, 300), backoffSecs(7));
     try std.testing.expectEqual(@as(u32, 300), backoffSecs(1000));
+}
+
+/// A context for tests that make requests but run no job: its log lines go to `log`.
+fn testContext(arena: Allocator, log: *sink.LogSink, err: *std.Io.Writer, cfg: *Config) Context {
+    return .{
+        .arena = arena,
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .environ = undefined,
+        .cfg = cfg,
+        .log = log,
+        .err = err,
+        .secrets = &.{},
+        .name = "t",
+    };
+}
+
+test "a poll that is never answered is given up after its timeout" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const io = std.testing.io;
+    // Connections complete in the listener's backlog and are never accepted, so a request is sent
+    // and nothing ever comes back: a connection that died under the poll.
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const url = try std.fmt.allocPrint(
+        a.allocator(),
+        "http://127.0.0.1:{d}/message",
+        .{listener.socket.address.getPort()},
+    );
+
+    var out_buf: [1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var err_buf: [1024]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+    var cfg: Config = .{ .gh_token = "", .scope = undefined };
+    const c = testContext(a.allocator(), &log, &err, &cfg);
+
+    const started = std.Io.Clock.awake.now(io).toMilliseconds();
+    const r = try poll(c, url, "token", .fromMilliseconds(300));
+    const took = std.Io.Clock.awake.now(io).toMilliseconds() - started;
+    try std.testing.expect(r == .timeout);
+    try std.testing.expect(took >= 300 and took < 5000);
+}
+
+test "acquirejob is tried again after a 5xx or a failed connection, not after a 4xx" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var server: @import("github/testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    var url_buf: [64]u8 = undefined;
+
+    var cfg: Config = .{ .gh_token = "", .scope = undefined };
+    var err_buf: [1024]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+    const retry_ms = [_]i64{ 1, 1 };
+
+    // 503 on every attempt: tried three times, and the last answer is returned.
+    {
+        var out_buf: [4096]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&out_buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+        const c = testContext(arena, &log, &err, &cfg);
+        const jr: runservice.JobRequest = .{
+            .runner_request_id = "r",
+            .run_service_url = try arena.dupe(
+                u8,
+                server.url(&url_buf, "127.0.0.1", "/unavailable"),
+            ),
+        };
+        const r = try acquire(c, jr, "token", &retry_ms);
+        try std.testing.expectEqual(std.http.Status.service_unavailable, r.status);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out.buffered(), "HTTP 503"));
+    }
+    // 404 is an answer, not a failure: returned at once.
+    {
+        var out_buf: [4096]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&out_buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+        const c = testContext(arena, &log, &err, &cfg);
+        const jr: runservice.JobRequest = .{
+            .runner_request_id = "r",
+            .run_service_url = try arena.dupe(u8, server.url(&url_buf, "127.0.0.1", "/nowhere")),
+        };
+        const r = try acquire(c, jr, "token", &retry_ms);
+        try std.testing.expectEqual(std.http.Status.not_found, r.status);
+        const retries = std.mem.count(u8, out.buffered(), "trying again");
+        try std.testing.expectEqual(@as(usize, 0), retries);
+    }
+    // Nothing listening: tried three times, then the error.
+    {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        var closed = try addr.listen(io, .{ .reuse_address = true });
+        const port = closed.socket.address.getPort();
+        closed.deinit(io);
+
+        var out_buf: [4096]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&out_buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+        const c = testContext(arena, &log, &err, &cfg);
+        const jr: runservice.JobRequest = .{
+            .runner_request_id = "r",
+            .run_service_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{port}),
+        };
+        if (acquire(c, jr, "token", &retry_ms)) |_| return error.TestUnexpectedResult else |_| {}
+        const retries = std.mem.count(u8, out.buffered(), "trying again");
+        try std.testing.expectEqual(@as(usize, 2), retries);
+    }
 }
 
 test "a repository whose output keys run over the limit is remembered once" {
