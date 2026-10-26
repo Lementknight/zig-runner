@@ -41,3 +41,6 @@ zls/
 *.agdai
 _build/
 __pycache__/
+
+# Zig 0.17 unpacks build.zig.zon dependencies here.
+zig-pkg/

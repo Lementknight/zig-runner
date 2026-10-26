@@ -11,8 +11,10 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
-/// std's TLS client plus CertificateRequest support (needed for Tiger Data); see the file header.
-const TlsClient = @import("vendor/tls_client.zig");
+/// Not std's TLS client: it fails when the server asks for a client certificate (a TLS 1.3
+/// CertificateRequest), which Tiger Data and any Postgres configured with a CA file do. This one
+/// answers with an empty Certificate message, as RFC 8446 §4.4.2 says a client without one does.
+const tls = @import("tls");
 const Io = std.Io;
 
 pub const SslMode = enum {
@@ -376,7 +378,9 @@ pub const Client = struct {
     stream: Io.net.Stream,
     stream_reader: Io.net.Stream.Reader,
     stream_writer: Io.net.Stream.Writer,
-    tls: ?TlsClient = null,
+    tls: ?tls.Connection = null,
+    tls_reader: tls.Connection.Reader = undefined,
+    tls_writer: tls.Connection.Writer = undefined,
     r: *Io.Reader,
     w: *Io.Writer,
     buffers: []u8,
@@ -395,16 +399,16 @@ pub const Client = struct {
         // waiting for its answer, which would otherwise wait for good.
         @import("github/http.zig").keepAlive(stream.socket.handle);
 
-        const tls_len = TlsClient.min_buffer_len;
-        const total = 2 * tls_len + (tls_len + plain_buf_len) + tls_len + 2 * plain_buf_len;
-        const buffers = try gpa.alloc(u8, total);
+        const sock_len = tls.input_buffer_len + tls.output_buffer_len;
+        const buffers = try gpa.alloc(u8, sock_len + 2 * plain_buf_len);
         errdefer gpa.free(buffers);
 
         const c = try gpa.create(Client);
         errdefer gpa.destroy(c);
-        // Socket-level buffers (ciphertext when TLS is on), then the TLS plaintext buffers.
-        const sock_r = buffers[0..tls_len];
-        const sock_w = buffers[tls_len .. 2 * tls_len];
+        // Socket-level buffers (ciphertext when TLS is on, sized for a whole record), then the TLS
+        // plaintext buffers.
+        const sock_r = buffers[0..tls.input_buffer_len];
+        const sock_w = buffers[tls.input_buffer_len..sock_len];
         c.* = .{
             .gpa = gpa,
             .io = io,
@@ -419,7 +423,7 @@ pub const Client = struct {
         c.w = &c.stream_writer.interface;
 
         errdefer c.ca_bundle.deinit(gpa);
-        if (cfg.sslmode != .disable) try c.startTls(cfg, buffers[2 * tls_len ..]);
+        if (cfg.sslmode != .disable) try c.startTls(cfg, buffers[sock_len..]);
         try c.startup(cfg);
         return c;
     }
@@ -427,8 +431,7 @@ pub const Client = struct {
     pub fn close(c: *Client) void {
         c.sendMessage('X', "") catch {};
         c.flush() catch {};
-        if (c.tls) |*t| t.end() catch {};
-        c.stream_writer.interface.flush() catch {};
+        if (c.tls) |*t| t.close() catch {};
         c.stream.close(c.io);
         c.ca_bundle.deinit(c.gpa);
         const gpa = c.gpa;
@@ -436,8 +439,7 @@ pub const Client = struct {
         gpa.destroy(c);
     }
 
-    fn startTls(c: *Client, cfg: Config, rest: []u8) Error!void {
-        const tls_len = TlsClient.min_buffer_len;
+    fn startTls(c: *Client, cfg: Config, plain: []u8) Error!void {
         // SSLRequest: int32 length 8, int32 code 80877103.
         c.w.writeInt(u32, 8, .big) catch return error.ConnectionClosed;
         c.w.writeInt(u32, 80877103, .big) catch return error.ConnectionClosed;
@@ -445,36 +447,26 @@ pub const Client = struct {
         const answer = c.r.takeByte() catch return error.ConnectionClosed;
         if (answer != 'S') return error.TlsRefused;
 
-        var entropy: [TlsClient.Options.entropy_len]u8 = undefined;
-        c.io.random(&entropy);
+        const rng: std.Random.IoSource = .{ .io = c.io };
         const now = Io.Clock.real.now(c.io);
-        var opts: TlsClient.Options = .{
-            .host = .no_verification,
-            .ca = .no_verification,
-            .write_buffer = rest[0..tls_len],
-            .read_buffer = rest[tls_len .. 2 * tls_len + plain_buf_len],
-            .entropy = &entropy,
-            .realtime_now = now,
-        };
-        if (cfg.sslmode == .require) {
-            c.ca_bundle.rescan(c.gpa, c.io, now) catch return error.TlsFailed;
-            var lock: Io.RwLock = .init;
-            opts.host = .{ .explicit = cfg.host };
-            opts.ca = .{ .bundle = .{
-                .gpa = c.gpa,
-                .io = c.io,
-                .lock = &lock,
-                .bundle = &c.ca_bundle,
-            } };
-        }
-        c.tls = TlsClient.init(c.r, c.w, opts) catch return error.TlsFailed;
-        c.r = &c.tls.?.reader;
-        c.w = &c.tls.?.writer;
+        const verify = cfg.sslmode == .require;
+        if (verify) c.ca_bundle.rescan(c.gpa, c.io, now) catch return error.TlsFailed;
+        c.tls = tls.client(c.r, c.w, .{
+            .rng = rng.interface(),
+            .now = now,
+            .host = cfg.host,
+            .root_ca = c.ca_bundle,
+            .insecure_skip_verify = !verify,
+        }) catch return error.TlsFailed;
+        c.tls_reader = c.tls.?.reader(plain[0..plain_buf_len]);
+        c.tls_writer = c.tls.?.writer(plain[plain_buf_len..]);
+        c.r = &c.tls_reader.interface;
+        c.w = &c.tls_writer.interface;
     }
 
+    /// With TLS on, each record is written through to the socket as it is sealed.
     fn flush(c: *Client) Io.Writer.Error!void {
         try c.w.flush();
-        if (c.tls != null) try c.stream_writer.interface.flush();
     }
 
     /// `tag` null is the untagged startup message.
