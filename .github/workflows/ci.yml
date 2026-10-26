@@ -118,7 +118,7 @@ jobs:
       # Named, not `.`: zig-pkg/ holds the dependencies once anything has built, in their own style.
       - name: Format check
         working-directory: runner
-        run: zig fmt --check build.zig build.zig.zon src
+        run: zig fmt --check build.zig build.zig.zon src tools
 
       # runner/src/expr.zig against GitHub's own expression test cases (actions/languageservices):
       # fails on a case that broke, or on one that now passes and is still listed as failing.
