@@ -218,6 +218,8 @@ pub const poll_timeout: std.Io.Duration = .fromSeconds(90);
 fn poll(c: Context, url: []const u8, token: []const u8, timeout: std.Io.Duration) !Polled {
     var buf: [3]Polled = undefined;
     var sel: std.Io.Select(Polled) = .init(c.io, &buf);
+    // A task that could not start must not leave the ones that did running on `buf`.
+    errdefer while (sel.cancel()) |_| {};
     try sel.concurrent(.poll, pollOnce, .{ c.arena, c.io, url, token });
     try sel.concurrent(.stop, waitForStop, .{c});
     try sel.concurrent(.timeout, waitFor, .{ c.io, timeout });
