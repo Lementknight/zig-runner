@@ -72,6 +72,10 @@ repository:
   workflow built it from which commit:
   `gh attestation verify zig-runner-linux-x86_64 --repo Open-Blue/zig-runner`, or
   `gh attestation verify oci://ghcr.io/open-blue/zig-runner:<tag> --repo Open-Blue/zig-runner`.
+  The binaries' release also carries their SBOM (`zig-runner.spdx.json`: tls.zig and Zig's
+  standard library, the only code compiled in besides the runner's own), attested too, and both
+  attestations' bundles for checking offline (`--bundle zig-runner.provenance.jsonl`). A release is
+  published only once all of it is attached.
 - **Scanned.** Trivy checks the Dockerfile and the image before a push; accepted findings are in
   `.trivyignore.yaml`, each with why. GitHub's secret scanning blocks pushes carrying credentials.
 - **Checked.** actionlint and zizmor check the workflows, shellcheck every shell script
