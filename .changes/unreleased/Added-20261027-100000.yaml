@@ -1,3 +1,0 @@
-kind: Added
-body: 'An `action.yml` may now have quoted strings and flow collections (`[...]`, `{...}`) over several lines, with comments, and explicit keys (`? key` then `: value`, `{? k: v}`): they read as Go''s YAML reader (go-yaml v3) reads them, folding included, where they were refused before. Reading YAML is also stricter where it misread before: `\/` and other escapes YAML does not have, plain values starting with `,` `%` `@` `|` and the like, a comment followed by more of a plain value, control characters and invalid UTF-8 are errors, as go-yaml says.'
-time: 2026-10-27T10:00:00.000000-04:00

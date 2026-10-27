@@ -10,6 +10,12 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.13.0 - 2026-10-27
+### Added
+* An `action.yml` may now have quoted strings and flow collections (`[...]`, `{...}`) over several lines, with comments, and explicit keys (`? key` then `: value`, `{? k: v}`): they read as Go's YAML reader (go-yaml v3) reads them, folding included, where they were refused before. Reading YAML is also stricter where it misread before: `\/` and other escapes YAML does not have, plain values starting with `,` `%` `@` `|` and the like, a comment followed by more of a plain value, control characters and invalid UTF-8 are errors, as go-yaml says.
+### Fixed
+* With step caching (the default), uv's project environment no longer goes in a per-ref cache volume (`RUNNER_UV_ENV_IN_CACHE`): a replayed `uv sync` writes nothing there, so a re-run of an older commit could run its tests against the dependencies a newer commit's job had synced. The environment now stays in the workspace in jobs whose steps are cached, where a replay restores it exactly; uv's download and wheel cache keeps its volume. Jobs without step caching still get the environment in the volume. A `uv sync` that does run now copies from uv's cache instead of hardlinking (about 27 s against 0.2 s for flask on a Raspberry Pi's SD card, 0.12 s against 0.04 s on an NVMe laptop).
+
 ## v0.12.2 - 2026-10-27
 ### Fixed
 * With step caching (the default), a step that read the event payload without naming `GITHUB_EVENT_PATH` (a script in a file reading a `workflow_dispatch` input, say) could be replayed with an earlier run's payload. Such a step is now given the JSON string `"zig-runner-withheld"` there instead, as it is given that constant for the run-specific variables, so reading a field fails visibly; a step whose script names `GITHUB_EVENT_PATH` or `/github/workflow/event.json` runs every time and gets the real payload. `RUNNER_ENFORCE_VOLATILE=false` restores GitHub's behaviour.

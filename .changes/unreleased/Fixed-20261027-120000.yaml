@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'With step caching (the default), uv''s project environment no longer goes in a per-ref cache volume (`RUNNER_UV_ENV_IN_CACHE`): a replayed `uv sync` writes nothing there, so a re-run of an older commit could run its tests against the dependencies a newer commit''s job had synced. The environment now stays in the workspace in jobs whose steps are cached, where a replay restores it exactly; uv''s download and wheel cache keeps its volume. Jobs without step caching still get the environment in the volume. A `uv sync` that does run now copies from uv''s cache instead of hardlinking (about 27 s against 0.2 s for flask on a Raspberry Pi''s SD card, 0.12 s against 0.04 s on an NVMe laptop).'
-time: 2026-10-27T12:00:00.000000-04:00
