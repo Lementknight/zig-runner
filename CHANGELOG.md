@@ -10,6 +10,10 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.13.1 - 2026-10-27
+### Fixed
+* A step replayed from the step cache now logs its output as the live run did: stdout and stderr in the order they were written, blank lines included, so `::add-mask::`, `::stop-commands::`, `::set-output` and problem matchers apply as they did. A step's script now sends its stderr to its stdout. And a step can no longer print another step's `::zig-step::` marker and have its lines counted as that step's, which kept a later replayed step's output (its `::set-output` lines included) from being processed: the runner's markers carry a per-job secret the step does not see. The first run after this change replays no step.
+
 ## v0.13.0 - 2026-10-27
 ### Added
 * An `action.yml` may now have quoted strings and flow collections (`[...]`, `{...}`) over several lines, with comments, and explicit keys (`? key` then `: value`, `{? k: v}`): they read as Go's YAML reader (go-yaml v3) reads them, folding included, where they were refused before. Reading YAML is also stricter where it misread before: `\/` and other escapes YAML does not have, plain values starting with `,` `%` `@` `|` and the like, a comment followed by more of a plain value, control characters and invalid UTF-8 are errors, as go-yaml says.

@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A step replayed from the step cache now logs its output as the live run did: stdout and stderr in the order they were written, blank lines included, so `::add-mask::`, `::stop-commands::`, `::set-output` and problem matchers apply as they did. A step''s script now sends its stderr to its stdout. And a step can no longer print another step''s `::zig-step::` marker and have its lines counted as that step''s, which kept a later replayed step''s output (its `::set-output` lines included) from being processed: the runner''s markers carry a per-job secret the step does not see. The first run after this change replays no step.'
-time: 2026-10-27T15:00:00.000000-04:00
