@@ -6,15 +6,15 @@
 # No elan: the version is the one pinned, never one a toolchain file names.
 set -euo pipefail
 
-version=4.34.1
+version=4.35.0
 case $(uname -m) in
 x86_64)
 	asset="lean-$version-linux"
-	sum=47bf4bbd78f70c2e9670598ab7124d92b6efb7330ff33e5fbb4030f6fd72e4e4
+	sum=7289597a44543246c9227b8cae501767e095ce17f6d448b95fc4a8dc97268f6d
 	;;
 aarch64)
 	asset="lean-$version-linux_aarch64"
-	sum=fdb974c2cdb4627e090d5d4007b913e09d13c4868720fb5594e22808b3de9e37
+	sum=c8f0f8a3920e839718b1343e6781fd80a3e9b1024fbcd7078eb30f54e806b028
 	;;
 *)
 	echo "no Lean $version checksum for $(uname -m)" >&2
