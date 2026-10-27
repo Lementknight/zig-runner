@@ -52,6 +52,9 @@ pub const Context = struct {
     /// Where `serve` keeps the previous cycle's ending, running in the background (`endCycle`);
     /// null ends a cycle in place, as tests and one-off commands do.
     ending: ?*?std.Io.Future(void) = null,
+    /// Where `serve` keeps the next cycle's registration, started while this cycle's job finishes
+    /// (`Registering`); null registers each cycle in its turn, as tests and `--once` do.
+    next: ?*?*Registering = null,
 };
 
 /// Output keys cost two walks of the job's filesystem whatever the step changed, so they are cheap
@@ -160,6 +163,9 @@ const Slot = struct {
 pub fn serve(c: Context) !Exit {
     var ending: ?std.Io.Future(void) = null;
     defer if (ending) |*f| f.await(c.io);
+    var next: ?*Registering = null;
+    // A registration made for a cycle that will not run is removed, as an idle one must be.
+    defer if (next) |r| r.discard(c);
     var failures: u32 = 0;
     while (true) {
         var cycle_arena: std.heap.ArenaAllocator = .init(c.gpa);
@@ -167,9 +173,8 @@ pub fn serve(c: Context) !Exit {
         var cc = c;
         cc.arena = cycle_arena.allocator();
         cc.ending = &ending;
-        var suffix: [4]u8 = undefined;
-        c.io.random(&suffix);
-        cc.name = try std.fmt.allocPrint(cc.arena, "{s}-{x}", .{ c.cfg.name_prefix, suffix });
+        if (!c.cfg.once) cc.next = &next;
+        cc.name = if (next) |r| try cc.arena.dupe(u8, r.name) else try runnerName(cc.arena, c);
 
         const r = try cycle(cc);
         c.err.flush() catch {};
@@ -200,6 +205,95 @@ pub fn serve(c: Context) !Exit {
             },
         }
     }
+}
+
+/// A new registration name: the prefix and a random suffix.
+fn runnerName(arena: Allocator, c: Context) ![]const u8 {
+    var suffix: [4]u8 = undefined;
+    c.io.random(&suffix);
+    return std.fmt.allocPrint(arena, "{s}-{x}", .{ c.cfg.name_prefix, suffix });
+}
+
+/// The next cycle's JIT registration, made in the background while this cycle's job finishes
+/// (completing it with GitHub, uploading its logs), so the next cycle can open its session at once
+/// instead of first waiting for GitHub to register it: about 0.5 s between jobs. It is started only
+/// once a job's steps are done, so it is never left waiting through a long job, and it outlives
+/// the cycle whose arena `serve` frees, so it has memory of its own.
+pub const Registering = struct {
+    arena: std.heap.ArenaAllocator,
+    c: Context,
+    name: []const u8,
+    future: std.Io.Future(void) = undefined,
+    /// GitHub's calls, replaced in tests.
+    calls: Calls = .{},
+    result: union(enum) {
+        pending,
+        ok: jitconfig.Jit,
+        failed: struct { err: anyerror, status: std.http.Status, message: []const u8 },
+    } = .pending,
+
+    const Calls = struct {
+        generate: *const @TypeOf(jitconfig.generate) = jitconfig.generate,
+        remove: *const fn (Context, u64, []const u8) void = removeRegistration,
+    };
+
+    fn start(c: Context) !*Registering {
+        return startWith(c, .{});
+    }
+
+    fn startWith(c: Context, calls: Calls) !*Registering {
+        const r = try c.gpa.create(Registering);
+        errdefer c.gpa.destroy(r);
+        r.* = .{ .arena = .init(c.gpa), .c = c, .name = undefined, .calls = calls };
+        errdefer r.arena.deinit();
+        const a = r.arena.allocator();
+        r.name = try runnerName(a, c);
+        r.c.arena = a;
+        r.c.name = r.name;
+        r.c.ending = null;
+        r.c.next = null;
+        r.future = try c.io.concurrent(run, .{r});
+        return r;
+    }
+
+    fn run(r: *Registering) void {
+        var status: std.http.Status = .ok;
+        var message: []const u8 = "";
+        r.result = if (r.calls.generate(r.c.arena, r.c.io, r.c.cfg, r.name, &status, &message)) |jit|
+            .{ .ok = jit }
+        else |e|
+            .{ .failed = .{ .err = e, .status = status, .message = message } };
+    }
+
+    /// The registration, copied into `arena` (the cycle's); this is freed.
+    fn take(r: *Registering, arena: Allocator) !@TypeOf(r.result) {
+        r.future.await(r.c.io);
+        defer r.free();
+        return switch (r.result) {
+            .pending => unreachable,
+            .ok => |jit| .{ .ok = try copyJit(arena, jit) },
+            .failed => |f| .{ .failed = .{ .err = f.err, .status = f.status, .message = try arena.dupe(u8, f.message) } },
+        };
+    }
+
+    /// Never used: waited for, and the registration removed.
+    fn discard(r: *Registering, c: Context) void {
+        r.future.await(c.io);
+        if (r.result == .ok) r.calls.remove(r.c, r.result.ok.runner_id, r.result.ok.runner_name);
+        r.free();
+    }
+
+    fn free(r: *Registering) void {
+        const gpa = r.c.gpa;
+        r.arena.deinit();
+        gpa.destroy(r);
+    }
+};
+
+fn copyJit(arena: Allocator, jit: jitconfig.Jit) !jitconfig.Jit {
+    const files = try arena.alloc(jitconfig.File, jit.files.len);
+    for (jit.files, files) |f, *o| o.* = .{ .name = try arena.dupe(u8, f.name), .content = try arena.dupe(u8, f.content) };
+    return .{ .runner_id = jit.runner_id, .runner_name = try arena.dupe(u8, jit.runner_name), .files = files };
 }
 
 /// Seconds to wait after `failures` failed cycles in a row: 5, 10, 20, ... up to 5 minutes.
@@ -351,7 +445,14 @@ const EndingTask = struct {
 pub fn cycle(c: Context) !Cycle {
     var status: std.http.Status = .ok;
     var message: []const u8 = "";
-    const jit = jitconfig.generate(c.arena, c.io, c.cfg, c.name, &status, &message) catch |e|
+    // Made while the previous job finished, when there was one (`Registering`).
+    const early: ?*Registering = if (c.next) |slot| slot.* else null;
+    if (c.next) |slot| slot.* = null;
+    const jit = if (early) |r| switch (try r.take(c.arena)) {
+        .pending => unreachable,
+        .ok => |j| j,
+        .failed => |f| return registrationFailed(c, f.err, f.status, f.message),
+    } else jitconfig.generate(c.arena, c.io, c.cfg, c.name, &status, &message) catch |e|
         return registrationFailed(c, e, status, message);
     // Read when the cycle ends: the session once there is one, and the latest token.
     var token: []const u8 = "";
@@ -705,6 +806,10 @@ fn handleJob(c: Context, session: Listening, body: []const u8) !Cycle {
     const job_started_ms = std.Io.Clock.real.now(c.io).toMilliseconds();
     var reporter = try startReporter(c, job, job_started_ms);
     const result = try runJobSteps(c, job, log, &cancel, &live, if (reporter) |*r| r else null);
+    // The steps are done: register the next runner while this job is wrapped up.
+    if (c.next) |slot| if (slot.* == null and !stopRequested()) {
+        slot.* = Registering.start(c) catch null;
+    };
 
     const completion = try logCompleteJob(c, job, log, &live, result, job_started_ms);
     if (reporter) |*r| {
@@ -1832,6 +1937,59 @@ fn testContext(arena: Allocator, log: *sink.LogSink, err: *std.Io.Writer, cfg: *
         .secrets = &.{},
         .name = "t",
     };
+}
+
+const FakeGitHub = struct {
+    var removed: ?u64 = null;
+
+    fn generate(arena: Allocator, _: std.Io, _: *const Config, name: []const u8, _: *std.http.Status, _: *[]const u8) jitconfig.Error!jitconfig.Jit {
+        const files = try arena.alloc(jitconfig.File, 1);
+        files[0] = .{ .name = ".runner", .content = try arena.dupe(u8, "{\"agentId\": 7}") };
+        return .{ .runner_id = 7, .runner_name = try arena.dupe(u8, name), .files = files };
+    }
+
+    fn refuse(_: Allocator, _: std.Io, _: *const Config, _: []const u8, status: *std.http.Status, message: *[]const u8) jitconfig.Error!jitconfig.Jit {
+        status.* = .forbidden;
+        message.* = "no";
+        return error.GithubRejected;
+    }
+
+    fn remove(_: Context, id: u64, _: []const u8) void {
+        removed = id;
+    }
+};
+
+test "the next registration, made while a job finishes, is taken over, or removed when unused" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    var cfg: Config = .{ .gh_token = "", .scope = undefined, .name_prefix = "r" };
+    const c = testContext(a.allocator(), &log, &w, &cfg);
+
+    // Taken over: copied into the cycle's arena, and the background task's memory freed (the
+    // testing allocator would report it otherwise).
+    const r = try Registering.startWith(c, .{ .generate = FakeGitHub.generate, .remove = FakeGitHub.remove });
+    const name = try a.allocator().dupe(u8, r.name);
+    const got = (try r.take(a.allocator())).ok;
+    try std.testing.expectEqual(@as(u64, 7), got.runner_id);
+    try std.testing.expectEqualStrings(name, got.runner_name);
+    try std.testing.expect(std.mem.startsWith(u8, got.runner_name, "r-"));
+    try std.testing.expectEqualStrings("{\"agentId\": 7}", got.files[0].content);
+
+    // Never used: removed from GitHub, as an idle registration must be.
+    FakeGitHub.removed = null;
+    const unused = try Registering.startWith(c, .{ .generate = FakeGitHub.generate, .remove = FakeGitHub.remove });
+    unused.discard(c);
+    try std.testing.expectEqual(@as(?u64, 7), FakeGitHub.removed);
+
+    // Refused: the cycle gets GitHub's answer, as if it had registered itself.
+    const refused = try Registering.startWith(c, .{ .generate = FakeGitHub.refuse, .remove = FakeGitHub.remove });
+    const f = (try refused.take(a.allocator())).failed;
+    try std.testing.expectEqual(error.GithubRejected, f.err);
+    try std.testing.expectEqual(std.http.Status.forbidden, f.status);
+    try std.testing.expectEqualStrings("no", f.message);
 }
 
 test "a poll that is never answered is given up after its timeout" {
