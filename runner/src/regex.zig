@@ -5,7 +5,8 @@
 //! patterns problem matchers published on GitHub use and on random ones.
 //!
 //! **What ECMAScript mode means in .NET**, and so here (each checked against .NET):
-//! - `\w`, `\d`, `\s` and `\b` are ASCII-only, in classes and under `(?i)` too.
+//! - `\w`, `\d`, `\s` and `\b` are ASCII-only, in classes and under `(?i)` too, except that a word
+//!   character may also be `İ` (U+0130), as .NET's ECMAWordClass and IsECMAWordChar have it.
 //! - `\N` is a backreference when group N is already open, else an octal escape (`\033` is ESC);
 //!   `\8` and `\9` are digits; octal stops before passing `\377`. A backreference to a group that
 //!   took no part matches the empty string.
@@ -20,14 +21,25 @@
 //! `* + ? {n} {n,} {n,m}` greedy or lazy, and the escapes `\t \n \r \f \v \a \e \xHH \uHHHH \cX`
 //! and octal. Groups are numbered as .NET numbers them: unnamed ones first, then named ones.
 //!
-//! **Refused, loudly** (`error.Unsupported`): Unicode categories and blocks (`\p{…}`: they need
-//! Unicode's tables) and balancing groups (`(?<a-b>…)`). A matcher whose pattern is refused goes
-//! inert and says so: an expression understood wrongly annotates the wrong file and line, which is
-//! worse than annotating nothing.
+//! **Unicode categories and blocks**, `\p{…}` and `\P{…}`, in classes too, as .NET 8 has them
+//! (ECMAScript mode takes them): the general categories (`Lu`, …, `Cn`) and their groups (`L`,
+//! `M`, `N`, `P`, `S`, `Z`, `C`), and .NET's own list of blocks, which is not Unicode's: legacy
+//! names (`IsGreek` beside `IsGreekandCoptic`), ranges as Unicode had them years ago, and four
+//! undocumented `_xml…` classes. Names are case-sensitive; an unknown one, `\pL` without braces,
+//! and a category as a range's end are errors. The tables (unicode_tables.zig) are Unicode 15.0's,
+//! which .NET 8's are, and every code unit's answer for every name was checked against .NET's. With
+//! `(?i)`, `Lu`, `Ll` and `Lt` each mean all three, other categories are not case folded, and a
+//! block folds as its ranges do (`(?i)\P{IsBasicLatin}` matches `k`, for the Kelvin sign).
+//!
+//! **Refused, loudly** (`error.Unsupported`): balancing groups (`(?<a-b>…)`). A matcher whose
+//! pattern is refused goes inert and says so: an expression understood wrongly annotates the wrong
+//! file and line, which is worse than annotating nothing.
 //!
 //! **Characters, not bytes**: input is matched by code point (a byte that is not valid UTF-8 is a
 //! character of its own); positions stay byte offsets. .NET counts UTF-16 units, so a character
-//! outside the Basic Multilingual Plane (an emoji) is one character here and two there.
+//! outside the Basic Multilingual Plane (an emoji) is one character here and two there. To `\p` it
+//! is what its first unit is to .NET: a surrogate (`Cs`), in `IsHighSurrogates` or
+//! `IsHighPrivateUseSurrogates`, so `\p{L}` matches no part of it and `\P{IsBasicLatin}` all of it.
 //!
 //! **Where .NET is not followed**, on purpose: in a few patterns no problem matcher would write,
 //! .NET's answers cannot be right (a match that leaves out the pattern's own first characters,
@@ -47,6 +59,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const tables = @import("unicode_tables.zig");
 
 pub const Error = error{ BadPattern, Unsupported, TooComplex, OutOfMemory };
 
@@ -143,9 +156,10 @@ fn foldEq(a: u21, b: u21) bool {
     return a == b or lower(a) == lower(b);
 }
 
-/// What `\w` is in ECMAScript mode: ASCII letters, digits and `_`.
+/// What `\w` (and `\b`) take as a word character in ECMAScript mode: ASCII letters, digits, `_`,
+/// and `İ`, which .NET adds (RegexCharClass.IsECMAWordChar).
 fn isWord(c: u21) bool {
-    return c == '_' or (c < 0x80 and std.ascii.isAlphanumeric(@intCast(c)));
+    return c == '_' or c == 0x130 or (c < 0x80 and std.ascii.isAlphanumeric(@intCast(c)));
 }
 
 // --- character sets ---
@@ -161,6 +175,7 @@ const Set = struct {
     const Item = union(enum) {
         range: [2]u21,
         shorthand: Shorthand,
+        category: Categories,
     };
 
     /// Membership before negation, case folded when `fold` (so `(?i)[^a]` does not match `A`).
@@ -178,6 +193,8 @@ const Set = struct {
                 }
             },
             .shorthand => |s| if (s.matches(c)) return true,
+            // Never case folded (.NET folds only a class's ranges).
+            .category => |k| if (k.matches(c)) return true,
         };
         return false;
     }
@@ -213,6 +230,73 @@ const Shorthand = struct {
         return in != s.negated;
     }
 };
+
+/// `\p{L}`, `\P{Lu}`: general categories, as a set of them (a bit per `tables.Category`).
+const Categories = struct {
+    mask: u32,
+    negated: bool,
+
+    fn matches(k: Categories, c: u21) bool {
+        const in = k.mask & bit(categoryOf(c)) != 0;
+        return in != k.negated;
+    }
+};
+
+fn bit(c: tables.Category) u32 {
+    return @as(u32, 1) << @backingInt(c);
+}
+
+/// The general category .NET gives `c`. It counts UTF-16 units, and both halves of a character
+/// outside the Basic Multilingual Plane are surrogates.
+fn categoryOf(c: u21) tables.Category {
+    if (c > 0xFFFF) return .Cs;
+    // The last run starting at or before `c`.
+    var lo: usize = 0;
+    var hi: usize = tables.run_starts.len;
+    while (hi - lo > 1) {
+        const mid = (lo + hi) / 2;
+        if (tables.run_starts[mid] <= c) lo = mid else hi = mid;
+    }
+    return tables.run_categories[lo];
+}
+
+/// A category or group of them by .NET's name (RegexCharClass.s_definedCategories). With `fold`,
+/// `Lu`, `Ll` and `Lt` each mean all three, as in .NET.
+fn categoryMask(name: []const u8, fold: bool) ?u32 {
+    const groups = [_]struct { []const u8, []const tables.Category }{
+        .{ "L", &.{ .Lu, .Ll, .Lt, .Lm, .Lo } },
+        .{ "M", &.{ .Mn, .Mc, .Me } },
+        .{ "N", &.{ .Nd, .Nl, .No } },
+        .{ "P", &.{ .Pc, .Pd, .Ps, .Pe, .Pi, .Pf, .Po } },
+        .{ "S", &.{ .Sm, .Sc, .Sk, .So } },
+        .{ "Z", &.{ .Zs, .Zl, .Zp } },
+        .{ "C", &.{ .Cc, .Cf, .Cs, .Co, .Cn } },
+    };
+    for (groups) |g| if (std.mem.eql(u8, name, g[0])) {
+        var mask: u32 = 0;
+        for (g[1]) |c| mask |= bit(c);
+        return mask;
+    };
+    const one = std.meta.stringToEnum(tables.Category, name) orelse return null;
+    if (fold and (one == .Lu or one == .Ll or one == .Lt)) return bit(.Lu) | bit(.Ll) | bit(.Lt);
+    return bit(one);
+}
+
+/// .NET's block `name` as code unit ranges; null when there is none.
+fn blockRanges(name: []const u8) ?[]const [2]u16 {
+    for (tables.blocks) |b| if (std.mem.eql(u8, name, b.name))
+        return tables.block_ranges[b.first..][0..b.count];
+    return null;
+}
+
+/// A range of code units as an item, and the characters outside the Basic Multilingual Plane whose
+/// first UTF-16 unit is in it (a high surrogate), which here are one character.
+fn appendUnits(arena: Allocator, items: *std.ArrayList(Set.Item), lo: u21, hi: u21) Error!void {
+    try items.append(arena, .{ .range = .{ lo, hi } });
+    const a: u21 = @max(lo, 0xD800);
+    const b: u21 = @min(hi, 0xDBFF);
+    if (a <= b) try items.append(arena, .{ .range = .{ 0x10000 + ((a - 0xD800) << 10), 0x10000 + ((b - 0xD800) << 10) + 0x3FF } });
+}
 
 // --- syntax ---
 
@@ -435,11 +519,11 @@ const Parser = struct {
             '(' => return p.parseGroup(f, depth),
             '[' => {
                 p.i += 1;
-                return .{ .set = .{ .set = try p.parseClass(), .fold = f.i } };
+                return .{ .set = .{ .set = try p.parseClass(f.i), .fold = f.i } };
             },
             '\\' => {
                 p.i += 1;
-                return switch (try p.parseEscape(false)) {
+                return switch (try p.parseEscape(false, f.i)) {
                     .char => |ch| .{ .char = .{ .c = ch, .fold = f.i } },
                     .set => |s| .{ .set = .{ .set = s, .fold = f.i } },
                     .assert => |a| .{ .assert = a },
@@ -600,7 +684,7 @@ const Parser = struct {
     };
 
     /// What follows a `\` (consumed), in a class or not.
-    fn parseEscape(p: *Parser, in_class: bool) Error!Escape {
+    fn parseEscape(p: *Parser, in_class: bool, fold: bool) Error!Escape {
         const c = p.peek() orelse return error.BadPattern; // `\` at the end
         p.i += 1;
         const short: ?Shorthand = switch (c) {
@@ -620,7 +704,7 @@ const Parser = struct {
             return .{ .set = set };
         }
         switch (c) {
-            'p', 'P' => return error.Unsupported, // Unicode categories and blocks
+            'p', 'P' => return .{ .set = try p.property(c == 'P', fold) },
             't' => return .{ .char = '\t' },
             'n' => return .{ .char = '\n' },
             'r' => return .{ .char = '\r' },
@@ -689,6 +773,39 @@ const Parser = struct {
         return .{ .char = d.c };
     }
 
+    /// `{name}` after `\p` or `\P` (`negated`), as .NET's ParseProperty reads it: braces required,
+    /// the name made of word characters and `-`, nothing else (no spaces, even with `x`). A category
+    /// is tested as one; a block becomes its ranges, or for `\P` the ranges between them, so that
+    /// `(?i)` folds them as .NET folds a class's ranges.
+    fn property(p: *Parser, negated: bool, fold: bool) Error!*const Set {
+        if (p.peek() != '{') return error.BadPattern; // `\pL`: "Incomplete \p{X} character escape"
+        p.i += 1;
+        const start = p.i;
+        while (p.i < p.src.len and (isWord(p.src[p.i]) or p.src[p.i] == '-')) p.i += 1;
+        const name = p.src[start..p.i];
+        if (p.peek() != '}') return error.BadPattern;
+        p.i += 1;
+        var items: std.ArrayList(Set.Item) = .empty;
+        if (categoryMask(name, fold)) |mask| {
+            try items.append(p.arena, .{ .category = .{ .mask = mask, .negated = negated } });
+        } else {
+            const ranges = blockRanges(name) orelse return error.BadPattern; // "Unknown property"
+            if (!negated) {
+                for (ranges) |r| try appendUnits(p.arena, &items, r[0], r[1]);
+            } else {
+                var next: u21 = 0;
+                for (ranges) |r| {
+                    if (r[0] > next) try appendUnits(p.arena, &items, next, r[0] - 1);
+                    next = @as(u21, r[1]) + 1;
+                }
+                if (next <= 0xFFFF) try appendUnits(p.arena, &items, next, 0xFFFF);
+            }
+        }
+        const set = try p.arena.create(Set);
+        set.* = .{ .items = items.items };
+        return set;
+    }
+
     /// Whether group `n` exists and its `(` comes before `at`, by the first pass's numbering.
     fn opensBefore(p: *Parser, n: u32, at: usize) bool {
         for (p.known) |k| if (k.number == n and k.at < at) return true;
@@ -725,7 +842,7 @@ const Parser = struct {
     }
 
     /// A class after its `[`.
-    fn parseClass(p: *Parser) Error!*const Set {
+    fn parseClass(p: *Parser, fold: bool) Error!*const Set {
         const set = try p.arena.create(Set);
         set.* = .{};
         if (p.peek() == '^') {
@@ -750,19 +867,19 @@ const Parser = struct {
             if (c == '-' and p.i + 1 < p.src.len and p.src[p.i + 1] == '[') {
                 // `-[...]` subtracts, and must end the class.
                 p.i += 2;
-                set.subtract = try p.parseClass();
+                set.subtract = try p.parseClass(fold);
                 if (p.peek() != ']') return error.BadPattern;
                 p.i += 1;
                 break;
             }
-            const lo = try p.classElement();
+            const lo = try p.classElement(fold);
             switch (lo) {
-                .set => |s| try items.append(p.arena, s.items[0]),
+                .set => |s| try items.appendSlice(p.arena, s.items),
                 .char => |lo_c| {
                     // `a-z`, unless the `-` is last, or starts a subtraction.
                     if (p.i + 1 < p.src.len and p.src[p.i] == '-' and p.src[p.i + 1] != ']' and p.src[p.i + 1] != '[') {
                         p.i += 1;
-                        const hi = switch (try p.classElement()) {
+                        const hi = switch (try p.classElement(fold)) {
                             .char => |h| h,
                             .set => return error.BadPattern, // a class in a range
                         };
@@ -776,10 +893,10 @@ const Parser = struct {
         return set;
     }
 
-    fn classElement(p: *Parser) Error!union(enum) { char: u21, set: *const Set } {
+    fn classElement(p: *Parser, fold: bool) Error!union(enum) { char: u21, set: *const Set } {
         if (p.src[p.i] == '\\') {
             p.i += 1;
-            return switch (try p.parseEscape(true)) {
+            return switch (try p.parseEscape(true, fold)) {
                 .char => |ch| .{ .char = ch },
                 .set => |s| .{ .set = s },
                 else => unreachable, // no assertions or backreferences in a class
@@ -1455,6 +1572,12 @@ test "characters, not bytes; ECMAScript's ASCII shorthands" {
     try testing.expectEqualStrings("É", (try whole(ar, "(?i)é", "É")).?);
     try testing.expectEqualStrings("\u{212A}", (try whole(ar, "(?i)k", "\u{212A}")).?);
     try testing.expect((try whole(ar, "(?i)[^a]", "A")) == null);
+    // .NET's one exception: `İ` is a word character, to `\w` and `\b` alike.
+    try testing.expectEqualStrings("aİb", (try whole(ar, "\\w+", "aİb")).?);
+    try testing.expect((try whole(ar, "\\W", "İ")) == null);
+    try testing.expectEqualStrings("İ", (try whole(ar, "İ\\b", "İ")).?);
+    try testing.expect((try whole(ar, "x\\b", "xİ")) == null);
+    try testing.expect((try whole(ar, "(?i)\\w", "ı")) == null);
 }
 
 test "escapes: octal, hexadecimal, control, and backreference or octal by ECMAScript's rule" {
@@ -1515,12 +1638,78 @@ test "lookaround, right to left behind; atomic groups; options" {
     try testing.expectEqualStrings("4", (try whole(ar, "[\\d-[3]]", "34")).?);
 }
 
+test "Unicode categories and blocks, in and out of classes, as .NET 8 reads them" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    try testing.expectEqualStrings("Éte", (try whole(ar, "\\p{L}+", "1 Éte2")).?);
+    try testing.expectEqualStrings("É", (try whole(ar, "\\p{Lu}", "aÉ")).?);
+    try testing.expectEqualStrings("1 ", (try whole(ar, "\\P{L}+", "1 Éte")).?);
+    try testing.expectEqualStrings("٣", (try whole(ar, "\\p{Nd}", "x٣")).?); // unlike `\d`
+    try testing.expectEqualStrings("中a5", (try whole(ar, "[\\p{L}\\d]+", "-中a5-")).?);
+    try testing.expectEqualStrings("-", (try whole(ar, "[^\\p{L}\\d]", "中a5-")).?);
+    try testing.expectEqualStrings("é", (try whole(ar, "[^\\P{Ll}]", "Aé")).?);
+    try testing.expectEqualStrings("b", (try whole(ar, "[\\p{L}-[a]]", "ab")).?);
+    try testing.expectEqualStrings("-", (try whole(ar, "[\\p{L}-z]", "1-")).?); // `-` is literal
+    try testing.expectEqualStrings("\u{0CF3}", (try whole(ar, "\\p{Mc}", "\u{0CF3}")).?); // new in 15.0
+    try testing.expectEqualStrings("\u{2FFC}", (try whole(ar, "\\p{Cn}", "\u{2FFC}")).?); // new in 15.1
+    try testing.expectEqualStrings("€", (try whole(ar, "\\p{Sc}", "a€")).?);
+    try testing.expectEqualStrings("\u{00A0}", (try whole(ar, "\\p{Z}", "a\u{00A0}")).?);
+    // Blocks, by .NET's list: legacy names, a hyphenated one, an `_xml…` class.
+    try testing.expectEqualStrings("az", (try whole(ar, "\\p{IsBasicLatin}+", "éaz")).?);
+    try testing.expectEqualStrings("é→", (try whole(ar, "\\P{IsBasicLatin}+", "aé→")).?);
+    try testing.expectEqualStrings("αω", (try whole(ar, "\\p{IsGreek}\\p{IsGreekandCoptic}", "αω")).?);
+    try testing.expectEqualStrings("é", (try whole(ar, "\\p{IsLatin-1Supplement}", "aé")).?);
+    try testing.expectEqualStrings("a-1", (try whole(ar, "\\p{_xmlC}+", "a-1")).?);
+    // `(?i)`: Lu, Ll and Lt each mean all three; other categories and \P too.
+    try testing.expectEqualStrings("a", (try whole(ar, "(?i)\\p{Lu}", "a")).?);
+    try testing.expectEqualStrings("A", (try whole(ar, "(?i)[\\p{Ll}]", "A")).?);
+    try testing.expect((try whole(ar, "(?i)\\P{Lu}", "a")) == null);
+    try testing.expect((try whole(ar, "(?i)[^\\p{Lu}]", "A")) == null);
+    try testing.expect((try whole(ar, "(?i)\\p{Mn}", "\u{03B9}")) == null); // not folded
+    // A block folds as ranges: the Kelvin sign is outside Basic Latin and folds to `k`.
+    try testing.expectEqualStrings("k", (try whole(ar, "(?i)\\P{IsBasicLatin}", "k")).?);
+    try testing.expect((try whole(ar, "(?i)\\P{IsBasicLatin}", "a")) == null);
+    try testing.expectEqualStrings("\u{212A}", (try whole(ar, "(?i)\\p{IsBasicLatin}", "\u{212A}")).?);
+    // Outside the Basic Multilingual Plane, a character is to `\p` what its first UTF-16 unit is.
+    try testing.expect((try whole(ar, "\\p{L}", "\u{1D400}")) == null);
+    try testing.expectEqualStrings("\u{1D400}", (try whole(ar, "\\p{Cs}+", "\u{1D400}")).?);
+    try testing.expectEqualStrings("\u{1D400}", (try whole(ar, "\\p{IsHighSurrogates}", "\u{1D400}")).?);
+    try testing.expectEqualStrings("\u{F0000}", (try whole(ar, "\\p{IsHighPrivateUseSurrogates}", "\u{F0000}")).?);
+    try testing.expect((try whole(ar, "\\p{IsHighSurrogates}", "\u{F0000}")) == null);
+    try testing.expectEqualStrings("é😀", (try whole(ar, "\\P{IsBasicLatin}+", "aé😀")).?);
+    // Errors, as .NET has them: no braces, an unknown or miscased name, spaces, a class in a range.
+    for ([_][]const u8{
+        "\\pL",       "\\p",                              "\\p{",     "\\p{L",             "\\p{}",   "\\p{Foo}", "\\p{l}",
+        "\\p{ L}",    "(?x)\\p{ L }",                     "\\p{L&}",  "\\p{isBasicLatin}", "\\p{Is}", "[\\pL]",   "[\\p{Foo}]",
+        "[a-\\p{L}]", "\\p{__InternalRegexIgnoreCase__}", "\\P{Any}",
+    }) |pattern| {
+        testing.expectError(error.BadPattern, Regex.compile(ar, pattern)) catch |e| {
+            std.debug.print("{s}\n", .{pattern});
+            return e;
+        };
+    }
+}
+
+test "every code unit's category agrees with .NET's on a sample" {
+    // From .NET 8's char.GetUnicodeCategory. The whole table, and every block, was compared with
+    // .NET's answers for every code unit when generated; regex-diff.sh tries every name.
+    const want = [_]struct { u21, tables.Category }{
+        .{ 0x0000, .Cc }, .{ 0x0020, .Zs }, .{ 0x0041, .Lu }, .{ 0x005F, .Pc },  .{ 0x00AA, .Lo },
+        .{ 0x00AD, .Cf }, .{ 0x00B5, .Ll }, .{ 0x01C5, .Lt }, .{ 0x02B0, .Lm },  .{ 0x0300, .Mn },
+        .{ 0x0378, .Cn }, .{ 0x0488, .Me }, .{ 0x16EE, .Nl }, .{ 0x00B2, .No },  .{ 0x2028, .Zl },
+        .{ 0x2029, .Zp }, .{ 0x2018, .Pi }, .{ 0x2019, .Pf }, .{ 0x4E00, .Lo },  .{ 0x9FFF, .Lo },
+        .{ 0xAC00, .Lo }, .{ 0xD7A3, .Lo }, .{ 0xD800, .Cs }, .{ 0xDFFF, .Cs },  .{ 0xE000, .Co },
+        .{ 0xF8FF, .Co }, .{ 0xFFFD, .So }, .{ 0xFFFF, .Cn }, .{ 0x1F600, .Cs },
+    };
+    for (want) |w| try testing.expectEqual(w[1], categoryOf(w[0]));
+}
+
 test "unsupported constructs are refused, not approximated; malformed ones are errors" {
     var a: std.heap.ArenaAllocator = .init(testing.allocator);
     defer a.deinit();
     const ar = a.allocator();
-    for ([_][]const u8{ "\\p{L}+", "(?<a-b>x)" }) |pattern|
-        try testing.expectError(error.Unsupported, Regex.compile(ar, pattern));
+    try testing.expectError(error.Unsupported, Regex.compile(ar, "(?<a-b>x)"));
     for ([_][]const u8{
         "(unclosed", "[unclosed", "a)",      "*nothing",       "a{3,2}",   "a**", "a{2}+",
         "a*?+",      "[z-a]",     "[a-\\d]", "[a-z-[aeiou]x]", "(?P<n>a)", "[]",

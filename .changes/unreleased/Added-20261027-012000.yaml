@@ -1,0 +1,3 @@
+kind: Added
+body: 'Problem matchers read Unicode categories and blocks as GitHub''s runner does (.NET 8): `\p{L}`, `\P{Lu}`, `\p{IsBasicLatin}`, in classes too (`[\p{L}\d]`), with .NET''s own list of block names and Unicode 15.0''s categories, as .NET 8 has them. A matcher using one went inert before. Unknown names and `\pL` are errors, as in .NET.'
+time: 2026-10-27T01:20:00.000000-04:00
