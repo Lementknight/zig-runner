@@ -1,0 +1,3 @@
+kind: Security
+body: 'A step can no longer crash the runner or make it allocate gigabytes by printing its own step marker: `echo ''::zig-step::begin 4000000000''` made the log sink grow an array to about 32 GB. A marker naming no step of the job is now the step''s output. Also fixed: a panic when a local action''s path is 256 to 400 bytes long, and an overflow reading a corrupt log spool.'
+time: 2026-10-27T05:00:00.000000-04:00

@@ -481,9 +481,12 @@ pub const h2 = struct {
         if (abs.len > 400) return fail(w, stream, not_found, "no such path");
         var msg: [512]u8 = undefined;
         msg[0] = 0x0a;
-        msg[1] = @intCast(abs.len);
+        // A varint length: one byte under 128, two up to the 400 checked above. (Storing the
+        // length in one byte first, and only then checking, panicked for 256 to 400.)
         var n: usize = 2;
-        if (abs.len >= 0x80) {
+        if (abs.len < 0x80) {
+            msg[1] = @intCast(abs.len);
+        } else {
             msg[1] = @intCast((abs.len & 0x7f) | 0x80);
             msg[2] = @intCast(abs.len >> 7);
             n = 3;
