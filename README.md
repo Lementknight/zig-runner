@@ -109,23 +109,27 @@ trust, and the runner itself enforces it:
   other job fails before a step runs, with the reason in its log. The `prod` GitHub environment
   holds the release's deploy key, deploys only from `main` and `v*` tags, and waits for the
   maintainer's approval.
-- **pre-prod**, a runner on a 64-bit machine of its own (the Dagger engine is built for
-  `linux/amd64` and `linux/arm64` only) with nothing worth reaching
-  (`runs-on: [self-hosted, pre-prod]`), runs pull requests and anything else: no trusted refs, no
-  secrets, and no access to its Dagger engine from steps (`deploy/runner.preprod.env.example`).
+- **pre-prod**, where pull requests and the merge queue run, is GitHub's `ubuntu-latest`, on
+  purpose: a hosted runner starts cold every time, so every pull request builds and tests the
+  project in the worst case, with no caches to hide a slow or broken first build. Nothing there is
+  trusted or holds a secret.
 
-CI's tests run on these runners once they exist, so every change exercises the runner: pushes to
-`main` on prod, pull requests and the merge queue on pre-prod. Each is switched on by a repository
-variable holding its `runs-on` labels as JSON, set once its runner is registered with those labels:
+Pushes to `main` run CI on prod, so every merge exercises the runner; the repository variable
+`PROD_RUNNER` holds prod's `runs-on` labels as JSON (unset, GitHub's runner stands in):
 
 ```sh
 gh variable set PROD_RUNNER --body '["self-hosted","prod"]'
-gh variable set PREPROD_RUNNER --body '["self-hosted","pre-prod"]'
 ```
 
-Unset, GitHub's `ubuntu-latest` runs them instead. The release still builds on GitHub's runners.
+Pull requests therefore do not exercise the runner itself, which is the price of the cold builds;
+the release checks ("Binaries (check)" and "Image" in `release.yml`) still build it with `zig build`
+on every pull request. A self-hosted pre-prod remains possible (`PREPROD_RUNNER`, and
+`deploy/runner.preprod.env.example` for a runner with no trusted refs, no secrets and no access to
+its Dagger engine from steps; the engine is built for `linux/amd64` and `linux/arm64` only), but
+the project leaves it unset. The release still builds on GitHub's runners.
 
-Workflows name `prod` or `pre-prod`, never just `zig`, which both runners carry. Workflows from
+Workflows name `prod` (or `pre-prod`, should one exist), never just `zig`, which any of this project's
+runners carries. Workflows from
 outside contributors' pull requests also wait for approval before they run at all.
 
 ## Deploying releases
