@@ -10,6 +10,10 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.11.1 - 2026-10-27
+### Fixed
+* `hashFiles('--follow-symbolic-links', …)` works in a job, as on GitHub: links are followed, and a link back up the tree is skipped instead of walked for ever, decided by `realpath` in the job's container (Dagger's API gives no canonical paths). It was refused before.
+
 ## v0.11.0 - 2026-10-27
 
 ## v0.10.0 - 2026-10-27

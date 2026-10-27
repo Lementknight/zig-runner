@@ -1,3 +1,0 @@
-kind: Fixed
-body: '`hashFiles(''--follow-symbolic-links'', …)` works in a job, as on GitHub: links are followed, and a link back up the tree is skipped instead of walked for ever, decided by `realpath` in the job''s container (Dagger''s API gives no canonical paths). It was refused before.'
-time: 2026-10-27T04:00:00.000000-04:00
