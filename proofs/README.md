@@ -105,11 +105,11 @@ longer able to tell them apart.
 
 What that leaves to assume is determinism and mount-blindness: two obligations instead of three.
 **It is in the runner**, on by default, as `RUNNER_ENFORCE_VOLATILE` — a step that did not name a
-run-specific value is given the constant `zig-runner-withheld` in its own `env` prefix. But only for
-the 16 variables in `volatile_env`: the event payload is still written to every step's
-`$GITHUB_EVENT_PATH`, and the parent shell's environment still holds the real values, so
-`volatile_clause_discharged` holds of the model and not yet of the runner (see "Against today's
-code" below, and #68). See
+run-specific value is given the constant `zig-runner-withheld` in its own `env` prefix, and the
+same constant, as a JSON string, at `$GITHUB_EVENT_PATH` in place of the event payload (#68; until
+then the payload was written to every step, and a script reading it from a file was replayed with
+an earlier run's). One way around it is left: the parent shell's environment still holds the real
+values, so a step that reads `/proc/$PPID/environ` can see them (see "Against today's code"). See
 [SPEC.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/SPEC.md) §9, the first
 entry in "Where this runner differs from GitHub's". Early cutoff turns out to need it too, and that
 is new: what a step exports through `$GITHUB_ENV` is in the next step's container, so an unmarked
@@ -215,7 +215,7 @@ and the theorems still hold of the model. Where the runner does not do what the 
 
 | Where | What the runner does | Consequence | Issue |
 |---|---|---|---|
-| `Enforce` | Withholds only the 16 `volatile_env` variables. The event payload is written in full to `$GITHUB_EVENT_PATH` before every step, from a volatile variable outside the key; the parent shell keeps the real values | A step whose script reads the payload from a file is replayed with an earlier run's payload, with default settings. `nothing_volatile_survives` is false of the runner | #68 |
+| `Enforce` | Withheld the 16 `volatile_env` variables but wrote the event payload in full to every step's `$GITHUB_EVENT_PATH`, from a volatile variable outside the key. Now a replayable step finds the withheld constant there instead, and a script naming `GITHUB_EVENT_PATH` or the file runs every time. The parent shell still keeps the real values in its environment | Was: a step whose script read the payload from a file was replayed with an earlier run's payload (#68, fixed). Left: reading `/proc/$PPID/environ` | #68 |
 | `Output`, `Disciplined` | Failed steps are recorded (`withExec(expect: ANY)`) and replayed; `GITHUB_RUN_ATTEMPT` is volatile | A flaky failure is replayed on every re-run. The model's `Output` has no exit code | #69 |
 | `Input.mounts`, `Disciplined` | uv's venv lives in a per-ref cache volume by default (`uv_env_in_cache`) | Mount-blindness, the clause counterexample 4 breaks, is something ordinary Python jobs now depend on | #70 |
 | `Output.log` | A replay prints stdout, then stderr, without blank lines; a step can print another step's in-range marker | Workflow commands (masks, stop-commands) can apply differently in a replay | #71 |
