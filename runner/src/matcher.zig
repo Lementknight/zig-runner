@@ -14,9 +14,9 @@
 //! patterns are carried forward, which is how an error line that mentions no filename still gets
 //! one. A line that breaks the sequence resets it, and is then retried as a first pattern.
 //!
-//! The regular expressions come from `regex.zig`, whose subset was read off the matchers real
-//! actions ship. A pattern it refuses makes **that matcher** inert with a warning, not the step
-//! fail: an action that ships a pattern using lookahead should lose its annotations, not its job.
+//! The regular expressions come from `regex.zig`, which reads them as GitHub's runner does (.NET,
+//! ECMAScript mode). A pattern it refuses (a Unicode category, `\p{L}`) makes **that matcher**
+//! inert with a warning, not the step fail: an action should lose its annotations, not its job.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -429,12 +429,13 @@ test "a matcher whose pattern this engine refuses goes inert, and says which" {
     defer a.deinit();
     const ar = a.allocator();
 
-    // Lookahead is refused by regex.zig; the matcher must not be registered half-compiled.
-    const lookahead =
+    // Unicode categories are refused by regex.zig; the matcher must not be registered
+    // half-compiled.
+    const category =
         \\{ "problemMatcher": [ { "owner": "exotic", "pattern": [
-        \\  { "regexp": "^(?=x)(.*)$", "message": 1 } ] } ] }
+        \\  { "regexp": "^\\p{L}(.*)$", "message": 1 } ] } ] }
     ;
-    const loaded = try load(ar, lookahead);
+    const loaded = try load(ar, category);
     try testing.expectEqual(@as(usize, 0), loaded.matchers.len);
     try testing.expectEqual(@as(usize, 1), loaded.refused.len);
     try testing.expectEqualStrings("exotic", loaded.refused[0].owner);
@@ -445,7 +446,7 @@ test "a matcher whose pattern this engine refuses goes inert, and says which" {
     const half_bad =
         \\{ "problemMatcher": [ { "owner": "half", "pattern": [
         \\  { "regexp": "^(.*)$", "file": 1 },
-        \\  { "regexp": "\\bword\\b", "message": 1 } ] } ] }
+        \\  { "regexp": "\\p{Lu}word", "message": 1 } ] } ] }
     ;
     const partly = try load(ar, half_bad);
     try testing.expectEqual(@as(usize, 0), partly.matchers.len);

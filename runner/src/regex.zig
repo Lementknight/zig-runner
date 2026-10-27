@@ -1,186 +1,279 @@
-//! A backtracking regular expression matcher, for the patterns in GitHub's problem matchers.
+//! Regular expressions as GitHub's runner reads a problem matcher's: actions/runner's IssueMatcher.cs
+//! compiles each with .NET's `new Regex(pattern, RegexOptions.CultureInvariant |
+//! RegexOptions.ECMAScript)` and reads groups by number. This is that, in Zig: what .NET accepts in
+//! that mode, with its answers. `.github/scripts/regex-diff.sh` compares it with .NET itself, on the
+//! patterns problem matchers published on GitHub use and on random ones.
 //!
-//! Problem matchers carry regular expressions (`::add-matcher::`) and Zig's standard library has
-//! none. The subset here was not guessed: it is what the matchers shipped by `actions/setup-go` and
-//! `actions/setup-node` (eslint-compact, eslint-stylish, tsc) actually use, and those five patterns
-//! are the acceptance test at the bottom of this file.
+//! **What ECMAScript mode means in .NET**, and so here (each checked against .NET):
+//! - `\w`, `\d`, `\s` and `\b` are ASCII-only, in classes and under `(?i)` too.
+//! - `\N` is a backreference when group N is already open, else an octal escape (`\033` is ESC);
+//!   `\8` and `\9` are digits; octal stops before passing `\377`. A backreference to a group that
+//!   took no part matches the empty string.
+//! - An unknown escape is the character itself (`\Q` is `Q`); `[^]` is any character.
 //!
-//! Supported: `^` `$`, literals, `.`, the escapes `\s \S \d \D \w \W` and any escaped
-//! metacharacter, character classes with ranges, negation and escapes (`[^\s]`, `[\(:]`, `[a-z]`),
-//! capturing and non-capturing groups (`(…)`, `(?:…)`), alternation, and the quantifiers `*` `+`
-//! `?` `{n}` `{n,}` `{n,m}`, greedy or lazy.
+//! **Supported**, as in .NET: literals (any code point), `.`, classes (ranges, negation,
+//! subtraction `[a-z-[aeiou]]`, shorthands, escapes), `^ $ \A \z \Z \G \b \B`, capturing,
+//! non-capturing, named (`(?<n>…)`, `(?'n'…)`) and numbered (`(?<2>…)`) groups, numbered and named
+//! backreferences (`\1`, `\k<n>`), lookahead and lookbehind (of any length, matched right to left
+//! as .NET does), atomic groups `(?>…)`, conditionals `(?(1)…|…)`, `(?(name)…)`, `(?(?=…)…)`,
+//! inline options `i m s x n` (`(?i)`, `(?-i)`, `(?i:…)`), comments `(?#…)`, the quantifiers
+//! `* + ? {n} {n,} {n,m}` greedy or lazy, and the escapes `\t \n \r \f \v \a \e \xHH \uHHHH \cX`
+//! and octal. Groups are numbered as .NET numbers them: unnamed ones first, then named ones.
 //!
-//! **Refused, loudly**: lookaround (`(?=` `(?!` `(?<=` `(?<!`), backreferences, named groups,
-//! possessive quantifiers, word boundaries and Unicode categories — each with a reason. A matcher
-//! whose pattern is refused goes inert and says so. That is the rule the rest of the runner
-//! follows: a construct understood *wrongly* annotates the wrong file and line, which is worse than
-//! annotating nothing.
+//! **Refused, loudly** (`error.Unsupported`): Unicode categories and blocks (`\p{…}`: they need
+//! Unicode's tables) and balancing groups (`(?<a-b>…)`). A matcher whose pattern is refused goes
+//! inert and says so: an expression understood wrongly annotates the wrong file and line, which is
+//! worse than annotating nothing.
 //!
-//! Bytes, not codepoints. Log lines are bytes and these patterns are ASCII; `.` matches any byte
-//! but a newline, as in .NET without `RegexOptions.Singleline`.
+//! **Characters, not bytes**: input is matched by code point (a byte that is not valid UTF-8 is a
+//! character of its own); positions stay byte offsets. .NET counts UTF-16 units, so a character
+//! outside the Basic Multilingual Plane (an emoji) is one character here and two there.
 //!
-//! **The design is a compiled program and a recursive VM**, after Thompson's construction as Russ
-//! Cox describes it: `char`, `class`, `any`, `split`, `jmp`, `save`, `bol`, `eol`, `match`. The
-//! first version of this file matched the syntax tree directly and needed a continuation passed
-//! through every node to let a group give back what it had taken; it worked for the five patterns
-//! and was wrong in general, which is not a trade worth making for a hundred lines. A flat program
-//! handles nesting, alternation and captures with no special cases.
+//! **Where .NET is not followed**, on purpose: in a few patterns no problem matcher would write,
+//! .NET's answers cannot be right (a match that leaves out the pattern's own first characters,
+//! with a quantifier over something that matches nothing: `c\((\B)+?.`, `\2+?` for a group that
+//! took no part, a group referring to itself), or come from its optimizer (`\W{2,}\B` refusing to
+//! give back a character where `\W{3}\B` matches). These keep the plain reading.
+//!
+//! **The design is a compiled program and an iterative VM**, after Thompson's construction as Russ
+//! Cox describes it, backtracking on a heap stack with a trail to undo captures. Lookaround,
+//! atomic groups and conditions on lookahead run their body as a nested match. Lookbehind bodies
+//! are compiled to run backwards.
 //!
 //! **There is a step budget.** Backtracking can be made to run for ever by a pattern and an input
 //! together (`(a+)+b` against a long run of `a`), and this is handed patterns from actions and
 //! lines from builds. Past the budget a match fails with `error.TooComplex` rather than hanging the
-//! runner, and the caller makes the matcher inert.
+//! runner, and the caller makes the matcher inert. (GitHub's runner sets a timeout for the same.)
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const Error = error{ BadPattern, Unsupported, TooComplex, OutOfMemory };
 
-/// Instructions executed per `find` before giving up. Generous for the patterns above on a long log
-/// line, and small enough to stay imperceptible.
+/// Instructions executed per `find` (nested matches included) before giving up. Generous for real
+/// patterns on a long log line, and small enough to stay imperceptible.
 const step_budget: usize = 200_000;
 
-/// Backtracking points held at once. Bounds memory as `step_budget` bounds time: without it a
-/// pathological pattern would push an entry per step and reach tens of megabytes before the step
-/// budget noticed.
+/// Backtracking points held at once. Bounds memory as `step_budget` bounds time.
 const max_backtrack: usize = 50_000;
 
 /// Instructions a compiled program may hold; `{n,m}` is expanded, so this bounds it.
 const max_program: usize = 10_000;
 
-/// One entry of a character class: a byte, a range, or a `\d`-style shorthand.
-const ClassItem = union(enum) {
-    byte: u8,
-    range: struct { lo: u8, hi: u8 },
-    shorthand: Shorthand,
+/// How deeply groups may nest; bounds the parser's own recursion.
+const max_depth = 64;
+
+// --- characters ---
+
+const Decoded = struct { c: u21, len: usize };
+
+/// The character at `s[i]`. A byte that does not start valid UTF-8 is a character of its own, in
+/// the lone-surrogate range, which valid UTF-8 never produces.
+fn decodeAt(s: []const u8, i: usize) ?Decoded {
+    if (i >= s.len) return null;
+    const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 0;
+    if (len > 1 and i + len <= s.len) {
+        if (std.unicode.utf8Decode(s[i .. i + len])) |c| return .{ .c = c, .len = len } else |_| {}
+    }
+    if (len == 1) return .{ .c = s[i], .len = 1 };
+    return .{ .c = 0xDC00 | @as(u21, s[i]), .len = 1 };
+}
+
+/// The character that ends at `s[i]` (what a backwards step consumes).
+fn decodeBefore(s: []const u8, i: usize) ?Decoded {
+    if (i == 0) return null;
+    var start = i - 1;
+    var n: usize = 0;
+    while (start > 0 and n < 3 and s[start] & 0xC0 == 0x80) : (n += 1) start -= 1;
+    if (decodeAt(s, start)) |d| if (start + d.len == i) return d;
+    return decodeAt(s, i - 1);
+}
+
+/// Simple lower-case mapping (CultureInvariant): ASCII, Latin-1, Latin Extended-A, Greek, Cyrillic,
+/// and the few letters whose lower case lives elsewhere (the Kelvin sign is `k`).
+fn lower(c: u21) u21 {
+    return switch (c) {
+        'A'...'Z' => c + 32,
+        0xC0...0xD6, 0xD8...0xDE => c + 0x20,
+        0x100...0x12F, 0x132...0x137, 0x14A...0x177 => c | 1,
+        0x139...0x148, 0x179...0x17E => if (c % 2 == 1) c + 1 else c,
+        0x178 => 0xFF,
+        0x386 => 0x3AC,
+        0x388...0x38A => c + 37,
+        0x38C => 0x3CC,
+        0x38E, 0x38F => c + 63,
+        0x391...0x3A1, 0x3A3...0x3AB => c + 0x20,
+        0x400...0x40F => c + 0x50,
+        0x410...0x42F => c + 0x20,
+        0x460...0x481, 0x48A...0x4BF, 0x4D0...0x52F => c | 1,
+        0x4C1...0x4CE => if (c % 2 == 1) c + 1 else c,
+        0x4C0 => 0x4CF,
+        0x1E9E => 0xDF, // capital sharp s
+        0x212A => 'k', // Kelvin sign
+        0x212B => 0xE5, // Ångström sign
+        0x2126 => 0x3C9, // Ohm sign
+        else => c,
+    };
+}
+
+/// Simple upper-case mapping, the other direction of `lower`.
+fn upper(c: u21) u21 {
+    return switch (c) {
+        'a'...'z' => c - 32,
+        0xE0...0xF6, 0xF8...0xFE => c - 0x20,
+        0xFF => 0x178,
+        0x101...0x12F, 0x133...0x137, 0x14B...0x177 => if (c % 2 == 1) c - 1 else c,
+        0x13A...0x148, 0x17A...0x17E => if (c % 2 == 0) c - 1 else c,
+        0x3AC => 0x386,
+        0x3AD...0x3AF => c - 37,
+        0x3CC => 0x38C,
+        0x3CD, 0x3CE => c - 63,
+        0x3B1...0x3C1, 0x3C3...0x3CB => c - 0x20,
+        0x3C2 => 0x3A3,
+        0x430...0x44F => c - 0x20,
+        0x450...0x45F => c - 0x50,
+        0x461...0x481, 0x48B...0x4BF, 0x4D1...0x52F => if (c % 2 == 1) c - 1 else c,
+        0x4C2...0x4CE => if (c % 2 == 0) c - 1 else c,
+        0x4CF => 0x4C0,
+        else => c,
+    };
+}
+
+fn foldEq(a: u21, b: u21) bool {
+    return a == b or lower(a) == lower(b);
+}
+
+/// What `\w` is in ECMAScript mode: ASCII letters, digits and `_`.
+fn isWord(c: u21) bool {
+    return c == '_' or (c < 0x80 and std.ascii.isAlphanumeric(@intCast(c)));
+}
+
+// --- character sets ---
+
+const Set = struct {
+    negated: bool = false,
+    /// `[^]`: any character, newlines included.
+    any: bool = false,
+    items: []const Item = &.{},
+    /// `[a-z-[aeiou]]`: what is taken out.
+    subtract: ?*const Set = null,
+
+    const Item = union(enum) {
+        range: [2]u21,
+        shorthand: Shorthand,
+    };
+
+    /// Membership before negation, case folded when `fold` (so `(?i)[^a]` does not match `A`).
+    fn positive(set: *const Set, c: u21, fold: bool) bool {
+        if (set.any) return true;
+        for (set.items) |it| switch (it) {
+            .range => |r| {
+                if (c >= r[0] and c <= r[1]) return true;
+                if (fold) {
+                    const l = lower(c);
+                    const u = upper(c);
+                    if ((l >= r[0] and l <= r[1]) or (u >= r[0] and u <= r[1])) return true;
+                    // A range of upper case letters folded for a lower case one, and the reverse.
+                    if (rangeHasFold(r, c)) return true;
+                }
+            },
+            .shorthand => |s| if (s.matches(c)) return true,
+        };
+        return false;
+    }
+
+    fn has(set: *const Set, c: u21, fold: bool) bool {
+        var in = set.positive(c, fold) != set.negated;
+        if (in) if (set.subtract) |sub| {
+            if (sub.has(c, fold)) in = false;
+        };
+        return in;
+    }
 };
+
+/// Whether some character in `r` folds to the same as `c` (the Kelvin sign for `[a-z]`).
+fn rangeHasFold(r: [2]u21, c: u21) bool {
+    const want = lower(c);
+    for ([_]u21{ 0x212A, 0x212B, 0x2126, 0x1E9E }) |special| {
+        if (special >= r[0] and special <= r[1] and lower(special) == want) return true;
+    }
+    return false;
+}
 
 const Shorthand = struct {
     kind: enum { space, digit, word },
     negated: bool,
 
-    fn matches(s: Shorthand, c: u8) bool {
+    fn matches(s: Shorthand, c: u21) bool {
         const in = switch (s.kind) {
             .space => c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0b or c == 0x0c,
             .digit => c >= '0' and c <= '9',
-            .word => c == '_' or std.ascii.isAlphanumeric(c),
+            .word => isWord(c),
         };
         return in != s.negated;
     }
 };
 
-const Class = struct { negated: bool, items: []const ClassItem };
+// --- syntax ---
 
-const Inst = union(enum) {
-    char: u8,
-    any,
-    class: Class,
-    /// Try `a` first, then `b` from the same position.
-    split: struct { a: usize, b: usize },
-    jmp: usize,
-    /// Record the current position in capture slot `n` (group g uses 2g and 2g+1).
-    save: usize,
-    /// Record the position at the start of a loop iteration, in slot `n`.
-    mark: usize,
-    /// End a loop iteration. If it consumed nothing since `mark` wrote `slot`, leave the loop by
-    /// jumping to `exit` instead of repeating — but *having run*, so the captures it made stick.
-    ///
-    /// Both halves came from the differential test. Without the check at all, a loop whose body
-    /// matches the empty string (`(x*?)+`, `(a*)*`) repeats for ever: 38 cases hit the step budget
-    /// on patterns Python answers. With the check failing the iteration instead of leaving the
-    /// loop, `([ab]?)*` reported its group absent where Python reports an empty string, because the
-    /// empty iteration's captures were thrown away: 9 more disagreements. Leaving the loop keeps
-    /// both the termination and the captures.
-    progress: struct { slot: usize, exit: usize },
+const Assert = enum {
+    /// `^`, and `^` with `m`.
     bol,
+    bol_multi,
+    /// `$` (end, or before a final newline), and `$` with `m`.
     eol,
-    match,
+    eol_multi,
+    /// `\A`, `\z`, `\Z`, `\G`.
+    start,
+    end,
+    end_or_newline,
+    search_start,
+    /// `\b`, `\B`.
+    boundary,
+    not_boundary,
 };
 
-/// The syntax tree, kept only until the program is emitted.
+const Flags = struct {
+    i: bool = false,
+    m: bool = false,
+    s: bool = false,
+    x: bool = false,
+    n: bool = false,
+};
+
+/// A reference by number or by name, resolved to a number once every group is known.
+const Ref = struct {
+    name: ?[]const u8 = null,
+    number: u32 = 0,
+};
+
 const Node = union(enum) {
-    char: u8,
-    any,
-    class: Class,
-    /// `index` is the capture number, null for `(?:…)`.
-    group: struct { index: ?usize, alts: []const []const Node },
+    char: struct { c: u21, fold: bool },
+    any: struct { dotall: bool },
+    set: struct { set: *const Set, fold: bool },
+    assert: Assert,
+    /// `cap`: the capture's index in `Parser.caps`, null for a group that does not capture.
+    group: struct { cap: ?usize, alts: []const []const Node },
     repeat: struct { node: *const Node, min: u32, max: u32, greedy: bool },
-    bol,
-    eol,
+    backref: struct { ref: *Ref, fold: bool },
+    look: struct { behind: bool, negate: bool, alts: []const []const Node },
+    atomic: []const []const Node,
+    cond: struct { cond: *Cond, yes: []const Node, no: []const Node },
 };
 
-pub const Span = struct {
-    start: usize,
-    end: usize,
-
-    pub fn of(s: Span, input: []const u8) []const u8 {
-        return input[s.start..s.end];
-    }
+/// What a conditional tests: whether a group matched, or a lookahead. `(?(x)…)` names a group if
+/// there is one called `x`, else it is the lookahead `x`: both are parsed, and settled at the end.
+const Cond = struct {
+    ref: ?Ref = null,
+    look: ?[]const []const Node = null,
 };
 
-/// Where the match and each group landed. A group that took part in no match is null, which is how
-/// `(?:(\d+):(\d+):)?` reports an absent line and column.
-pub const Captures = struct {
-    whole: Span,
-    groups: []const ?Span,
-
-    pub fn group(c: Captures, n: usize) ?Span {
-        if (n == 0) return c.whole;
-        return if (n <= c.groups.len) c.groups[n - 1] else null;
-    }
-
-    /// The text of group `n`, or null — what a problem matcher reads for `file`, `line` and so on.
-    pub fn text(c: Captures, n: usize, input: []const u8) ?[]const u8 {
-        return if (c.group(n)) |s| s.of(input) else null;
-    }
-};
-
-pub const Regex = struct {
-    prog: []const Inst,
-    group_count: usize,
-    /// Capture slots plus one per loop (see `compileStar`).
-    slot_count: usize,
-
-    /// Parses and compiles `pattern`, or says why it cannot.
-    pub fn compile(arena: Allocator, pattern: []const u8) Error!Regex {
-        var p: Parser = .{ .arena = arena, .src = pattern };
-        const alts = try p.parseAlternation(0);
-        if (p.i != pattern.len) return error.BadPattern; // an unbalanced ')'
-
-        var c: Compiler = .{ .arena = arena, .loop_slot_base = 2 * (p.groups + 1) };
-        // Slot 0 and 1 hold the whole match, so group g gets 2g and 2g+1.
-        try c.emit(.{ .save = 0 });
-        try c.compileAlts(alts);
-        try c.emit(.{ .save = 1 });
-        try c.emit(.match);
-        return .{
-            .prog = c.prog.items,
-            .group_count = p.groups,
-            .slot_count = c.loop_slot_base + c.loops,
-        };
-    }
-
-    /// The leftmost match at or after `from`, as .NET's `Regex.Match` finds it: start offsets are
-    /// tried in turn, so an unanchored pattern searches and an anchored one does not.
-    pub fn find(re: Regex, arena: Allocator, input: []const u8, from: usize) Error!?Captures {
-        const slots = try arena.alloc(?usize, re.slot_count);
-        var vm: Vm = .{ .input = input, .prog = re.prog, .slots = slots, .arena = arena };
-        var start = from;
-        while (start <= input.len) : (start += 1) {
-            @memset(slots, null);
-            vm.steps = 0;
-            if (try vm.run(0, start)) {
-                const groups = try arena.alloc(?Span, re.group_count);
-                for (groups, 0..) |*g, i| {
-                    const s = slots[2 * (i + 1)];
-                    const e = slots[2 * (i + 1) + 1];
-                    g.* = if (s != null and e != null) .{ .start = s.?, .end = e.? } else null;
-                }
-                return .{ .whole = .{ .start = slots[0].?, .end = slots[1].? }, .groups = groups };
-            }
-        }
-        return null;
-    }
+/// A capturing group as written: unnamed (numbered as it opens), named, or explicitly numbered;
+/// `at` is where its `(` is in the pattern.
+const Cap = struct {
+    name: ?[]const u8 = null,
+    number: u32 = 0,
+    at: usize = 0,
 };
 
 // --- parsing ---
@@ -189,14 +282,43 @@ const Parser = struct {
     arena: Allocator,
     src: []const u8,
     i: usize = 0,
-    groups: usize = 0,
+    /// Unnamed capturing groups opened so far: their numbers, and what `\N` may refer to.
+    unnamed: u32 = 0,
+    caps: std.ArrayList(Cap) = .empty,
+    refs: std.ArrayList(*Ref) = .empty,
+    conds: std.ArrayList(*Cond) = .empty,
+    /// From a first pass over the pattern: every group, with its final number and where it opens.
+    /// `\N` is a backreference only to a group that opens before it (.NET's ScanBasicBackslash).
+    known: []const Cap = &.{},
 
-    fn parseAlternation(p: *Parser, depth: usize) Error![]const []const Node {
-        if (depth > 32) return error.Unsupported; // bounds the parser's own recursion
+    fn peek(p: *Parser) ?u8 {
+        return if (p.i < p.src.len) p.src[p.i] else null;
+    }
+
+    fn startsWith(p: *Parser, s: []const u8) bool {
+        return std.mem.startsWith(u8, p.src[p.i..], s);
+    }
+
+    /// With `x`: whitespace, and `#` to the end of the line, are not part of the pattern.
+    fn skipIgnored(p: *Parser, f: Flags) void {
+        if (!f.x) return;
+        while (p.i < p.src.len) {
+            const c = p.src[p.i];
+            if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0b or c == 0x0c) {
+                p.i += 1;
+            } else if (c == '#') {
+                while (p.i < p.src.len and p.src[p.i] != '\n') p.i += 1;
+            } else break;
+        }
+    }
+
+    fn parseAlternation(p: *Parser, flags: Flags, depth: usize) Error![]const []const Node {
+        if (depth > max_depth) return error.Unsupported;
+        var f = flags;
         var alts: std.ArrayList([]const Node) = .empty;
         while (true) {
-            try alts.append(p.arena, try p.parseSequence(depth));
-            if (p.i < p.src.len and p.src[p.i] == '|') {
+            try alts.append(p.arena, try p.parseSequence(&f, depth));
+            if (p.peek() == '|') {
                 p.i += 1;
                 continue;
             }
@@ -205,18 +327,59 @@ const Parser = struct {
         return alts.items;
     }
 
-    fn parseSequence(p: *Parser, depth: usize) Error![]const Node {
+    /// Inline options (`(?i)`) change `f` for the rest of the enclosing group.
+    fn parseSequence(p: *Parser, f: *Flags, depth: usize) Error![]const Node {
         var seq: std.ArrayList(Node) = .empty;
-        while (p.i < p.src.len and p.src[p.i] != '|' and p.src[p.i] != ')') {
-            const atom = try p.parseAtom(depth);
-            try seq.append(p.arena, try p.parseQuantifier(atom));
+        while (true) {
+            p.skipIgnored(f.*);
+            const c = p.peek() orelse break;
+            if (c == '|' or c == ')') break;
+            if (c == '*' or c == '+' or c == '?' or (c == '{' and p.quantifierAt(p.i) != null))
+                return error.BadPattern; // nothing to repeat
+            const atom = try p.parseAtom(f, depth) orelse {
+                p.skipIgnored(f.*);
+                if (p.peek()) |q| if (q == '*' or q == '+' or q == '?' or (q == '{' and p.quantifierAt(p.i) != null))
+                    return error.BadPattern;
+                continue;
+            };
+            p.skipIgnored(f.*);
+            try seq.append(p.arena, try p.parseQuantifier(atom, f.*));
         }
         return seq.items;
     }
 
-    /// A quantifier binds to the atom before it; a trailing `?` makes it lazy.
-    fn parseQuantifier(p: *Parser, atom: Node) Error!Node {
-        if (p.i >= p.src.len) return atom;
+    /// `{n}`, `{n,}` or `{n,m}` at `at`, as min, max and where it ends; null when it is not one
+    /// (then `{` is a literal).
+    fn quantifierAt(p: *Parser, at: usize) ?struct { min: u32, max: u32, end: usize } {
+        var i = at + 1;
+        const lo_start = i;
+        while (i < p.src.len and std.ascii.isDigit(p.src[i])) i += 1;
+        if (i == lo_start or i >= p.src.len) return null;
+        const lo = p.src[lo_start..i];
+        if (p.src[i] == '}') {
+            const n = std.fmt.parseInt(u32, lo, 10) catch return .{ .min = std.math.maxInt(u32), .max = 0, .end = i + 1 };
+            return .{ .min = n, .max = n, .end = i + 1 };
+        }
+        if (p.src[i] != ',') return null;
+        i += 1;
+        const hi_start = i;
+        while (i < p.src.len and std.ascii.isDigit(p.src[i])) i += 1;
+        if (i >= p.src.len or p.src[i] != '}') return null;
+        const min = std.fmt.parseInt(u32, lo, 10) catch return .{ .min = std.math.maxInt(u32), .max = 0, .end = i + 1 };
+        const max = if (i == hi_start) std.math.maxInt(u32) else std.fmt.parseInt(u32, p.src[hi_start..i], 10) catch
+            return .{ .min = std.math.maxInt(u32), .max = 0, .end = i + 1 };
+        return .{ .min = min, .max = max, .end = i + 1 };
+    }
+
+    fn atQuantifier(p: *Parser) bool {
+        const c = p.peek() orelse return false;
+        return c == '*' or c == '+' or c == '?' or (c == '{' and p.quantifierAt(p.i) != null);
+    }
+
+    /// A quantifier binds to the atom before it; a trailing `?` makes it lazy. A second quantifier
+    /// straight after (`a**`, `a{2}+`, `a*?+`) is an error, as .NET has it.
+    fn parseQuantifier(p: *Parser, atom: Node, f: Flags) Error!Node {
+        if (!p.atQuantifier()) return atom;
         var min: u32 = 0;
         var max: u32 = std.math.maxInt(u32);
         switch (p.src[p.i]) {
@@ -229,138 +392,216 @@ const Parser = struct {
                 max = 1;
                 p.i += 1;
             },
-            '{' => {
-                const close = std.mem.indexOfScalarPos(u8, p.src, p.i, '}') orelse
-                    return atom; // a literal '{'
-                const body = p.src[p.i + 1 .. close];
-                if (body.len == 0) return atom;
-                if (std.mem.indexOfScalar(u8, body, ',')) |cm| {
-                    min = std.fmt.parseInt(u32, body[0..cm], 10) catch return atom;
-                    max = if (cm + 1 == body.len) std.math.maxInt(u32) else std.fmt.parseInt(
-                        u32,
-                        body[cm + 1 ..],
-                        10,
-                    ) catch return atom;
-                } else {
-                    min = std.fmt.parseInt(u32, body, 10) catch return atom; // `{a}` is literal
-                    max = min;
-                }
-                if (max < min) return error.BadPattern;
-                p.i = close + 1;
+            else => {
+                const q = p.quantifierAt(p.i).?;
+                // .NET refuses counts of 2^31 and more.
+                if (q.min > std.math.maxInt(i32) or (q.max != std.math.maxInt(u32) and q.max > std.math.maxInt(i32)))
+                    return error.BadPattern;
+                if (q.max < q.min) return error.BadPattern;
+                min = q.min;
+                max = q.max;
+                p.i = q.end;
             },
-            else => return atom,
         }
         var greedy = true;
-        if (p.i < p.src.len and p.src[p.i] == '?') {
+        p.skipIgnored(f);
+        if (p.peek() == '?') {
             greedy = false;
             p.i += 1;
-        } else if (p.i < p.src.len and p.src[p.i] == '+') {
-            return error.Unsupported; // possessive
+            p.skipIgnored(f);
         }
+        if (p.atQuantifier()) return error.BadPattern; // a nested quantifier
         const owned = try p.arena.create(Node);
         owned.* = atom;
         return .{ .repeat = .{ .node = owned, .min = min, .max = max, .greedy = greedy } };
     }
 
-    fn parseAtom(p: *Parser, depth: usize) Error!Node {
+    /// One atom, or null for what matches nothing and is not repeatable (`(?i)`, `(?#…)`).
+    fn parseAtom(p: *Parser, f: *Flags, depth: usize) Error!?Node {
         const c = p.src[p.i];
         switch (c) {
             '^' => {
                 p.i += 1;
-                return .bol;
+                return .{ .assert = if (f.m) .bol_multi else .bol };
             },
             '$' => {
                 p.i += 1;
-                return .eol;
+                return .{ .assert = if (f.m) .eol_multi else .eol };
             },
             '.' => {
                 p.i += 1;
-                return .any;
+                return .{ .any = .{ .dotall = f.s } };
             },
-            '(' => return p.parseGroup(depth),
-            '[' => return p.parseClass(),
-            '\\' => return p.parseEscape(),
-            '*', '+', '?' => return error.BadPattern, // nothing to repeat
-            else => {
+            '(' => return p.parseGroup(f, depth),
+            '[' => {
                 p.i += 1;
-                return .{ .char = c };
+                return .{ .set = .{ .set = try p.parseClass(), .fold = f.i } };
             },
-        }
-    }
-
-    fn parseGroup(p: *Parser, depth: usize) Error!Node {
-        p.i += 1; // '('
-        var index: ?usize = null;
-        if (p.i < p.src.len and p.src[p.i] == '?') {
-            if (p.i + 1 >= p.src.len) return error.BadPattern;
-            switch (p.src[p.i + 1]) {
-                ':' => p.i += 2,
-                // Refused rather than approximated; see the header.
-                '=', '!', '<', '\'', 'P', '#' => return error.Unsupported,
-                else => return error.Unsupported,
-            }
-        } else {
-            p.groups += 1;
-            index = p.groups;
-        }
-        const alts = try p.parseAlternation(depth + 1);
-        if (p.i >= p.src.len or p.src[p.i] != ')') return error.BadPattern;
-        p.i += 1;
-        return .{ .group = .{ .index = index, .alts = alts } };
-    }
-
-    fn parseClass(p: *Parser) Error!Node {
-        p.i += 1; // '['
-        var negated = false;
-        if (p.i < p.src.len and p.src[p.i] == '^') {
-            negated = true;
-            p.i += 1;
-        }
-        var items: std.ArrayList(ClassItem) = .empty;
-        var first = true; // a ']' first is a literal ']'
-        while (p.i < p.src.len and (p.src[p.i] != ']' or first)) {
-            first = false;
-            const lo: u8 = if (p.src[p.i] == '\\') switch (try p.parseEscape()) {
-                .char => |b| b,
-                .class => |cl| {
-                    // `[^\s]`: a shorthand inside a class contributes its own membership test.
-                    if (cl.items.len != 1) return error.Unsupported;
-                    try items.append(p.arena, cl.items[0]);
-                    continue;
-                },
-                else => return error.Unsupported,
-            } else blk: {
-                const b = p.src[p.i];
+            '\\' => {
                 p.i += 1;
-                break :blk b;
-            };
-            // A '-' just before ']' is a literal '-'.
-            if (p.i + 1 < p.src.len and p.src[p.i] == '-' and p.src[p.i + 1] != ']') {
-                p.i += 1;
-                const hi: u8 = if (p.src[p.i] == '\\') switch (try p.parseEscape()) {
-                    .char => |b| b,
-                    else => return error.Unsupported,
-                } else blk: {
-                    const b = p.src[p.i];
-                    p.i += 1;
-                    break :blk b;
+                return switch (try p.parseEscape(false)) {
+                    .char => |ch| .{ .char = .{ .c = ch, .fold = f.i } },
+                    .set => |s| .{ .set = .{ .set = s, .fold = f.i } },
+                    .assert => |a| .{ .assert = a },
+                    .backref => |r| .{ .backref = .{ .ref = r, .fold = f.i } },
                 };
-                if (hi < lo) return error.BadPattern;
-                try items.append(p.arena, .{ .range = .{ .lo = lo, .hi = hi } });
-            } else {
-                try items.append(p.arena, .{ .byte = lo });
-            }
+            },
+            else => {
+                const d = decodeAt(p.src, p.i).?;
+                p.i += d.len;
+                return .{ .char = .{ .c = d.c, .fold = f.i } };
+            },
         }
-        if (p.i >= p.src.len) return error.BadPattern; // no closing ']'
-        p.i += 1;
-        return .{ .class = .{ .negated = negated, .items = items.items } };
     }
 
-    /// A `\s`-style shorthand becomes a one-item class, so classes can hold them too.
-    fn parseEscape(p: *Parser) Error!Node {
-        p.i += 1; // '\'
-        if (p.i >= p.src.len) return error.BadPattern;
-        const c = p.src[p.i];
+    fn parseGroup(p: *Parser, f: *Flags, depth: usize) Error!?Node {
+        const at = p.i;
+        p.i += 1; // '('
+        if (p.peek() != '?') {
+            // `n`: only named groups capture.
+            var cap: ?usize = null;
+            if (!f.n) {
+                p.unnamed += 1;
+                cap = p.caps.items.len;
+                try p.caps.append(p.arena, .{ .number = p.unnamed, .at = at });
+            }
+            return .{ .group = .{ .cap = cap, .alts = try p.groupBody(f.*, depth) } };
+        }
+        p.i += 1; // '?'
+        if (p.startsWith(":")) {
+            p.i += 1;
+            return .{ .group = .{ .cap = null, .alts = try p.groupBody(f.*, depth) } };
+        }
+        if (p.startsWith("=") or p.startsWith("!")) {
+            const negate = p.src[p.i] == '!';
+            p.i += 1;
+            return .{ .look = .{ .behind = false, .negate = negate, .alts = try p.groupBody(f.*, depth) } };
+        }
+        if (p.startsWith("<=") or p.startsWith("<!")) {
+            const negate = p.src[p.i + 1] == '!';
+            p.i += 2;
+            return .{ .look = .{ .behind = true, .negate = negate, .alts = try p.groupBody(f.*, depth) } };
+        }
+        if (p.startsWith(">")) {
+            p.i += 1;
+            return .{ .atomic = try p.groupBody(f.*, depth) };
+        }
+        if (p.startsWith("#")) {
+            const close = std.mem.indexOfScalarPos(u8, p.src, p.i, ')') orelse return error.BadPattern;
+            p.i = close + 1;
+            return null;
+        }
+        if (p.startsWith("<") or p.startsWith("'")) {
+            const close: u8 = if (p.src[p.i] == '<') '>' else '\'';
+            p.i += 1;
+            const name = try p.groupName(close);
+            var cap: Cap = .{ .at = at };
+            if (std.ascii.isDigit(name[0])) {
+                cap.number = std.fmt.parseInt(u32, name, 10) catch return error.BadPattern;
+                if (cap.number == 0 or cap.number > std.math.maxInt(i32)) return error.BadPattern;
+            } else cap.name = name;
+            const index = p.caps.items.len;
+            try p.caps.append(p.arena, cap);
+            return .{ .group = .{ .cap = index, .alts = try p.groupBody(f.*, depth) } };
+        }
+        if (p.startsWith("(")) return try p.parseConditional(f.*, depth);
+        // Inline options: `(?i)`, `(?-i)`, `(?i-s:…)`.
+        var set = true;
+        var g = f.*;
+        while (p.i < p.src.len) : (p.i += 1) {
+            switch (p.src[p.i]) {
+                '-' => set = false,
+                'i' => g.i = set,
+                'm' => g.m = set,
+                's' => g.s = set,
+                'x' => g.x = set,
+                'n' => g.n = set,
+                ')' => {
+                    p.i += 1;
+                    f.* = g;
+                    return null;
+                },
+                ':' => {
+                    p.i += 1;
+                    return .{ .group = .{ .cap = null, .alts = try p.groupBody(g, depth) } };
+                },
+                else => return error.BadPattern, // an unrecognized grouping construct
+            }
+        }
+        return error.BadPattern;
+    }
+
+    /// A group's alternatives and its closing `)`.
+    fn groupBody(p: *Parser, f: Flags, depth: usize) Error![]const []const Node {
+        const alts = try p.parseAlternation(f, depth + 1);
+        if (p.peek() != ')') return error.BadPattern; // not enough )'s
+        p.i += 1;
+        return alts;
+    }
+
+    /// A group's name up to `close`: a number, or a word starting with a word character that is
+    /// not a digit. `(?<a-b>…)`, a balancing group, is not supported.
+    fn groupName(p: *Parser, close: u8) Error![]const u8 {
+        const start = p.i;
+        while (p.i < p.src.len and p.src[p.i] != close and p.src[p.i] != '-') : (p.i += 1) {
+            if (!isWord(p.src[p.i])) return error.BadPattern;
+        }
+        if (p.i >= p.src.len or p.i == start) return error.BadPattern;
+        if (p.src[p.i] == '-') return error.Unsupported;
+        const name = p.src[start..p.i];
+        p.i += 1;
+        if (std.ascii.isDigit(name[0])) for (name) |c| if (!std.ascii.isDigit(c)) return error.BadPattern;
+        return name;
+    }
+
+    /// `(?(test)yes|no)`; the `(?` is consumed.
+    fn parseConditional(p: *Parser, f: Flags, depth: usize) Error!Node {
+        const cond = try p.arena.create(Cond);
+        cond.* = .{};
+        if (p.startsWith("(?=") or p.startsWith("(?!") or p.startsWith("(?<=") or p.startsWith("(?<!")) {
+            // An explicit lookaround: its result decides.
+            const look = (try p.parseGroup(@constCast(&f), depth + 1)).?;
+            const one = try p.arena.alloc([]const Node, 1);
+            const seq = try p.arena.alloc(Node, 1);
+            seq[0] = look;
+            one[0] = seq;
+            cond.look = one;
+        } else {
+            p.i += 1; // '('
+            const close = std.mem.indexOfScalarPos(u8, p.src, p.i, ')') orelse return error.BadPattern;
+            const text = p.src[p.i..close];
+            var sub: Parser = .{ .arena = p.arena, .src = text, .unnamed = p.unnamed };
+            const as_look = sub.parseAlternation(f, depth + 1) catch null;
+            if (text.len > 0 and std.ascii.isDigit(text[0])) {
+                const n = std.fmt.parseInt(u32, text, 10) catch return error.BadPattern;
+                cond.ref = .{ .number = n };
+            } else if (text.len > 0 and allWord(text)) {
+                cond.ref = .{ .name = text };
+                if (as_look != null and sub.i == text.len) cond.look = as_look;
+            } else {
+                if (as_look == null or sub.i != text.len) return error.BadPattern;
+                cond.look = as_look;
+            }
+            p.i = close + 1;
+        }
+        try p.conds.append(p.arena, cond);
+        const alts = try p.parseAlternation(f, depth + 1);
+        if (alts.len > 2) return error.BadPattern; // too many | in (?()|)
+        if (p.peek() != ')') return error.BadPattern;
+        p.i += 1;
+        return .{ .cond = .{ .cond = cond, .yes = alts[0], .no = if (alts.len > 1) alts[1] else &.{} } };
+    }
+
+    const Escape = union(enum) {
+        char: u21,
+        set: *const Set,
+        assert: Assert,
+        backref: *Ref,
+    };
+
+    /// What follows a `\` (consumed), in a class or not.
+    fn parseEscape(p: *Parser, in_class: bool) Error!Escape {
+        const c = p.peek() orelse return error.BadPattern; // `\` at the end
         p.i += 1;
         const short: ?Shorthand = switch (c) {
             's' => .{ .kind = .space, .negated = false },
@@ -372,34 +613,272 @@ const Parser = struct {
             else => null,
         };
         if (short) |s| {
-            const items = try p.arena.alloc(ClassItem, 1);
+            const set = try p.arena.create(Set);
+            const items = try p.arena.alloc(Set.Item, 1);
             items[0] = .{ .shorthand = s };
-            return .{ .class = .{ .negated = false, .items = items } };
+            set.* = .{ .items = items };
+            return .{ .set = set };
         }
-        return switch (c) {
-            'n' => .{ .char = '\n' },
-            'r' => .{ .char = '\r' },
-            't' => .{ .char = '\t' },
-            'f' => .{ .char = 0x0c },
-            'v' => .{ .char = 0x0b },
-            '0' => .{ .char = 0 },
-            '1'...'9' => error.Unsupported, // a backreference
-            'b', 'B', 'A', 'Z', 'z', 'G' => error.Unsupported, // boundaries
-            'p', 'P' => error.Unsupported, // Unicode categories
-            'k' => error.Unsupported, // a named backreference
-            else => .{ .char = c }, // `\.`, `\(`, `\\`, and the rest
+        switch (c) {
+            'p', 'P' => return error.Unsupported, // Unicode categories and blocks
+            't' => return .{ .char = '\t' },
+            'n' => return .{ .char = '\n' },
+            'r' => return .{ .char = '\r' },
+            'f' => return .{ .char = 0x0c },
+            'v' => return .{ .char = 0x0b },
+            'a' => return .{ .char = 0x07 },
+            'e' => return .{ .char = 0x1b },
+            'x' => return .{ .char = try p.hex(2) },
+            'u' => return .{ .char = try p.hex(4) },
+            'c' => {
+                const l = p.peek() orelse return error.BadPattern;
+                if (!std.ascii.isAlphabetic(l)) return error.BadPattern;
+                p.i += 1;
+                return .{ .char = std.ascii.toUpper(l) - '@' };
+            },
+            '0' => return .{ .char = p.octal(0) },
+            '1'...'9' => {
+                // ECMAScript mode: a backreference to the longest run of digits that numbers a group
+                // opening before this `\`; else octal, or the digit itself for 8 and 9.
+                if (!in_class) {
+                    const backslash = p.i - 2;
+                    var n: u32 = c - '0';
+                    var best: ?u32 = null;
+                    var best_end = p.i;
+                    var end = p.i;
+                    while (true) {
+                        if (p.opensBefore(n, backslash)) {
+                            best = n;
+                            best_end = end;
+                        }
+                        if (end >= p.src.len or !std.ascii.isDigit(p.src[end]) or n > 100_000) break;
+                        n = n * 10 + (p.src[end] - '0');
+                        end += 1;
+                    }
+                    if (best) |b| {
+                        p.i = best_end;
+                        return .{ .backref = try p.ref(.{ .number = b }) };
+                    }
+                }
+                if (c >= '8') return .{ .char = c };
+                return .{ .char = p.octal(c - '0') };
+            },
+            else => {},
+        }
+        if (!in_class) switch (c) {
+            'b' => return .{ .assert = .boundary },
+            'B' => return .{ .assert = .not_boundary },
+            'A' => return .{ .assert = .start },
+            'z' => return .{ .assert = .end },
+            'Z' => return .{ .assert = .end_or_newline },
+            'G' => return .{ .assert = .search_start },
+            'k' => if (p.peek() == '<' or p.peek() == '\'') {
+                const close: u8 = if (p.src[p.i] == '<') '>' else '\'';
+                p.i += 1;
+                const name = try p.groupName(close);
+                if (std.ascii.isDigit(name[0]))
+                    return .{ .backref = try p.ref(.{ .number = std.fmt.parseInt(u32, name, 10) catch return error.BadPattern }) };
+                return .{ .backref = try p.ref(.{ .name = name }) };
+            },
+            else => {},
+        } else if (c == 'b') return .{ .char = 0x08 };
+        // Anything else is the character itself (`\.`, `\(`, `\Q`).
+        p.i -= 1;
+        const d = decodeAt(p.src, p.i).?;
+        p.i += d.len;
+        return .{ .char = d.c };
+    }
+
+    /// Whether group `n` exists and its `(` comes before `at`, by the first pass's numbering.
+    fn opensBefore(p: *Parser, n: u32, at: usize) bool {
+        for (p.known) |k| if (k.number == n and k.at < at) return true;
+        return false;
+    }
+
+    fn ref(p: *Parser, r: Ref) Error!*Ref {
+        const out = try p.arena.create(Ref);
+        out.* = r;
+        try p.refs.append(p.arena, out);
+        return out;
+    }
+
+    /// Exactly `n` hexadecimal digits.
+    fn hex(p: *Parser, n: usize) Error!u21 {
+        if (p.i + n > p.src.len) return error.BadPattern;
+        const v = std.fmt.parseInt(u21, p.src[p.i .. p.i + n], 16) catch return error.BadPattern;
+        p.i += n;
+        return v;
+    }
+
+    /// An octal escape whose first digit (already consumed) is `first`: up to three digits, as
+    /// long as the value stays within `\377`.
+    fn octal(p: *Parser, first: u21) u21 {
+        var v: u21 = first;
+        var digits: usize = 1;
+        while (digits < 3) : (digits += 1) {
+            const d = p.peek() orelse break;
+            if (d < '0' or d > '7' or v * 8 + (d - '0') > 0o377) break;
+            v = v * 8 + (d - '0');
+            p.i += 1;
+        }
+        return v;
+    }
+
+    /// A class after its `[`.
+    fn parseClass(p: *Parser) Error!*const Set {
+        const set = try p.arena.create(Set);
+        set.* = .{};
+        if (p.peek() == '^') {
+            set.negated = true;
+            p.i += 1;
+            // ECMAScript: `[^]` is any character.
+            if (p.peek() == ']') {
+                p.i += 1;
+                set.* = .{ .any = true };
+                return set;
+            }
+        }
+        var items: std.ArrayList(Set.Item) = .empty;
+        var first = true; // a `]` first is a literal `]`
+        while (true) {
+            const c = p.peek() orelse return error.BadPattern; // unterminated
+            if (c == ']' and !first) {
+                p.i += 1;
+                break;
+            }
+            first = false;
+            if (c == '-' and p.i + 1 < p.src.len and p.src[p.i + 1] == '[') {
+                // `-[...]` subtracts, and must end the class.
+                p.i += 2;
+                set.subtract = try p.parseClass();
+                if (p.peek() != ']') return error.BadPattern;
+                p.i += 1;
+                break;
+            }
+            const lo = try p.classElement();
+            switch (lo) {
+                .set => |s| try items.append(p.arena, s.items[0]),
+                .char => |lo_c| {
+                    // `a-z`, unless the `-` is last, or starts a subtraction.
+                    if (p.i + 1 < p.src.len and p.src[p.i] == '-' and p.src[p.i + 1] != ']' and p.src[p.i + 1] != '[') {
+                        p.i += 1;
+                        const hi = switch (try p.classElement()) {
+                            .char => |h| h,
+                            .set => return error.BadPattern, // a class in a range
+                        };
+                        if (hi < lo_c) return error.BadPattern; // a range in reverse order
+                        try items.append(p.arena, .{ .range = .{ lo_c, hi } });
+                    } else try items.append(p.arena, .{ .range = .{ lo_c, lo_c } });
+                },
+            }
+        }
+        set.items = items.items;
+        return set;
+    }
+
+    fn classElement(p: *Parser) Error!union(enum) { char: u21, set: *const Set } {
+        if (p.src[p.i] == '\\') {
+            p.i += 1;
+            return switch (try p.parseEscape(true)) {
+                .char => |ch| .{ .char = ch },
+                .set => |s| .{ .set = s },
+                else => unreachable, // no assertions or backreferences in a class
+            };
+        }
+        const d = decodeAt(p.src, p.i).?;
+        p.i += d.len;
+        return .{ .char = d.c };
+    }
+
+    /// Numbers for named groups (after the unnamed ones, as .NET numbers them), and every reference
+    /// resolved. Returns the highest group number.
+    fn resolve(p: *Parser) Error!u32 {
+        var names: std.StringHashMapUnmanaged(u32) = .empty;
+        var used: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        var top: u32 = 0;
+        for (p.caps.items) |c| if (c.name == null) {
+            try used.put(p.arena, c.number, {});
+            top = @max(top, c.number);
         };
+        var next: u32 = p.unnamed + 1;
+        for (p.caps.items) |*c| if (c.name) |name| {
+            if (names.get(name)) |n| {
+                c.number = n;
+                continue;
+            }
+            while (used.contains(next)) next += 1;
+            c.number = next;
+            try used.put(p.arena, next, {});
+            try names.put(p.arena, name, next);
+            top = @max(top, next);
+        };
+        for (p.refs.items) |r| {
+            if (r.name) |name| r.number = names.get(name) orelse return error.BadPattern //
+            else if (!used.contains(r.number)) return error.BadPattern;
+        }
+        for (p.conds.items) |c| if (c.ref) |r| {
+            if (r.name) |name| {
+                if (names.get(name)) |n| {
+                    c.ref.?.number = n;
+                    c.look = null;
+                } else c.ref = null; // not a group: the lookahead it also is
+            } else if (!used.contains(r.number)) return error.BadPattern;
+        };
+        return top;
     }
 };
 
+fn allWord(s: []const u8) bool {
+    for (s) |c| if (!isWord(c)) return false;
+    return true;
+}
+
 // --- compiling ---
+
+const Inst = union(enum) {
+    char: struct { c: u21, fold: bool, back: bool },
+    any: struct { dotall: bool, back: bool },
+    set: struct { set: *const Set, fold: bool, back: bool },
+    assert: Assert,
+    /// The text group `n` matched (the empty string when it took part in no match).
+    backref: struct { n: u32, fold: bool, back: bool },
+    /// Try `a` first, then `b` from the same position.
+    split: struct { a: usize, b: usize },
+    jmp: usize,
+    /// Record the current position in capture slot `n` (group g uses 2g and 2g+1).
+    save: usize,
+    /// Record where group `g` is opening, in its pending slot; `close` makes it the group's.
+    open: struct { g: u32, pending: usize },
+    /// Group `g` closes here: its capture is the pending position and this one. Until then a
+    /// backreference inside it still sees the previous iteration's (ECMAScript's self-reference).
+    close: struct { g: u32, pending: usize, back: bool },
+    /// Record the position at the start of a loop iteration, in slot `n`.
+    mark: usize,
+    /// End a loop iteration. If it consumed nothing since `mark` wrote `slot`, leave the loop by
+    /// jumping to `exit` instead of repeating, *having run*, so the captures it made stick.
+    progress: struct { slot: usize, exit: usize },
+    /// Match `body` (ending in `done`) where we are, without moving; `next` follows.
+    look: struct { behind: bool, negate: bool, body: usize, next: usize },
+    /// Match `body` once, keep where it ended, never backtrack into it.
+    atomic: struct { body: usize, next: usize },
+    /// Group `n` matched: go on; else to `no`.
+    cond_group: struct { n: u32, no: usize },
+    /// `body` (a lookahead) matches here: go on; else to `no`.
+    cond_look: struct { body: usize, no: usize },
+    /// The end of a nested body.
+    done,
+    match,
+};
 
 const Compiler = struct {
     arena: Allocator,
+    caps: []const Cap,
     prog: std.ArrayList(Inst) = .empty,
-    /// Where loop slots start: after the capture slots, which are 2 per group plus 2 for the whole.
+    /// Where loop slots start: after the capture slots.
     loop_slot_base: usize,
     loops: usize = 0,
+    /// Where groups' pending slots start (one per group number); set once loops are counted.
+    pending_base: usize = 0,
 
     fn emit(c: *Compiler, in: Inst) Error!void {
         if (c.prog.items.len >= max_program) return error.Unsupported; // an expansion too large
@@ -410,19 +889,17 @@ const Compiler = struct {
         return c.prog.items.len;
     }
 
-    fn compileAlts(c: *Compiler, alts: []const []const Node) Error!void {
-        if (alts.len == 1) return c.compileSeq(alts[0]);
-        // split to each alternative in turn; each one jumps to the end when it matches.
+    fn compileAlts(c: *Compiler, alts: []const []const Node, back: bool) Error!void {
+        if (alts.len == 1) return c.compileSeq(alts[0], back);
         var jumps: std.ArrayList(usize) = .empty;
         for (alts, 0..) |alt, i| {
             const last = i + 1 == alts.len;
             var split_at: usize = 0;
             if (!last) {
                 split_at = c.here();
-                try c.emit(.{ .split = .{ .a = 0, .b = 0 } });
-                c.prog.items[split_at] = .{ .split = .{ .a = c.here(), .b = 0 } };
+                try c.emit(.{ .split = .{ .a = split_at + 1, .b = 0 } });
             }
-            try c.compileSeq(alt);
+            try c.compileSeq(alt, back);
             if (!last) {
                 try jumps.append(c.arena, c.here());
                 try c.emit(.{ .jmp = 0 });
@@ -432,58 +909,101 @@ const Compiler = struct {
         for (jumps.items) |j| c.prog.items[j] = .{ .jmp = c.here() };
     }
 
-    fn compileSeq(c: *Compiler, seq: []const Node) Error!void {
-        for (seq) |n| try c.compileNode(n);
+    /// Backwards (a lookbehind's body), a sequence runs last element first.
+    fn compileSeq(c: *Compiler, seq: []const Node, back: bool) Error!void {
+        if (back) {
+            var i = seq.len;
+            while (i > 0) {
+                i -= 1;
+                try c.compileNode(seq[i], back);
+            }
+        } else for (seq) |n| try c.compileNode(n, back);
     }
 
-    fn compileNode(c: *Compiler, n: Node) Error!void {
+    /// A body run on its own (lookaround, atomic, a condition), ending in `done`; returns where it
+    /// starts. Emitted after a jump over it.
+    fn body(c: *Compiler, alts: []const []const Node, back: bool) Error!struct { start: usize, end: usize } {
+        const start = c.here();
+        try c.compileAlts(alts, back);
+        try c.emit(.done);
+        return .{ .start = start, .end = c.here() };
+    }
+
+    fn compileNode(c: *Compiler, n: Node, back: bool) Error!void {
         switch (n) {
-            .char => |b| try c.emit(.{ .char = b }),
-            .any => try c.emit(.any),
-            .class => |cl| try c.emit(.{ .class = cl }),
-            .bol => try c.emit(.bol),
-            .eol => try c.emit(.eol),
+            .char => |ch| try c.emit(.{ .char = .{ .c = ch.c, .fold = ch.fold, .back = back } }),
+            .any => |a| try c.emit(.{ .any = .{ .dotall = a.dotall, .back = back } }),
+            .set => |s| try c.emit(.{ .set = .{ .set = s.set, .fold = s.fold, .back = back } }),
+            .assert => |a| try c.emit(.{ .assert = a }),
+            .backref => |r| try c.emit(.{ .backref = .{ .n = r.ref.number, .fold = r.fold, .back = back } }),
             .group => |g| {
-                if (g.index) |gi| try c.emit(.{ .save = 2 * gi });
-                try c.compileAlts(g.alts);
-                if (g.index) |gi| try c.emit(.{ .save = 2 * gi + 1 });
+                const num: ?u32 = if (g.cap) |ci| c.caps[ci].number else null;
+                const pending = if (num) |gi| c.pending_base + gi else 0;
+                if (num) |gi| try c.emit(.{ .open = .{ .g = gi, .pending = pending } });
+                try c.compileAlts(g.alts, back);
+                if (num) |gi| try c.emit(.{ .close = .{ .g = gi, .pending = pending, .back = back } });
             },
-            .repeat => |r| try c.compileRepeat(r.node.*, r.min, r.max, r.greedy),
+            .repeat => |r| try c.compileRepeat(r.node.*, r.min, r.max, r.greedy, back),
+            .look => |l| {
+                const at = c.here();
+                try c.emit(.{ .look = .{ .behind = l.behind, .negate = l.negate, .body = 0, .next = 0 } });
+                const b = try c.body(l.alts, l.behind);
+                c.prog.items[at].look.body = b.start;
+                c.prog.items[at].look.next = b.end;
+            },
+            .atomic => |alts| {
+                const at = c.here();
+                try c.emit(.{ .atomic = .{ .body = 0, .next = 0 } });
+                const b = try c.body(alts, back);
+                c.prog.items[at].atomic.body = b.start;
+                c.prog.items[at].atomic.next = b.end;
+            },
+            .cond => |cd| {
+                const at = c.here();
+                if (cd.cond.ref) |r| {
+                    try c.emit(.{ .cond_group = .{ .n = r.number, .no = 0 } });
+                } else {
+                    // The lookahead's body sits after a jump over it.
+                    try c.emit(.{ .cond_look = .{ .body = 0, .no = 0 } });
+                    const skip = c.here();
+                    try c.emit(.{ .jmp = 0 });
+                    const b = try c.body(cd.cond.look.?, false);
+                    c.prog.items[at].cond_look.body = b.start;
+                    c.prog.items[skip] = .{ .jmp = b.end };
+                }
+                try c.compileSeq(cd.yes, back);
+                const over = c.here();
+                try c.emit(.{ .jmp = 0 });
+                switch (c.prog.items[at]) {
+                    .cond_group => c.prog.items[at].cond_group.no = c.here(),
+                    .cond_look => c.prog.items[at].cond_look.no = c.here(),
+                    else => unreachable,
+                }
+                try c.compileSeq(cd.no, back);
+                c.prog.items[over] = .{ .jmp = c.here() };
+            },
         }
     }
 
     /// `{n,m}` is expanded: n copies, then (m-n) optional ones, or a star for an open end. The
-    /// program bound in `max_program` is what keeps `a{1,10000}` from compiling.
-    fn compileRepeat(c: *Compiler, n: Node, min: u32, max: u32, greedy: bool) Error!void {
-        for (0..min) |_| try c.compileNode(n);
-        if (max == std.math.maxInt(u32)) {
-            if (min == 0) return c.compileStar(n, greedy);
-            // `x+` is `x` already emitted, then a star of the same node.
-            return c.compileStar(n, greedy);
-        }
-        // Every optional copy's "skip" branch leaves the whole repeat, so copy i+1 is reachable
-        // only by having taken copy i. Pointing a skip at the *next* copy instead — which is what
-        // this did first — adds a path a real loop does not have ("skip the first, take the
-        // second") and explores the counts in the wrong order. The grammar generator found it:
-        // `(a|.b){0,2}?$` on "ab" captured "ab" where Python and Perl both capture "b", because a
-        // lazy repeat must try one whole iteration and then another, not re-enter the first
-        // iteration's alternatives before considering a second iteration.
+    /// program bound in `max_program` keeps `a{1,10000}` from compiling.
+    fn compileRepeat(c: *Compiler, n: Node, min: u32, max: u32, greedy: bool, back: bool) Error!void {
+        for (0..min) |_| try c.compileNode(n, back);
+        if (max == std.math.maxInt(u32)) return c.compileStar(n, greedy, back);
+        // Every optional copy's "skip" branch leaves the whole repeat, so copy i+1 is reachable only
+        // by having taken copy i, and an iteration that consumes nothing ends the repetition (the
+        // mandatory copies are not guarded: `(a?){2}` does match the empty string twice). Both rules
+        // came from an earlier differential test.
         var skips: std.ArrayList(usize) = .empty;
         var guards: std.ArrayList(usize) = .empty;
         for (min..max) |_| {
             const split_at = c.here();
             try c.emit(.{ .split = .{ .a = 0, .b = 0 } });
             try skips.append(c.arena, split_at);
-            // The empty-iteration rule applies to a bounded repeat as well, not only to a star:
-            // an iteration that consumes nothing ends the repetition. Found by the grammar
-            // generator — `(\s{0,2}|…){0,2}` matched an empty iteration and then a long one,
-            // capturing the long one, where Python and Perl both stop after the empty iteration
-            // and so capture what a *second non-empty* iteration took. The mandatory copies below
-            // `min` are deliberately not guarded: `(a?){2}` does match the empty string twice.
             const slot = c.loop_slot_base + c.loops;
             c.loops += 1;
             try c.emit(.{ .mark = slot });
-            try c.compileNode(n);
+            try c.compileNode(n, back);
             try guards.append(c.arena, c.here());
             try c.emit(.{ .progress = .{ .slot = slot, .exit = 0 } });
         }
@@ -497,16 +1017,13 @@ const Compiler = struct {
         for (guards.items) |g| c.prog.items[g].progress.exit = after;
     }
 
-    fn compileStar(c: *Compiler, n: Node, greedy: bool) Error!void {
-        // Each loop gets a slot to remember where its current iteration began, so an iteration that
-        // consumes nothing ends the loop instead of repeating. The slot lives past the capture
-        // slots and is undone on backtracking like any other.
+    fn compileStar(c: *Compiler, n: Node, greedy: bool, back: bool) Error!void {
         const slot = c.loop_slot_base + c.loops;
         c.loops += 1;
         const split_at = c.here();
         try c.emit(.{ .split = .{ .a = 0, .b = 0 } });
         try c.emit(.{ .mark = slot });
-        try c.compileNode(n);
+        try c.compileNode(n, back);
         const progress_at = c.here();
         try c.emit(.{ .progress = .{ .slot = slot, .exit = 0 } });
         try c.emit(.{ .jmp = split_at });
@@ -519,6 +1036,89 @@ const Compiler = struct {
     }
 };
 
+// --- the public interface ---
+
+pub const Span = struct {
+    start: usize,
+    end: usize,
+
+    pub fn of(s: Span, input: []const u8) []const u8 {
+        return input[s.start..s.end];
+    }
+};
+
+/// Where the match and each group landed, by group number. A group that took part in no match
+/// (or a number no group has) is null, which is how `(?:(\d+):(\d+):)?` reports an absent line.
+pub const Captures = struct {
+    whole: Span,
+    groups: []const ?Span,
+
+    pub fn group(c: Captures, n: usize) ?Span {
+        if (n == 0) return c.whole;
+        return if (n <= c.groups.len) c.groups[n - 1] else null;
+    }
+
+    /// The text of group `n`, or null: what a problem matcher reads for `file`, `line` and so on.
+    pub fn text(c: Captures, n: usize, input: []const u8) ?[]const u8 {
+        return if (c.group(n)) |s| s.of(input) else null;
+    }
+};
+
+pub const Regex = struct {
+    prog: []const Inst,
+    /// The highest group number.
+    group_count: usize,
+    /// Capture slots plus one per loop.
+    slot_count: usize,
+
+    /// Parses and compiles `pattern`, or says why it cannot.
+    pub fn compile(arena: Allocator, pattern: []const u8) Error!Regex {
+        // Twice, as .NET counts groups before it parses: the first pass finds every group and its
+        // number, which decides whether a later `\N` is a backreference or an octal escape.
+        var first: Parser = .{ .arena = arena, .src = pattern };
+        _ = try first.parseAlternation(.{}, 0);
+        if (first.i != pattern.len) return error.BadPattern; // too many )'s
+        _ = first.resolve() catch {};
+        var p: Parser = .{ .arena = arena, .src = pattern, .known = first.caps.items };
+        const alts = try p.parseAlternation(.{}, 0);
+        if (p.i != pattern.len) return error.BadPattern;
+        const top = try p.resolve();
+
+        // Slots: the captures (2 per group, 0 for the whole match), each group's pending start, then
+        // one per loop.
+        const groups = @as(usize, top) + 1;
+        var c: Compiler = .{ .arena = arena, .caps = p.caps.items, .pending_base = 2 * groups, .loop_slot_base = 3 * groups };
+        try c.emit(.{ .save = 0 });
+        try c.compileAlts(alts, false);
+        try c.emit(.{ .save = 1 });
+        try c.emit(.match);
+        return .{ .prog = c.prog.items, .group_count = top, .slot_count = c.loop_slot_base + c.loops };
+    }
+
+    /// The leftmost match at or after `from`, as .NET's `Regex.Match` finds it: start offsets are
+    /// tried in turn, a character at a time, so an unanchored pattern searches.
+    pub fn find(re: Regex, arena: Allocator, input: []const u8, from: usize) Error!?Captures {
+        const slots = try arena.alloc(?usize, re.slot_count);
+        var steps: usize = 0;
+        var vm: Vm = .{ .input = input, .prog = re.prog, .slots = slots, .arena = arena, .steps = &steps, .search_start = from };
+        var start = from;
+        while (start <= input.len) {
+            @memset(slots, null);
+            if (try vm.run(0, start) != null) {
+                const groups = try arena.alloc(?Span, re.group_count);
+                for (groups, 0..) |*g, i| {
+                    const s = slots[2 * (i + 1)];
+                    const e = slots[2 * (i + 1) + 1];
+                    g.* = if (s != null and e != null and s.? <= e.?) .{ .start = s.?, .end = e.? } else null;
+                }
+                return .{ .whole = .{ .start = slots[0].?, .end = slots[1].? }, .groups = groups };
+            }
+            start += if (decodeAt(input, start)) |d| d.len else 1;
+        }
+        return null;
+    }
+};
+
 // --- matching ---
 
 /// A backtracking point: where to resume, and how far to undo the capture trail first.
@@ -527,76 +1127,114 @@ const Backtrack = struct { pc: usize, pos: usize, trail: usize };
 /// What a `save` overwrote, so backtracking can put it back.
 const Undo = struct { slot: usize, old: ?usize };
 
-/// **Iterative on purpose.** The first version recursed, one frame per instruction, and the
-/// differential test crashed it: a step budget of a million is meaningless when a step is a stack
-/// frame. Depth is also O(input length) for `.*` over a long line, so capping depth would reject
-/// legitimate matches on long log lines — and the runner matches inside `std.Io` tasks, whose
-/// stacks are smaller than main's. So the backtracking points live on the heap, and captures are
-/// undone from a trail rather than by returning through frames.
+/// **Iterative on purpose**: one stack frame per instruction crashed an earlier version, and depth
+/// is O(input length) for `.*` over a long line. Backtracking points live on the heap, and captures
+/// are undone from a trail. Nested bodies (lookaround, atomic groups) recurse once per nesting
+/// level of the pattern, which the parser bounds.
 const Vm = struct {
     input: []const u8,
     prog: []const Inst,
     slots: []?usize,
     arena: Allocator,
+    steps: *usize,
+    search_start: usize,
     stack: std.ArrayList(Backtrack) = .empty,
     trail: std.ArrayList(Undo) = .empty,
-    steps: usize = 0,
 
-    fn run(vm: *Vm, start_pc: usize, start_pos: usize) Error!bool {
+    /// Runs from `start_pc` at `start_pos` to `match` or `done`; where it ended, or null.
+    fn run(vm: *Vm, start_pc: usize, start_pos: usize) Error!?usize {
         vm.stack.clearRetainingCapacity();
         vm.trail.clearRetainingCapacity();
         var pc = start_pc;
         var pos = start_pos;
         while (true) {
-            vm.steps += 1;
-            if (vm.steps > step_budget) return error.TooComplex;
-            const advance: ?struct { pc: usize, pos: usize } = switch (vm.prog[pc]) {
-                .match => return true,
-                .char => |b| if (pos < vm.input.len and vm.input[pos] == b) .{
-                    .pc = pc + 1,
-                    .pos = pos + 1,
-                } else null,
-                .any => if (pos < vm.input.len and vm.input[pos] != '\n') .{
-                    .pc = pc + 1,
-                    .pos = pos + 1,
-                } else null,
-                .class => |cl| if (pos < vm.input.len and classMatches(cl, vm.input[pos])) .{
-                    .pc = pc + 1,
-                    .pos = pos + 1,
-                } else null,
-                .bol => if (pos == 0) .{ .pc = pc + 1, .pos = pos } else null,
-                .eol => if (pos == vm.input.len) .{ .pc = pc + 1, .pos = pos } else null,
-                .jmp => |t| .{ .pc = t, .pos = pos },
+            vm.steps.* += 1;
+            if (vm.steps.* > step_budget) return error.TooComplex;
+            const next: ?usize = switch (vm.prog[pc]) {
+                .match, .done => return pos,
+                .char => |ch| blk: {
+                    const d = (if (ch.back) decodeBefore(vm.input, pos) else decodeAt(vm.input, pos)) orelse break :blk null;
+                    if (!(d.c == ch.c or (ch.fold and foldEq(d.c, ch.c)))) break :blk null;
+                    pos = if (ch.back) pos - d.len else pos + d.len;
+                    break :blk pc + 1;
+                },
+                .any => |a| blk: {
+                    const d = (if (a.back) decodeBefore(vm.input, pos) else decodeAt(vm.input, pos)) orelse break :blk null;
+                    if (d.c == '\n' and !a.dotall) break :blk null;
+                    pos = if (a.back) pos - d.len else pos + d.len;
+                    break :blk pc + 1;
+                },
+                .set => |s| blk: {
+                    const d = (if (s.back) decodeBefore(vm.input, pos) else decodeAt(vm.input, pos)) orelse break :blk null;
+                    if (!s.set.has(d.c, s.fold)) break :blk null;
+                    pos = if (s.back) pos - d.len else pos + d.len;
+                    break :blk pc + 1;
+                },
+                .assert => |a| if (vm.holds(a, pos)) pc + 1 else null,
+                .backref => |r| blk: {
+                    const s = vm.slots[2 * @as(usize, r.n)];
+                    const e = vm.slots[2 * @as(usize, r.n) + 1];
+                    // ECMAScript: a group that took no part matches the empty string.
+                    if (s == null or e == null or s.? > e.?) break :blk pc + 1;
+                    const end = vm.matchText(vm.input[s.?..e.?], pos, r.fold, r.back) orelse break :blk null;
+                    pos = end;
+                    break :blk pc + 1;
+                },
+                .jmp => |t| t,
                 .split => |s| blk: {
                     if (vm.stack.items.len >= max_backtrack) return error.TooComplex;
-                    try vm.stack.append(
-                        vm.arena,
-                        .{ .pc = s.b, .pos = pos, .trail = vm.trail.items.len },
-                    );
-                    break :blk .{ .pc = s.a, .pos = pos };
+                    try vm.stack.append(vm.arena, .{ .pc = s.b, .pos = pos, .trail = vm.trail.items.len });
+                    break :blk s.a;
                 },
-                .mark => |slot| blk: {
-                    try vm.trail.append(vm.arena, .{ .slot = slot, .old = vm.slots[slot] });
-                    vm.slots[slot] = pos;
-                    break :blk .{ .pc = pc + 1, .pos = pos };
+                .mark, .save => |slot| blk: {
+                    try vm.set(slot, pos);
+                    break :blk pc + 1;
+                },
+                .open => |o| blk: {
+                    try vm.set(o.pending, pos);
+                    break :blk pc + 1;
+                },
+                .close => |cl| blk: {
+                    // Backwards, the group opened at its end.
+                    const from = vm.slots[cl.pending].?;
+                    try vm.set(2 * @as(usize, cl.g), if (cl.back) pos else from);
+                    try vm.set(2 * @as(usize, cl.g) + 1, if (cl.back) from else pos);
+                    break :blk pc + 1;
                 },
                 .progress => |g| blk: {
                     const stalled = if (vm.slots[g.slot]) |was| pos == was else false;
-                    break :blk .{ .pc = if (stalled) g.exit else pc + 1, .pos = pos };
+                    break :blk if (stalled) g.exit else pc + 1;
                 },
-                .save => |slot| blk: {
-                    try vm.trail.append(vm.arena, .{ .slot = slot, .old = vm.slots[slot] });
-                    vm.slots[slot] = pos;
-                    break :blk .{ .pc = pc + 1, .pos = pos };
+                .look => |l| blk: {
+                    const got = try vm.nested(l.body, pos);
+                    if ((got != null) == l.negate) break :blk null;
+                    // A positive lookaround's captures stand; a negative one has none.
+                    if (got) |g| try vm.adopt(g.slots);
+                    break :blk l.next;
+                },
+                .atomic => |a| blk: {
+                    const got = try vm.nested(a.body, pos) orelse break :blk null;
+                    try vm.adopt(got.slots);
+                    pos = got.pos;
+                    break :blk a.next;
+                },
+                .cond_group => |cg| blk: {
+                    const s = vm.slots[2 * @as(usize, cg.n)];
+                    const e = vm.slots[2 * @as(usize, cg.n) + 1];
+                    break :blk if (s != null and e != null) pc + 1 else cg.no;
+                },
+                .cond_look => |cl| blk: {
+                    const got = try vm.nested(cl.body, pos) orelse break :blk cl.no;
+                    try vm.adopt(got.slots);
+                    break :blk pc + 1;
                 },
             };
-            if (advance) |a| {
-                pc = a.pc;
-                pos = a.pos;
+            if (next) |n| {
+                pc = n;
                 continue;
             }
             // This path failed: take the most recent alternative, undoing the captures made since.
-            const b = vm.stack.pop() orelse return false;
+            const b = vm.stack.pop() orelse return null;
             while (vm.trail.items.len > b.trail) {
                 const u = vm.trail.pop().?;
                 vm.slots[u.slot] = u.old;
@@ -605,20 +1243,89 @@ const Vm = struct {
             pos = b.pos;
         }
     }
-};
 
-fn classMatches(cl: Class, c: u8) bool {
-    var in = false;
-    for (cl.items) |it| {
-        in = switch (it) {
-            .byte => |b| c == b,
-            .range => |r| c >= r.lo and c <= r.hi,
-            .shorthand => |s| s.matches(c),
-        };
-        if (in) break;
+    fn set(vm: *Vm, slot: usize, pos: usize) Error!void {
+        try vm.trail.append(vm.arena, .{ .slot = slot, .old = vm.slots[slot] });
+        vm.slots[slot] = pos;
     }
-    return in != cl.negated;
-}
+
+    /// A body run on its own from `pos`, with a copy of the captures; where it ended and its
+    /// captures, or null.
+    fn nested(vm: *Vm, pc: usize, pos: usize) Error!?struct { pos: usize, slots: []?usize } {
+        var child: Vm = .{
+            .input = vm.input,
+            .prog = vm.prog,
+            .slots = try vm.arena.dupe(?usize, vm.slots),
+            .arena = vm.arena,
+            .steps = vm.steps,
+            .search_start = vm.search_start,
+        };
+        const end = try child.run(pc, pos) orelse return null;
+        return .{ .pos = end, .slots = child.slots };
+    }
+
+    /// A nested body's captures, made this path's (and undone with it).
+    fn adopt(vm: *Vm, slots: []const ?usize) Error!void {
+        for (slots, 0..) |s, i| {
+            if (!std.meta.eql(s, vm.slots[i])) {
+                try vm.trail.append(vm.arena, .{ .slot = i, .old = vm.slots[i] });
+                vm.slots[i] = s;
+            }
+        }
+    }
+
+    /// `text` at `pos` (or, backwards, ending there), case folded when `fold`: where it ends.
+    fn matchText(vm: *Vm, text: []const u8, pos: usize, fold: bool, back: bool) ?usize {
+        if (!fold) {
+            if (back) {
+                if (pos < text.len or !std.mem.eql(u8, vm.input[pos - text.len .. pos], text)) return null;
+                return pos - text.len;
+            }
+            if (!std.mem.startsWith(u8, vm.input[pos..], text)) return null;
+            return pos + text.len;
+        }
+        if (back) {
+            var at = pos;
+            var j = text.len;
+            while (j > 0) {
+                const want = decodeBefore(text, j).?;
+                const got = decodeBefore(vm.input, at) orelse return null;
+                if (!foldEq(want.c, got.c)) return null;
+                j -= want.len;
+                at -= got.len;
+            }
+            return at;
+        }
+        var at = pos;
+        var j: usize = 0;
+        while (j < text.len) {
+            const want = decodeAt(text, j).?;
+            const got = decodeAt(vm.input, at) orelse return null;
+            if (!foldEq(want.c, got.c)) return null;
+            j += want.len;
+            at += got.len;
+        }
+        return at;
+    }
+
+    fn holds(vm: *Vm, a: Assert, pos: usize) bool {
+        const in = vm.input;
+        return switch (a) {
+            .bol => pos == 0,
+            .bol_multi => pos == 0 or in[pos - 1] == '\n',
+            .eol, .end_or_newline => pos == in.len or (pos + 1 == in.len and in[pos] == '\n'),
+            .eol_multi => pos == in.len or in[pos] == '\n',
+            .start => pos == 0,
+            .end => pos == in.len,
+            .search_start => pos == vm.search_start,
+            .boundary, .not_boundary => blk: {
+                const before = if (decodeBefore(in, pos)) |d| isWord(d.c) else false;
+                const after = if (decodeAt(in, pos)) |d| isWord(d.c) else false;
+                break :blk (before != after) == (a == .boundary);
+            },
+        };
+    }
+};
 
 // --- tests ---
 
@@ -649,6 +1356,12 @@ fn expectGroups(
             try testing.expectEqualStrings(w.?, g.?);
         }
     }
+}
+
+fn whole(arena: Allocator, pattern: []const u8, input: []const u8) !?[]const u8 {
+    const re = try Regex.compile(arena, pattern);
+    const m = try re.find(arena, input, 0) orelse return null;
+    return m.whole.of(input);
 }
 
 test "the five problem-matcher patterns real actions ship" {
@@ -722,33 +1435,104 @@ test "anchors, classes, quantifiers and laziness" {
     try expectGroups(ar, "([a-]+)", "-a-", &.{"-a-"});
     try expectGroups(ar, "([\\(:]+)", "x(:y", &.{"(:"});
 
-    // `.` stops at a newline, as in .NET without Singleline.
+    // `.` stops at a newline, as in .NET without Singleline; `$` allows one before the end.
     try testing.expect((try caps(ar, "^a.b$", "a\nb")) == null);
+    try testing.expectEqualStrings("a", (try whole(ar, "a$", "a\n")).?);
 
     // An alternative that matches nothing still lets a later one match.
     try expectGroups(ar, "^(x|y|z)$", "y", &.{"y"});
 }
 
-test "unsupported constructs are refused, not approximated" {
+test "characters, not bytes; ECMAScript's ASCII shorthands" {
     var a: std.heap.ArenaAllocator = .init(testing.allocator);
     defer a.deinit();
     const ar = a.allocator();
-    for ([_][]const u8{
-        "(?=foo)", // lookahead
-        "(?!foo)", // negative lookahead
-        "(?<=foo)", // lookbehind
-        "(?<name>x)", // a named group
-        "(a)\\1", // a backreference
-        "\\bword\\b", // word boundaries
-        "\\p{L}+", // a Unicode category
-        "a++", // possessive
-    }) |pattern| {
+    try testing.expectEqualStrings("é", (try whole(ar, "^.$", "é")).?);
+    try testing.expectEqualStrings("→", (try whole(ar, "[↑|↗|→]", "x → y")).?);
+    try testing.expect((try whole(ar, "\\w", "é")) == null);
+    try testing.expect((try whole(ar, "(?i)\\w", "é")) == null);
+    try testing.expect((try whole(ar, "\\d", "٣")) == null);
+    try testing.expectEqualStrings("É", (try whole(ar, "(?i)é", "É")).?);
+    try testing.expectEqualStrings("\u{212A}", (try whole(ar, "(?i)k", "\u{212A}")).?);
+    try testing.expect((try whole(ar, "(?i)[^a]", "A")) == null);
+}
+
+test "escapes: octal, hexadecimal, control, and backreference or octal by ECMAScript's rule" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // flake8-style matchers colour their output: `\033` is ESC.
+    try expectGroups(ar, "^([^:]+): \\033\\[[\\d;]+m(.+)$", "a.py: \x1b[1;31mbad", &.{ "a.py", "bad" });
+    try testing.expectEqualStrings(" 0", (try whole(ar, "\\400", "x 0")).?); // \40, then 0
+    try testing.expectEqualStrings("\n3", (try whole(ar, "\\0123", "\n3")).?);
+    try testing.expectEqualStrings("A\x01\x1b\x07", (try whole(ar, "\\x41\\ca\\e\\a", "A\x01\x1b\x07")).?);
+    try testing.expectEqualStrings("Q", (try whole(ar, "\\Q", "Q")).?);
+    try testing.expectEqualStrings("8", (try whole(ar, "\\8", "8")).?);
+    // `\1` before group 1 opens is octal; `\12` with one group is `\1` then `2`; a named group
+    // numbers too, and `\N` for a group opening later is octal.
+    try testing.expect((try whole(ar, "\\1(a)", "a")) == null);
+    try testing.expectEqualStrings("aa", (try whole(ar, "(?<n>a)\\1", "aa")).?);
+    try testing.expectEqualStrings("a\x02b", (try whole(ar, "(a)\\2(b)", "a\x02b")).?);
+    try testing.expectEqualStrings("aa2", (try whole(ar, "(a)\\12", "aa2")).?);
+    // A group that took no part: the empty string.
+    try testing.expectEqualStrings("b", (try whole(ar, "(a)?\\1b", "b")).?);
+    for ([_][]const u8{ "\\x4", "\\u004", "\\c1", "\\c", "\\" }) |bad|
+        try testing.expectError(error.BadPattern, Regex.compile(ar, bad));
+}
+
+test "groups: named, numbered as .NET numbers them, backreferences, conditionals" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // Unnamed groups first, then named ones.
+    try expectGroups(ar, "(?<x>a)(b)(?<y>c)(d)", "abcd", &.{ "b", "d", "a", "c" });
+    try expectGroups(ar, "(?<x>a)\\k<x>(?'y'b)\\k'y'", "aabb", &.{ "a", "b" });
+    try expectGroups(ar, "(?<2>a)", "a", &.{ null, "a" });
+    try expectGroups(ar, "(?n)(a)(?<x>b)", "ab", &.{"b"});
+    try expectGroups(ar, "(?<n>x)?(?(n)y|z)", "z", &.{null});
+    try testing.expectEqualStrings("a", (try whole(ar, "(?(a)a|b)", "a")).?);
+    try testing.expectError(error.BadPattern, Regex.compile(ar, "\\k<nope>"));
+    try testing.expectError(error.BadPattern, Regex.compile(ar, "(a)?(?(1)b|c|d)"));
+}
+
+test "lookaround, right to left behind; atomic groups; options" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    try testing.expectEqualStrings("b", (try whole(ar, "a(?=b)b", "ab")).?[1..]);
+    try testing.expect((try whole(ar, "a(?!b)", "ab")) == null);
+    try expectGroups(ar, "(?<=(a+))b", "aaab", &.{"aaa"});
+    try expectGroups(ar, "(?<=(a+?))b", "aaab", &.{"a"});
+    try testing.expect((try whole(ar, "(?<!^)a", "a")) == null);
+    try testing.expect((try whole(ar, "(?>a|ab)c", "abc")) == null);
+    try testing.expectEqualStrings("Aa", (try whole(ar, "(?i)a(?-i)a", "Aa")).?);
+    try testing.expect((try whole(ar, "(?i:a)a", "AA")) == null);
+    try testing.expectEqualStrings("ab", (try whole(ar, "(?x) a b # c", "ab")).?);
+    try testing.expectEqualStrings("a\nb", (try whole(ar, "(?s)a.b", "a\nb")).?);
+    try testing.expectEqualStrings("b", (try whole(ar, "(?m)^b", "a\nb")).?);
+    try testing.expectEqualStrings("x\ny", (try whole(ar, "x[^]y", "x\ny")).?);
+    try testing.expectEqualStrings("b", (try whole(ar, "[a-c-[ac]]", "abc")).?);
+    try testing.expectEqualStrings("4", (try whole(ar, "[\\d-[3]]", "34")).?);
+}
+
+test "unsupported constructs are refused, not approximated; malformed ones are errors" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    for ([_][]const u8{ "\\p{L}+", "(?<a-b>x)" }) |pattern|
         try testing.expectError(error.Unsupported, Regex.compile(ar, pattern));
+    for ([_][]const u8{
+        "(unclosed", "[unclosed", "a)",      "*nothing",       "a{3,2}",   "a**", "a{2}+",
+        "a*?+",      "[z-a]",     "[a-\\d]", "[a-z-[aeiou]x]", "(?P<n>a)", "[]",
+    }) |pattern| {
+        testing.expectError(error.BadPattern, Regex.compile(ar, pattern)) catch |e| {
+            std.debug.print("{s}\n", .{pattern});
+            return e;
+        };
     }
-    // And malformed patterns are told apart from unsupported ones.
-    for ([_][]const u8{ "(unclosed", "[unclosed", "a)", "*nothing", "a{3,2}" }) |pattern| {
-        try testing.expectError(error.BadPattern, Regex.compile(ar, pattern));
-    }
+    // What .NET reads as literals.
+    try testing.expectEqualStrings("a{,2}", (try whole(ar, "a{,2}", "a{,2}")).?);
+    try testing.expectEqualStrings("{", (try whole(ar, "{", "{")).?);
 }
 
 test "a pathological pattern gives up instead of hanging" {
