@@ -10,6 +10,10 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.9.3 - 2026-10-27
+### Fixed
+* `hashFiles()` now finds files exactly as GitHub's does and gives the same hash: its search is @actions/glob (what GitHub's runner runs it with, on Node) ported to Zig, reading the job's container through Dagger's API instead of Dagger's glob. Files are hashed in GitHub's order (depth-first, each directory's entries in byte order), so with several files the result is GitHub's hash too, where it differed before. Every pattern feature @actions/glob has works (classes, POSIX classes, escapes, `~`), and unknown `--` options are refused as GitHub refuses them. `--follow-symbolic-links` is refused for now: it needs canonical paths, which Dagger's API does not give.
+
 ## v0.9.2 - 2026-10-27
 ### Fixed
 * `hashFiles()` selects the files GitHub's does, checked against GitHub's own script on @actions/glob: a pattern matching a directory brings in everything below it again (Dagger's glob lists nothing for `src/*/**`, so `hashFiles('src/*')` missed the files in `src`'s subdirectories); a trailing `/` matches directories only (`*/` is every file in a subdirectory, not every file); a symbolic link to a directory is skipped instead of failing the step; and a `.` or `..` segment in a pattern is refused, as GitHub refuses it.
