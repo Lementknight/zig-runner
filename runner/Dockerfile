@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 # The runner as a container image: one static binary and the CA certificates it verifies GitHub and
 # the database with, nothing else (about 2 MB). Zig cross-compiles, so the build stage runs on the
 # build machine's platform for every target platform.
