@@ -81,7 +81,11 @@ pub const Config = struct {
     log_spool_dir: []const u8 = "/tmp",
     /// Put uv's project environment inside its cache volume, so uv can hardlink into it instead of
     /// copying every file (28.6 s against 0.2 s on a Raspberry Pi; see SPEC Â§6 "Package caches").
-    /// The workspace gets a `.venv` symlink to it, so paths into `.venv` still work.
+    /// The workspace gets a `.venv` symlink to it, so paths into `.venv` still work. Only in jobs
+    /// whose steps are not cached (`step_cache` off, or the job opted out): a replayed `uv sync`
+    /// writes nothing into the volume, so later steps would run against whatever environment
+    /// another commit's job left there (#70). With step caching the environment stays in the
+    /// workspace, part of each step's cached result.
     uv_env_in_cache: bool = true,
     /// Keep Zig's local cache (`.zig-cache`) between jobs, in a cache volume of its own: about 1.2 s
     /// off every `zig build test` of zig-runner itself, and 4-6 s when the previous build of the
