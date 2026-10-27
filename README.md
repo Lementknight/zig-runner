@@ -58,8 +58,9 @@ the tag runs `release`: the binaries with [GoReleaser](https://goreleaser.com), 
 [Trivy](https://trivy.dev) scan, each with signed build provenance. `scorecard` grades the
 repository weekly with [OpenSSF Scorecard](https://scorecard.dev).
 `compare` runs the comparison tools weekly
-(`.github/scripts/*-diff.sh`): the expression evaluator, YAML reader, `hashFiles()` and problem
-matcher regular expressions against the implementations they follow, on fresh random cases.
+(`.github/scripts/*-diff.sh`): the expression evaluator, YAML reader, `hashFiles()`, problem
+matcher regular expressions, HPACK decoder and RS256 signing against the implementations they
+follow, on fresh random cases.
 `proofs` checks the [Lean proofs](proofs/README.md) (the step cache, the regex matcher's loops, and
 the `hashFiles()` walk) and compares the walk's model with `runner/src/glob.zig` on random cases,
 when either changes and weekly. The workflows are written to be hard to turn against the
