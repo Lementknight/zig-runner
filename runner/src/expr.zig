@@ -56,8 +56,8 @@ pub const Scope = struct {
     diag: ?*[]const u8 = null,
     /// What `hashFiles()` reads files with; without it, `hashFiles()` is unsupported.
     hash_files: ?HashFiles = null,
-    /// Bytes the functions that build strings have made so far; `evaluate` sets it.
-    memory: ?*usize = null,
+    /// The evaluation's memory, counted as GitHub counts it (`Memory`); `evaluate` sets it.
+    memory: ?*Memory = null,
     /// The arrays `*` filters have made (see `access`); `evaluate` sets it.
     filtered: ?*Filtered = null,
 
@@ -66,23 +66,94 @@ pub const Scope = struct {
         return error.EvalError;
     }
 
-    /// Counts `n` more bytes against the evaluation's memory limit (`max_memory`).
-    fn charge(s: Scope, n: usize, arena: Allocator) Error!void {
-        const used = s.memory orelse return;
-        used.* += n;
-        if (used.* > max_memory) return s.fail(
-            "the expression needs more than {d} MiB of memory",
-            .{max_memory >> 20},
-            arena,
-        );
+    fn tooMuchMemory(s: Scope, arena: Allocator) Error {
+        return s.fail("the expression needs more than the {d} bytes of memory GitHub allows", .{max_memory}, arena);
+    }
+
+    /// Counts what a node evaluated to (`Memory.add`), as GitHub's `ExpressionNode.Evaluate`
+    /// does after each node.
+    fn account(s: Scope, arena: Allocator, level: usize, r: Evaluated) Error!void {
+        const m = s.memory orelse return;
+        // From a context or fromJSON, a boolean, number or string is GitHub's context data object
+        // (StringContextData, ...): it costs an object, then its plain value as well, and does not
+        // let the levels below be dropped.
+        const data = r.data and (r.v == .boolean or r.v == .number or r.v == .string);
+        const bytes = r.bytes orelse if (data) min_object_size else costOf(r.v);
+        if (try m.add(arena, level, bytes, !data and isPrimitive(r.v))) return s.tooMuchMemory(arena);
+        if (data and try m.add(arena, level, costOf(r.v), false)) return s.tooMuchMemory(arena);
     }
 };
 
-/// What one evaluation's string-building functions (`format`, `join`, `toJSON`, `fromJSON`) may
-/// make in all. GitHub refuses at about 1 MB, counted its own way; this is looser, to never refuse
-/// what GitHub runs, and is here so that `format('{0}{0}{0}{0}', format('{0}{0}{0}{0}', ...))`
-/// fails instead of growing until the runner runs out of memory.
-const max_memory = 10 << 20;
+/// The memory GitHub lets one evaluation use, and how it counts it: actions/runner's
+/// `EvaluationMemory`, `MemoryCounter` and `ExpressionNode.Evaluate`
+/// (src/Sdk/DTExpressions2/Expressions2/Sdk/). Each node's result is counted at its level in the
+/// tree: a string as 26 bytes and two per UTF-16 code unit (as .NET stores it), anything else as
+/// an object's 24, a `*` filter's result as 24 and a pointer per element. When a node's result is
+/// a plain primitive (a literal's, a function's, an operator's), it no longer refers to what was
+/// made below it, so the levels below are dropped from the count first. `format` also counts what
+/// it builds as it goes, segment by segment, against the same limit. Past it, the evaluation
+/// fails, as GitHub's does (`syntax-errors/memory-errors` in GitHub's tests), before
+/// `format('{0}{0}{0}{0}', format('{0}{0}{0}{0}', ...))` can grow until the runner runs out of
+/// memory.
+///
+/// The count follows the C# evaluator (actions/runner), the one GitHub runs: GitHub's TypeScript
+/// one (actions/languageservices), whose evaluation order this file otherwise follows, has no
+/// memory limit.
+const max_memory = 1048576;
+const min_object_size = 24;
+const string_overhead = 26;
+const pointer_size = 8;
+
+/// What GitHub counts a value as (`EvaluationMemory.CalculateBytes`).
+fn costOf(v: Value) usize {
+    return switch (v) {
+        .string => |text| string_overhead + 2 * utf16Len(text),
+        else => min_object_size,
+    };
+}
+
+/// The length .NET gives a string: UTF-16 code units, two for a character past U+FFFF.
+fn utf16Len(text: []const u8) usize {
+    var n: usize = 0;
+    for (text) |b| {
+        if (b & 0xc0 != 0x80) n += if (b >= 0xf0) 2 else 1;
+    }
+    return n;
+}
+
+/// GitHub's `EvaluationMemory`: bytes counted per level of the expression tree.
+const Memory = struct {
+    depths: std.ArrayList(usize) = .empty,
+    /// Levels in use, from 0: C#'s `m_maxActiveDepth + 1`.
+    active: usize = 0,
+    total: usize = 0,
+
+    /// Counts `bytes` at `level`, first dropping the levels below it when `trim`. True when the
+    /// total is past the limit.
+    fn add(m: *Memory, arena: Allocator, level: usize, bytes: usize, trim: bool) Allocator.Error!bool {
+        if (trim) while (m.active > level + 1) {
+            m.active -= 1;
+            m.total -= m.depths.items[m.active];
+            m.depths.items[m.active] = 0;
+        };
+        if (level + 1 > m.active) {
+            while (m.depths.items.len <= level) try m.depths.append(arena, 0);
+            m.active = level + 1;
+        }
+        m.depths.items[level] += bytes;
+        m.total += bytes;
+        return m.total > max_memory;
+    }
+};
+
+/// A node's value, with what GitHub's memory count needs to know of it.
+const Evaluated = struct {
+    v: Value,
+    /// Read from a context or made by fromJSON (GitHub's context data), not made by the expression.
+    data: bool = false,
+    /// What the node itself counts it as, when not the value's own cost (`ResultMemory.Bytes`).
+    bytes: ?usize = null,
+};
 
 /// How deeply `fromJSON` input may nest. Its result is converted (and compared, and written back)
 /// recursively, so `fromJSON('[[[[...]]]]')` would otherwise overflow the stack.
@@ -774,10 +845,16 @@ fn starValues(arena: Allocator, v: Value) Error![]const Value {
 /// elements, also when the filtered array has come through a function (`case(c, a.*, b.*)[0]`).
 /// An element that is neither an array nor an object contributes nothing, and neither does one
 /// without the key.
-fn access(arena: Allocator, o: Value, idx: Index, scope: Scope) Error!Value {
-    if (!isFiltered(scope, o)) return switch (idx) {
-        .star => filteredArray(arena, scope, try starValues(arena, o)),
-        .key => |k| try deref(o, k, arena),
+fn access(arena: Allocator, o: Value, idx: Index, scope: Scope) Error!Evaluated {
+    if (!isFiltered(scope, o)) switch (idx) {
+        // GitHub counts the new array as an object and a pointer per element.
+        .star => {
+            const items = try starValues(arena, o);
+            const bytes = if (o == .array or o == .object) min_object_size + pointer_size * items.len else null;
+            if ((bytes orelse 0) > max_memory) return scope.tooMuchMemory(arena);
+            return .{ .v = try filteredArray(arena, scope, items), .bytes = bytes };
+        },
+        .key => |k| return .{ .v = try deref(o, k, arena), .data = true },
     };
     var out: std.ArrayList(Value) = .empty;
     for (o.array) |item| switch (item) {
@@ -793,7 +870,9 @@ fn access(arena: Allocator, o: Value, idx: Index, scope: Scope) Error!Value {
         },
         else => {},
     };
-    return filteredArray(arena, scope, out.items);
+    // A pointer per element; no object, as GitHub counts it for a filter of a filter.
+    if (pointer_size * out.items.len > max_memory) return scope.tooMuchMemory(arena);
+    return .{ .v = try filteredArray(arena, scope, out.items), .bytes = pointer_size * out.items.len };
 }
 
 const Index = union(enum) { star, key: Value };
@@ -818,25 +897,32 @@ fn isFiltered(scope: Scope, v: Value) bool {
 /// A chain of `&&` (or of `||`), operand by operand from the left, without recursing down it: a
 /// chain of any length is depth 2 to GitHub, but `a || b || c` is parsed as `(a || b) || c`.
 /// `&&` returns the first falsy operand or the last; `||` the first truthy one or the last.
-fn evalChain(arena: Allocator, n: *const Node, scope: Scope) Error!Value {
+fn evalChain(arena: Allocator, n: *const Node, scope: Scope, level: usize) Error!Value {
     const op = n.bin.op;
     var rights: std.ArrayList(*const Node) = .empty;
     var left = n;
     while (left.* == .bin and left.bin.op == op) : (left = left.bin.l)
         try rights.append(arena, left.bin.r);
-    var v = try eval(arena, left, scope);
+    var v = try eval(arena, left, scope, level + 1);
     var i = rights.items.len;
     while (i > 0) {
         if (toBool(v) == (op == .or_)) return v;
         i -= 1;
-        v = try eval(arena, rights.items[i], scope);
+        v = try eval(arena, rights.items[i], scope, level + 1);
     }
     return v;
 }
 
-fn eval(arena: Allocator, n: *const Node, scope: Scope) Error!Value {
+/// `n`, at `level` in the tree (the root is 0), counted against the evaluation's memory.
+fn eval(arena: Allocator, n: *const Node, scope: Scope, level: usize) Error!Value {
+    const r = try evalNode(arena, n, scope, level);
+    try scope.account(arena, level, r);
+    return r.v;
+}
+
+fn evalNode(arena: Allocator, n: *const Node, scope: Scope, level: usize) Error!Evaluated {
     switch (n.*) {
-        .literal => |v| return v,
+        .literal => |v| return .{ .v = v },
         .ident => |name| {
             for (scope.unsupported_contexts) |u| if (std.ascii.eqlIgnoreCase(u, name)) {
                 if (scope.diag) |d| d.* = std.fmt.allocPrint(
@@ -846,38 +932,55 @@ fn eval(arena: Allocator, n: *const Node, scope: Scope) Error!Value {
                 ) catch "unsupported context";
                 return error.Unsupported;
             };
-            return lookupEntry(scope.contexts, name) orelse .null;
+            return .{ .v = lookupEntry(scope.contexts, name) orelse .null, .data = true };
         },
-        .prop => |p| return access(arena, try eval(arena, p.obj, scope), .{ .key = .{ .string = p.name } }, scope),
+        .prop => |p| {
+            const o = try eval(arena, p.obj, scope, level + 1);
+            // GitHub's `a.b` is an index with the literal 'b', evaluated (and counted) after `a`.
+            const key: Value = .{ .string = p.name };
+            try scope.account(arena, level + 1, .{ .v = key });
+            return access(arena, o, .{ .key = key }, scope);
+        },
         .index => |ix| {
             // The index first, as GitHub evaluates it.
-            const k = try eval(arena, ix.idx, scope);
-            return access(arena, try eval(arena, ix.obj, scope), .{ .key = k }, scope);
+            const k = try eval(arena, ix.idx, scope, level + 1);
+            return access(arena, try eval(arena, ix.obj, scope, level + 1), .{ .key = k }, scope);
         },
-        .star => |inner| return access(arena, try eval(arena, inner, scope), .star, scope),
-        .not => |inner| return .{ .boolean = !toBool(try eval(arena, inner, scope)) },
+        .star => |inner| {
+            const o = try eval(arena, inner, scope, level + 1);
+            // The `*` is a node of its own to GitHub, which evaluates to the string "*".
+            try scope.account(arena, level + 1, .{ .v = .{ .string = "*" } });
+            return access(arena, o, .star, scope);
+        },
+        .not => |inner| return .{ .v = .{ .boolean = !toBool(try eval(arena, inner, scope, level + 1)) } },
         .bin => |b| {
-            if (b.op == .and_ or b.op == .or_) return evalChain(arena, n, scope);
-            const l = try eval(arena, b.l, scope);
-            const r = try eval(arena, b.r, scope);
+            if (b.op == .and_ or b.op == .or_) return .{ .v = try evalChain(arena, n, scope, level) };
+            const l = try eval(arena, b.l, scope, level + 1);
+            const r = try eval(arena, b.r, scope, level + 1);
             return .{
-                .boolean = switch (b.op) {
-                    .eq => looseEquals(l, r),
-                    .ne => !looseEquals(l, r),
-                    .lt => if (compare(l, r)) |o| o == .lt else false,
-                    // `a <= b` is `a == b || a < b` to GitHub: an array is <= itself.
-                    .le => looseEquals(l, r) or if (compare(l, r)) |o| o == .lt else false,
-                    .gt => if (compare(l, r)) |o| o == .gt else false,
-                    .ge => looseEquals(l, r) or if (compare(l, r)) |o| o == .gt else false,
-                    else => unreachable,
+                .v = .{
+                    .boolean = switch (b.op) {
+                        .eq => looseEquals(l, r),
+                        .ne => !looseEquals(l, r),
+                        .lt => if (compare(l, r)) |o| o == .lt else false,
+                        // `a <= b` is `a == b || a < b` to GitHub: an array is <= itself.
+                        .le => looseEquals(l, r) or if (compare(l, r)) |o| o == .lt else false,
+                        .gt => if (compare(l, r)) |o| o == .gt else false,
+                        .ge => looseEquals(l, r) or if (compare(l, r)) |o| o == .gt else false,
+                        else => unreachable,
+                    },
                 },
             };
         },
-        .call => |c| return callFunction(arena, c.name, c.args, scope),
+        .call => |c| {
+            const v = try callFunction(arena, c.name, c.args, scope, level);
+            // fromJSON makes context data, as a context holds; the other functions plain values.
+            return .{ .v = v, .data = std.ascii.eqlIgnoreCase(c.name, "fromJSON") };
+        },
     }
 }
 
-fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: Scope) Error!Value {
+fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: Scope, level: usize) Error!Value {
     const eql = std.ascii.eqlIgnoreCase;
     if (statusFunction(name, scope)) |v| return v;
     if (eql(name, "hashFiles") and scope.hash_files == null) {
@@ -886,7 +989,7 @@ fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: S
     }
 
     const args = try arena.alloc(Value, arg_nodes.len);
-    for (arg_nodes, args) |an, *out| out.* = try eval(arena, an, scope);
+    for (arg_nodes, args) |an, *out| out.* = try eval(arena, an, scope, level + 1);
 
     if (eql(name, "hashFiles")) return callHashFiles(arena, args, scope);
     if (eql(name, "case")) return callCase(arena, args, scope);
@@ -986,7 +1089,6 @@ fn callJoin(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
             var out: std.ArrayList(u8) = .empty;
             for (a, 0..) |e, i| {
                 const item = try toStr(arena, e);
-                try scope.charge(item.len + if (i > 0) sep.len else 0, arena);
                 if (i > 0) try out.appendSlice(arena, sep);
                 try out.appendSlice(arena, item);
             }
@@ -1000,14 +1102,12 @@ fn callToJson(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
     if (args.len != 1) return scope.fail("toJSON() takes 1 argument", .{}, arena);
     var aw: std.Io.Writer.Allocating = .init(arena);
     writeJson(&aw.writer, args[0], 0) catch return error.OutOfMemory; // Allocating writer: only OOM
-    try scope.charge(aw.written().len, arena);
     return .{ .string = aw.written() };
 }
 
 fn callFromJson(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
     if (args.len != 1) return scope.fail("fromJSON() takes 1 argument", .{}, arena);
     const text = try toStr(arena, args[0]);
-    try scope.charge(text.len, arena);
     if (jsonNesting(text) > max_json_nesting)
         return scope.fail("fromJSON(): nested more than {d} deep", .{max_json_nesting}, arena);
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch
@@ -1039,6 +1139,9 @@ fn jsonNesting(text: []const u8) usize {
     return deepest;
 }
 
+/// `format()`. What it builds is counted as it goes, as GitHub's `Format` counts it: each piece of
+/// the format string between placeholders (an escaped brace ends one), and each argument where it
+/// is placed, as a string of its own (`costOf`), against `max_memory`.
 fn formatString(
     arena: Allocator,
     fmt: []const u8,
@@ -1046,13 +1149,18 @@ fn formatString(
     scope: Scope,
 ) Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
+    var counted: usize = 0;
+    // Where the piece of the format string being built began.
+    var piece: usize = 0;
     var i: usize = 0;
     while (i < fmt.len) {
         const c = fmt[i];
         if (c == '{') {
             if (i + 1 < fmt.len and fmt[i + 1] == '{') {
                 try out.append(arena, '{');
+                try countPiece(&counted, fmt[piece .. i + 1], scope, arena);
                 i += 2;
+                piece = i;
                 continue;
             }
             const close = std.mem.indexOfScalarPos(u8, fmt, i, '}') orelse
@@ -1062,14 +1170,18 @@ fn formatString(
                 return scope.fail("format(): invalid placeholder '{s}'", .{placeholder}, arena);
             if (idx >= args.len)
                 return scope.fail("format(): placeholder {{{d}}} has no argument", .{idx}, arena);
+            try countPiece(&counted, fmt[piece..i], scope, arena);
             const arg = try toStr(arena, args[idx]);
-            try scope.charge(arg.len, arena);
+            try countPiece(&counted, arg, scope, arena);
             try out.appendSlice(arena, arg);
             i = close + 1;
+            piece = i;
         } else if (c == '}') {
             if (i + 1 < fmt.len and fmt[i + 1] == '}') {
                 try out.append(arena, '}');
+                try countPiece(&counted, fmt[piece .. i + 1], scope, arena);
                 i += 2;
+                piece = i;
                 continue;
             }
             return scope.fail("format(): unmatched '}}' in '{s}'", .{fmt}, arena);
@@ -1078,7 +1190,16 @@ fn formatString(
             i += 1;
         }
     }
+    try countPiece(&counted, fmt[piece..], scope, arena);
     return out.items;
+}
+
+/// One piece of `format()`'s result, counted as GitHub's `MemoryCounter.Add` counts it (an empty
+/// one is not).
+fn countPiece(counted: *usize, text: []const u8, scope: Scope, arena: Allocator) Error!void {
+    if (text.len == 0) return;
+    counted.* += costOf(.{ .string = text });
+    if (counted.* > max_memory) return scope.tooMuchMemory(arena);
 }
 
 fn writeJson(w: *std.Io.Writer, v: Value, depth: usize) !void {
@@ -1154,12 +1275,12 @@ pub fn evaluate(arena: Allocator, text: []const u8, scope: Scope) Error!Value {
     // GitHub evaluates an empty expression to null.
     if (std.mem.trim(u8, text, " \t\r\n").len == 0) return .null;
     const n = try parse(arena, text, scope.diag, scope.contexts);
-    var used: usize = 0;
+    var memory: Memory = .{};
     var filtered: Filtered = .empty;
     var s = scope;
-    if (s.memory == null) s.memory = &used;
+    if (s.memory == null) s.memory = &memory;
     if (s.filtered == null) s.filtered = &filtered;
-    return eval(arena, n, s) catch |e| switch (e) {
+    return eval(arena, n, s, 0) catch |e| switch (e) {
         error.Unsupported => {
             if (scope.diag) |d| if (d.*.len == 0) {
                 d.* = "the '*' object filter is not supported yet";
@@ -1563,7 +1684,7 @@ test "a long chain of && or || is one node to GitHub, and evaluates without recu
     try std.testing.expectEqualStrings("2", try evalStr(ar, "1 && 2 || 3 && 4", s));
 }
 
-test "string building has a memory limit, and fromJSON a nesting limit" {
+test "string building has GitHub's memory limit, and fromJSON a nesting limit" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const ar = a.allocator();
@@ -1578,6 +1699,33 @@ test "string building has a memory limit, and fromJSON a nesting limit" {
     try std.testing.expectError(error.EvalError, evaluate(ar, deep, s));
     // Brackets inside strings do not count.
     try std.testing.expectEqualStrings("]]]]", try evalStr(ar, "fromJSON('[[\"]]]]\"]]')[0][0]", s));
+}
+
+test "memory is counted as GitHub counts it, to the byte" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    try std.testing.expectEqual(@as(usize, 3), utf16Len("\u{e9}\u{1f600}"));
+    // `format('{0}', env.x)`, `env.x` a string of `n` characters. At the most, before format's
+    // result replaces what was made below it: '{0}' (26 + 2 * 3) and `env.x` (an object, 24, and
+    // its string, 26 + 2n) at level 1; `env` (24) and 'x' (26 + 2) at level 2. 134 + 2n in all,
+    // so n = 524221 is the longest that fits in 1048576.
+    for ([_]struct { usize, bool }{ .{ 524221, true }, .{ 524222, false } }) |c| {
+        const x = try ar.alloc(u8, c[0]);
+        @memset(x, 'x');
+        const env = [_]Value.Entry{.{ .key = "x", .value = .{ .string = x } }};
+        const s = tctx(&.{.{ .key = "env", .value = .{ .object = &env } }});
+        if (c[1])
+            try std.testing.expectEqual(c[0], (try evalStr(ar, "format('{0}', env.x)", s)).len)
+        else
+            try std.testing.expectError(error.EvalError, evaluate(ar, "format('{0}', env.x)", s));
+    }
+    // A plain result lets what was made below it go: each format() here is under the limit, and
+    // so is the whole, as on GitHub, though together they built more than it.
+    const s: Scope = .{};
+    const f = "format('{0}{0}{0}{0}{0}{0}{0}{0}', ";
+    const nested = try repeated(ar, &.{ .{ f, 5 }, .{ "'xx'", 1 }, .{ ")", 5 } });
+    try std.testing.expectEqual(@as(usize, 2 * 8 * 8 * 8 * 8 * 8), (try evalStr(ar, nested, s)).len);
 }
 
 test "numbers are read as JavaScript's Number() reads them, as GitHub does" {
