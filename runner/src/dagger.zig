@@ -13,7 +13,10 @@
 //! Live output comes from `dagger run`'s progress log on stderr, read by a reader task. Each step's
 //! script brackets its output with marker lines so lines can be attributed to the step:
 //!
-//!     <marker>begin N      <marker>end N
+//!     <marker>begin N <mark>      <marker>end N <mark>
+//!
+//! `<mark>` is the job's secret (`mark_env`), so a step cannot forge another step's markers by
+//! printing text; see `scan`.
 //!
 //! Dagger's log frontend may repeat a span's header when it switches spans, so lines are attributed
 //! to the step named in the most recent span header (a single line that contains the step's `begin`
@@ -171,14 +174,25 @@ pub const Scan = struct {
     /// Step output that preceded the marker on the same line (output without a trailing newline).
     before: []const u8,
     marker: Marker,
+    /// The word after the step number: the job's `mark_env` value in a marker the runner's script
+    /// printed, "" when there is none (a service's marker).
+    mark: []const u8 = "",
 };
 
-/// Finds a marker anywhere in `line`. Returns null for ordinary output.
+/// Finds a marker at the end of `line` (`<marker><kind> <n>[ <mark>]`). Returns null for ordinary
+/// output. Whether it is the runner's own, and not text a step printed, is for the caller to say
+/// (`Shared.isOwn`, `replayRecorded`): any step can print this text.
+///
+/// The last occurrence counts: the runner's markers are echoed on a line of their own, so one that
+/// shares a line follows a step's output without a trailing newline — output that may itself
+/// contain the marker text.
 pub fn scan(line: []const u8) ?Scan {
-    const i = std.mem.indexOf(u8, line, marker) orelse return null;
+    const i = std.mem.lastIndexOf(u8, line, marker) orelse return null;
     var it = std.mem.tokenizeScalar(u8, line[i + marker.len ..], ' ');
     const kind = it.next() orelse return null;
     const step = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+    const mark = it.next() orelse "";
+    if (it.next() != null) return null;
     const m: Marker = if (std.mem.eql(u8, kind, "begin"))
         .{ .begin = step }
     else if (std.mem.eql(u8, kind, "end"))
@@ -187,7 +201,7 @@ pub fn scan(line: []const u8) ?Scan {
         .{ .service = step }
     else
         return null;
-    return .{ .before = line[0..i], .marker = m };
+    return .{ .before = line[0..i], .marker = m, .mark = mark };
 }
 
 /// Dagger prefixes span headers with a block glyph (U+25xx, e.g. "▼", "▋").
@@ -289,6 +303,10 @@ fn fcPath(arena: Allocator, kind: []const u8, n: u32) ![]const u8 {
 /// key, and the first run after such a change replays nothing. What keeps two steps of one job
 /// apart is not the number here but the container each starts from (see proofs/,
 /// `Runner.Counterexamples.SameStepTwice`).
+///
+/// The script's stderr goes to its stdout (`stream_prologue`), so its output is one stream in the
+/// order it was written: the live log and a replay of the recorded stdout are the same lines in
+/// the same order (issue #71).
 pub fn stepScript(arena: Allocator, n: u32, r: Resolved, action_name: []const u8) ![]const u8 {
     return stepScriptFc(arena, n, n, r, action_name);
 }
@@ -304,7 +322,9 @@ fn stepScriptFc(
 ) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
-    try w.print("echo '{s}begin {d}'\nmkdir -p " ++ fc_dir ++ " && : ", .{ marker, n });
+    try w.writeAll(stream_prologue);
+    try writeMarkerEcho(w, "begin", n);
+    try w.writeAll("mkdir -p " ++ fc_dir ++ " && : ");
     for (fc_kinds) |k| try w.print("> {s} ", .{try fcPath(arena, k, fc)});
     try w.writeByte('\n');
     switch (r) {
@@ -329,8 +349,37 @@ fn stepScriptFc(
     for (fc_kinds) |k| try w.print(">> {s} ", .{try fcPath(arena, k, fc)});
     try w.writeByte('\n');
     try writeCombinedFileCommands(w, arena, "", fc);
-    try w.print("echo '{s}end {d}'\nexit $rc\n", .{ marker, n });
+    try writeMarkerEcho(w, "end", n);
+    try w.writeAll("exit $rc\n");
     return aw.written();
+}
+
+/// The first line of every step's script: its stderr from here on is its stdout.
+///
+/// Why one stream. A step's output is logged as it streams, and replayed from the exec's recorded
+/// `stdout` and `stderr` when Dagger serves the exec from cache. Recorded as two strings, the order
+/// between them is lost, and workflow commands depend on it: an `::add-mask::` on stdout masks a
+/// stderr line after it, `::stop-commands::` turns later lines of either stream into text, and
+/// problem matchers read lines in order. With one stream the recorded stdout is the log in the
+/// order it was written, which is what the live log shows too, and the live log gets the exact
+/// order as well, where two pipes read apart could reorder lines close in time.
+///
+/// What it costs: a step's programs see one pipe for both, where GitHub's runner gives two and
+/// merges them as it reads them. Nothing in this runner tells the streams apart for a step: its
+/// lines are all logged alike (`Shared.appendLocked`), GitHub's log has no stream either, and
+/// workflow commands and problem matchers are read on both. The one place that read `stderr` alone
+/// (`bun_load_errors`) reads both. A program can still tell, by comparing its file descriptors,
+/// but none a workflow runs is known to care. Recording a second, ordered copy of the output (a
+/// `tee` of both streams into a file command) would keep the pipes apart, at the price of every
+/// step's output stored twice and a process between the step and its output, and was not worth
+/// it.
+const stream_prologue = "exec 2>&1\n";
+
+/// `echo '<marker><kind> <n>' "$ZIG_RUNNER_MARK"`: a marker that carries the job's secret (see
+/// `mark_env`). The variable's name, not its value, is in the script, so the script text (part of
+/// the step's cache key) is the same in every job.
+fn writeMarkerEcho(w: *std.Io.Writer, kind: []const u8, n: u32) !void {
+    try w.print("echo '{s}{s} {d}' \"${{" ++ mark_env ++ "-}}\"\n", .{ marker, kind, n });
 }
 
 /// The `run:` part of a step's script: the event file when asked, the script written to its file,
@@ -435,11 +484,10 @@ fn containerScript(
 ) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
-    try w.print(
-        "echo '{s}begin {d}'\nB=" ++ busybox_path ++ "\n\"$B\" mkdir -p " ++ fc_dir ++ " " ++
-            docker_home ++ " " ++ event_dir ++ " && : ",
-        .{ marker, n },
-    );
+    try w.writeAll(stream_prologue);
+    try writeMarkerEcho(w, "begin", n);
+    try w.writeAll("B=" ++ busybox_path ++ "\n\"$B\" mkdir -p " ++ fc_dir ++ " " ++
+        docker_home ++ " " ++ event_dir ++ " && : ");
     for (fc_kinds) |k| try w.print("> {s} ", .{try fcPath(arena, k, fc)});
     try w.writeByte('\n');
     if (always_run) |why| {
@@ -468,7 +516,8 @@ fn containerScript(
     for (fc_kinds) |k| try w.print(">> {s} ", .{try fcPath(arena, k, fc)});
     try w.writeByte('\n');
     try writeCombinedFileCommands(w, arena, "\"$B\" ", fc);
-    try w.print("echo '{s}end {d}'\nexit $rc\n", .{ marker, n });
+    try writeMarkerEcho(w, "end", n);
+    try w.writeAll("exit $rc\n");
     return aw.written();
 }
 
@@ -553,7 +602,7 @@ fn writeEnvCommand(
     try w.writeAll(env_cmd);
     for (secret_env, 0..) |_, i| try w.print("-u {s} ", .{try secretAlias(arena, i)});
     if (write_event) try w.writeAll("-u " ++ event_env ++ " ");
-    try w.writeAll("-u " ++ ran_env ++ " ");
+    try w.writeAll("-u " ++ ran_env ++ " -u " ++ mark_env ++ " ");
     // Before the step's own env, so a workflow that sets one of these itself still wins.
     if (withhold_volatile) for (volatile_env) |name| {
         try shellQuote(w, try std.fmt.allocPrint(arena, "{s}=" ++ volatile_sentinel, .{name}));
@@ -1051,6 +1100,8 @@ pub const Options = struct {
     test_transport: ?Transport = null,
     /// Tests: this job's `ran_env` value instead of a random one.
     test_ran_marker: ?[]const u8 = null,
+    /// Tests: this job's `mark_env` value instead of a random one.
+    test_step_mark: ?[]const u8 = null,
 };
 
 // --- the HTTP transport to the session ---
@@ -1882,6 +1933,9 @@ const Shared = struct {
     /// seen.
     live_lines: []std.atomic.Value(u32),
     ended: []std.atomic.Value(bool),
+    /// This job's `mark_env` value: a `begin` or `end` marker without it is a step's output.
+    /// Set before the log reader starts, and never changed.
+    mark: []const u8 = "",
     /// Dagger's own progress lines outside any step (guarded by `mu`), kept for engine errors.
     tail: [20][]const u8 = undefined,
     tail_len: usize = 0,
@@ -2144,13 +2198,20 @@ const Shared = struct {
         sh.log.flush() catch {};
     }
 
-    /// Whether a marker names one of this job's steps (or services). Anything else came from a
-    /// step's own output: `echo '::zig-step::begin 4000000000'` once made the log sink grow an array
-    /// to that many entries, about 32 GB.
-    fn isStep(sh: *Shared, m: Marker) bool {
-        return switch (m) {
-            .begin, .end => |n| n >= 1 and n <= sh.ended.len,
-            .service => |n| n < sh.service_logs.len,
+    /// Whether a marker is the runner's own, read in a span that is step `in_step`'s (null: no
+    /// step's yet). Anything else came from a step's own output and is logged as such.
+    ///
+    /// A step's `begin` or `end` must carry the job's secret (`mark_env`): a step that printed
+    /// `::zig-step::begin 3` once had its lines counted as step 3's, and step 3, replayed later,
+    /// then looked live and its recorded output (`::set-output` included) was never processed
+    /// (issue #71). It must name one of the job's steps too: `echo '::zig-step::begin 4000000000'`
+    /// once made the log sink grow an array to that many entries, about 32 GB (#59). A service's
+    /// marker carries no secret (a service is not a step and is not given one); it counts only
+    /// before any step's marker in its span, which is where a service prints it.
+    fn isOwn(sh: *Shared, sc: Scan, in_step: ?u32) bool {
+        return switch (sc.marker) {
+            .begin, .end => |n| n >= 1 and n <= sh.ended.len and std.mem.eql(u8, sc.mark, sh.mark),
+            .service => |n| in_step == null and n < sh.service_logs.len,
         };
     }
 
@@ -2240,9 +2301,8 @@ const Demux = struct {
             return;
         }
         if (scan(line)) |sc| {
-            // A step can print a marker itself; one naming a step this job does not have is its
-            // output, not a marker.
-            if (!d.sh.isStep(sc.marker)) {
+            // A step can print a marker itself: that is its output, not a marker.
+            if (!d.sh.isOwn(sc, d.span_step)) {
                 if (d.span_step) |c| d.sh.emitLive(c, line) else if (line.len > 0) d.sh.noise(line);
                 return;
             }
@@ -2377,6 +2437,11 @@ fn sharedFor(
     @memset(service_logs, .empty);
     const service_dropped = try arena.alloc(u32, job.services.len);
     @memset(service_dropped, 0);
+    const mark = opts.test_step_mark orelse mark: {
+        var raw: [12]u8 = undefined;
+        io.random(&raw);
+        break :mark try arena.dupe(u8, &std.fmt.bytesToHex(raw, .lower));
+    };
     return .{
         .io = io,
         .arena = arena,
@@ -2384,6 +2449,7 @@ fn sharedFor(
         .sink_job_id = opts.sink_job_id,
         .live_lines = live,
         .ended = ended,
+        .mark = mark,
         .commands = step_commands,
         .replayed_steps = replayed_steps,
         .line_counts = line_counts,
@@ -2699,7 +2765,7 @@ const SpanDemux = struct {
 
     fn line(d: *SpanDemux, span: *Span, text: []const u8) void {
         if (scan(text)) |sc| {
-            if (!d.sh.isStep(sc.marker)) {
+            if (!d.sh.isOwn(sc, span.step)) {
                 if (span.step) |c| d.sh.emitLive(c, text) else if (text.len > 0) d.sh.noise(text);
                 return;
             }
@@ -2755,6 +2821,8 @@ const BasePlan = struct {
     /// The volume for Zig's local cache, with `zig_local_cache`.
     zig_local: ?[]const u8 = null,
     ran_marker: []const u8,
+    /// The job's `mark_env` value (`Shared.mark`).
+    mark: []const u8,
 };
 
 /// The container every step starts from, as one query: the job image behind its registry auth and
@@ -2916,6 +2984,8 @@ fn writeRunEnv(q: *Query, ev: *Evaluator, plan: BasePlan) !void {
     }
     if (plan.step_cache)
         try q.call("withVolatileVariable", .{ .name = ran_env, .value = plan.ran_marker });
+    // Every step's markers carry it, with step caching or without (`mark_env`).
+    try q.call(envVarNode(plan.step_cache), .{ .name = mark_env, .value = plan.mark });
     if (plan.uv_env) |e| {
         try q.call("withEnvVariable", .{ .name = "UV_PROJECT_ENVIRONMENT", .value = e });
         // The environment outlives the job, and `uv venv` refuses to replace one that exists
@@ -3391,11 +3461,20 @@ fn runSteps(
     // leaves a fresh database empty), so a job with services runs every step.
     const no_services = job.services.len == 0;
     const step_cache = opts.step_cache and !optsOutOfStepCache(ev.job_env.items) and no_services;
-    const plan = basePlan(arena, io, transport, &ev, job, opts, step_cache, &err_msg) catch |e|
-        switch (e) {
-            error.BaseContainerFailed => return fail(sh, results, err_msg),
-            else => return e,
-        };
+    const plan = basePlan(
+        arena,
+        io,
+        transport,
+        &ev,
+        job,
+        opts,
+        step_cache,
+        sh.mark,
+        &err_msg,
+    ) catch |e| switch (e) {
+        error.BaseContainerFailed => return fail(sh, results, err_msg),
+        else => return e,
+    };
     var counter: u32 = 0;
     const base = baseContainerId(arena, transport, &ev, job, plan, &counter, &err_msg) catch |e|
         switch (e) {
@@ -3472,6 +3551,7 @@ fn basePlan(
     job: job_mod.Job,
     opts: Options,
     step_cache: bool,
+    mark: []const u8,
     err_msg: *[]const u8,
 ) !BasePlan {
     // `container:` replaces the image every step runs in.
@@ -3509,6 +3589,7 @@ fn basePlan(
         .cache_ids = volumes.ids,
         .zig_local = volumes.zig_local,
         .ran_marker = ran_marker,
+        .mark = mark,
     };
 }
 
@@ -4655,8 +4736,11 @@ const Exec = struct {
             .invalid => |why| x.sh.append(num, try std.fmt.allocPrint(arena, "Unable to " ++
                 "process the GITHUB_STATE file command: {s}", .{why})),
         };
+        // Bun's message is on stderr, which the step's script sends to its stdout
+        // (`stream_prologue`).
         const refused = code != 0 and for (bun_load_errors) |e| {
-            if (std.mem.indexOf(u8, stderr, e) != null) break true;
+            if (std.mem.indexOf(u8, stdout, e) != null or std.mem.indexOf(u8, stderr, e) != null)
+                break true;
         } else false;
         return .{ .code = code, .outputs = outputs, .state = state, .bun_refused = refused };
     }
@@ -6456,6 +6540,7 @@ const Exec = struct {
         }
         if (x.step_cache)
             try q.call("withVolatileVariable", .{ .name = ran_env, .value = x.ran_marker });
+        try q.call(envVarNode(x.step_cache), .{ .name = mark_env, .value = x.sh.mark });
     }
 
     /// Each secret as a Dagger secret variable under its alias.
@@ -7239,6 +7324,18 @@ const event_env = "ZIG_RUNNER_EVENT";
 /// or its result was replayed from Dagger's cache, instead of guessing from whether its log lines
 /// arrived in time.
 const ran_env = "ZIG_RUNNER_RAN";
+/// The job's secret that its step markers carry (`writeMarkerEcho`): a value new for every job,
+/// which a step's own program does not see (`env -u`, as `ran_env`), so a step cannot print another
+/// step's `begin` or `end` and have its lines counted as that step's (issue #71). Not `ran_env`'s
+/// value: that one is written to the step's file commands, where later steps can read it.
+///
+/// It is volatile under step caching (not part of exec cache keys); the scripts name the variable,
+/// not its value. A replayed exec's recorded output carries an earlier job's value, which
+/// `replayRecorded` learns from the recorded `begin` marker, the first line the script prints.
+///
+/// It keeps out text, not a determined step: one running as the same user can read the value
+/// from its parent shell's /proc/<pid>/environ, and steps have sudo anyway.
+const mark_env = "ZIG_RUNNER_MARK";
 /// Linux limits one environment string to 128 KiB; larger payloads are written as a file instead.
 const max_event_env = 100 * 1024;
 
@@ -7671,9 +7768,9 @@ test "file commands come back from one combined file" {
 }
 
 /// Gives the reader a moment to deliver this step's lines; if none show up the step was served from
-/// cache, so its recorded stdout and stderr are logged instead. `ran`: whether the step ran in this
-/// job, when its marker says so (see `ran_env`); null when there is none, and then a step counts as
-/// cached if neither its lines nor its end marker arrived in time.
+/// cache, so its recorded output is logged instead (`replayRecorded`). `ran`: whether the step ran
+/// in this job, when its marker says so (see `ran_env`); null when there is none, and then a step
+/// counts as cached if neither its lines nor its end marker arrived in time.
 fn awaitLiveOrReplay(
     io: std.Io,
     sh: *Shared,
@@ -7688,28 +7785,55 @@ fn awaitLiveOrReplay(
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     if (sh.live_lines[idx].load(.monotonic) > 0) return false;
-    // The step ran (its end marker arrived) but none of its lines did: they came after the marker,
-    // as a program's stderr can when it fails at once (Bun refusing an action's bundle, on Linux),
-    // and so belonged to no step. Show the result's output, which has them, as the step's own.
+    // The step ran (its end marker arrived) but none of its lines did. Before a step's stderr went
+    // to its stdout (`stream_prologue`), a program's stderr could arrive after the marker when it
+    // failed at once (Bun refusing an action's bundle, on Linux), and so belonged to no step. Show
+    // the result's output, which has them, as the step's own.
     const cached = if (ran) |r| !r else !sh.ended[idx].load(.acquire);
     if (cached) {
         sh.mu.lockUncancelable(sh.io);
         defer sh.mu.unlock(sh.io);
         if (idx < sh.replayed_steps.len) sh.replayed_steps[idx] = true;
     }
+    replayRecorded(sh, step, stdout, stderr);
+    sh.flush();
+    return cached;
+}
+
+/// Logs an exec's recorded output as step `step`'s, as the live log showed it when it ran: every
+/// line in order, blank ones included, each through the same workflow-command processing
+/// (`Shared.stepOutput`), so masks, stopped commands, `::set-output` and problem matchers come out
+/// as they did (issue #71).
+///
+/// The recorded stdout is the script's whole output, stderr included (`stream_prologue`), so its
+/// order is the order it was written. `stderr` is normally empty and is logged after it.
+///
+/// The script's own markers are left out, and nothing else is: a marker is the script's when it
+/// carries the secret of the job that ran the exec, which for a replayed exec is an earlier job's
+/// (`mark_env`). That one is learnt from the `begin` marker on the first line, printed before any
+/// of the step's output. Any other marker text is the step's output, as it was live
+/// (`Shared.isOwn`); recorded output without a `begin` marker first is all output.
+fn replayRecorded(sh: *Shared, step: u32, stdout: []const u8, stderr: []const u8) void {
+    var mark: ?[]const u8 = null;
+    var first = true;
     for ([_][]const u8{ stdout, stderr }) |text| {
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |l| {
+            // After the last newline: nothing (the usual end), or a last line without one.
+            if (l.len == 0 and lines.peek() == null) break;
             const t = std.mem.trimEnd(u8, l, "\r");
-            if (scan(t)) |s| {
-                if (s.before.len > 0) sh.replay(step, s.before);
+            defer first = false;
+            if (scan(t)) |sc| own: {
+                if (sc.marker == .service) break :own;
+                if (first and sc.marker == .begin) mark = sc.mark;
+                const m = mark orelse break :own;
+                if (!std.mem.eql(u8, sc.mark, m)) break :own;
+                if (sc.before.len > 0) sh.replay(step, sc.before);
                 continue;
             }
-            if (t.len > 0) sh.replay(step, t);
+            sh.replay(step, t);
         }
     }
-    sh.flush();
-    return cached;
 }
 
 /// Logs why a step could not run and marks it failed (the job too, unless continue-on-error).
@@ -7970,7 +8094,7 @@ test "script quotes, applies env, shell and working directory, and propagates th
         .working_directory = "sub dir",
         .env = &.{.{ .name = "X", .value = "a b" }},
     } }, "build");
-    try std.testing.expect(std.mem.indexOf(u8, w, "cd 'sub dir' && env -u ZIG_RUNNER_RAN 'X=a b' 'GITHUB_OUTPUT=/github/file_commands/output_2'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w, "cd 'sub dir' && env -u ZIG_RUNNER_RAN -u ZIG_RUNNER_MARK 'X=a b' 'GITHUB_OUTPUT=/github/file_commands/output_2'") != null);
     // The script is written to a file that the shell runs, as GitHub does.
     try std.testing.expect(std.mem.indexOf(u8, w, "printf '%s' 'echo '\\''hi'\\'' && echo $X' > /tmp/zig-runner-step-2.sh\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, w, "'GITHUB_ACTION=build' 'sh' '-e' '/tmp/zig-runner-step-2.sh' )") != null);
@@ -8003,6 +8127,27 @@ test "script quotes, applies env, shell and working directory, and propagates th
     try std.testing.expect(std.mem.indexOf(u8, w, ">> /github/file_commands/path_2") != null);
     try std.testing.expect(std.mem.indexOf(u8, w, marker ++ "begin 2") != null);
     try std.testing.expect(std.mem.endsWith(u8, w, "exit $rc\n"));
+    // One stream from the first line, and markers with the job's secret by name only (#71).
+    try std.testing.expect(std.mem.startsWith(u8, w, "exec 2>&1\necho '" ++ marker ++ "begin 2' \"${ZIG_RUNNER_MARK-}\"\n"));
+    try std.testing.expect(std.mem.indexOf(u8, w, "echo '" ++ marker ++ "end 2' \"${ZIG_RUNNER_MARK-}\"\nexit $rc\n") != null);
+    // A Docker action's script too.
+    const c = try containerScript(a.allocator(), 3, 3, &.{"/entry"}, &.{}, &.{}, null, false, false, "x");
+    try std.testing.expect(std.mem.startsWith(u8, c, "exec 2>&1\necho '" ++ marker ++ "begin 3' \"${ZIG_RUNNER_MARK-}\"\n"));
+    try std.testing.expect(std.mem.indexOf(u8, c, "-u ZIG_RUNNER_MARK ") != null);
+    try std.testing.expect(std.mem.endsWith(u8, c, "echo '" ++ marker ++ "end 3' \"${ZIG_RUNNER_MARK-}\"\nexit $rc\n"));
+}
+
+test "the marker a step's script prints is one `scan` reads, with the secret after the number" {
+    const sc = scan(marker ++ "begin 2 0123abcd").?;
+    try std.testing.expectEqual(@as(u32, 2), sc.marker.begin);
+    try std.testing.expectEqualStrings("0123abcd", sc.mark);
+    // The variable unset: `echo` leaves a trailing space and no secret.
+    try std.testing.expectEqualStrings("", scan(marker ++ "end 2 ").?.mark);
+    // The runner's marker is the last on its line; output before it may hold marker text.
+    const e = scan("out " ++ marker ++ marker ++ "end 2 m").?;
+    try std.testing.expectEqual(@as(u32, 2), e.marker.end);
+    try std.testing.expectEqualStrings("out " ++ marker, e.before);
+    try std.testing.expect(scan(marker ++ "end 2 m extra") == null);
 }
 
 test "secret variables reach the script through aliases, whatever their names" {
@@ -8016,7 +8161,7 @@ test "secret variables reach the script through aliases, whatever their names" {
         .secret_env = &.{ "INPUT_GITHUB-TOKEN", "TOKEN" },
     } }, "a");
     // Aliases are unset before the assignments; the real names come after the plain env.
-    try std.testing.expect(std.mem.indexOf(u8, w, "env -u ZIG_SECRET_0 -u ZIG_SECRET_1 -u ZIG_RUNNER_RAN 'PLAIN=p' 'INPUT_GITHUB-TOKEN='\"$ZIG_SECRET_0\" 'TOKEN='\"$ZIG_SECRET_1\" ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w, "env -u ZIG_SECRET_0 -u ZIG_SECRET_1 -u ZIG_RUNNER_RAN -u ZIG_RUNNER_MARK 'PLAIN=p' 'INPUT_GITHUB-TOKEN='\"$ZIG_SECRET_0\" 'TOKEN='\"$ZIG_SECRET_1\" ") != null);
 }
 
 test "the checkout log names the ref as the checkout leaves it" {
@@ -8233,15 +8378,17 @@ test "run streams live lines from the session's log and does not replay them" {
     const child =
         \\printf '0 tok\n'
         \\{ echo "connecting"; printf '\342\226\274 withExec sh -c '\''echo '\\\\'\''::zig-step::begin 1'\\\\'\''\\\\nexit $rc\\\\n'\'' (expect: ANY)\n'
-        \\  echo "::zig-step::begin 1"; echo "live-line"; echo "::zig-step::end 1"; } >&2
+        \\  echo "::zig-step::begin 1 m-job"; echo "live-line"; echo "::zig-step::end 1 m-job"; } >&2
         \\cat >/dev/null
     ;
     var buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    const res = try run(arena, std.testing.io, &env, .{ .test_step_mark = "m-job", .test_session_argv = &.{ "sh", "-c", child }, .test_transport = fake.transport() }, testJob(&steps), &log);
     try std.testing.expect(res.succeeded);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "live-line\n"));
+    // The markers carry the job's secret, so they are markers, not output.
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), marker) == null);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "withExec") == null);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "connecting") == null);
 }
@@ -9225,6 +9372,132 @@ test "a marker a step prints itself, naming no step of the job, is output, not a
     try std.testing.expect(std.mem.indexOf(u8, out, "still step 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "step 4000000000") == null);
     try std.testing.expect(ended[0].load(.acquire));
+}
+
+test "a marker a step prints for another step of the job is output, not a marker" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    var live = [_]std.atomic.Value(u32){ .init(0), .init(0), .init(0) };
+    var ended = [_]std.atomic.Value(bool){ .init(false), .init(false), .init(false) };
+    var replayed = [_]bool{ false, false, false };
+    var cmds = [_]Shared.StepCommands{ .{}, .{}, .{} };
+    var sh: Shared = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = &live, .ended = &ended, .replayed_steps = &replayed, .commands = &cmds, .mark = "s3cr3t" };
+    for ([_]bool{ false, true }) |direct| {
+        // Step 1 prints step 3's markers, in the old form and with a guessed secret.
+        const lines = [_][]const u8{
+            marker ++ "begin 1 s3cr3t",
+            marker ++ "begin 3",
+            "forged ::set-output name=x::1",
+            marker ++ "begin 3 guess",
+            marker ++ "end 3",
+            "partial" ++ marker ++ "end 1 s3cr3t",
+        };
+        if (direct) {
+            var sd: SpanDemux = .{ .sh = &sh, .gpa = std.testing.allocator };
+            defer sd.deinit();
+            var span: SpanDemux.Span = .{};
+            for (lines) |l| sd.line(&span, l);
+        } else {
+            var d: Demux = .{ .sh = &sh };
+            for (lines) |l| d.feed(l);
+        }
+        try std.testing.expect(ended[0].load(.acquire));
+        // Nothing reached step 3: it is still free to be replayed.
+        try std.testing.expectEqual(@as(u32, 0), live[2].load(.monotonic));
+        try std.testing.expect(!ended[2].load(.acquire));
+        try std.testing.expectEqual(@as(u32, 5), live[0].load(.monotonic));
+        ended[0].store(false, .release);
+        live[0].store(0, .monotonic);
+    }
+    const out = w.buffered();
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "[job 0 step 1 stdout] " ++ marker ++ "begin 3 guess\n"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "[job 0 step 1 stdout] partial\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "step 3") == null);
+    // Step 3, replayed, is processed: its `::set-output` counts.
+    try std.testing.expect(awaitLiveOrReplay(std.testing.io, &sh, 3, marker ++ "begin 3 earlier\n::set-output name=v::from-3\n" ++ marker ++ "end 3 earlier\n", "", false));
+    const outs = sh.takeOutputs(3);
+    try std.testing.expectEqual(@as(usize, 1), outs.len);
+    try std.testing.expectEqualStrings("from-3", outs[0].value);
+}
+
+test "a replay logs what the live run logged: one stream, in order, blank lines and masks too" {
+    // The step's output as its script wrote it, stdout and stderr in one stream
+    // (`stream_prologue`): a stderr line before the mask, a blank line, the secret after it, a
+    // stopped command, a line without a trailing newline before the end marker, and marker text
+    // of the step's own.
+    const body = [_][]const u8{
+        "out: starting",
+        "err: password hunter2 leaked early",
+        "",
+        "::add-mask::hunter2",
+        "err: hunter2 again",
+        "",
+        "::stop-commands::tok",
+        "::group::not a group",
+        "::tok::",
+        marker ++ "end 1 another-jobs-secret",
+        marker ++ "begin 2",
+    };
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+
+    const logOf = struct {
+        fn f(arena: Allocator, mark: []const u8, comptime replay: bool, lines: []const []const u8, tail: []const u8) ![]const u8 {
+            var aw: std.Io.Writer.Allocating = .init(arena);
+            var log: sink.LogSink = .{ .stdout = .{ .writer = &aw.writer } };
+            var live = [_]std.atomic.Value(u32){ .init(0), .init(0) };
+            var ended = [_]std.atomic.Value(bool){ .init(false), .init(false) };
+            var replayed = [_]bool{ false, false };
+            var cmds = [_]Shared.StepCommands{ .{}, .{} };
+            var line_counts = [_]u32{ 0, 0, 0 };
+            var sh: Shared = .{ .io = std.testing.io, .arena = arena, .log = &log, .sink_job_id = 0, .live_lines = &live, .ended = &ended, .replayed_steps = &replayed, .commands = &cmds, .line_counts = &line_counts, .mark = "this-job" };
+            const begin = try std.fmt.allocPrint(arena, marker ++ "begin 1 {s}", .{mark});
+            const end = try std.fmt.allocPrint(arena, "{s}" ++ marker ++ "end 1 {s}", .{ tail, mark });
+            if (replay) {
+                // The exec's recorded stdout, from an earlier job (another secret).
+                var rec: std.ArrayList(u8) = .empty;
+                try rec.appendSlice(arena, begin);
+                try rec.append(arena, '\n');
+                for (lines) |l| {
+                    try rec.appendSlice(arena, l);
+                    try rec.append(arena, '\n');
+                }
+                try rec.appendSlice(arena, end);
+                try rec.append(arena, '\n');
+                try std.testing.expect(awaitLiveOrReplay(std.testing.io, &sh, 1, rec.items, "", false));
+            } else {
+                var sd: SpanDemux = .{ .sh = &sh, .gpa = std.testing.allocator };
+                defer sd.deinit();
+                var span: SpanDemux.Span = .{};
+                sd.line(&span, begin);
+                for (lines) |l| sd.line(&span, l);
+                sd.line(&span, end);
+                try std.testing.expect(ended[0].load(.acquire));
+            }
+            try log.flush();
+            return aw.written();
+        }
+    }.f;
+    const live_log = try logOf(ar, "this-job", false, &body, "no newline");
+    const replay_log = try logOf(ar, "earlier-job", true, &body, "no newline");
+    try std.testing.expectEqualStrings(live_log, replay_log);
+    // And what that log is: masked from the mask on, blank lines kept, commands stopped.
+    try std.testing.expectEqualStrings(
+        "[job 0 step 1 stdout] out: starting\n" ++
+            "[job 0 step 1 stdout] err: password hunter2 leaked early\n" ++
+            "[job 0 step 1 stdout] \n" ++
+            "[job 0 step 1 stdout] err: *** again\n" ++
+            "[job 0 step 1 stdout] \n" ++
+            "[job 0 step 1 stdout] ::group::not a group\n" ++
+            "[job 0 step 1 stdout] " ++ marker ++ "end 1 another-jobs-secret\n" ++
+            "[job 0 step 1 stdout] " ++ marker ++ "begin 2\n" ++
+            "[job 0 step 1 stdout] no newline\n",
+        live_log,
+    );
 }
 
 test "a local action is read from the workspace when its step runs, and is not mounted" {
@@ -10316,6 +10589,9 @@ test "with step caching, each step's marker says whether it ran in this job or w
     // Each step writes it with its file commands, and its own program does not see it.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "::zig-file-command::ran' \\\"${ZIG_RUNNER_RAN-}\\\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "-u ZIG_RUNNER_RAN ") != null);
+    // The markers' secret is volatile too, and hidden from the step's program.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "withVolatileVariable(name:\"ZIG_RUNNER_MARK\",value:\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "-u ZIG_RUNNER_MARK ") != null);
     const got = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 1 stdout] fast") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 1 stdout] Reused") == null);
