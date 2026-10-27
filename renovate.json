@@ -29,6 +29,13 @@
       ],
       "groupName": "zig",
       "separateMinorPatch": true
+    },
+    {
+      "description": "A new Lean: its own pull request. proofs/lean-toolchain and install-lean.sh move together, and install-lean.sh's checksums are updated by hand from the release's assets, which CI enforces by failing until they are.",
+      "matchDepNames": [
+        "leanprover/lean4"
+      ],
+      "groupName": "lean"
     }
   ],
   "customManagers": [
@@ -80,6 +87,57 @@
         "TRIVY_IMAGE: (?<depName>aquasec/trivy):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
       ],
       "datasourceTemplate": "docker"
+    },
+    {
+      "description": "Lean: install-lean.sh and proofs/lean-toolchain (versions are releases of leanprover/lean4).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/scripts/install-lean\\.sh$/",
+        "/^proofs/lean-toolchain$/"
+      ],
+      "matchStrings": [
+        "(?:\\nversion=|leanprover/lean4:v)(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "leanprover/lean4",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>\\d+\\.\\d+\\.\\d+)$"
+    },
+    {
+      "description": "Images the scripts run, pinned by digest (shellcheck, and the reference implementations the diff tools compare with).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/scripts/[^/]+\\.sh$/"
+      ],
+      "matchStrings": [
+        "(?<depName>(?:[a-z0-9.-]+/)*[a-z0-9._-]+):(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "description": "actionlint, run by version from Go in CI and the hooks.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/ci\\.yml$/",
+        "/^\\.githooks/pre-(commit|push)$/"
+      ],
+      "matchStrings": [
+        "github\\.com/rhysd/actionlint/cmd/actionlint@(?<currentValue>v[0-9.]+)"
+      ],
+      "depNameTemplate": "github.com/rhysd/actionlint",
+      "datasourceTemplate": "go"
+    },
+    {
+      "description": "zizmor, run by version from PyPI in CI and the pre-push hook.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/ci\\.yml$/",
+        "/^\\.githooks/pre-push$/"
+      ],
+      "matchStrings": [
+        "zizmor(?:==|@)(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "zizmor",
+      "datasourceTemplate": "pypi"
     }
   ]
 }
