@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Before a push: the checks CI runs on a pull request, on exactly the commits being pushed (each is
+# checked out in a temporary worktree, so uncommitted changes neither help nor hurt):
+#
+#   - the branch name's prefix (CI's "Branch name"; it decides the release, README "Versioning");
+#   - zig fmt, GitHub's expression cases, and the build and tests ("Format, build and test");
+#     the database tests run too when PG* or ZIG_TEST_PG_URL point at a database;
+#   - actionlint and zizmor, when workflows changed ("Workflows");
+#   - gofmt and go vet for the Go tools under runner/tools, when they changed.
+#
+# README, "Git hooks".
+set -euo pipefail
+hook=pre-push
+top=$(git rev-parse --show-toplevel)
+cd "$top"
+. .githooks/common.sh
+# Git may hand hooks these; inside the worktree they would point back here.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+
+zero=0000000000000000000000000000000000000000
+checked=false
+while read -r local_ref local_sha remote_ref remote_sha; do
+	[[ $local_sha == "$zero" ]] && continue # a deletion
+	case $remote_ref in
+	refs/heads/*) branch=${remote_ref#refs/heads/} ;;
+	*) continue ;; # tags: the release workflow makes those
+	esac
+	case $branch in
+	feature/?* | feat/?* | bugfix/?* | hotfix/?* | ci/?* | release/?* | docs/?* | perf/?* | refactor/?* | renovate/?*) ;;
+	main) fail "pushing to main: main takes changes through pull requests" ;;
+	*) fail "'$branch' needs one of the prefixes feature/, feat/, bugfix/, hotfix/, ci/, release/, docs/, perf/ or refactor/ (README, \"Versioning\")" ;;
+	esac
+
+	# What changed: against the remote branch, or where a new branch left main.
+	base=$remote_sha
+	[[ $base == "$zero" ]] && base=$(git merge-base "$local_sha" origin/main 2>/dev/null || echo "")
+	changed=$( [[ -n $base ]] && git diff --name-only "$base" "$local_sha" || git ls-tree -r --name-only "$local_sha")
+
+	$checked || use_zig "$top"
+	checked=true
+	tree=$(mktemp -d)
+	trap 'git -C "$top" worktree remove --force "$tree" >/dev/null 2>&1 || true; rm -rf "$tree"' EXIT
+	git worktree add --detach --quiet "$tree" "$local_sha"
+	say "checking $branch at ${local_sha:0:8}"
+	(
+		cd "$tree/runner"
+		zig fmt --check build.zig build.zig.zon src tools >/dev/null || fail "zig fmt: run zig fmt on the files above"
+		say "GitHub's expression cases"
+		../.github/scripts/expr-conformance.sh >/dev/null || fail "expressions: ../.github/scripts/expr-conformance.sh --report shows what changed"
+		say "build and tests"
+		log=$(mktemp)
+		if ! ../.github/scripts/zig-test.sh >"$log" 2>&1; then
+			grep -E 'FAIL|error|passed;' "$log" | tail -20 >&2
+			rm -f "$log"
+			fail "the build or the tests failed"
+		fi
+		tail -1 "$log" | sed "s/^/$hook: /" >&2
+		rm -f "$log"
+	)
+	if grep -q '^\.github/workflows/' <<<"$changed"; then
+		say "actionlint and zizmor"
+		(cd "$tree" && go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12) || fail "actionlint found problems"
+		if command -v pipx >/dev/null; then zizmor=(pipx run zizmor==1.31.1)
+		elif command -v uvx >/dev/null; then zizmor=(uvx zizmor@1.31.1)
+		else fail "workflows changed, and zizmor needs pipx or uv to run (CI's \"Workflows\" job runs zizmor 1.31.1)"; fi
+		(cd "$tree" && "${zizmor[@]}" .github/workflows) || fail "zizmor found problems"
+	fi
+	for mod in $(grep -o '^runner/tools/[^/]*/' <<<"$changed" | sort -u); do
+		[[ -f $tree/$mod/go.mod ]] || continue
+		say "gofmt and go vet $mod"
+		[[ -z $(cd "$tree/$mod" && gofmt -l .) ]] || fail "gofmt: $mod is not formatted"
+		(cd "$tree/$mod" && go vet ./...) || fail "go vet found problems in $mod"
+	done
+	git worktree remove --force "$tree"
+	trap - EXIT
+done
