@@ -143,19 +143,30 @@ model").
 
 There is no `env` here: the variables a step sees are the container's, which the job sets once and
 earlier steps add to through `$GITHUB_ENV` (`Output.sets` below). A `run:` step's own `env:`
-travels inside the script text, as `writeEnvCommand` puts it there, so it is part of `text`. -/
+travels inside the script text, as `writeEnvCommand` puts it there, so it is part of `text`.
+
+`readsEvent` says the script really consults the event payload (`Input.event`). The runner's
+`readsRunSpecific` approximates it by looking for `GITHUB_EVENT_PATH` or the file's path in the
+text (#68), as it approximates `reads` by looking for the names. -/
 structure Step where
   text : Body
   num : Nat
   mounts : Mounts
   reads : List Name
+  readsEvent : Bool
   deriving DecidableEq, Repr
 
-/-- Everything a step's result could possibly depend on. -/
+/-- Everything a step's result could possibly depend on.
+
+`event` is what the step finds at `$GITHUB_EVENT_PATH`: the event payload, which differs on every
+run and, like the volatile variables, is in no key. The runner writes it into the step's container
+from a variable of its own; it is a separate field here, beside `env`, because it reached steps by
+a path of its own — the file — which withholding the variables did not close (#68). -/
 structure Input where
   parent : State
   script : Script
   env : Env
+  event : Content
   mounts : Mounts
   deriving DecidableEq, Repr
 
@@ -164,11 +175,21 @@ filesystem, and the variables it exported. The digest is `changes(from:).layer.d
 `outputKeyed`; it is a fact about the bytes, not about who produced them. `sets` is what the step
 wrote to `$GITHUB_ENV` and `$GITHUB_PATH`, which the runner reads from the step's file commands and
 adds to the next step's container — and which it therefore reads out of a *replayed* step's file
-commands too, so a replay must export the same. -/
+commands too, so a replay must export the same.
+
+`code` is the step's exit code, 0 for success. The engine records failures as well
+(`withExec(expect: ANY)`), so a cache entry can hold one; what the runner does with such an answer
+is `Runner.Build.replayable`.
+
+`log` is the step's log as a whole. Since #71 a step's script sends its stderr to its stdout
+(`exec 2>&1`), so the recorded stdout *is* the log, in the order it was written, and a replay
+prints it as it is; before, a replay printed stdout and then stderr, which no single atom can
+express. `Runner.Logs` models the two streams and shows the difference. -/
 structure Output where
   log : Log
   digest : Content
   sets : Env
+  code : Nat
   deriving DecidableEq, Repr
 
 /-! ## Keys
