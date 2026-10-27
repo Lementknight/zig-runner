@@ -7,7 +7,8 @@
 #     the database tests run too when PG* or ZIG_TEST_PG_URL point at a database;
 #   - actionlint and zizmor, when workflows changed, and shellcheck, when shell scripts did
 #     ("Workflows");
-#   - gofmt and go vet for the Go tools under runner/tools, when they changed.
+#   - gofmt and go vet for the Go tools under runner/tools, when they changed;
+#   - the Lean proofs, and the hashFiles model against glob.zig, when either changed ("Proofs").
 #
 # README, "Git hooks".
 set -euo pipefail
@@ -59,7 +60,7 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 			rm -f "$log"
 			fail "the build or the tests failed"
 		fi
-		tail -1 "$log" | sed "s/^/$hook: /" >&2
+		grep "passed;" "$log" | tail -1 | sed "s/^/$hook: /" >&2
 		rm -f "$log"
 	)
 	if grep -qE '\.sh$|^\.githooks/|^deploy/zig-runner-deploy$' <<<"$changed"; then
@@ -80,6 +81,14 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 		[[ -z $(cd "$tree/$mod" && gofmt -l .) ]] || fail "gofmt: $mod is not formatted"
 		(cd "$tree/$mod" && go vet ./...) || fail "go vet found problems in $mod"
 	done < <(grep -o '^runner/tools/[^/]*/' <<<"$changed" | sort -u)
+	if grep -qE '^proofs/|^runner/src/glob\.zig$|^runner/tools/globleancorpus\.zig$|^\.github/scripts/glob-lean-diff\.sh$' <<<"$changed"; then
+		say "the proofs, and the hashFiles model against glob.zig"
+		# elan installs lake in ~/.elan/bin without necessarily putting it on PATH.
+		command -v lake >/dev/null || PATH="$HOME/.elan/bin:$PATH"
+		command -v lake >/dev/null || fail "proofs/ or glob.zig changed, and checking them needs Lean (proofs/README.md)"
+		(cd "$tree/proofs" && lake build >/dev/null) || fail "the proofs do not check: run lake build in proofs/"
+		(cd "$tree" && .github/scripts/glob-lean-diff.sh 2000 "$RANDOM" >&2) || fail "glob.zig and the Lean model differ"
+	fi
 	git worktree remove --force "$tree"
 	trap - EXIT
 done

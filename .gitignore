@@ -37,9 +37,8 @@ deploy/runner.env
 # A zls clone someone keeps here; not part of this repository.
 zls/
 
-# Agda's type-checking artefacts (proofs/).
-*.agdai
-_build/
+# Lean's build output (proofs/).
+.lake/
 __pycache__/
 
 # Zig 0.17 unpacks build.zig.zon dependencies here.

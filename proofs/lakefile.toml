@@ -1,0 +1,12 @@
+name = "proofs"
+defaultTargets = ["Glob", "globoracle", "Runner"]
+
+[[lean_lib]]
+name = "Glob"
+
+[[lean_lib]]
+name = "Runner"
+
+[[lean_exe]]
+name = "globoracle"
+root = "Oracle"

@@ -1,0 +1,293 @@
+# The proofs, in Lean
+
+Audience: whoever changes the caching, the regex matcher or `hashFiles()`, or doubts them ·
+Companion: [MEASURE.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/MEASURE.md),
+[CLAIMS.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/CLAIMS.md),
+[RELATED.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/RELATED.md),
+[SPEC.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/SPEC.md) §6
+
+```
+cd proofs && lake build
+```
+
+That checks two libraries: `Runner` (the step cache and the regex matcher's loops) and `Glob` (the
+`hashFiles()` walk), plus the `globoracle` executable. They use Lean core only — no Mathlib, no
+Batteries — and the toolchain is pinned by `lean-toolchain`. Nothing in `Runner/` uses `sorry`,
+`axiom`, `native_decide`, `unsafe` or `partial`; `#print axioms` on the main theorems shows at most
+`propext` and `Quot.sound`. A clean build is the whole claim.
+
+The `Runner` library is a port of the Agda proofs in
+[zig-actions-runner](https://github.com/Lementknight/zig-actions-runner) at commit
+`1158524d2346fa8936352c21f9a63ef52d1f54dc`, theorem for theorem; the Agda names map to Lean ones by
+replacing `-` with `_` and `⇒`/`≡` with words (`replay≡run` is `replay_eq_run`,
+`recorded⇒not-run` is `recorded_not_run`). [Formulation changes](#formulation-changes-in-the-port)
+lists where the encoding differs.
+
+| Module | What |
+|---|---|
+| `Runner/Prelude.lean` | where the Agda prelude went in Lean core, and the few lemmas core lacks |
+| `Runner/Model.lean` | the vocabulary: scripts, containers, keys, the cache |
+| `Runner/Build.lean` | the scheduler and rebuilder, P1–P4, P6, pruning, a shared cache |
+| `Runner/OutputKeys.lean` | output keys and early cutoff |
+| `Runner/Declared.lean` | P5, enforcement over guessing |
+| `Runner/Enforce.lean` | the volatile clause of `Disciplined`, discharged |
+| `Runner/Counterexamples.lean` | eight computing jobs |
+| `Runner/Regex.lean` | why the regex matcher's loops terminate |
+| `Glob/Match.lean`, `Glob/Walk.lean` | the `hashFiles()` matcher and walk |
+
+## The step cache
+
+[MEASURE.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/MEASURE.md) §4 lists
+six properties the caching must *have* rather than merely measure. No benchmark can establish one of
+them: a measurement says a step was replayed quickly, not that replaying it was right. These modules
+state them and prove them, and for each hypothesis a proof needs, they give a concrete job where
+dropping it makes the cache hand back an answer that running would not have given.
+
+### What is modelled, and what it is in the code
+
+| In the model | In the runner |
+|---|---|
+| `State`: a container *is* the recipe that built it | Dagger's container id is a lazy description; two containers built the same way have the same key |
+| `State.afterCopy before digest` | `outputKeyed`: the container before an always-run step, with what it produced copied in by content digest |
+| `Script.body text num` | the script text *and* the step's position, which `containerScript` writes in as `echo '<marker>begin <n>'` |
+| `Script.stamped t s` | the always-run marker, `: 'zig-runner runs this step every time: … (run <nonce>)'`, written into the script so it lands in the key |
+| `Trial` | one job's nonce: `run_nonce` is the run id, the attempt **and** the job |
+| `Key = parent · script · stable env` | the exec recipe: `loadContainerFromID` + `withEnvVariable` + `withExec` |
+| `stable` drops volatile names | `withVolatileVariable` for the names in `volatile_env` |
+| `Progress.env`, and `Output.sets` feeding it | the container's variables, and what a step exported through `$GITHUB_ENV` / `$GITHUB_PATH`, which the runner reads from the step's file commands — a replayed step's included |
+| `Input.mounts`, absent from the key | `withMountedCache`: BuildKit leaves mounts out of an exec's key |
+| `Output = log · digest · sets` | the step's output, `changes(from:).layer.digest`, and its file commands |
+| `mark st = .everyRun` | `readsRunSpecific`, plus the secret and OIDC reasons, which are the same case |
+| `Mode = Nat → Keys` | `RUNNER_OUTPUT_KEYS`, **per step**: `outputKeyed` falls back to the step's own container whenever anything fails, which is `.off` for that step |
+| `Subset` | the output store's pruning by age (`output_keys_days`) |
+| `Elsewhere` | a cache a pool of runners shares, written by other jobs |
+| `Runner.Declared` | the shelved `ZIG_RUNNER_INPUTS` prototype, which is *not* in the shipped runner |
+
+Two choices are deliberate and worth arguing with. The key is modelled as a *projection*, not a hash,
+so collisions are out of scope rather than silently assumed away. And `exec` takes the trial as well
+as the input, so a step is **not** forced to be a function of its inputs — a flaky test is a
+well-typed inhabitant, which is why determinism has to be asked for by name.
+
+### What is proved
+
+All names are under `Runner.`; `Build.`, `OutputKeys.` and so on are the modules' namespaces.
+
+| MEASURE.md | Statement | Where |
+|---|---|---|
+| **P1** replay equals run | `Build.replay_eq_run`, for every mode — output keys on, off, or falling back per step | `Runner/Build.lean` |
+| **P2** a changed input invalidates | `Build.text_matters`, `position_matters`, `parent_matters`, `stable_env_matters` | `Runner/Build.lean` |
+| **P3** an excluded input does not | `Build.mounts_invisible`, `volatile_invisible` | `Runner/Build.lean` |
+| **P4** volatile ⇒ always-run | `Build.marked_misses`, and `Counterexamples.Marked` for the whole mechanism | `Runner/Build.lean`, `Runner/Counterexamples.lean` |
+| **P5** enforcement over guessing | `Declared.undeclared_absent`, `enforced_depends_only_on_the_declaration`, and `Declared.Guessing` for what the alternative costs | `Runner/Declared.lean` |
+| **P6** minimality | `Build.hit_keeps_ran`, `warm_runs_nothing`, `recorded_not_run`, `step_runs_at_most_once` | `Runner/Build.lean` |
+| early cutoff | `OutputKeys.cutoff`, `cutoff_needs_only_the_digest`, `no_cutoff_without_keys`, `different_bytes_different_container` | `Runner/OutputKeys.lean` |
+| pruning is safe | `Build.coherent_subset`, `ahead_subset`: both of P1's hypotheses survive dropping entries, so pruning can only cause misses | `Runner/Build.lean` |
+| a shared cache is safe | `Build.elsewhere_ahead`: no other job can write under this job's nonce, which is why a pool may share one cache | `Runner/Build.lean` |
+| **the volatile clause, discharged** | `Enforce.input_determined_by_key`, `volatile_clause_discharged`, `nothing_volatile_survives` | `Runner/Enforce.lean` |
+
+P1 is the one that matters: *a job run against a cache left by other jobs produces what the same job
+produces with the step cache off, step for step.* It needs one real hypothesis.
+
+**`Disciplined`** — for a step the runner does not mark, inputs agreeing on everything the key keeps
+give the same result. It bundles three obligations: the step is deterministic, it does not consult a
+volatile variable, and it does not depend on the content of a mounted cache volume. The runner
+enforces none of them; it marks the steps it can detect and relies on this for the rest.
+
+**One of the three can be discharged rather than assumed**, and `Runner/Enforce.lean` proves it.
+Detection cannot be made sound — a script can reach a volatile value through a file it sources, a
+program that reads the environment, or a name it builds from pieces, which is counterexample 1 and
+the live B1 check. So apply what P5 does for files: hand an unmarked step **only what its key keeps**.
+Then `input_determined_by_key` says its input is a function of its key, and
+`volatile_clause_discharged` says equal keys give equal results as soon as the step is deterministic
+— nothing need be assumed about what it reads, because nothing in its environment varies between
+runs. `Counterexamples.Enforced` is counterexample 1's own `exec` against the same two jobs, no
+longer able to tell them apart.
+
+What that leaves to assume is determinism and mount-blindness: two obligations instead of three.
+**It is in the runner**, on by default, as `RUNNER_ENFORCE_VOLATILE` — a step that did not name a
+run-specific value is given the constant `zig-runner-withheld` in its own `env` prefix. But only for
+the 16 variables in `volatile_env`: the event payload is still written to every step's
+`$GITHUB_EVENT_PATH`, and the parent shell's environment still holds the real values, so
+`volatile_clause_discharged` holds of the model and not yet of the runner (see "Against today's
+code" below, and #68). See
+[SPEC.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/SPEC.md) §9, the first
+entry in "Where this runner differs from GitHub's". Early cutoff turns out to need it too, and that
+is new: what a step exports through `$GITHUB_ENV` is in the next step's container, so an unmarked
+step that exported different variables in two jobs would part the keys after it
+(`OutputKeys.keys_job_independent` takes `Disciplined`).
+
+Everything else the proof uses is bookkeeping the implementation already does: `Coherent` (entries
+are honest), `Ahead` and `Numbered` (the cache holds nothing yet for the steps still to come).
+
+### What the counterexamples establish
+
+Each is a complete, computing job in `Runner/Counterexamples.lean`, checked by `rfl` (the model
+running) or `decide` (two concrete answers differ).
+
+| # | The step | What happens | Hypothesis |
+|---|---|---|---|
+| 1 | reads `GITHUB_RUN_ID` without naming it (`VolatileRead`) | job 2 is handed job 1's answer and runs nothing; **8** closes this | `Disciplined` |
+| 3 | a flaky test, unmarked (`Flaky`) | job 1 passed, so job 2 "passes" without running | `Disciplined` |
+| 4 | reads a cache volume, unmarked (`MountedCache`) | replayed although the volume changed between jobs | `Disciplined` |
+| `Guessing` | keyed on a guessed input set, run in the whole workspace | replayed with a stale answer; enforced, it sees nothing instead | P5 |
+
+The others are positive: **2** (`Marked`) declares the read and the marker makes the key new; **5**
+(`SameStepTwice`) is a correction (below); **6** (`OutputKeys`) computes experiment 7.6's four
+numbers — cold 2 runs, warm with keys 1, warm without keys 2, warm with a noisy output 2, which is
+why `outputs_ignored` exists; **7** (`Exported`) shows a replayed setup step still exporting its
+variable, so the step after it is replayed too; **8** (`Enforced`) runs counterexample 1's own
+`exec`, unchanged, against an unmarked step's enforced input and finds it can no longer tell the two
+jobs apart (`cannot_tell_them_apart`).
+
+**1 and 8 are a pair, and only 1 of them is still the runner's behaviour.** Counterexample 1 is why
+`RUNNER_ENFORCE_VOLATILE` exists and what it would cost to turn off; 8 is what the runner does by
+default (SPEC.md §9). The live counterpart, B1 in
+[properties/](https://github.com/Lementknight/zig-actions-runner/blob/main/properties/README.md),
+asserts both: still undetected and still replayed, as 1 has it, and told nothing rather than told
+wrongly, as 8 has it. 3 and 4 have no 8 of their own — they are open.
+
+### Three things this turned up
+
+- **A claim of the first version of this model was wrong, and the model refuted it.** With `State`
+  opaque, `exec` chose the container it left, so a step could leave the chain where it found it, and
+  two marked steps in one job then shared a key — which made the step number in the log marker look
+  load-bearing for correctness. It is not. A container's identity is the recipe that built it, so
+  every step starts one deeper than the last (`depth_advances`), and that is what keeps two
+  occurrences apart. `SameStepTwice` computes the miss. What *is* true of the marker is narrower and
+  still worth knowing: the script text is in the key, so changing the marker format gives every step
+  of every job a new key. (The Agda `Script` comment still calls the position load-bearing and
+  points at the counterexamples; the port keeps that comment and marks the disagreement.)
+- **Replay hides flakiness by construction**, not by omission. `disciplined_deterministic` derives
+  determinism from the hypothesis P1 needs, so the step cache is sound only for jobs with no flaky
+  unmarked step — a replayed step gives the result it recorded, a pass staying a pass. (And, the
+  audit found, a failure staying a failure: failed steps are cached too, and replayed on re-run,
+  #69.)
+  [RELATED.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/RELATED.md) noted we
+  had never measured flakiness; this says measuring it needs the cache off.
+- **The documented gap is a correctness gap.**
+  [SPEC.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/SPEC.md) §6 already
+  says a script that reads run-specific values from a file in the repository is "not detected".
+  Counterexample 1 shows what that costs: not a slower job, a wrong one.
+
+### Obligations for the harness
+
+What a proof of a property buys is a *test that is worth generating*: the model says which cases
+matter and what must hold in each, so
+[MEASURE.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/MEASURE.md) stage 3
+does not have to guess. Each row is one generated family, against a real engine rather than the fake
+session.
+
+| From | Generate | Assert |
+|---|---|---|
+| P1 | any job, twice at the same commit: `RUNNER_STEP_CACHE=false`, then on | the same step logs, file commands and conclusions; and `N of M steps replayed` is M the second time. Two known exceptions: with the cache off nothing is withheld, so a step that prints a run-specific value it did not name prints the real one off and `zig-runner-withheld` on (the model's `uncached` keeps the stamping and withholding); and a replay prints stdout then stderr, not interleaved (#71) |
+| P2 | four jobs, each changing exactly one keyed input: the script text, the step's position in the job, a file in the workspace, a non-volatile variable | the step ran — the `ZIG_RUNNER_RAN` marker is this job's |
+| P3 | two jobs differing only in a volatile value (run id, actor, commit), and two differing only in a cache volume's content | the step was replayed |
+| P4 | one job per name in `volatile_env`, whose script names it; and one using a secret, and one with `id-token: write` | the step ran, every time |
+| P5 | on `feat/declared-inputs-v2`: a step whose declaration omits a file it reads | the step **fails**; it does not replay |
+| P6 | a job whose every step hits | no step ran, and `N of M` is M |
+| early cutoff | a marked step with a stable output, followed by unmarked steps; then the same with an output that changes every run | the marked step runs both times; the steps after it are replayed in the first case and run in the second |
+| pruning | fill the output store, prune it (`RUNNER_OUTPUT_KEYS_DAYS`), re-run | results identical to the unpruned run; only the replay counts differ |
+| shared cache | two jobs of the same workflow at once, on a pool sharing one engine | the same results as running them one after the other |
+| `$GITHUB_ENV` | a setup step that exports a variable, replayed, and a step after it that reads it | the second step sees the same value and is itself replayed |
+
+Three of these cannot be made to pass, and that is the point of having them: counterexample 1's
+indirect volatile read, counterexample 3's flaky step, and counterexample 4's cache-volume read are
+what the design *cannot* detect. Generate them as **expected failures**, so that the day one starts
+passing, something has changed.
+
+### What this does not model
+
+Not proof of anything about: hash collisions (the key is a projection, so two different recipes never
+collide here); the *interleaving* of concurrent jobs, only the shared cache they end up with
+(`Elsewhere`) — the store's first-writer-wins `mv -T` is not modelled; anything bash does; and every
+question of *cost* — nothing here says a replay is faster, only that it is right. Experiment 5's +28%
+and +85% are why `Runner.Declared`'s mechanism is shelved, and no theorem in it argues otherwise.
+
+`Step.reads` is the set of names a script really consults. `readsRunSpecific` approximates it by
+looking for the name in the text, so the model's `mark` is an idealisation of the runner's, and
+counterexample 1 is exactly the distance between them.
+
+### Against today's code
+
+The model was written against `runner/src/dagger.zig` on 2026-10-16; on 2026-10-27 it was audited
+against the code again, element by element. The cache mechanism itself has barely changed since,
+and the theorems still hold of the model. Where the runner does not do what the model assumes:
+
+| Where | What the runner does | Consequence | Issue |
+|---|---|---|---|
+| `Enforce` | Withholds only the 16 `volatile_env` variables. The event payload is written in full to `$GITHUB_EVENT_PATH` before every step, from a volatile variable outside the key; the parent shell keeps the real values | A step whose script reads the payload from a file is replayed with an earlier run's payload, with default settings. `nothing_volatile_survives` is false of the runner | #68 |
+| `Output`, `Disciplined` | Failed steps are recorded (`withExec(expect: ANY)`) and replayed; `GITHUB_RUN_ATTEMPT` is volatile | A flaky failure is replayed on every re-run. The model's `Output` has no exit code | #69 |
+| `Input.mounts`, `Disciplined` | uv's venv lives in a per-ref cache volume by default (`uv_env_in_cache`) | Mount-blindness, the clause counterexample 4 breaks, is something ordinary Python jobs now depend on | #70 |
+| `Output.log` | A replay prints stdout, then stderr, without blank lines; a step can print another step's in-range marker | Workflow commands (masks, stop-commands) can apply differently in a replay | #71 |
+| `uncached` | `RUNNER_STEP_CACHE=false` turns off stamping and withholding too | P1 compares with a hypothetical stamped, withheld run, not with the cache-off runner | — |
+| `Script`, `Numbered`, `Ahead` | Composite inner steps and JavaScript pre/main/post share a step number; what keeps their scripts apart is the file-command directory in the text, plus the container's depth | The bookkeeping hypotheses are false in letter, true in substance: no two executions in a job share a stamped script | — |
+| `Subset` | Models BuildKit's cache pruning; the output store (`output_keys_days`) is a separate digest-to-bytes map the model has no object for | Store pruning is safe for another reason: the apply copies from the store and fails (so falls back) if the content is gone | — |
+| `Key` | The real key holds more: cache volume identities, action code, user and directory, the nesting flag, secret variables, the file-command paths | Only extra misses, so safe | — |
+| `mark` | The runner also marks every Docker action, every JavaScript action when a job token exists, and every step when the job has `id-token: write` | Only extra runs, so safe | — |
+
+`Enforce` is also never composed with `Build`: "P1 under enforcement" would need `exec` instantiated
+with the withheld input, which no theorem here does.
+
+## Why the regex matcher terminates
+
+`Runner/Regex.lean` is about a different part of the runner: the backtracking matcher that problem
+matchers need (`runner/src/regex.zig`). Backtracking does not terminate for free — a loop whose body
+matches the empty string repeats at one position for ever — and the engine stops that with two
+instructions, `mark` recording where an iteration began and `progress` leaving the loop when the
+iteration consumed nothing.
+
+| What | Statement |
+|---|---|
+| `Regex.bounded` | `iterations r + pos ≤ n` — the iterations taken plus the starting position cannot exceed the input |
+| `Regex.bounded_from_zero` | so a loop over the whole input runs at most `n` times |
+| `Regex.bounded_back` | the same backwards: a loop inside a lookbehind, matched right to left as .NET does, runs at most as many times as the position it started from |
+| `Regex.stall`, `Regex.unbounded` | weaken the strict advance to `pos ≤ pos'` and runs of *every* length exist, so no bound can hold |
+
+So the step budget in the engine is a safety net, not the reason it stops. And `stall` is the shape
+of a bug that shipped twice: the guard was missing on stars (38 patterns reached the budget that
+Python answers) and then missing on *bounded* repeats (an empty iteration followed by a non-empty one
+captured the wrong text). Both were found by the differential test that checks the engine against
+Python's `re` and Perl on patterns generated from the grammar it claims to accept (here
+`.github/scripts/regex-diff.sh`) — the proof says why the fix is the right one, the test says the
+fix is actually there.
+
+## `hashFiles()`: the walk
+
+`Glob/Match.lean` models minimatch's `matchOne` as `runner/src/glob.zig` has it, for any segment
+matcher, and `Glob/Walk.lean` the directory walk that `hashFiles()` does.
+
+| What | Statement |
+|---|---|
+| `Glob.partial_of_match` | partial matching never wrongly says no: if a path below a directory matches, the directory partially matches, so the walk is right to skip what partial matching rejects |
+| `Glob.walk_eq_full` | the pruned walk yields exactly what the full walk does — the same files, in the same order — for any patterns and any tree |
+
+`.github/scripts/glob-lean-diff.sh` ties the model to the code that ships: `globoracle`
+(`Oracle.lean`) runs the walk `Glob.walk_eq_full` is proved of, and the script compares its answers
+with `runner/src/glob.zig`'s on random trees and pattern sets.
+
+## Formulation changes in the port
+
+Every Agda theorem, lemma and counterexample has a Lean counterpart with the same meaning. Where the
+encoding differs:
+
+- **Parameterised modules.** `Runner.Build (vol) (exec)`, `Runner.OutputKeys (vol) (exec)` and
+  `Runner.Enforce (vol)` become section variables, so the definitions take them as their first
+  explicit arguments (`build vol exec md t p job`), and the counterexamples apply them directly
+  instead of `module V = B vol execV`.
+- **`Set` used as a proposition becomes `Prop`.** `Honest`, `Coherent`, `Ahead`, `Disciplined`,
+  `Warm`, `Numbered`, `Clean`, `Subset`, `Elsewhere`, `Nonced` and `AllPlain` are `Prop`s; the Agda
+  `Σ` in them and in `look-found` is `∃`, `⊎` is `∨`, `⊤`/`⊥` are `True`/`False`. `Run` and
+  `Stalling` stay `Type`-valued so `iterations` can count them, and `unbounded`'s `Σ` is a
+  `Subtype`, so the run is still data.
+- **`All P xs`** is `∀ x ∈ xs, P x`, in `keys_stay_nonced`, `no_cutoff_without_keys` and `AllPlain`.
+- **Decidable equality.** `_≟Script_`, `_≟State_`, `_≟Key_`, `_≟Env_` and the prelude's `_≟ℕ_`,
+  `×-dec`, `List-dec` are derived or core `DecidableEq` instances; `with x ≟ y` is `if x = y`.
+  The counterexamples compute through them with `rfl` and `decide`; the Agda's absurd pattern `()`
+  on a concrete equation is `by decide` on `≠`.
+- **The prelude** is Lean core (`Runner/Prelude.lean` has the mapping); `filter-idempotent`,
+  `≤-loosen`, `suc≰`, `+-mono`, `+-zero` and `+-suc` keep Agda-named copies. Lean's `+` recurses on
+  the right, so `+-zero`/`+-suc` are definitional and `bounded` uses `omega` for the rearrangement
+  Agda got by reduction.
+- **Renames forced by Lean.** `Nonced.below` is `Nonced.beneath` (Lean reserves `below`); `_∈?_` is
+  `mem?`, with a scoped `∈?` notation; `true≢false` is `true_ne_false`. `OutputKeys.parent_inputFor`
+  is one lemma for what the Agda did with a local `parent-nonced` split on the mark at each use.
