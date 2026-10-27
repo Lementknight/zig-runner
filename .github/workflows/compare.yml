@@ -1,0 +1,59 @@
+name: compare
+
+# The comparison tools, weekly: the runner's own implementations against the ones they follow, on
+# fresh random cases each week (README, "Pipeline"). They search rather than check, and need the
+# network and containers, so they stay out of pull requests; a failure here is a case for an issue.
+#
+#   expr-diff.sh       runner/src/expr.zig against Gitea's actionslib, on random expressions
+#   yaml-diff.sh       runner/src/yaml.zig against go.yaml.in/yaml/v3, on popular actions' action.yml
+#                      and random YAML
+#   hashfiles-diff.sh  hashFiles() (runner/src/glob.zig) against GitHub's own script on @actions/glob
+#   regex-diff.sh      runner/src/regex.zig against .NET, as GitHub's runner compiles problem matchers
+#
+# The seed is the run number (or the one given), and is printed: a failure reproduces locally with
+# the same script and seed.
+
+on:
+  schedule:
+    - cron: "23 5 * * 1" # Mondays, 05:23 UTC
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: Random seed (default the run number)
+        required: false
+
+permissions: {}
+
+jobs:
+  compare:
+    name: ${{ matrix.tool }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read # to check out the code
+    strategy:
+      fail-fast: false
+      matrix:
+        tool: [expr-diff, yaml-diff, hashfiles-diff, regex-diff]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      # Go is on GitHub's runner; it fetches the toolchain each go.mod names, checked against Go's
+      # checksum database.
+      - name: Compare
+        env:
+          TOOL: ${{ matrix.tool }}
+          SEED: ${{ inputs.seed || github.run_number }}
+        run: |
+          echo "seed $SEED: reproduce with .github/scripts/$TOOL.sh '' $SEED"
+          case "$TOOL" in
+            expr-diff) .github/scripts/expr-diff.sh 20000 "$SEED" ;;
+            yaml-diff) .github/scripts/yaml-diff.sh 2000 "$SEED" ;;
+            hashfiles-diff) .github/scripts/hashfiles-diff.sh 400 "$SEED" ;;
+            regex-diff) .github/scripts/regex-diff.sh 2000 "$SEED" ;;
+          esac

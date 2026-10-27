@@ -56,7 +56,10 @@ against TimescaleDB. The GitHub client's tests run over real connections to a lo
 `version`, which waits for approval in the `prod` environment, commits and tags the release, and
 the tag runs `release`: the binaries with [GoReleaser](https://goreleaser.com), the image after a
 [Trivy](https://trivy.dev) scan, each with signed build provenance. `scorecard` grades the
-repository weekly with [OpenSSF Scorecard](https://scorecard.dev). The workflows are written to be hard to turn against the
+repository weekly with [OpenSSF Scorecard](https://scorecard.dev).
+`compare` runs the comparison tools weekly
+(`.github/scripts/*-diff.sh`): the expression evaluator, YAML reader, `hashFiles()` and problem
+matcher regular expressions against the implementations they follow, on fresh random cases. The workflows are written to be hard to turn against the
 repository:
 
 - **Least privilege.** Each workflow grants nothing by default; each job asks for only what it
