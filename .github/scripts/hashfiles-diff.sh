@@ -25,7 +25,7 @@ wait
 mkdir "$s/node"
 cp tools/hashfilesdiff/reference.mjs "$s/node/"
 docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$s/node:/app" -v "$s/tree:/tree:ro" \
-	-v "$s/cases.json:/cases.json:ro" -w /app node:22-alpine sh -c 'npm init -y >/dev/null &&
+	-v "$s/cases.json:/cases.json:ro" -w /app node:22-alpine@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914 sh -c 'npm init -y >/dev/null &&
 		npm install --silent @actions/glob@0.7.0 && node reference.mjs /cases.json /tree' >"$s/reference.jsonl"
 
 "$s/hashfilescorpus" "$s/cases.json" /tree "$s/tree" "$s/reference.jsonl"
