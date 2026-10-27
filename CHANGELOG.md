@@ -10,6 +10,8 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.12.1 - 2026-10-27
+
 ## v0.12.0 - 2026-10-27
 ### Added
 * Problem matchers read Unicode categories and blocks as GitHub's runner does (.NET 8): `\p{L}`, `\P{Lu}`, `\p{IsBasicLatin}`, in classes too (`[\p{L}\d]`), with .NET's own list of block names and Unicode 15.0's categories, as .NET 8 has them. A matcher using one went inert before. Unknown names and `\pL` are errors, as in .NET.
