@@ -5,8 +5,13 @@
 //! `! < <= > >= == != && ||` with GitHub's loose type coercion (string comparison is case
 //! insensitive, `&&`/`||` return an operand), and the functions contains, startsWith, endsWith,
 //! format, join, toJSON, fromJSON, success/always/cancelled/failure, and hashFiles when the scope
-//! can read files (`Scope.hash_files`). The `*` object filter is not supported and reports so,
-//! instead of evaluating wrongly.
+//! can read files (`Scope.hash_files`).
+//!
+//! Where GitHub's two evaluators differ, this follows the one its runner executes (actions/runner,
+//! C#) over its editor tooling's (actions/languageservices, TypeScript), whose test cases it
+//! otherwise passes: `case()` evaluates only the value it picks, `format()` an argument only when a
+//! placeholder needs it, and `a[k]` evaluates `a` first and `k` only when `a` is an array or an
+//! object. So an error in what is never needed is no error, as in a workflow on GitHub (#64).
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -96,9 +101,8 @@ pub const Scope = struct {
 /// `format('{0}{0}{0}{0}', format('{0}{0}{0}{0}', ...))` can grow until the runner runs out of
 /// memory.
 ///
-/// The count follows the C# evaluator (actions/runner), the one GitHub runs: GitHub's TypeScript
-/// one (actions/languageservices), whose evaluation order this file otherwise follows, has no
-/// memory limit.
+/// The count follows the C# evaluator (actions/runner), the one GitHub runs; GitHub's TypeScript
+/// one (actions/languageservices) has no memory limit.
 const max_memory = 1048576;
 const min_object_size = 24;
 const string_overhead = 26;
@@ -934,20 +938,26 @@ fn evalNode(arena: Allocator, n: *const Node, scope: Scope, level: usize) Error!
             };
             return .{ .v = lookupEntry(scope.contexts, name) orelse .null, .data = true };
         },
+        // An index evaluates what it indexes first, and the index only when that is an array or an
+        // object (GitHub's `Index`): `null[fromJSON('{')]` is null, not an error.
         .prop => |p| {
             const o = try eval(arena, p.obj, scope, level + 1);
+            if (!isCollection(o)) return .{ .v = .null };
             // GitHub's `a.b` is an index with the literal 'b', evaluated (and counted) after `a`.
             const key: Value = .{ .string = p.name };
             try scope.account(arena, level + 1, .{ .v = key });
             return access(arena, o, .{ .key = key }, scope);
         },
         .index => |ix| {
-            // The index first, as GitHub evaluates it.
+            const o = try eval(arena, ix.obj, scope, level + 1);
+            if (!isCollection(o)) return .{ .v = .null };
             const k = try eval(arena, ix.idx, scope, level + 1);
-            return access(arena, try eval(arena, ix.obj, scope, level + 1), .{ .key = k }, scope);
+            return access(arena, o, .{ .key = k }, scope);
         },
         .star => |inner| {
             const o = try eval(arena, inner, scope, level + 1);
+            // Not a collection: an empty filter, as GitHub's `Index` makes.
+            if (!isCollection(o)) return access(arena, o, .star, scope);
             // The `*` is a node of its own to GitHub, which evaluates to the string "*".
             try scope.account(arena, level + 1, .{ .v = .{ .string = "*" } });
             return access(arena, o, .star, scope);
@@ -988,11 +998,18 @@ fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: S
         return error.Unsupported;
     }
 
+    // These two evaluate their arguments as they need them, as GitHub's runner does: an argument
+    // they do not use is never evaluated, so an error in it is no error.
+    if (eql(name, "case")) return callCase(arena, arg_nodes, scope, level);
+    if (eql(name, "format")) {
+        const fmt = try toStr(arena, try eval(arena, arg_nodes[0], scope, level + 1));
+        return .{ .string = try formatString(arena, fmt, arg_nodes[1..], scope, level) };
+    }
+
     const args = try arena.alloc(Value, arg_nodes.len);
     for (arg_nodes, args) |an, *out| out.* = try eval(arena, an, scope, level + 1);
 
     if (eql(name, "hashFiles")) return callHashFiles(arena, args, scope);
-    if (eql(name, "case")) return callCase(arena, args, scope);
     if (eql(name, "contains")) return callContains(arena, args, scope);
     if (eql(name, "startsWith") or eql(name, "endsWith")) {
         if (args.len != 2) return scope.fail("{s}() takes 2 arguments", .{name}, arena);
@@ -1004,10 +1021,6 @@ fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: S
         else
             std.mem.endsWith(u8, s, t) };
     }
-    if (eql(name, "format")) {
-        if (args.len < 1) return scope.fail("format() needs a format string", .{}, arena);
-        return .{ .string = try formatString(arena, try toStr(arena, args[0]), args[1..], scope) };
-    }
     if (eql(name, "join")) return callJoin(arena, args, scope);
     if (eql(name, "toJSON")) return callToJson(arena, args, scope);
     if (eql(name, "fromJSON")) return callFromJson(arena, args, scope);
@@ -1015,17 +1028,18 @@ fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: S
 }
 
 /// `case(pred1, value1, pred2, value2, ..., default)`: the value after the first true predicate,
-/// else the default. A predicate up to the first true one must be a boolean. Every argument is
-/// evaluated first, as for any function on GitHub, so an error in any of them is an error.
-fn callCase(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
+/// else the default. As GitHub's runner does it (`Case`): predicates in turn, each of which must be
+/// a boolean, and then only the value chosen; the others are never evaluated. (The parser has
+/// checked that there is an odd number of arguments.)
+fn callCase(arena: Allocator, arg_nodes: []*Node, scope: Scope, level: usize) Error!Value {
     var i: usize = 0;
-    while (i + 1 < args.len) : (i += 2) {
-        switch (args[i]) {
-            .boolean => |b| if (b) return args[i + 1],
+    while (i + 1 < arg_nodes.len) : (i += 2) {
+        switch (try eval(arena, arg_nodes[i], scope, level + 1)) {
+            .boolean => |b| if (b) return eval(arena, arg_nodes[i + 1], scope, level + 1),
             else => return scope.fail("case(): a predicate must be true or false", .{}, arena),
         }
     }
-    return args[args.len - 1];
+    return eval(arena, arg_nodes[arg_nodes.len - 1], scope, level + 1);
 }
 
 /// `success()`, `always()`, `cancelled()`, `failure()`: the job's state, no arguments evaluated.
@@ -1056,6 +1070,11 @@ fn callHashFiles(arena: Allocator, args: []const Value, scope: Scope) Error!Valu
 /// Not an array or an object. The string functions are false for anything else, as GitHub's are.
 fn isPrimitive(v: Value) bool {
     return v != .array and v != .object;
+}
+
+/// What an index looks into: an array (a `*` filter's result too) or an object.
+fn isCollection(v: Value) bool {
+    return !isPrimitive(v);
 }
 
 fn callContains(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
@@ -1139,25 +1158,32 @@ fn jsonNesting(text: []const u8) usize {
     return deepest;
 }
 
-/// `format()`. What it builds is counted as it goes, as GitHub's `Format` counts it: each piece of
-/// the format string between placeholders (an escaped brace ends one), and each argument where it
-/// is placed, as a string of its own (`costOf`), against `max_memory`.
+/// `format()`, as GitHub's runner does it (`Format`): the format string is read first, whole, and
+/// a mistake in it is an error before any argument is evaluated; then the pieces are put
+/// together, each argument evaluated the first time a placeholder needs it (and only then: an
+/// argument no placeholder uses is never evaluated). What it builds is counted as it goes, as
+/// `Format` counts it: each piece of the format string between placeholders (an escaped brace ends
+/// one) as the string is read, then each argument where it is placed, as a string of its own
+/// (`costOf`), against `max_memory`.
 fn formatString(
     arena: Allocator,
     fmt: []const u8,
-    args: []const Value,
+    arg_nodes: []*Node,
     scope: Scope,
+    level: usize,
 ) Error![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
+    const Piece = union(enum) { text: []const u8, arg: usize };
+    var pieces: std.ArrayList(Piece) = .empty;
     var counted: usize = 0;
-    // Where the piece of the format string being built began.
+    // Where the piece of the format string being read began.
     var piece: usize = 0;
     var i: usize = 0;
     while (i < fmt.len) {
         const c = fmt[i];
         if (c == '{') {
             if (i + 1 < fmt.len and fmt[i + 1] == '{') {
-                try out.append(arena, '{');
+                // The piece takes one of the two braces.
+                try pieces.append(arena, .{ .text = fmt[piece .. i + 1] });
                 try countPiece(&counted, fmt[piece .. i + 1], scope, arena);
                 i += 2;
                 piece = i;
@@ -1168,29 +1194,43 @@ fn formatString(
             const placeholder = fmt[i .. close + 1];
             const idx = std.fmt.parseInt(usize, fmt[i + 1 .. close], 10) catch
                 return scope.fail("format(): invalid placeholder '{s}'", .{placeholder}, arena);
-            if (idx >= args.len)
+            if (idx >= arg_nodes.len)
                 return scope.fail("format(): placeholder {{{d}}} has no argument", .{idx}, arena);
-            try countPiece(&counted, fmt[piece..i], scope, arena);
-            const arg = try toStr(arena, args[idx]);
-            try countPiece(&counted, arg, scope, arena);
-            try out.appendSlice(arena, arg);
+            if (i > piece) {
+                try pieces.append(arena, .{ .text = fmt[piece..i] });
+                try countPiece(&counted, fmt[piece..i], scope, arena);
+            }
+            try pieces.append(arena, .{ .arg = idx });
             i = close + 1;
             piece = i;
         } else if (c == '}') {
             if (i + 1 < fmt.len and fmt[i + 1] == '}') {
-                try out.append(arena, '}');
+                try pieces.append(arena, .{ .text = fmt[piece .. i + 1] });
                 try countPiece(&counted, fmt[piece .. i + 1], scope, arena);
                 i += 2;
                 piece = i;
                 continue;
             }
             return scope.fail("format(): unmatched '}}' in '{s}'", .{fmt}, arena);
-        } else {
-            try out.append(arena, c);
-            i += 1;
-        }
+        } else i += 1;
     }
-    try countPiece(&counted, fmt[piece..], scope, arena);
+    if (piece < fmt.len) {
+        try pieces.append(arena, .{ .text = fmt[piece..] });
+        try countPiece(&counted, fmt[piece..], scope, arena);
+    }
+
+    const evaluated = try arena.alloc(?[]const u8, arg_nodes.len);
+    @memset(evaluated, null);
+    var out: std.ArrayList(u8) = .empty;
+    for (pieces.items) |p| switch (p) {
+        .text => |t| try out.appendSlice(arena, t),
+        .arg => |a| {
+            if (evaluated[a] == null)
+                evaluated[a] = try toStr(arena, try eval(arena, arg_nodes[a], scope, level + 1));
+            try countPiece(&counted, evaluated[a].?, scope, arena);
+            try out.appendSlice(arena, evaluated[a].?);
+        },
+    };
     return out.items;
 }
 
@@ -1601,11 +1641,38 @@ test "case() picks the value after the first true predicate" {
     const s: Scope = .{};
     try std.testing.expectEqualStrings("b", try evalStr(ar, "case(false, 'a', 1 == 1, 'b', 'c')", s));
     try std.testing.expectEqualStrings("c", try evalStr(ar, "case(false, 'a', false, 'b', 'c')", s));
-    // Every argument is evaluated, as on GitHub: an error after the first true predicate is one.
-    try std.testing.expectError(error.EvalError, evaluate(ar, "case(true, 'a', fromJSON('{'), 'b', 'c')", s));
+    // Only what is needed is evaluated, as GitHub's runner does (#64): an error after the first
+    // true predicate, or in a value not picked, is none.
+    try std.testing.expectEqualStrings("a", try evalStr(ar, "case(true, 'a', fromJSON('{'), 'b', 'c')", s));
+    try std.testing.expectEqualStrings("c", try evalStr(ar, "case(false, fromJSON('{'), false, 'b', 'c')", s));
     // A predicate after the first true one is not looked at.
     try std.testing.expectEqualStrings("a", try evalStr(ar, "case(true, 'a', 1, 'b', 'c')", s));
     try std.testing.expectError(error.EvalError, evaluate(ar, "case(1, 'a', 'b')", s));
+    // The value picked is evaluated, errors and all.
+    try std.testing.expectError(error.EvalError, evaluate(ar, "case(true, fromJSON('{'), 'c')", s));
+}
+
+test "format() and indexes evaluate what they need, when they need it, as GitHub's runner does" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const s: Scope = .{};
+    // An argument no placeholder uses is never evaluated.
+    try std.testing.expectEqualStrings("1", try evalStr(ar, "format('{0}', 1, fromJSON('{'))", s));
+    // One used is, once, however often it is placed.
+    try std.testing.expectEqualStrings("x-x", try evalStr(ar, "format('{0}-{0}', 'x', 'y')", s));
+    try std.testing.expectError(error.EvalError, evaluate(ar, "format('{1}', 1, fromJSON('{'))", s));
+    // A mistake in the format string is found before any argument is evaluated.
+    var diag: []const u8 = "";
+    const sd: Scope = .{ .diag = &diag };
+    try std.testing.expectError(error.EvalError, evaluate(ar, "format('{0} {', fromJSON('{'))", sd));
+    try std.testing.expect(std.mem.indexOf(u8, diag, "unterminated") != null);
+    // An index evaluates what it indexes first, and the index only when that is an array or an
+    // object.
+    try std.testing.expectEqualStrings("", try evalStr(ar, "fromJSON('null')[fromJSON('{')]", s));
+    try std.testing.expectEqualStrings("", try evalStr(ar, "fromJSON('1')[fromJSON('{')]", s));
+    try std.testing.expectError(error.EvalError, evaluate(ar, "fromJSON('[1]')[fromJSON('{')]", s));
+    try std.testing.expectEqualStrings("2", try evalStr(ar, "fromJSON('[1,2]')[1]", s));
 }
 
 test "unsupported contexts fail loudly" {
