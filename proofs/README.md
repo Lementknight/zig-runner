@@ -27,11 +27,12 @@ lists where the encoding differs.
 |---|---|
 | `Runner/Prelude.lean` | where the Agda prelude went in Lean core, and the few lemmas core lacks |
 | `Runner/Model.lean` | the vocabulary: scripts, containers, keys, the cache |
-| `Runner/Build.lean` | the scheduler and rebuilder, P1–P4, P6, pruning, a shared cache |
+| `Runner/Build.lean` | the scheduler and rebuilder, P1–P4, P6, failures not replayed, pruning, a shared cache |
 | `Runner/OutputKeys.lean` | output keys and early cutoff |
 | `Runner/Declared.lean` | P5, enforcement over guessing |
-| `Runner/Enforce.lean` | the volatile clause of `Disciplined`, discharged |
-| `Runner/Counterexamples.lean` | eight computing jobs |
+| `Runner/Enforce.lean` | the volatile clause of `Disciplined`, discharged, and P1 under enforcement |
+| `Runner/Counterexamples.lean` | twelve computing jobs |
+| `Runner/Logs.lean` | why a replayed log needs one output stream |
 | `Runner/Regex.lean` | why the regex matcher's loops terminate |
 | `Glob/Match.lean`, `Glob/Walk.lean` | the `hashFiles()` matcher and walk |
 
@@ -56,8 +57,12 @@ dropping it makes the cache hand back an answer that running would not have give
 | `stable` drops volatile names | `withVolatileVariable` for the names in `volatile_env` |
 | `Progress.env`, and `Output.sets` feeding it | the container's variables, and what a step exported through `$GITHUB_ENV` / `$GITHUB_PATH`, which the runner reads from the step's file commands — a replayed step's included |
 | `Input.mounts`, absent from the key | `withMountedCache`: BuildKit leaves mounts out of an exec's key |
-| `Output = log · digest · sets` | the step's output, `changes(from:).layer.digest`, and its file commands |
-| `mark st = .everyRun` | `readsRunSpecific`, plus the secret and OIDC reasons, which are the same case |
+| `Output = log · digest · sets · code` | the step's output, `changes(from:).layer.digest`, its file commands, and its exit code |
+| `Input.event`, `Progress.event`, absent from the key | the event payload the runner writes to `$GITHUB_EVENT_PATH` from a variable of its own |
+| `replayable`: a hit counts only if it succeeded | `execScript`: a failure the cache answers with (`ranThisRun == false`) is discarded and the step runs again |
+| `Enforce.enforced exec`: an unmarked step handed `withhold i` | `RUNNER_ENFORCE_VOLATILE`: `zig-runner-withheld` for the volatile variables, `withheld_event` at `$GITHUB_EVENT_PATH` |
+| `Logs.merged`, `Logs.replay` | `exec 2>&1` at the top of every step's script, and `replayRecorded` |
+| `mark st = .everyRun` | `readsRunSpecific` (a volatile name, `GITHUB_EVENT_PATH` or the event file), plus the secret and OIDC reasons, which are the same case |
 | `Mode = Nat → Keys` | `RUNNER_OUTPUT_KEYS`, **per step**: `outputKeyed` falls back to the step's own container whenever anything fails, which is `.off` for that step |
 | `Subset` | the output store's pruning by age (`output_keys_days`) |
 | `Elsewhere` | a cache a pool of runners shares, written by other jobs |
@@ -74,16 +79,19 @@ All names are under `Runner.`; `Build.`, `OutputKeys.` and so on are the modules
 
 | MEASURE.md | Statement | Where |
 |---|---|---|
-| **P1** replay equals run | `Build.replay_eq_run`, for every mode — output keys on, off, or falling back per step | `Runner/Build.lean` |
+| **P1** replay equals run | `Build.replay_eq_run`, for every mode — output keys on, off, or falling back per step — with failures in the cache | `Runner/Build.lean` |
+| **P1 under enforcement** | `Enforce.replay_eq_run_enforced`: the same, for the step as the enforcing runner runs it, assuming only determinism and mount-blindness | `Runner/Enforce.lean` |
+| a failure is not replayed (#69) | `Build.replayed_succeeds`: a step that was not run contributed a success; `recorded_failure_runs`: a step the cache answers with a failure runs | `Runner/Build.lean` |
+| a replay's log is the run's (#71) | `Build.replay_logs_eq_run`; `Logs.replay_merged`, `live_merged`, and `Logs.TwoStreams` for the two streams before the fix | `Runner/Build.lean`, `Runner/Logs.lean` |
 | **P2** a changed input invalidates | `Build.text_matters`, `position_matters`, `parent_matters`, `stable_env_matters` | `Runner/Build.lean` |
-| **P3** an excluded input does not | `Build.mounts_invisible`, `volatile_invisible` | `Runner/Build.lean` |
+| **P3** an excluded input does not | `Build.mounts_invisible`, `volatile_invisible`, `event_invisible` | `Runner/Build.lean` |
 | **P4** volatile ⇒ always-run | `Build.marked_misses`, and `Counterexamples.Marked` for the whole mechanism | `Runner/Build.lean`, `Runner/Counterexamples.lean` |
 | **P5** enforcement over guessing | `Declared.undeclared_absent`, `enforced_depends_only_on_the_declaration`, and `Declared.Guessing` for what the alternative costs | `Runner/Declared.lean` |
 | **P6** minimality | `Build.hit_keeps_ran`, `warm_runs_nothing`, `recorded_not_run`, `step_runs_at_most_once` | `Runner/Build.lean` |
-| early cutoff | `OutputKeys.cutoff`, `cutoff_needs_only_the_digest`, `no_cutoff_without_keys`, `different_bytes_different_container` | `Runner/OutputKeys.lean` |
+| early cutoff | `OutputKeys.cutoff`, `cutoff_needs_only_the_digest` (both for a marked step that succeeded), `no_cutoff_without_keys`, `failure_is_a_wall`, `different_bytes_different_container` | `Runner/OutputKeys.lean` |
 | pruning is safe | `Build.coherent_subset`, `ahead_subset`: both of P1's hypotheses survive dropping entries, so pruning can only cause misses | `Runner/Build.lean` |
 | a shared cache is safe | `Build.elsewhere_ahead`: no other job can write under this job's nonce, which is why a pool may share one cache | `Runner/Build.lean` |
-| **the volatile clause, discharged** | `Enforce.input_determined_by_key`, `volatile_clause_discharged`, `nothing_volatile_survives` | `Runner/Enforce.lean` |
+| **the volatile clause, discharged** | `Enforce.input_determined_by_key`, `volatile_clause_discharged`, `nothing_volatile_survives`, `no_payload_survives`, `enforced_disciplined` | `Runner/Enforce.lean` |
 
 P1 is the one that matters: *a job run against a cache left by other jobs produces what the same job
 produces with the step cache off, step for step.* It needs one real hypothesis.
@@ -101,7 +109,14 @@ Then `input_determined_by_key` says its input is a function of its key, and
 `volatile_clause_discharged` says equal keys give equal results as soon as the step is deterministic
 — nothing need be assumed about what it reads, because nothing in its environment varies between
 runs. `Counterexamples.Enforced` is counterexample 1's own `exec` against the same two jobs, no
-longer able to tell them apart.
+longer able to tell them apart. The event payload is the same case (`no_payload_survives`,
+`Counterexamples.EventEnforced`).
+
+And it composes with the cache. `Enforce.enforced exec` is the step as the enforcing runner runs it
+— withheld input if unmarked, the real one if marked — and `enforced_disciplined` says it is
+`Disciplined` as soon as `exec` is `Deterministic` and `MountBlind` on unmarked inputs. So
+`replay_eq_run_enforced` is P1 for the runner as it ships, with the volatile clause proved rather
+than assumed.
 
 What that leaves to assume is determinism and mount-blindness: two obligations instead of three.
 **It is in the runner**, on by default, as `RUNNER_ENFORCE_VOLATILE` — a step that did not name a
@@ -129,6 +144,7 @@ running) or `decide` (two concrete answers differ).
 | 1 | reads `GITHUB_RUN_ID` without naming it (`VolatileRead`) | job 2 is handed job 1's answer and runs nothing; **8** closes this | `Disciplined` |
 | 3 | a flaky test, unmarked (`Flaky`) | job 1 passed, so job 2 "passes" without running | `Disciplined` |
 | 4 | reads a cache volume, unmarked (`MountedCache`) | replayed although the volume changed between jobs | `Disciplined` |
+| 9 | reads the event payload from a file, unmarked (`EventRead`), as the runner did before #68 | run 2 is handed run 1's payload; **11** closes this | `Disciplined` |
 | `Guessing` | keyed on a guessed input set, run in the whole workspace | replayed with a stale answer; enforced, it sees nothing instead | P5 |
 
 The others are positive: **2** (`Marked`) declares the read and the marker makes the key new; **5**
@@ -137,7 +153,10 @@ numbers — cold 2 runs, warm with keys 1, warm without keys 2, warm with a nois
 why `outputs_ignored` exists; **7** (`Exported`) shows a replayed setup step still exporting its
 variable, so the step after it is replayed too; **8** (`Enforced`) runs counterexample 1's own
 `exec`, unchanged, against an unmarked step's enforced input and finds it can no longer tell the two
-jobs apart (`cannot_tell_them_apart`).
+jobs apart (`cannot_tell_them_apart`); **3b** (`FlakyFailure`) is a step that failed once and passes
+after, which the cache recorded and, since #69, runs again rather than replays; **10**
+(`EventMarked`) names the payload and runs every time; **11** (`EventEnforced`) is 9's `exec` under
+enforcement, replayed and right.
 
 **1 and 8 are a pair, and only 1 of them is still the runner's behaviour.** Counterexample 1 is why
 `RUNNER_ENFORCE_VOLATILE` exists and what it would cost to turn off; 8 is what the runner does by
@@ -214,18 +233,18 @@ and the theorems still hold of the model. Where the runner does not do what the 
 
 | Where | What the runner does | Consequence | Issue |
 |---|---|---|---|
-| `Enforce` | Withheld the 16 `volatile_env` variables but wrote the event payload in full to every step's `$GITHUB_EVENT_PATH`, from a volatile variable outside the key. Now a replayable step finds the withheld constant there instead, and a script naming `GITHUB_EVENT_PATH` or the file runs every time. The parent shell still keeps the real values in its environment | Was: a step whose script read the payload from a file was replayed with an earlier run's payload (#68, fixed). Left: reading `/proc/$PPID/environ` | #68 |
-| `Output`, `Disciplined` | Failed steps are recorded (`withExec(expect: ANY)`), and were replayed; `GITHUB_RUN_ATTEMPT` is volatile. Now a failure the cache answers with is discarded and the step runs again, stamped with the run's nonce | Was: a flaky failure was replayed on every re-run (#69, fixed). The model's `Output` still has no exit code: a replayed result is now always a success | #69 |
+| `Enforce`, `Input.event` | Withheld the 16 `volatile_env` variables but wrote the event payload in full to every step's `$GITHUB_EVENT_PATH`, from a volatile variable outside the key. Now a replayable step finds the withheld constant there instead, and a script naming `GITHUB_EVENT_PATH` or the file runs every time. The parent shell still keeps the real values in its environment | Was: a step whose script read the payload from a file was replayed with an earlier run's payload (#68, fixed; `Counterexamples.EventRead` computes it, `Enforce.no_payload_survives` and `EventEnforced` are the fix). Left: reading `/proc/$PPID/environ`, which the model does not have | #68 |
+| `Output.code`, `replayable` | Failed steps are recorded (`withExec(expect: ANY)`), and were replayed; `GITHUB_RUN_ATTEMPT` is volatile. Now a failure the cache answers with is discarded and the step runs again, stamped with the run's nonce | Was: a flaky failure was replayed on every re-run (#69, fixed; `Counterexamples.FlakyFailure`). Modelled since: `Build.replayed_succeeds`, and `replay_eq_run` with failures in the cache. The model reruns the step under its own key rather than stamped, so it records the rerun where the runner keeps the failure: only which later jobs hit differs, not what any step produces | #69 |
 | `Input.mounts`, `Disciplined` | Put uv's venv in a per-ref cache volume by default (`uv_env_in_cache`), step caching or not. Now that happens only in jobs whose steps are not cached; with step caching the venv stays in the workspace, part of each step's output, and the volume holds only uv's content-addressed download and wheel cache | Was: a replayed `uv sync` left the venv another commit's job synced, so later steps ran against its dependencies (#70, fixed). Left: mount-blindness is still assumed, not enforced, for what workflows themselves put in cache volumes | #70 |
-| `Output.log` | Printed a replay's stdout, then its stderr, without blank lines, and took any in-range `::zig-step::` marker a step printed as the runner's. Now a step's script sends its stderr to its stdout (`exec 2>&1`), so the recorded stdout is the log in the order it was written and a replay logs it line for line, blank lines included, through the same workflow-command processing; and the runner's markers carry a per-job secret (`ZIG_RUNNER_MARK`, volatile, hidden from the step with `env -u`), so marker text a step prints is its output, live and in a replay | Was: masks, stop-commands, `::set-output` and problem matchers could apply differently in a replay, and a forged marker could make a later replayed step's output go unprocessed (#71, fixed). Left: a step's programs see one pipe for stdout and stderr; a step that reads `/proc/$PPID/environ` can learn the secret; under `engine: cli`, a line a step prints that looks like a Dagger span header still names the step | #71 |
-| `uncached` | `RUNNER_STEP_CACHE=false` turns off stamping and withholding too | P1 compares with a hypothetical stamped, withheld run, not with the cache-off runner | — |
+| `Output.log` | Printed a replay's stdout, then its stderr, without blank lines, and took any in-range `::zig-step::` marker a step printed as the runner's. Now a step's script sends its stderr to its stdout (`exec 2>&1`), so the recorded stdout is the log in the order it was written and a replay logs it line for line, blank lines included, through the same workflow-command processing; and the runner's markers carry a per-job secret (`ZIG_RUNNER_MARK`, volatile, hidden from the step with `env -u`), so marker text a step prints is its output, live and in a replay | Was: masks, stop-commands, `::set-output` and problem matchers could apply differently in a replay, and a forged marker could make a later replayed step's output go unprocessed (#71, fixed; `Runner.Logs` models the two streams, `Logs.TwoStreams` the old order, `Build.replay_logs_eq_run` the log as one thing). Left: a step's programs see one pipe for stdout and stderr; a step that reads `/proc/$PPID/environ` can learn the secret; under `engine: cli`, a line a step prints that looks like a Dagger span header still names the step | #71 |
+| `uncached` | `RUNNER_STEP_CACHE=false` turns off stamping and withholding too | P1 compares with a hypothetical stamped run, not with the cache-off runner; `replay_eq_run_enforced` with one that is withheld as well. They differ only for a step that reads what it did not name, which with the cache off sees the real value | — |
 | `Script`, `Numbered`, `Ahead` | Composite inner steps and JavaScript pre/main/post share a step number; what keeps their scripts apart is the file-command directory in the text, plus the container's depth | The bookkeeping hypotheses are false in letter, true in substance: no two executions in a job share a stamped script | — |
 | `Subset` | Models BuildKit's cache pruning; the output store (`output_keys_days`) is a separate digest-to-bytes map the model has no object for | Store pruning is safe for another reason: the apply copies from the store and fails (so falls back) if the content is gone | — |
 | `Key` | The real key holds more: cache volume identities, action code, user and directory, the nesting flag, secret variables, the file-command paths | Only extra misses, so safe | — |
 | `mark` | The runner also marks every Docker action, every JavaScript action when a job token exists, and every step when the job has `id-token: write` | Only extra runs, so safe | — |
 
-`Enforce` is also never composed with `Build`: "P1 under enforcement" would need `exec` instantiated
-with the withheld input, which no theorem here does.
+`Enforce` is composed with `Build` since #89: `Enforce.replay_eq_run_enforced` is P1 for `exec`
+instantiated with the withheld input.
 
 ## Why the regex matcher terminates
 
@@ -290,3 +309,26 @@ encoding differs:
 - **Renames forced by Lean.** `Nonced.below` is `Nonced.beneath` (Lean reserves `below`); `_∈?_` is
   `mem?`, with a scoped `∈?` notation; `true≢false` is `true_ne_false`. `OutputKeys.parent_inputFor`
   is one lemma for what the Agda did with a local `parent-nonced` split on the mark at each use.
+
+## Changes since the port
+
+The model has changed since the Agda port, to cover the runner's fixes for #68, #69 and #71 (#89).
+Every theorem of the port is still here; some take more arguments or hypotheses:
+
+- **`Output.code`**, the exit code, and **`Build.replayable`**: a hit counts only if it succeeded.
+  `stepOnce` looks the key up through it; `step_ok` takes `replayable (look …) = r`; `Warm` and
+  `hit_keeps_ran` are about `replayable` hits; `recorded_not_run` needs what the cache holds for the
+  key to have succeeded (otherwise it runs, `recorded_failure_runs`). `Counterexamples.Flaky` now
+  passes in job 1 and fails in job 2, which the replay still hides.
+- **A failed marked step is not output-keyed** (`nextState`), as `execScript` asks `out.code == 0`.
+  So `cutoff` needs the marked step to have succeeded, and `cutoff_needs_only_the_digest` both runs.
+- **`Input.event`, `Progress.event`, `Step.readsEvent`**: the event payload, outside the key, and
+  whether a script reads it. `inputFor`, `nextState`, `uncached`, `keysFrom`, `Replays`,
+  `marked_misses`, `unmarked_replays` and the Enforce definitions take the payload as an argument;
+  `mark` marks a step that reads it.
+- **The rerun of a recorded failure** is modelled as a miss under the step's own mark, not stamped
+  as the runner does it. With the stamp, the rerun's result would be recorded under a key no input
+  of the unstamped step has, the next container would differ from `uncached`'s in identity though
+  not in content, and P1 against `uncached` could not be stated without a notion of content the
+  model does not have. What the simplification changes is which keys are recorded and asked — hits
+  and misses — not what any step produces.
