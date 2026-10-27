@@ -116,7 +116,7 @@ pub const Spool = struct {
             const seq = std.fmt.parseInt(u64, it.next() orelse break, 10) catch break;
             const ts = std.fmt.parseInt(i64, it.next() orelse break, 10) catch break;
             const len = std.fmt.parseInt(usize, it.next() orelse break, 10) catch break;
-            if (rest.len < len + 1) break;
+            if (len >= rest.len) break; // and `len + 1` cannot overflow
             try out.append(arena, .{ .step = step, .seq = seq, .ts_ms = ts, .text = rest[0..len] });
             rest = rest[len + 1 ..];
         }
@@ -149,6 +149,9 @@ pub const CollectSink = struct {
 
     pub const max_bytes: usize = 64 * 1024 * 1024;
 
+    /// Step numbers counted; a line under a larger one is kept unnumbered.
+    const max_steps = 1 << 16;
+
     pub const Listener = struct {
         ptr: *anyopaque,
         onLine: *const fn (ptr: *anyopaque, step: u32, seq: u64, text: []const u8) void,
@@ -157,6 +160,9 @@ pub const CollectSink = struct {
     /// The next number for `step`, counted from 1. A line dropped at the cap still takes one, so a
     /// gap in what was kept is visible rather than silent.
     fn nextSeq(s: *CollectSink, step: u32) u64 {
+        // Never grown past what a job can have (GitHub allows 1000 steps): a step number is read
+        // from markers in a step's output, and one of 4000000000 grew this to 32 GB.
+        if (step >= max_steps) return 0;
         while (s.seqs.items.len <= step) s.seqs.append(s.arena, 0) catch return 0;
         s.seqs.items[step] += 1;
         return s.seqs.items[step];
@@ -336,6 +342,13 @@ test "collect sink numbers each step's lines from one, and a dropped line still 
         try std.testing.expectEqual(seq, l.seq);
         try std.testing.expectEqual(step, l.step);
     }
+
+    // A step number no job has (a step can print a marker naming one) is kept unnumbered, without
+    // growing the count to it: 4000000000 counters were 32 GB.
+    try sink.append(1, 4_000_000_000, .stdout, "forged");
+    try std.testing.expectEqual(@as(u64, 0), sink.collect.lines.items[4].seq);
+    try std.testing.expect(sink.collect.seqs.items.len < 100);
+    sink.collect.lines.items.len = 4;
 
     // Past the cap a line is forwarded and counted but not kept — and it still takes its number, so
     // the next line that is kept does not quietly inherit it. A gap in the numbers is the record of

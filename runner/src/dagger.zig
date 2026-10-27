@@ -2138,6 +2138,16 @@ const Shared = struct {
         sh.log.flush() catch {};
     }
 
+    /// Whether a marker names one of this job's steps (or services). Anything else came from a
+    /// step's own output: `echo '::zig-step::begin 4000000000'` once made the log sink grow an array
+    /// to that many entries, about 32 GB.
+    fn isStep(sh: *Shared, m: Marker) bool {
+        return switch (m) {
+            .begin, .end => |n| n >= 1 and n <= sh.ended.len,
+            .service => |n| n < sh.service_logs.len,
+        };
+    }
+
     fn emitLive(sh: *Shared, step: u32, text: []const u8) void {
         if (step >= 1 and step <= sh.live_lines.len)
             _ = sh.live_lines[step - 1].fetchAdd(1, .monotonic);
@@ -2224,6 +2234,12 @@ const Demux = struct {
             return;
         }
         if (scan(line)) |sc| {
+            // A step can print a marker itself; one naming a step this job does not have is its
+            // output, not a marker.
+            if (!d.sh.isStep(sc.marker)) {
+                if (d.span_step) |c| d.sh.emitLive(c, line) else if (line.len > 0) d.sh.noise(line);
+                return;
+            }
             if (d.span_step) |c| if (sc.before.len > 0) d.sh.emitLive(c, sc.before);
             switch (sc.marker) {
                 .begin => |n| d.span_step = n,
@@ -2671,6 +2687,10 @@ const SpanDemux = struct {
 
     fn line(d: *SpanDemux, span: *Span, text: []const u8) void {
         if (scan(text)) |sc| {
+            if (!d.sh.isStep(sc.marker)) {
+                if (span.step) |c| d.sh.emitLive(c, text) else if (text.len > 0) d.sh.noise(text);
+                return;
+            }
             if (span.step) |c| if (sc.before.len > 0) d.sh.emitLive(c, sc.before);
             switch (sc.marker) {
                 .begin => |n| span.step = n,
@@ -9087,6 +9107,27 @@ test "hashFiles --follow-symbolic-links follows links, breaks a cycle by realpat
     try std.testing.expect(std.mem.indexOf(u8, seen[8], "realpath\",\"" ++ ws ++ "/a/loop\"") != null);
     // The cycle is not listed; the files are hashed in GitHub's order.
     try std.testing.expect(std.mem.indexOf(u8, seen[9], "contents:\"a/y.txt\\nx.txt\"") != null);
+}
+
+test "a marker a step prints itself, naming no step of the job, is output, not a marker" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const live = [_]std.atomic.Value(u32){.init(0)};
+    const ended = [_]std.atomic.Value(bool){.init(false)};
+    var sh: Shared = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = @constCast(&live), .ended = @constCast(&ended) };
+    var d: Demux = .{ .sh = &sh };
+    d.feed(marker ++ "begin 1");
+    d.feed(marker ++ "begin 4000000000"); // printed by the step
+    d.feed("still step 1");
+    d.feed(marker ++ "end 1");
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, marker ++ "begin 4000000000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "still step 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "step 4000000000") == null);
+    try std.testing.expect(ended[0].load(.acquire));
 }
 
 test "a local action is read from the workspace when its step runs, and is not mounted" {
