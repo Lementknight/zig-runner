@@ -3999,51 +3999,65 @@ const Exec = struct {
         mounts: []const Mount,
     ) !ExecOut {
         const arena = x.arena;
-        const step_run = try x.resolveRunStep(resolved_in, secret_env_in);
-        const resolved = step_run.resolved;
-        const secret_env = step_run.secret_env;
-        const script = try std.mem.concat(
-            arena,
-            u8,
-            &.{ x.forward_prelude, try stepScriptFc(arena, num, fc, resolved, action_name) },
-        );
-        const before = x.container_id;
-        // What the runner adds for the step, apart from its secrets: the variables earlier steps
-        // set, which the container before this step lacks, and the mounts. `outputKeyed` reuses it.
-        var env: Query = .initFragment(arena);
-        try x.writePendingEnv(&env);
-        var mount_nodes: Query = .initFragment(arena);
-        try writeMounts(&mount_nodes, mounts);
-        var pre: Query = .initFragment(arena);
-        try pre.splice(env.fragment());
-        try pre.splice(mount_nodes.fragment());
+        // Set when the cache answered with a failure: the step runs again, for real (below).
+        var rerun: ?[]const u8 = null;
+        while (true) {
+            const step_run = try x.resolveRunStep(resolved_in, secret_env_in, rerun);
+            const resolved = step_run.resolved;
+            const secret_env = step_run.secret_env;
+            const script = try std.mem.concat(
+                arena,
+                u8,
+                &.{ x.forward_prelude, try stepScriptFc(arena, num, fc, resolved, action_name) },
+            );
+            const before = x.container_id;
+            // What the runner adds for the step, apart from its secrets: the variables earlier
+            // steps set, which the container before this step lacks, and the mounts.
+            // `outputKeyed` reuses it.
+            var env: Query = .initFragment(arena);
+            try x.writePendingEnv(&env);
+            var mount_nodes: Query = .initFragment(arena);
+            try writeMounts(&mount_nodes, mounts);
+            var pre: Query = .initFragment(arena);
+            try pre.splice(env.fragment());
+            try pre.splice(mount_nodes.fragment());
 
-        var q: Query = .init(arena);
-        try q.call("loadContainerFromID", .{ .id = x.container_id });
-        try q.splice(env.fragment());
-        try writeActionSecrets(arena, &q, secret_env);
-        try q.splice(mount_nodes.fragment());
-        try x.writeScriptExec(&q, script, fc, secret_env);
+            var q: Query = .init(arena);
+            try q.call("loadContainerFromID", .{ .id = x.container_id });
+            try q.splice(env.fragment());
+            try writeActionSecrets(arena, &q, secret_env);
+            try q.splice(mount_nodes.fragment());
+            try x.writeScriptExec(&q, script, fc, secret_env);
 
-        x.beginExec(num);
-        const data = gql(arena, x.transport, try q.finish(), &x.err_msg) catch
-            return error.EngineFailed;
-        if (jsonFindString(data, "id")) |id| x.container_id = id;
-        const out = try x.collect(num, data);
-        // Any `::add-matcher::` this step emitted: read the files from the container it just
-        // produced, which is where the paths it printed are valid.
-        x.loadPendingMatchers(num);
-        if (x.output_keys != null and resolved == .run and resolved.run.always_run != null and
-            out.code == 0)
-        {
-            const started = std.Io.Clock.awake.now(x.io).toMilliseconds();
-            if (x.countOutputKeyed(
-                num,
-                started,
-                try x.outputKeyed(num, before, pre.fragment(), x.container_id),
-            )) |id| x.container_id = id;
+            x.beginExec(num);
+            const data = gql(arena, x.transport, try q.finish(), &x.err_msg) catch
+                return error.EngineFailed;
+            // A failure the cache kept from an earlier run is not this run's: the step may have
+            // failed for a reason that has passed (a network blip, a runner out of memory), and
+            // replaying it would fail every re-run the same way until an input changed (#69). So
+            // it runs again, marked to run every time, which no earlier run's result can match.
+            // Its replayed output is never shown and its file commands never applied.
+            if (rerun == null and exitCode(data) != 0 and x.ranThisRun(data) == false) {
+                rerun = "its earlier run failed, and a failure is not replayed";
+                continue;
+            }
+            if (jsonFindString(data, "id")) |id| x.container_id = id;
+            const out = try x.collect(num, data);
+            // Any `::add-matcher::` this step emitted: read the files from the container it just
+            // produced, which is where the paths it printed are valid.
+            x.loadPendingMatchers(num);
+            if (x.output_keys != null and resolved == .run and resolved.run.always_run != null and
+                out.code == 0)
+            {
+                const started = std.Io.Clock.awake.now(x.io).toMilliseconds();
+                if (x.countOutputKeyed(
+                    num,
+                    started,
+                    try x.outputKeyed(num, before, pre.fragment(), x.container_id),
+                )) |id| x.container_id = id;
+            }
+            return out;
         }
-        return out;
     }
 
     /// A step as it will run: the script's secret aliases and OIDC token set, and under step
@@ -4057,6 +4071,8 @@ const Exec = struct {
         x: *Exec,
         resolved_in: Resolved,
         secret_env_in: []const SecretRef,
+        /// Why the step must run again, if the cache answered with a failure (`execScript`).
+        rerun: ?[]const u8,
     ) !ScriptRun {
         const arena = x.arena;
         var resolved = resolved_in;
@@ -4091,7 +4107,7 @@ const Exec = struct {
             else if (readsRunSpecific(resolved.run.script))
                 "it reads run- or commit-specific values"
             else
-                null;
+                rerun;
             if (reason) |r| resolved.run.always_run = try std.fmt.allocPrint(
                 arena,
                 "zig-runner runs this step every time: {s} (run {s})",
@@ -8100,6 +8116,52 @@ fn exec(arena: Allocator, id: []const u8, code: i32, out: []const u8) ![]const u
             "\"exitCode\":{d},\"stdout\":\"{s}\",\"stderr\":\"\"}}}}}}}}",
         .{ id, code, out },
     );
+}
+
+/// An exec's answer that says whether it ran in the job marked `ran` (`Exec.ranThisRun`).
+fn execRan(arena: Allocator, id: []const u8, code: i32, out: []const u8, ran: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(
+        arena,
+        "{{\"data\":{{\"loadContainerFromID\":{{\"withExec\":{{\"id\":\"{s}\"," ++
+            "\"exitCode\":{d},\"stdout\":\"{s}\",\"stderr\":\"\",\"fc_ran\":{{\"contents\":\"{s}\"}}}}}}}}}}",
+        .{ id, code, out, ran },
+    );
+}
+
+test "step caching: a failure the cache kept from an earlier run is not replayed, the step runs again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("npm test")};
+    // #69: the first answer is an earlier job's failure (its ran marker is not this job's); the
+    // step runs again, stamped, and this time passes. Then: a failure in this very job stands.
+    for ([_]bool{ true, false }) |replayed| {
+        const answers = [_][]const u8{
+            base_answer,
+            try execRan(arena, "C1", 137, "killed", if (replayed) "earlier-job" else "j1"),
+            try execRan(arena, "C2", 0, "passed", "j1"),
+        };
+        var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .test_ran_marker = "j1", .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+        const seen = fake.seen.items;
+        const got = w.buffered();
+        if (replayed) {
+            try std.testing.expect(res.succeeded);
+            try std.testing.expectEqual(@as(usize, 3), seen.len);
+            try std.testing.expect(std.mem.indexOf(u8, seen[1], "runs this step every time") == null);
+            try std.testing.expect(std.mem.indexOf(u8, seen[2], "zig-runner runs this step every time: its earlier run failed, and a failure is not replayed (run ") != null);
+            // The earlier job's output is never shown; this run's is.
+            try std.testing.expect(std.mem.indexOf(u8, got, "killed") == null);
+            try std.testing.expect(std.mem.indexOf(u8, got, "passed") != null);
+        } else {
+            try std.testing.expect(!res.succeeded);
+            try std.testing.expectEqual(@as(usize, 2), seen.len);
+        }
+    }
 }
 
 test "run threads the container through steps, applies conditions, and replays cached output" {

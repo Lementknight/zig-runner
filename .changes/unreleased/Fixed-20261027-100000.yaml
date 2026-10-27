@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'With step caching, a step that failed was replayed as failed on every re-run, until an input changed, so a failure from a network blip or a runner out of memory stuck. A failure the cache answers with is now discarded and the step runs again for real; its replayed output is never shown.'
+time: 2026-10-27T10:00:00.000000-04:00

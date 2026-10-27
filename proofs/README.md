@@ -159,9 +159,8 @@ wrongly, as 8 has it. 3 and 4 have no 8 of their own — they are open.
   points at the counterexamples; the port keeps that comment and marks the disagreement.)
 - **Replay hides flakiness by construction**, not by omission. `disciplined_deterministic` derives
   determinism from the hypothesis P1 needs, so the step cache is sound only for jobs with no flaky
-  unmarked step — a replayed step gives the result it recorded, a pass staying a pass. (And, the
-  audit found, a failure staying a failure: failed steps are cached too, and replayed on re-run,
-  #69.)
+  unmarked step — a replayed step gives the result it recorded, a pass staying a pass. (A failure
+  is not replayed: the runner runs a step again when the cache answers with one, #69.)
   [RELATED.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/RELATED.md) noted we
   had never measured flakiness; this says measuring it needs the cache off.
 - **The documented gap is a correctness gap.**
@@ -216,7 +215,7 @@ and the theorems still hold of the model. Where the runner does not do what the 
 | Where | What the runner does | Consequence | Issue |
 |---|---|---|---|
 | `Enforce` | Withheld the 16 `volatile_env` variables but wrote the event payload in full to every step's `$GITHUB_EVENT_PATH`, from a volatile variable outside the key. Now a replayable step finds the withheld constant there instead, and a script naming `GITHUB_EVENT_PATH` or the file runs every time. The parent shell still keeps the real values in its environment | Was: a step whose script read the payload from a file was replayed with an earlier run's payload (#68, fixed). Left: reading `/proc/$PPID/environ` | #68 |
-| `Output`, `Disciplined` | Failed steps are recorded (`withExec(expect: ANY)`) and replayed; `GITHUB_RUN_ATTEMPT` is volatile | A flaky failure is replayed on every re-run. The model's `Output` has no exit code | #69 |
+| `Output`, `Disciplined` | Failed steps are recorded (`withExec(expect: ANY)`), and were replayed; `GITHUB_RUN_ATTEMPT` is volatile. Now a failure the cache answers with is discarded and the step runs again, stamped with the run's nonce | Was: a flaky failure was replayed on every re-run (#69, fixed). The model's `Output` still has no exit code: a replayed result is now always a success | #69 |
 | `Input.mounts`, `Disciplined` | uv's venv lives in a per-ref cache volume by default (`uv_env_in_cache`) | Mount-blindness, the clause counterexample 4 breaks, is something ordinary Python jobs now depend on | #70 |
 | `Output.log` | A replay prints stdout, then stderr, without blank lines; a step can print another step's in-range marker | Workflow commands (masks, stop-commands) can apply differently in a replay | #71 |
 | `uncached` | `RUNNER_STEP_CACHE=false` turns off stamping and withholding too | P1 compares with a hypothetical stamped, withheld run, not with the cache-off runner | — |
