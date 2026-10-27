@@ -34,21 +34,28 @@ pub const Decoder = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
         var i: usize = 0;
+        var fields = false;
         while (i < block.len) {
             const b = block[i];
+            if (b & 0xe0 == 0x20) {
+                // Table size updates come before the block's first field (RFC 7541 §4.2).
+                if (fields) return error.BadHpack;
+                const size = try int(block, &i, 5);
+                if (size > 4096) return error.BadHpack;
+                d.max_size = size;
+                d.evict(0);
+                continue;
+            }
+            fields = true;
             if (b & 0x80 != 0) {
                 const idx = try int(block, &i, 7);
                 const f = try d.field(idx);
                 on(ctx, f[0], f[1]);
             } else if (b & 0xc0 == 0x40) {
                 const f = try d.literal(arena, block, &i, 6);
-                try d.add(f[0], f[1]);
+                // Before adding it: adding may free the entry the name is from.
                 on(ctx, f[0], f[1]);
-            } else if (b & 0xe0 == 0x20) {
-                const size = try int(block, &i, 5);
-                if (size > 4096) return error.BadHpack;
-                d.max_size = size;
-                d.evict(0);
+                try d.add(f[0], f[1]);
             } else {
                 // Without indexing (0000) or never indexed (0001).
                 const f = try d.literal(arena, block, &i, 4);
@@ -78,15 +85,17 @@ pub const Decoder = struct {
         return .{ e[0], e[1] };
     }
 
+    /// `name` may be an entry's that the eviction frees (RFC 7541 §4.4), so it is copied first.
     fn add(d: *Decoder, name: []const u8, value: []const u8) Error!void {
         const size = name.len + value.len + 32;
-        d.evict(size);
-        if (size > d.max_size) return;
+        if (size > d.max_size) return d.evict(size);
         const n = try d.gpa.dupe(u8, name);
         errdefer d.gpa.free(n);
         const v = try d.gpa.dupe(u8, value);
         errdefer d.gpa.free(v);
-        try d.entries.append(d.gpa, .{ n, v });
+        try d.entries.ensureUnusedCapacity(d.gpa, 1);
+        d.evict(size);
+        d.entries.appendAssumeCapacity(.{ n, v });
         d.size += size;
     }
 
@@ -193,4 +202,47 @@ test "RFC 7541 C.4: requests with Huffman coding share a dynamic table" {
     try d.decode(&c43, &g3, Got.on);
     try std.testing.expectEqualStrings(":method=GET;:scheme=https;:path=/index.html;:authority=www.example.com;custom-key=custom-value;", g3.buf[0..g3.len]);
     try std.testing.expectEqual(@as(usize, 164), d.size);
+}
+
+test "a new entry keeps the name of the entry it evicts (RFC 7541 §4.4)" {
+    var d: Decoder = .{ .gpa = std.testing.allocator };
+    defer d.deinit();
+    const Last = struct {
+        name: [8]u8 = undefined,
+        name_len: usize = 0,
+        value_len: usize = 0,
+        fn on(l: *@This(), name: []const u8, value: []const u8) void {
+            l.name_len = @min(name.len, l.name.len);
+            @memcpy(l.name[0..l.name_len], name[0..l.name_len]);
+            l.value_len = value.len;
+        }
+    };
+    var l: Last = .{};
+    // `a: b`, indexed (62).
+    try d.decode(&[_]u8{ 0x40, 0x01, 'a', 0x01, 'b' }, &l, Last.on);
+    // `a` again by its index, with a value that fills the table: adding it evicts entry 62 first.
+    const value_len = 4096 - 32 - 1;
+    var block: [4 + value_len]u8 = undefined;
+    block[0] = 0x7e; // incremental indexing, name 62
+    block[1] = 0x7f; // value length: 127 + the rest in two bytes
+    block[2] = (value_len - 127) & 0x7f | 0x80;
+    block[3] = (value_len - 127) >> 7;
+    @memset(block[4..], 'v');
+    try d.decode(&block, &l, Last.on);
+    try std.testing.expectEqualStrings("a", l.name[0..l.name_len]);
+    try std.testing.expectEqual(value_len, l.value_len);
+    try std.testing.expectEqual(@as(usize, 4096), d.size);
+    try std.testing.expectEqualStrings("a", (try d.field(62))[0]);
+}
+
+test "table size updates only before a block's first field (RFC 7541 §4.2)" {
+    var d: Decoder = .{ .gpa = std.testing.allocator };
+    defer d.deinit();
+    const Ignore = struct {
+        fn on(_: void, _: []const u8, _: []const u8) void {}
+    };
+    // Two in a row first (what an encoder writes after shrinking the table and growing it again).
+    try d.decode(&[_]u8{ 0x20, 0x3f, 0xe1, 0x1f, 0x82 }, {}, Ignore.on);
+    try std.testing.expectEqual(@as(usize, 4096), d.max_size);
+    try std.testing.expectError(error.BadHpack, d.decode(&[_]u8{ 0x82, 0x20 }, {}, Ignore.on));
 }

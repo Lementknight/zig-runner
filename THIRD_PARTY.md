@@ -46,6 +46,8 @@ Another, `runner/tools/yamldiff` (Go, run by `.github/scripts/yaml-diff.sh`), us
 
 A third, `runner/tools/hashfilesdiff` (run by `.github/scripts/hashfiles-diff.sh`), runs [@actions/glob](https://github.com/actions/toolkit/tree/main/packages/glob) (MIT), installed in a `node` container when it runs, under `reference.mjs`, which follows actions/runner's hashFiles script (MIT), to compare with `runner/src/glob.zig`. `glob.zig` itself is a port of @actions/glob 0.7.0 and the part of [minimatch](https://github.com/isaacs/minimatch) (ISC) it uses, written new in Zig from their source.
 
+Two more, `runner/tools/hpackdiff` and `runner/tools/rsadiff` (Go, run by `.github/scripts/hpack-diff.sh` and `rsa-diff.sh`), compare `runner/src/hpack.zig` with [golang.org/x/net/http2/hpack](https://pkg.go.dev/golang.org/x/net/http2/hpack) (BSD-3-Clause, Copyright The Go Authors), pinned in its `go.mod`, and `runner/src/github/rsa_sign.zig` with Go's standard library `crypto/rsa` (BSD-3-Clause).
+
 CI downloads one more tool, which is in no build: the [Agda](https://github.com/agda/agda) release binary of the pinned version (`AGDA_VERSION` in `.github/workflows/ci.yml`, by checksum), to type-check `proofs/`. Agda is under BSD-style terms, and its statically linked build carries the notices of what it links (GMP under LGPL-3.0 among them). `proofs/` is this project's own code and uses no Agda library.
 
 ## actions/runner's license
