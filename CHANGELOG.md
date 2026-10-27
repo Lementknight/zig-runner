@@ -10,6 +10,10 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.9.2 - 2026-10-27
+### Fixed
+* `hashFiles()` selects the files GitHub's does, checked against GitHub's own script on @actions/glob: a pattern matching a directory brings in everything below it again (Dagger's glob lists nothing for `src/*/**`, so `hashFiles('src/*')` missed the files in `src`'s subdirectories); a trailing `/` matches directories only (`*/` is every file in a subdirectory, not every file); a symbolic link to a directory is skipped instead of failing the step; and a `.` or `..` segment in a pattern is refused, as GitHub refuses it.
+
 ## v0.9.1 - 2026-10-27
 ### Fixed
 * An `action.yml` with flow collections nested 100000 deep (`[[[…`) crashed the runner; past 64 levels they are now refused as unsupported. `Null` and `NULL` read as null, as YAML 1.2 reads them (only `null` and `~` did), and an explicit key in a flow mapping (`{? key : value}`) is refused instead of misread. Found by comparing the YAML reader with Go's go.yaml.in/yaml/v3 on 188 action.yml files from popular actions (all read the same) and 10000 random files.
