@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Compares the runner's YAML reader (runner/src/yaml.zig, which reads action.yml files) with
+# go.yaml.in/yaml/v3 (what nektos/act and Gitea's actionslib use), in two ways:
+#
+#   - the action.yml of every repository in runner/tools/yamldiff/repos.txt, fetched now from
+#     GitHub (read-only, unauthenticated) and not kept;
+#   - random YAML that runner/tools/yamldiff writes with Go's encoder, in every style it has.
+#
+# runner/tools/yamlcorpus.zig compares the trees. yaml.zig may refuse what is outside its subset
+# (it says so); reading something differently fails. Needs Go and network access; not run in CI.
+#
+#   yaml-diff.sh [random files] [seed]     defaults: 2000, 1
+set -euo pipefail
+cd "$(dirname "$0")/../../runner"
+
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+mkdir "$scratch/real" "$scratch/random"
+zig build-exe -OReleaseSafe --dep yaml -Mroot=tools/yamlcorpus.zig -Myaml=src/yaml.zig \
+	--name yamlcorpus -femit-bin="$scratch/yamlcorpus" &
+
+fetch() {
+	local name=${1//\//__}
+	for f in action.yml action.yaml; do
+		curl -fsSL --max-time 15 "https://raw.githubusercontent.com/$1/HEAD/$f" \
+			-o "$scratch/real/$name.yml" 2>/dev/null && return
+	done
+	rm -f "$scratch/real/$name.yml"
+}
+while read -r repo; do
+	[[ -n $repo ]] && fetch "$repo" &
+	while (($(jobs -r | wc -l) > 16)); do wait -n; done
+done <tools/yamldiff/repos.txt
+wait
+
+cd tools/yamldiff
+go run . -gen "${1:-2000}" -seed "${2:-1}" -out "$scratch/random"
+go run . "$scratch"/real/*.yml >"$scratch/real.jsonl"
+go run . "$scratch"/random/*.yml >"$scratch/random.jsonl"
+status=0
+echo "== action.yml files from GitHub"
+"$scratch/yamlcorpus" "$scratch/real.jsonl" "$scratch/real" || status=1
+echo "== random YAML"
+"$scratch/yamlcorpus" "$scratch/random.jsonl" "$scratch/random" | grep -v '^refused' || status=1
+exit $status
