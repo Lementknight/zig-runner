@@ -1,22 +1,25 @@
-# Version: after a pull request merges into main, the next version from the merged branches'
-# prefixes and labels (README, "Versioning"), then a release of it.
+# Version: once a day (and when started by hand), one release of everything merged into main since
+# the last: the next version from the merged branches' prefixes and labels (README, "Versioning").
+# Pull requests merge on their own all day; the maintainer approves one release for all of them,
+# and is asked only when something merged.
 # The release is a commit on main: the version in build.zig.zon and the changelog batched by
 # changie, tagged. main is protected; the RELEASE_DEPLOY_KEY deploy key may bypass that, and a tag
 # it pushes starts the release workflow. The key is the prod environment's: the job waits for the
 # maintainer's approval, and only runs from main (README, "Environments").
-# On a push to main, not on the pull request's closing: main takes nothing but merges, and a push
-# runs main's own workflow with nothing from the pull request (no pull_request_target).
+# On a schedule, not on the pull request's closing: main takes nothing but merges, and this runs
+# main's own workflow with nothing from any pull request (no pull_request_target).
 name: version
 
 on:
-  push:
-    branches: [main]
+  schedule:
+    - cron: "17 13 * * *" # daily, 13:17 UTC
+  workflow_dispatch:
 
 # Nothing by default; the job asks for what it needs.
 permissions: {}
 
 # One run at a time. GitHub keeps one waiting run and drops any older one; that loses nothing,
-# because each run releases all of main since the last tag, not just its own pull request.
+# because each run releases all of main since the last tag.
 concurrency:
   group: version
   cancel-in-progress: false
@@ -29,11 +32,36 @@ env:
   GITHUB_HOST_KEY: github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
 
 jobs:
+  # Whether anything merged since the last release, without the prod environment: a day with
+  # nothing to release asks the maintainer nothing.
+  check:
+    name: Anything to release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # to check out main and its tags
+      pull-requests: read # to read the merged pull requests' branches and labels
+    outputs:
+      tag: ${{ steps.next.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Next version
+        id: next
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "tag=$(.github/scripts/next-version.sh)" >> "$GITHUB_OUTPUT"
+
+  # Waits for approval, then works out the version again: what merged while it waited is part of
+  # the release too.
   tag:
     name: Tag
-    # Not the release commit this job pushes. Anyone could name a commit's author so; that only
-    # skips a release, which the next merge makes.
-    if: github.event.head_commit.author.name != 'github-actions[bot]'
+    needs: check
+    if: needs.check.outputs.tag != ''
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: prod
@@ -77,8 +105,8 @@ jobs:
           git tag -a "$TAG" -m "$TAG"
 
       # The key exists only in this step, in an agent: nothing run before (changie, the script)
-      # could read it. If main moved since the checkout, the push fails; that merge's own run,
-      # waiting behind this one, releases it and this together.
+      # could read it. If main moved since the checkout, the push fails; run the workflow again
+      # (or wait for tomorrow's), and it releases that merge with the rest.
       - name: Push
         if: steps.next.outputs.tag
         env:
