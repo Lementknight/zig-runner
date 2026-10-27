@@ -77,6 +77,27 @@ repository:
 - **No pull request code with secrets.** Nothing runs on `pull_request_target`; the release starts
   from a push to `main`, which only takes reviewed merges.
 
+### Git hooks
+
+`.githooks` runs CI's pull-request checks before code leaves your machine. Turn them on once per
+clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+- **pre-commit** refuses a commit on `main`, and checks that what is staged is formatted (`zig fmt`,
+  `gofmt`) and that staged workflows pass actionlint.
+- **pre-push** runs, on exactly the commits being pushed (in a temporary worktree): the branch
+  name's prefix, `zig fmt` over the project, GitHub's expression cases, and the build and tests
+  (`.github/scripts/zig-test.sh`; the database tests too when `PG*` or `ZIG_TEST_PG_URL` point at
+  one); actionlint and zizmor when workflows changed; `gofmt` and `go vet` for changed Go tools.
+  It takes about 20 s.
+
+They need the project's Zig (`minimum_zig_version` in `runner/build.zig.zon`) first on `PATH`, or
+`ZIG=/path/to/zig`; Go for actionlint; and pipx or uv for zizmor when workflows change.
+`--no-verify` skips them; CI checks the same things regardless.
+
 ## Environments
 
 A pull request can change any workflow and name any runner in `runs-on`, so jobs are split by

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Before a commit: no commits on main, and what is being committed is formatted (Zig, Go) and its
+# workflows lint clean. Checks the staged content, not the working tree. pre-push runs the rest
+# of CI's checks. README, "Git hooks".
+set -euo pipefail
+hook=pre-commit
+top=$(git rev-parse --show-toplevel)
+cd "$top"
+. .githooks/common.sh
+
+[[ $(git symbolic-ref --short -q HEAD || true) != main ]] ||
+	fail "this is main; commit on a branch (main takes changes through pull requests)"
+
+mapfile -t staged < <(git diff --cached --name-only --diff-filter=ACMR)
+bad=()
+zig_used=false
+for f in "${staged[@]}"; do
+	case $f in
+	runner/zig-pkg/*) ;;
+	*.zig | *.zon)
+		$zig_used || {
+			use_zig "$top"
+			zig_used=true
+		}
+		git show ":$f" | zig fmt --stdin --check >/dev/null 2>&1 || bad+=("$f (zig fmt)")
+		;;
+	*.go)
+		[[ -z $(git show ":$f" | gofmt -l 2>&1) ]] || bad+=("$f (gofmt)")
+		;;
+	esac
+done
+((${#bad[@]} == 0)) || fail "not formatted: ${bad[*]}"
+
+workflows=()
+for f in "${staged[@]}"; do
+	[[ $f == .github/workflows/*.yml ]] && workflows+=("$f")
+done
+if ((${#workflows[@]})); then
+	say "actionlint ${workflows[*]}"
+	go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 "${workflows[@]}" ||
+		fail "actionlint found problems (CI's \"Workflows\" job runs it)"
+fi
