@@ -15,7 +15,7 @@
 //! one. A line that breaks the sequence resets it, and is then retried as a first pattern.
 //!
 //! The regular expressions come from `regex.zig`, which reads them as GitHub's runner does (.NET,
-//! ECMAScript mode). A pattern it refuses (a Unicode category, `\p{L}`) makes **that matcher**
+//! ECMAScript mode). A pattern it refuses (a balancing group, `(?<a-b>…)`) makes **that matcher**
 //! inert with a warning, not the step fail: an action should lose its annotations, not its job.
 
 const std = @import("std");
@@ -429,13 +429,13 @@ test "a matcher whose pattern this engine refuses goes inert, and says which" {
     defer a.deinit();
     const ar = a.allocator();
 
-    // Unicode categories are refused by regex.zig; the matcher must not be registered
+    // Balancing groups are refused by regex.zig; the matcher must not be registered
     // half-compiled.
-    const category =
+    const balancing =
         \\{ "problemMatcher": [ { "owner": "exotic", "pattern": [
-        \\  { "regexp": "^\\p{L}(.*)$", "message": 1 } ] } ] }
+        \\  { "regexp": "^(?<a-b>x)(.*)$", "message": 1 } ] } ] }
     ;
-    const loaded = try load(ar, category);
+    const loaded = try load(ar, balancing);
     try testing.expectEqual(@as(usize, 0), loaded.matchers.len);
     try testing.expectEqual(@as(usize, 1), loaded.refused.len);
     try testing.expectEqualStrings("exotic", loaded.refused[0].owner);
@@ -446,7 +446,7 @@ test "a matcher whose pattern this engine refuses goes inert, and says which" {
     const half_bad =
         \\{ "problemMatcher": [ { "owner": "half", "pattern": [
         \\  { "regexp": "^(.*)$", "file": 1 },
-        \\  { "regexp": "\\p{Lu}word", "message": 1 } ] } ] }
+        \\  { "regexp": "(?<a-b>w)ord", "message": 1 } ] } ] }
     ;
     const partly = try load(ar, half_bad);
     try testing.expectEqual(@as(usize, 0), partly.matchers.len);

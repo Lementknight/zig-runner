@@ -7,7 +7,9 @@
 // Cases are the real patterns (every "regexp" in the problem matcher files in -matchers; the
 // script fetches those matchers.txt lists) and random ones over
 // what .NET's ECMAScript mode takes, each with inputs: strings the pattern was built to match,
-// mutations of them, log-like lines, and text outside ASCII.
+// mutations of them, log-like lines, and text outside ASCII. With random patterns come fixed ones
+// for Unicode categories and blocks: every name .NET has, as `\p{…}`, `\P{…}` and in a class, some
+// under `(?i)`, and the forms .NET refuses, on characters from many categories and blocks.
 package main
 
 import (
@@ -20,6 +22,7 @@ import (
 	"regexp/syntax"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -72,6 +75,11 @@ func main() {
 		}
 		cases = append(cases, testCase{ID: len(cases), Pattern: node.text, Inputs: g.inputs(samples)})
 	}
+	if *n > 0 {
+		for _, p := range propertyPatterns() {
+			cases = append(cases, testCase{ID: len(cases), Pattern: p, Inputs: poolLines})
+		}
+	}
 	raw, err := json.MarshalIndent(cases, "", " ")
 	must(err)
 	must(os.WriteFile(*out, raw, 0o644))
@@ -102,7 +110,9 @@ var plainChars = []string{"a", "b", "c", "x", "Z", "0", "7", "_", " ", ":", ",",
 var metaChars = []string{".", "*", "+", "?", "(", ")", "[", "]", "{", "}", "|", "^", "$", "\\", "/"}
 
 func (g *gen) atom(depth int) node {
-	switch g.r.IntN(20) {
+	switch g.r.IntN(21) {
+	case 20:
+		return g.property()
 	case 0, 1, 2, 3:
 		c := plainChars[g.r.IntN(len(plainChars))]
 		return lit(c, c)
@@ -169,7 +179,11 @@ func (g *gen) class() node {
 	var parts []string
 	var members []string
 	for range 1 + g.r.IntN(3) {
-		switch g.r.IntN(4) {
+		switch g.r.IntN(5) {
+		case 4:
+			p := g.property()
+			parts = append(parts, p.text)
+			members = append(members, p.sample(g))
 		case 0:
 			parts = append(parts, "a-f")
 			members = append(members, "c")
@@ -192,6 +206,120 @@ func (g *gen) class() node {
 		}
 		return members[g.r.IntN(len(members))]
 	}}
+}
+
+// .NET's names for \p{…}: the general categories and their groups (RegexCharClass's
+// s_definedCategories), and its blocks (s_propTable), as .NET 8 lists them, by reflection.
+var categoryNames = strings.Fields("L Lu Ll Lt Lm Lo M Mn Mc Me N Nd Nl No P Pc Pd Ps Pe Pi Pf Po " +
+	"S Sm Sc Sk So Z Zs Zl Zp C Cc Cf Cs Co Cn")
+var blockNames = strings.Fields(`IsAlphabeticPresentationForms IsArabic IsArabicPresentationForms-A
+IsArabicPresentationForms-B IsArmenian IsArrows IsBasicLatin IsBengali IsBlockElements IsBopomofo
+IsBopomofoExtended IsBoxDrawing IsBraillePatterns IsBuhid IsCJKCompatibility IsCJKCompatibilityForms
+IsCJKCompatibilityIdeographs IsCJKRadicalsSupplement IsCJKSymbolsandPunctuation IsCJKUnifiedIdeographs
+IsCJKUnifiedIdeographsExtensionA IsCherokee IsCombiningDiacriticalMarks
+IsCombiningDiacriticalMarksforSymbols IsCombiningHalfMarks IsCombiningMarksforSymbols
+IsControlPictures IsCurrencySymbols IsCyrillic IsCyrillicSupplement IsDevanagari IsDingbats
+IsEnclosedAlphanumerics IsEnclosedCJKLettersandMonths IsEthiopic IsGeneralPunctuation
+IsGeometricShapes IsGeorgian IsGreek IsGreekExtended IsGreekandCoptic IsGujarati IsGurmukhi
+IsHalfwidthandFullwidthForms IsHangulCompatibilityJamo IsHangulJamo IsHangulSyllables IsHanunoo
+IsHebrew IsHighPrivateUseSurrogates IsHighSurrogates IsHiragana IsIPAExtensions
+IsIdeographicDescriptionCharacters IsKanbun IsKangxiRadicals IsKannada IsKatakana
+IsKatakanaPhoneticExtensions IsKhmer IsKhmerSymbols IsLao IsLatin-1Supplement IsLatinExtended-A
+IsLatinExtended-B IsLatinExtendedAdditional IsLetterlikeSymbols IsLimbu IsLowSurrogates IsMalayalam
+IsMathematicalOperators IsMiscellaneousMathematicalSymbols-A IsMiscellaneousMathematicalSymbols-B
+IsMiscellaneousSymbols IsMiscellaneousSymbolsandArrows IsMiscellaneousTechnical IsMongolian IsMyanmar
+IsNumberForms IsOgham IsOpticalCharacterRecognition IsOriya IsPhoneticExtensions IsPrivateUse
+IsPrivateUseArea IsRunic IsSinhala IsSmallFormVariants IsSpacingModifierLetters IsSpecials
+IsSuperscriptsandSubscripts IsSupplementalArrows-A IsSupplementalArrows-B
+IsSupplementalMathematicalOperators IsSyriac IsTagalog IsTagbanwa IsTaiLe IsTamil IsTelugu IsThaana
+IsThai IsTibetan IsUnifiedCanadianAboriginalSyllabics IsVariationSelectors IsYiRadicals IsYiSyllables
+IsYijingHexagramSymbols _xmlC _xmlD _xmlI _xmlW`)
+
+// Blocks the random patterns use, with their ranges (for samples).
+var someBlocks = map[string][2]rune{
+	"IsBasicLatin": {0, 0x7F}, "IsLatin-1Supplement": {0x80, 0xFF}, "IsLatinExtended-A": {0x100, 0x17F},
+	"IsGreek": {0x370, 0x3FF}, "IsCyrillic": {0x400, 0x4FF}, "IsHebrew": {0x590, 0x5FF},
+	"IsGeneralPunctuation": {0x2000, 0x206F}, "IsCurrencySymbols": {0x20A0, 0x20CF},
+	"IsArrows": {0x2190, 0x21FF}, "IsCJKUnifiedIdeographs": {0x4E00, 0x9FFF},
+	"IsHalfwidthandFullwidthForms": {0xFF00, 0xFFEF}, "IsSpecials": {0xFFF0, 0xFFFF},
+}
+
+// Characters outside ASCII from many categories and blocks (none outside the Basic Multilingual
+// Plane, which .NET counts as two characters and regex.zig as one), and some case pairs that fold
+// across blocks (the Kelvin sign, long s, dotted I, micro sign).
+var unicodePool = []rune("aZ5_ -!(+^$\tÉéßµ×÷«»ª²½ĀăıİſǄǅǆʰə\u0301\u0345ΑαΜμωЖжѣԱաאب٣\u0903क" +
+	"ไ가ㄱあアー中「」。\u3000\u00a0\u2028\u2029\u200b\u200d—‘’…€₹ℓK\u212AÅⅫ←→∑≠⌘─█◆☃✓❤⟨⦃\u20DD" +
+	"\ue000\uf8ff\u0378\uffff\ufffdＡａ１\ufb01\ufe00\u2ff0")
+
+// Lines of the pool, the inputs of the fixed \p patterns.
+var poolLines = func() []string {
+	var out []string
+	for i := 0; i < len(unicodePool); i += 12 {
+		out = append(out, string(unicodePool[i:min(i+12, len(unicodePool))]))
+	}
+	return append(out, "café: résumé naïve ü 中文 ✓", "ǅungla Ǆ ǆ", "K k \u212A s ſ S i İ ı µ μ Μ")
+}()
+
+// inProperty: whether r is in the category or block name, by Go's tables (only for samples:
+// .NET decides what matches).
+func inProperty(name string, r rune) bool {
+	if b, ok := someBlocks[name]; ok {
+		return r >= b[0] && r <= b[1]
+	}
+	if name == "Cn" {
+		for _, t := range unicode.Categories {
+			if unicode.Is(t, r) {
+				return false
+			}
+		}
+		return true
+	}
+	if t, ok := unicode.Categories[name]; ok {
+		return unicode.Is(t, r)
+	}
+	return false
+}
+
+// property: `\p{…}` or `\P{…}`, a category or a block, sampled from the pool.
+func (g *gen) property() node {
+	names := append([]string{}, categoryNames...)
+	for b := range someBlocks {
+		names = append(names, b)
+	}
+	sort.Strings(names)
+	name := names[g.r.IntN(len(names))]
+	negate := g.r.IntN(3) == 0
+	var members []string
+	for _, r := range unicodePool {
+		if inProperty(name, r) != negate {
+			members = append(members, string(r))
+		}
+	}
+	if len(members) == 0 {
+		members = []string{"a"}
+	}
+	text := `\p{` + name + `}`
+	if negate {
+		text = `\P{` + name + `}`
+	}
+	return node{text: text, sample: func(g *gen) string { return g.pick(members...) }}
+}
+
+// propertyPatterns: every name .NET has, in and out of classes and negated, under `(?i)` where
+// case matters, and what .NET refuses.
+func propertyPatterns() []string {
+	var out []string
+	for _, n := range append(append([]string{}, categoryNames...), blockNames...) {
+		out = append(out, `(\p{`+n+`}+)`, `\P{`+n+`}+`, `[^\p{`+n+`}a]+`)
+	}
+	for _, n := range []string{"Lu", "Ll", "Lt", "L", "Lm", "IsBasicLatin", "IsGreek", "IsLatin-1Supplement", "IsLatinExtended-A", "IsCyrillic", "IsLetterlikeSymbols"} {
+		out = append(out, `(?i)\p{`+n+`}+`, `(?i)\P{`+n+`}+`, `(?i)[^\p{`+n+`}]+`, `(?i)[\P{`+n+`}5]+`)
+	}
+	return append(out,
+		`[\p{L}\d]+`, `[^\p{L}\d]+`, `[\p{L}-[a-z]]+`, `[\p{L}-z]+`, `\p{L}\P{L}\p{N}`, `(?i:\p{Lu})\p{Lu}`,
+		`[\P{IsBasicLatin}-[\p{L}]]+`, `\p{Cs}`, `\P{Cs}+`,
+		`\pL`, `\p`, `\p{`, `\p{L`, `\p{}`, `\p{Foo}`, `\p{l}`, `\p{ L}`, `(?x)\p{ L }`, `\p{L&}`,
+		`\p{isBasicLatin}`, `\p{Is}`, `[\pL]`, `[\p{Foo}]`, `[a-\p{L}]`, `\p{__InternalRegexIgnoreCase__}`, `\P{Any}`)
 }
 
 func (g *gen) group(depth int) node {

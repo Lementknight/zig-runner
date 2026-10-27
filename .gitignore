@@ -43,3 +43,7 @@ __pycache__/
 
 # Zig 0.17 unpacks build.zig.zon dependencies here.
 zig-pkg/
+
+# .NET builds of runner/tools/regexdiff/reference, which editors with C# support make on their own.
+runner/tools/regexdiff/reference/bin/
+runner/tools/regexdiff/reference/obj/
