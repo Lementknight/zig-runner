@@ -10,6 +10,10 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.9.1 - 2026-10-27
+### Fixed
+* An `action.yml` with flow collections nested 100000 deep (`[[[…`) crashed the runner; past 64 levels they are now refused as unsupported. `Null` and `NULL` read as null, as YAML 1.2 reads them (only `null` and `~` did), and an explicit key in a flow mapping (`{? key : value}`) is refused instead of misread. Found by comparing the YAML reader with Go's go.yaml.in/yaml/v3 on 188 action.yml files from popular actions (all read the same) and 10000 random files.
+
 ## v0.9.0 - 2026-10-26
 ### Added
 * CI checks the expression evaluator against GitHub's own expression test cases (from actions/languageservices): all but 1 of 1020 pass (GitHub's memory limit, which the runner keeps looser on purpose). Failures are listed in `runner/tools/exprcorpus-failing.txt`, and CI fails when a case breaks or when a listed one starts passing. `.github/scripts/expr-conformance.sh --report` shows what GitHub expects for each.
