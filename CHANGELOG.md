@@ -10,6 +10,8 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.11.0 - 2026-10-27
+
 ## v0.10.0 - 2026-10-27
 ### Added
 * Problem matchers read their regular expressions as GitHub's runner does (.NET, with RegexOptions.CultureInvariant | ECMAScript), so patterns that were refused or misread now work: lookahead and lookbehind, backreferences (numbered and named), named groups numbered as .NET numbers them, `\b`, atomic groups, conditionals, inline options (`(?i)` and the rest), class subtraction, octal escapes (`\033`, which colour-coded linter matchers use, never matched before), `\x`, `\u`, `\c`, and matching by character rather than by byte (a class like `[→↗]` or `.` against `é`). All 77 distinct patterns in 80 problem matcher files published on GitHub, and about 140000 random patterns' inputs, answer as .NET does. `\p{…}` (Unicode categories) is still refused, loudly.
