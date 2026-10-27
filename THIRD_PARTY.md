@@ -36,6 +36,8 @@ The optional `api/` and `web/` depend on npm packages listed in their `package-l
 
 CI also fetches GitHub's expression test cases from [actions/languageservices](https://github.com/actions/languageservices) (`expressions/testdata`, MIT, Copyright GitHub) at a pinned commit, to check `runner/src/expr.zig` against them (`.github/scripts/expr-conformance.sh`); only case names are kept here, in `runner/tools/exprcorpus-failing.txt`.
 
+A fourth, `runner/tools/regexdiff` (run by `.github/scripts/regex-diff.sh`), runs a small C# program (`reference/`, this project's own) in Microsoft's [.NET SDK](https://github.com/dotnet/sdk) container (MIT) to compare `runner/src/regex.zig` with .NET's regular expressions; `matchers.txt` lists the problem matcher files on GitHub it reads patterns from, fetched when it runs and not kept.
+
 A development tool, `runner/tools/exprdiff` (Go, run by `.github/scripts/expr-diff.sh`, not in CI or any build), uses Gitea's [actionslib](https://gitea.com/gitea/actionslib) (MIT), pinned in its `go.mod`, to compare expression results on random expressions.
 
 Another, `runner/tools/yamldiff` (Go, run by `.github/scripts/yaml-diff.sh`), uses [go.yaml.in/yaml/v3](https://github.com/yaml/go-yaml) (MIT and Apache-2.0), pinned in its `go.mod`, to compare `runner/src/yaml.zig` with it; the `action.yml` files it compares are fetched when it runs and not kept, and `runner/tools/yamldiff/repos.txt` lists only the repositories' names.
