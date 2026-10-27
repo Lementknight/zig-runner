@@ -6,7 +6,7 @@
 # No elan: the version is the one pinned, never one a toolchain file names.
 set -euo pipefail
 
-version=4.34.1
+version=4.35.0
 case $(uname -m) in
 x86_64)
 	asset="lean-$version-linux"
