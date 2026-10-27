@@ -4,8 +4,9 @@
 //! scalars (`|` and `>` with `-`, `+` and an indentation digit), plain scalars that continue on
 //! later lines, single-line flow sequences and mappings, comments, and a leading `---`.
 //!
-//! Every scalar is a string, except an empty value, `~` and `null`, which are null: callers turn
-//! strings into booleans or numbers where they need to (action inputs are strings anyway).
+//! Every scalar is a string, except an empty value, `~`, `null`, `Null` and `NULL`, which are null
+//! (YAML 1.2's core schema): callers turn strings into booleans or numbers where they need to
+//! (action inputs are strings anyway).
 //!
 //! Not supported, and reported as `UnsupportedYaml` instead of being misread: anchors, aliases,
 //! tags, merge keys, multiple documents, complex keys, and quoted or flow collections that span
@@ -280,7 +281,7 @@ const Parser = struct {
             p.pos += 1;
         }
         const s = buf.items;
-        if (std.mem.eql(u8, s, "~") or std.mem.eql(u8, s, "null")) return .null;
+        if (isNullWord(s)) return .null;
         return .{ .string = s };
     }
 
@@ -461,6 +462,12 @@ const Parser = struct {
     }
 };
 
+/// The plain scalars YAML 1.2's core schema reads as null, besides an empty one.
+fn isNullWord(s: []const u8) bool {
+    for ([_][]const u8{ "~", "null", "Null", "NULL" }) |w| if (std.mem.eql(u8, s, w)) return true;
+    return false;
+}
+
 fn isBlankLine(l: Line) bool {
     return std.mem.trim(u8, l.full, " \t").len == 0;
 }
@@ -471,6 +478,16 @@ const Flow = struct {
     l: Line,
     s: []const u8,
     i: usize = 0,
+    /// Collections open around `i`. `value` recurses into each, so 100000 nested `[` overflowed
+    /// the stack and took the runner down: an `action.yml` comes from whoever wrote the action.
+    depth: usize = 0,
+
+    const max_depth = 64;
+
+    fn enter(f: *Flow) Error!void {
+        f.depth += 1;
+        if (f.depth > max_depth) return f.p.unsupported(f.l, "flow collections nested over 64 deep");
+    }
 
     fn skipSpaces(f: *Flow) void {
         while (f.i < f.s.len and f.s[f.i] == ' ') f.i += 1;
@@ -482,6 +499,8 @@ const Flow = struct {
         switch (f.s[f.i]) {
             '[' => {
                 f.i += 1;
+                try f.enter();
+                defer f.depth -= 1;
                 var items: std.ArrayList(Node) = .empty;
                 while (true) {
                     f.skipSpaces();
@@ -499,6 +518,8 @@ const Flow = struct {
             },
             '{' => {
                 f.i += 1;
+                try f.enter();
+                defer f.depth -= 1;
                 var entries: std.ArrayList(Node.Entry) = .empty;
                 while (true) {
                     f.skipSpaces();
@@ -508,6 +529,9 @@ const Flow = struct {
                         f.i += 1;
                         break;
                     }
+                    // `{? key : value}`, an explicit key, as the block parser refuses `? key`.
+                    if (f.s[f.i] == '?' and (f.i + 1 == f.s.len or f.s[f.i + 1] == ' '))
+                        return f.p.unsupported(f.l, "complex mapping keys");
                     const k = try f.scalarText(true);
                     f.skipSpaces();
                     var v: Node = .null;
@@ -528,7 +552,7 @@ const Flow = struct {
             },
             else => {
                 const t = try f.scalarText(false);
-                if (t.len == 0 or std.mem.eql(u8, t, "~") or std.mem.eql(u8, t, "null"))
+                if (t.len == 0 or isNullWord(t))
                     return .null;
                 return .{ .string = t };
             },
@@ -870,4 +894,35 @@ test "the dagger-for-github action.yml shape parses" {
     try expectStr(steps[2].get("if"), "steps.should-exec.outputs.result == 'true'");
     try std.testing.expect(std.mem.indexOf(u8, steps[2].get("run").?.text().?, "sed -z 's/\\\\\\n/ /g; s/\\n/ /g'") != null);
     try expectStr(n.get("outputs").?.get("output").?.get("value"), "${{ steps.exec.outputs.stdout }}");
+}
+
+test "flow collections nested past 64 are refused, not a stack overflow" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    var deep: std.ArrayList(u8) = .empty;
+    try deep.appendSlice(ar, "a: ");
+    for (0..100_000) |_| try deep.append(ar, '[');
+    for (0..100_000) |_| try deep.append(ar, ']');
+    try std.testing.expectError(error.UnsupportedYaml, parse(ar, deep.items, null));
+    deep.clearRetainingCapacity();
+    try deep.appendSlice(ar, "a: ");
+    for (0..100_000) |_| try deep.appendSlice(ar, "{k: ");
+    for (0..100_000) |_| try deep.append(ar, '}');
+    try std.testing.expectError(error.UnsupportedYaml, parse(ar, deep.items, null));
+    const ok = try parse(ar, "a: [[1, {b: [2]}]]\n", null);
+    try std.testing.expectEqualStrings("2", ok.get("a").?.seq[0].seq[1].get("b").?.seq[0].string);
+}
+
+test "what comparing with Go's YAML turned up: the null words, and explicit keys in flow" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const n = try parse(ar, "a: Null\nb: NULL\nc: [Null, ~]\nd: nULL\n", null);
+    try std.testing.expect(n.get("a").? == .null);
+    try std.testing.expect(n.get("b").? == .null);
+    try std.testing.expect(n.get("c").?.seq[0] == .null);
+    try std.testing.expectEqualStrings("nULL", n.get("d").?.string);
+    // Refused, as `? key` is in block style, instead of a key named "? ...".
+    try std.testing.expectError(error.UnsupportedYaml, parse(ar, "a: {? \"multi\\nline\" : []}\n", null));
 }
