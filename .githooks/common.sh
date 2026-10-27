@@ -1,5 +1,7 @@
+# shellcheck shell=bash
 # Shared by the hooks (README, "Git hooks"): what they print, and finding the Zig the project
-# builds with.
+# builds with. The hook that sources this sets `hook` to its own name first.
+: "${hook:?set by the hook that sources this}"
 
 fail() {
 	printf '\033[31m%s:\033[0m %s\n' "$hook" "$*" >&2

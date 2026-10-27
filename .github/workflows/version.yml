@@ -35,6 +35,7 @@ jobs:
     # skips a release, which the next merge makes.
     if: github.event.head_commit.author.name != 'github-actions[bot]'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: prod
     permissions:
       contents: read # to check out main and its tags
