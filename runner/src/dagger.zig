@@ -134,7 +134,8 @@ fn zigLocalCacheDir(as_runner: bool) []const u8 {
 /// Where uv's project environment goes with `uv_env_in_cache`: inside its own cache volume, the
 /// only place a hardlink from that cache can reach (every mount is its own device, even two of one
 /// volume). Keyed by the ref, so jobs on different branches do not reconcile one environment to
-/// their own lockfiles in turn, and concurrent jobs on one branch want the same state anyway.
+/// their own lockfiles in turn, and concurrent jobs on one branch want the same state anyway. Never
+/// with step caching (see `uvEnvFor`).
 fn uvEnvPath(arena: Allocator, cache_path: []const u8, ref: []const u8) ![]const u8 {
     var key: std.ArrayList(u8) = .empty;
     for (if (ref.len > 0) ref else "default") |c| {
@@ -1030,7 +1031,8 @@ pub const Options = struct {
     /// that content, so its key depends on what the step produced, not on the step having run. The
     /// runner turns this on with `RUNNER_OUTPUT_KEYS`.
     output_keys: bool = false,
-    /// `Config.uv_env_in_cache`: uv's project environment goes inside its cache volume.
+    /// `Config.uv_env_in_cache`: uv's project environment goes inside its cache volume, in jobs
+    /// whose steps are not cached (see `uvEnvFor`).
     uv_env_in_cache: bool = true,
     /// `Config.zig_local_cache`: Zig's local cache goes in a cache volume of its own.
     zig_local_cache: bool = false,
@@ -3503,7 +3505,7 @@ fn basePlan(
         .provision = provision,
         .as_runner = as_runner,
         .step_cache = step_cache,
-        .uv_env = try uvEnvFor(arena, opts, job, as_runner),
+        .uv_env = try uvEnvFor(arena, opts, job, as_runner, step_cache),
         .cache_ids = volumes.ids,
         .zig_local = volumes.zig_local,
         .ran_marker = ran_marker,
@@ -3511,10 +3513,22 @@ fn basePlan(
 }
 
 /// uv's project environment, inside its cache volume so uv can hardlink into it (see `uvEnvPath`).
-/// Null when there is no cache volume to put it in.
-fn uvEnvFor(arena: Allocator, opts: Options, job: job_mod.Job, as_runner: bool) !?[]const u8 {
+/// Null when there is no cache volume to put it in, and when the job's steps are cached: a cache
+/// volume's content is not part of a step's key and a replayed step's writes into one are not made
+/// again, so a replayed `uv sync` would leave the environment another commit's job synced there,
+/// and later steps would run against its dependencies (#70). Left in the workspace, the environment
+/// is part of the container each step produces, and a replay restores it exactly; uv's download
+/// and wheel cache stays in its volume, content-addressed and safe to share.
+fn uvEnvFor(
+    arena: Allocator,
+    opts: Options,
+    job: job_mod.Job,
+    as_runner: bool,
+    step_cache: bool,
+) !?[]const u8 {
     if (!opts.uv_env_in_cache or !opts.package_caches or job.github.repository.len == 0)
         return null;
+    if (step_cache) return null;
     const i = for (
         package_cache_dirs,
         0..,
@@ -9765,6 +9779,23 @@ test "uv's environment goes in its cache, with a .venv symlink to it" {
     _ = try run(arena, std.testing.io, &env, .{ .step_user = .runner, .package_caches = true, .uv_env_in_cache = false, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake2.transport() }, job, &log2);
     try std.testing.expect(std.mem.indexOf(u8, fake2.seen.items[1], "UV_PROJECT_ENVIRONMENT") == null);
     try std.testing.expect(std.mem.indexOf(u8, fake2.seen.items[1], "ln -sfn") == null);
+
+    // With step caching, the environment stays in the workspace, where a replayed `uv sync`
+    // restores it with the rest of the container, not in a volume another commit's job synced
+    // (#70). uv's own cache is still mounted from its volume.
+    var fake3: FakeSession = .{ .answers = &answers, .arena = arena };
+    var w3: std.Io.Writer = .fixed(&buf);
+    var log3: sink.LogSink = .{ .stdout = .{ .writer = &w3 } };
+    const res3 = try run(arena, std.testing.io, &env, .{ .step_user = .runner, .package_caches = true, .step_cache = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake3.transport() }, job, &log3);
+    try std.testing.expect(res3.succeeded);
+    const cached = fake3.seen.items[1];
+    try std.testing.expect(std.mem.indexOf(u8, cached, "UV_PROJECT_ENVIRONMENT") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cached, "UV_VENV_CLEAR") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cached, "ln -sfn") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cached, "zig-runner-envs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cached, "withMountedCache(path:\"/home/runner/.cache/uv\"") != null);
+    // The step's own query does not point uv at the volume either.
+    try std.testing.expect(std.mem.indexOf(u8, fake3.seen.items[2], "UV_PROJECT_ENVIRONMENT") == null);
 }
 
 test "package caches: one volume per tool, keyed by repository, separate for fork pull requests" {
