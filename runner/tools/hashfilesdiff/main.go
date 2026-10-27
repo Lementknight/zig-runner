@@ -1,27 +1,20 @@
-// Command hashfilesdiff is the Go half of .github/scripts/hashfiles-diff.sh, which compares which
-// files the runner's hashFiles() selects with which GitHub's selects.
+// Command hashfilesdiff writes the test tree and the cases .github/scripts/hashfiles-diff.sh
+// compares the runner's hashFiles() (runner/src/glob.zig) with GitHub's on.
 //
-//	go run . setup -out <dir> [-n 400] [-seed 1]     a test tree in <dir>/tree, cases in <dir>/cases.json
-//	go run . glob -tree <dir> -plan <globs.json>    what Dagger's glob lists for each glob, as JSON
-//	go run . contents -tree <dir> -plan <dirs.json> what is in each directory, by its path, as JSON
+//	go run . -out <dir> [-n 400] [-seed 1]     a tree in <dir>/tree, cases in <dir>/cases.json
 //
-// The runner lists files with Dagger's Directory.glob (runner/src/dagger.zig) and picks among them
-// with runner/src/hashfiles.zig; GitHub's runner runs a Node script on @actions/glob
-// (reference.mjs here is that script, reporting the files instead of hashing them). glob asks the
-// engine at _EXPERIMENTAL_DAGGER_RUNNER_HOST, through Dagger's Go SDK, at the engine's version.
+// GitHub's side is reference.mjs here (actions/runner's hashFiles script on @actions/glob); the
+// runner's is runner/tools/hashfilescorpus.zig. Both read the same tree, so they see the same
+// directory order and the hashes themselves can be compared, not just the files.
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
-	"strings"
-
-	"dagger.io/dagger"
 )
 
 // The test tree: the files a repository has (lockfiles at several depths, vendored and installed
@@ -31,11 +24,15 @@ var files = []string{
 	"node_modules/x/package-lock.json", "node_modules/.bin/tool", ".hidden/file.json", ".dotfile",
 	".github/workflows/ci.yml", "a b/space file.txt", "UPPER.TXT", "lower.txt", "dir.json/inner.txt",
 	"deep/a/b/c/file.go", "go.sum", "go.mod", "src/main.go", "src/main_test.go", "src/util/util.go",
-	"vendor/x/x.go", "brackets[1].txt", "star*.txt", "q?.txt", "#hash.txt", "!bang.txt", "-dash.txt",
-	"café.txt", "src/.env", "deep/.cache/x.go",
+	"vendor/x/x.go", "brackets[1].txt", "brackets1.txt", "star*.txt", "q?.txt", "#hash.txt",
+	"!bang.txt", "-dash.txt", "café.txt", "src/.env", "deep/.cache/x.go", "a.txt", "a/b.txt",
+	"[x]/y.txt", "~/tilde.txt",
 }
 
-var symlinks = map[string]string{"linkdir": "src", "link.go": "src/main.go", "broken": "nowhere"}
+// Links: to a file, to a directory, to nowhere, and a cycle (followed with --follow-symbolic-links).
+var symlinks = map[string]string{
+	"link.go": "src/main.go", "linkdir": "src", "broken": "nowhere", "src/util/loop": "..",
+}
 
 // Patterns as workflows write them, and ones that probe the corners. The workspace is /tree.
 var pool = []string{
@@ -47,25 +44,8 @@ var pool = []string{
 	"link.go", "broken", "emptydir", "a b", "a b/*.txt", "**/**/*.go", "src//main.go", "src/./main.go",
 	"../tree/go.sum", "?ower.txt", "[lU]*.T?T", "star\\*.txt", "q\\?.txt", "\\#hash.txt", "\\!bang.txt",
 	"-dash.txt", "*.TXT", "**/*.txt", "go.*", "src/**/*.go", "src/*/", ".github/**/*.yml", "**/.env",
-	"src/*", "deep/*", "deep/a/*", "sub/*", "*/*", "node_modules/*",
-}
-
-func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: hashfilesdiff setup|glob ...")
-		os.Exit(2)
-	}
-	switch os.Args[1] {
-	case "setup":
-		setup(os.Args[2:])
-	case "glob":
-		globs(os.Args[2:], false)
-	case "contents":
-		globs(os.Args[2:], true)
-	default:
-		fmt.Fprintln(os.Stderr, "usage: hashfilesdiff setup|glob ...")
-		os.Exit(2)
-	}
+	"src/*", "deep/*", "deep/a/*", "sub/*", "*/*", "node_modules/*", "[[]x]/*", "\\[x]/y.txt",
+	"[!a-z]*", "[[:upper:]]*", "a*", "a/", "q?.txt", "~/tilde.txt", "!!src/*.go", "!", "linkdir/**",
 }
 
 type testCase struct {
@@ -73,12 +53,11 @@ type testCase struct {
 	Patterns []string `json:"patterns"`
 }
 
-func setup(args []string) {
-	fs := flag.NewFlagSet("setup", flag.ExitOnError)
-	out := fs.String("out", ".", "where to write the tree and the cases")
-	n := fs.Int("n", 400, "random cases, after one per pattern")
-	seed := fs.Uint64("seed", 1, "random seed")
-	fs.Parse(args)
+func main() {
+	out := flag.String("out", ".", "where to write the tree and the cases")
+	n := flag.Int("n", 400, "random cases, after one per pattern")
+	seed := flag.Uint64("seed", 1, "random seed")
+	flag.Parse()
 
 	tree := filepath.Join(*out, "tree")
 	for i, f := range files {
@@ -98,6 +77,9 @@ func setup(args []string) {
 	r := rand.New(rand.NewPCG(*seed, 0))
 	for range *n {
 		var ps []string
+		if r.IntN(5) == 0 {
+			ps = append(ps, "--follow-symbolic-links")
+		}
 		for j := range 1 + r.IntN(4) {
 			p := pool[r.IntN(len(pool))]
 			if j > 0 && r.IntN(2) == 0 {
@@ -111,60 +93,6 @@ func setup(args []string) {
 	must(err)
 	must(os.WriteFile(filepath.Join(*out, "cases.json"), raw, 0o644))
 }
-
-// globs lists each glob in the plan, or with contents, everything in each directory of the plan as
-// the runner asks for it: directory(path: D).glob("**").
-func globs(args []string, contents bool) {
-	fs := flag.NewFlagSet("glob", flag.ExitOnError)
-	tree := fs.String("tree", "", "the tree to glob")
-	plan := fs.String("plan", "", "a JSON array of the globs to ask for")
-	fs.Parse(args)
-
-	var want []string
-	raw, err := os.ReadFile(*plan)
-	must(err)
-	must(json.Unmarshal(raw, &want))
-
-	ctx := context.Background()
-	c, err := dagger.Connect(ctx)
-	must(err)
-	defer c.Close()
-	dir := c.Host().Directory(*tree)
-	got := map[string][]string{}
-	for _, g := range want {
-		var paths []string
-		var err error
-		if contents {
-			paths, err = dir.Directory(g).Glob(ctx, "**")
-		} else {
-			paths, err = dir.Glob(ctx, g)
-		}
-		if err != nil {
-			// The runner sends the same glob; an error there fails hashFiles().
-			got[g] = []string{"ERROR: " + strings.ReplaceAll(err.Error(), "\n", " ")}
-			continue
-		}
-		got[g] = append([]string{}, paths...)
-		// What is a directory once symbolic links are followed: the runner's hash step skips it,
-		// as GitHub's script does, and the harness needs to know which those are.
-		for _, p := range paths {
-			full := p
-			if contents {
-				full = g + p
-			}
-			if fi, err := os.Stat(filepath.Join(*tree, full)); err == nil && fi.IsDir() && !strings.HasSuffix(p, "/") {
-				got[followedKey] = append(got[followedKey], full)
-			}
-		}
-	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetEscapeHTML(false)
-	must(enc.Encode(got))
-}
-
-// followedKey holds, in glob's output, the listed names that are directories once symbolic links
-// are followed (a link to a directory).
-const followedKey = "//followed"
 
 func must(err error) {
 	if err != nil {

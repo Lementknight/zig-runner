@@ -25,7 +25,7 @@ const sink = @import("sink.zig");
 const broker = @import("github/broker.zig");
 const build_version = @import("version.zig");
 const expr = @import("expr.zig");
-const hashfiles = @import("hashfiles.zig");
+const glob = @import("glob.zig");
 const context = @import("context.zig");
 const commands = @import("commands.zig");
 const matcher = @import("matcher.zig");
@@ -5581,12 +5581,10 @@ const Exec = struct {
     }
 
     /// `hashFiles(patterns)`, as GitHub computes it: the SHA-256 of the SHA-256 digests of the
-    /// matching files under the workspace, "" when none match. Patterns are globs relative to the
-    /// workspace (or absolute inside it), one per argument or line; `!` excludes, and the last
-    /// matching pattern decides; a pattern that matches a directory matches everything in it. Files
-    /// are taken in path order; GitHub takes them in directory-walk order, which can differ when
-    /// several files match. The files are listed with Dagger's `glob` and hashed by `sha256sum` in
-    /// the job's container, which the exec does not change.
+    /// files its patterns find under the workspace, "" when none. The search is glob.zig
+    /// (@actions/glob, as GitHub's runner uses it), asking Dagger what is in the job's container
+    /// (`DaggerFs`); the files are hashed by `sha256sum` there, in the order the search found them,
+    /// which is GitHub's, so the result is the hash GitHub computes for the same files.
     fn hashFiles(
         ptr: *anyopaque,
         arena: Allocator,
@@ -5594,93 +5592,116 @@ const Exec = struct {
     ) Allocator.Error!expr.HashFiles.Result {
         const x: *Exec = @ptrCast(@alignCast(ptr));
         const ws = x.ev.workspace;
-        const patterns = switch (try hashfiles.patterns(arena, ws, args)) {
-            .none => return .{ .ok = "" },
+        const parsed = switch (try glob.parse(arena, args, ws, runner_home)) {
             .invalid => |why| return .{ .failed = why },
             .ok => |p| p,
         };
-        const files = switch (try x.globFiles(arena, ws, patterns)) {
+        var dfs: DaggerFs = .{ .x = x };
+        const found = switch (try glob.walk(arena, dfs.fs(), parsed.patterns, parsed.follow, ws, &dfs.why)) {
             .failed => |msg| return .{ .failed = msg },
             .files => |f| f,
         };
-        if (files.len == 0) return .{ .ok = "" };
-        return x.hashListed(arena, ws, files);
+        var files: std.ArrayList([]const u8) = .empty;
+        for (found) |path| {
+            if (std.mem.startsWith(u8, path, ws) and path.len > ws.len and path[ws.len] == '/')
+                try files.append(arena, path[ws.len + 1 ..]);
+        }
+        if (files.items.len == 0) return .{ .ok = "" };
+        return x.hashListed(arena, ws, files.items);
     }
 
-    /// What the globs matched, or why the engine could not say.
-    const Globbed = union(enum) { files: []const []const u8, failed: []const u8 };
-
-    /// The files the patterns select, in path order (hashfiles.zig): Dagger's `glob` for each
-    /// pattern as given, then what is in each directory those matched.
-    fn globFiles(
+    /// glob.Fs on the job's container, through Dagger's API: `exists` for what a path is (it is
+    /// false for a missing path, where `stat` would fail the query) and `entries` for what is in
+    /// a directory, many paths to a query. No canonical paths, so no `--follow-symbolic-links`.
+    const DaggerFs = struct {
         x: *Exec,
-        arena: Allocator,
-        ws: []const u8,
-        patterns: []const hashfiles.Pattern,
-    ) Allocator.Error!Globbed {
-        var msg: []const u8 = "";
-        const data = gql(arena, x.transport, try globQuery(arena, x.container_id, ws, patterns), &msg) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return .{ .failed = msg },
-        };
-        const as_given = try arena.alloc([]const []const u8, patterns.len);
-        for (as_given, 0..) |*found, i| {
-            const key = try std.fmt.allocPrint(arena, "p{d}", .{i});
-            found.* = jsonStrings(arena, jsonFind(data, key)) catch return error.OutOfMemory;
+        why: []const u8 = "",
+
+        /// Paths to a query, so that a big tree does not make one enormous document.
+        const batch = 1000;
+
+        fn fs(d: *DaggerFs) glob.Fs {
+            return .{ .ptr = d, .vtable = &.{ .stat = stat, .list = list, .realpath = null } };
         }
-        var contents: std.StringHashMapUnmanaged([]const []const u8) = .empty;
-        const dirs = try hashfiles.directories(arena, as_given);
-        if (dirs.len > 0) {
-            const inside = gql(arena, x.transport, try contentsQuery(arena, x.container_id, ws, dirs), &msg) catch |e| switch (e) {
+
+        fn run(d: *DaggerFs, arena: Allocator, query: []const u8) glob.Fs.Error!std.json.Value {
+            var msg: []const u8 = "";
+            return gql(arena, d.x.transport, query, &msg) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => return .{ .failed = msg },
+                else => {
+                    d.why = msg;
+                    return error.FsFailed;
+                },
             };
-            for (dirs, 0..) |dir, j| {
-                const key = try std.fmt.allocPrint(arena, "c{d}", .{j});
-                const listed = jsonFind(inside, key) orelse continue;
-                try contents.put(arena, dir, jsonStrings(arena, jsonFind(listed, "glob")) catch
-                    return error.OutOfMemory);
+        }
+
+        fn stat(ptr: *anyopaque, arena: Allocator, paths: []const []const u8, follow: bool) glob.Fs.Error![]const glob.Kind {
+            const d: *DaggerFs = @ptrCast(@alignCast(ptr));
+            const out = try arena.alloc(glob.Kind, paths.len);
+            var start: usize = 0;
+            while (start < paths.len) : (start += batch) {
+                const end = @min(start + batch, paths.len);
+                var q: Query = .init(arena);
+                q.call("loadContainerFromID", .{ .id = d.x.container_id }) catch return error.OutOfMemory;
+                q.open("rootfs") catch return error.OutOfMemory;
+                for (paths[start..end], start..) |p, i| {
+                    const types = [_]struct { []const u8, ?[]const u8 }{
+                        .{ "e", null }, .{ "d", "DIRECTORY_TYPE" }, .{ "f", "REGULAR_TYPE" }, .{ "l", "SYMLINK_TYPE" },
+                    };
+                    for (types) |t| {
+                        const alias = try std.fmt.allocPrint(arena, "{s}{d}", .{ t[0], i });
+                        // A link is only itself when links are not followed.
+                        const no_follow = !follow or std.mem.eql(u8, t[0], "l");
+                        if (t[1]) |ty| {
+                            q.leafArgs(alias, "exists", .{ .path = p, .expectedType = Raw{ .text = ty }, .doNotFollowSymlinks = no_follow }) catch return error.OutOfMemory;
+                        } else q.leafArgs(alias, "exists", .{ .path = p, .doNotFollowSymlinks = no_follow }) catch return error.OutOfMemory;
+                    }
+                }
+                const data = try d.run(arena, q.finish() catch return error.OutOfMemory);
+                for (start..end) |i| {
+                    const yes = struct {
+                        fn f(arena_: Allocator, v: std.json.Value, kind: []const u8, at: usize) bool {
+                            const key = std.fmt.allocPrint(arena_, "{s}{d}", .{ kind, at }) catch return false;
+                            const got = jsonFind(v, key) orelse return false;
+                            return got == .bool and got.bool;
+                        }
+                    }.f;
+                    out[i] = if (!yes(arena, data, "e", i)) .missing //
+                        else if (!follow and yes(arena, data, "l", i)) .symlink //
+                        else if (yes(arena, data, "d", i)) .directory //
+                        else if (yes(arena, data, "f", i)) .file //
+                        else .other;
+                }
             }
+            return out;
         }
-        return .{ .files = try hashfiles.select(arena, patterns, as_given, &contents) };
-    }
 
-    /// One query: each pattern as given (`p<i>`), against the workspace.
-    fn globQuery(
-        arena: Allocator,
-        container_id: []const u8,
-        ws: []const u8,
-        patterns: []const hashfiles.Pattern,
-    ) Allocator.Error![]const u8 {
-        var q: Query = .init(arena);
-        q.call("loadContainerFromID", .{ .id = container_id }) catch return error.OutOfMemory;
-        q.call("directory", .{ .path = ws }) catch return error.OutOfMemory;
-        for (patterns, 0..) |p, i| {
-            const alias = try std.fmt.allocPrint(arena, "p{d}", .{i});
-            q.leafArgs(alias, "glob", .{ .pattern = p.glob }) catch return error.OutOfMemory;
+        fn list(ptr: *anyopaque, arena: Allocator, dirs: []const []const u8) glob.Fs.Error![]const []const []const u8 {
+            const d: *DaggerFs = @ptrCast(@alignCast(ptr));
+            const out = try arena.alloc([]const []const u8, dirs.len);
+            var start: usize = 0;
+            while (start < dirs.len) : (start += batch) {
+                const end = @min(start + batch, dirs.len);
+                var q: Query = .init(arena);
+                q.call("loadContainerFromID", .{ .id = d.x.container_id }) catch return error.OutOfMemory;
+                q.open("rootfs") catch return error.OutOfMemory;
+                for (dirs[start..end], start..) |dir, j| {
+                    const alias = try std.fmt.allocPrint(arena, "c{d}", .{j});
+                    q.leafArgs(alias, "entries", .{ .path = dir }) catch return error.OutOfMemory;
+                }
+                const data = try d.run(arena, q.finish() catch return error.OutOfMemory);
+                for (start..end) |j| {
+                    const key = try std.fmt.allocPrint(arena, "c{d}", .{j});
+                    // Entries name directories with a trailing `/`; the walk wants bare names.
+                    const names = jsonStrings(arena, jsonFind(data, key)) catch return error.OutOfMemory;
+                    const bare = try arena.alloc([]const u8, names.len);
+                    for (names, bare) |n, *b| b.* = std.mem.trimEnd(u8, n, "/");
+                    out[j] = bare;
+                }
+            }
+            return out;
         }
-        return q.finish() catch return error.OutOfMemory;
-    }
-
-    /// One query: everything in each directory (`c<j>`), by its path, so nothing in the path is
-    /// read as a glob.
-    fn contentsQuery(
-        arena: Allocator,
-        container_id: []const u8,
-        ws: []const u8,
-        dirs: []const []const u8,
-    ) Allocator.Error![]const u8 {
-        var q: Query = .init(arena);
-        q.call("loadContainerFromID", .{ .id = container_id }) catch return error.OutOfMemory;
-        q.call("directory", .{ .path = ws }) catch return error.OutOfMemory;
-        for (dirs, 0..) |dir, j| {
-            const alias = try std.fmt.allocPrint(arena, "c{d}", .{j});
-            q.callAs(alias, "directory", .{ .path = dir }) catch return error.OutOfMemory;
-            q.leafArgs(null, "glob", .{ .pattern = "**" }) catch return error.OutOfMemory;
-            q.close(1) catch return error.OutOfMemory;
-        }
-        return q.finish() catch return error.OutOfMemory;
-    }
+    };
 
     /// `sha256sum` over the files, in order, in the job's container (the names are listed in a
     /// file, so any number fits), then the SHA-256 of those digests, as GitHub computes it.
@@ -8922,7 +8943,21 @@ test "Docker actions: built or pulled, the workspace copied in and back, args, e
     try std.testing.expect(std.mem.indexOf(u8, out, "image: alpine:3.22") != null);
 }
 
-test "hashFiles globs the workspace, honours exclusions, and hashes the files' digests in path order" {
+/// Dagger's answer to DaggerFs.stat: one letter per path, `d`irectory, `f`ile, `l`ink, `m`issing.
+fn existsAnswer(arena: Allocator, kinds: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, "{\"data\":{\"loadContainerFromID\":{\"rootfs\":{");
+    for (kinds, 0..) |k, i| {
+        if (i > 0) try out.append(arena, ',');
+        try out.print(arena, "\"e{d}\":{},\"d{d}\":{},\"f{d}\":{},\"l{d}\":{}", .{
+            i, k != 'm', i, k == 'd', i, k == 'f', i, k == 'l',
+        });
+    }
+    try out.appendSlice(arena, "}}}}");
+    return out.items;
+}
+
+test "hashFiles finds files as GitHub's script does, through Dagger, and hashes them in its order" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -8934,12 +8969,17 @@ test "hashFiles globs the workspace, honours exclusions, and hashes the files' d
     const steps = [_]job_mod.Step{ st, none };
     const d1 = "1111111111111111111111111111111111111111111111111111111111111111";
     const d2 = "2222222222222222222222222222222222222222222222222222222222222222";
+    const list = "{\"data\":{\"loadContainerFromID\":{\"rootfs\":{";
     const answers = [_][]const u8{
         base_answer,
-        "{\"data\":{\"loadContainerFromID\":{\"directory\":{\"p0\":[\"package-lock.json\",\"node_modules/x/package-lock.json\",\"a/package-lock.json\"]," ++
-            "\"p1\":[\"node_modules/\",\"node_modules/x/\",\"node_modules/x/package-lock.json\"]}}}}",
-        // What is in the two directories p1 matched.
-        "{\"data\":{\"loadContainerFromID\":{\"directory\":{\"c0\":{\"glob\":[\"x/\",\"x/package-lock.json\"]},\"c1\":{\"glob\":[\"package-lock.json\"]}}}}}",
+        // The workspace, then what is in it (listed in any order; walked in byte order).
+        try existsAnswer(arena, "d"),
+        list ++ "\"c0\":[\"package-lock.json\",\"node_modules/\",\"a/\"]}}}}",
+        try existsAnswer(arena, "ddf"), // a, node_modules, package-lock.json
+        list ++ "\"c0\":[\"package-lock.json\"],\"c1\":[\"x/\"]}}}}",
+        try existsAnswer(arena, "fd"), // a/package-lock.json, node_modules/x
+        list ++ "\"c0\":[\"package-lock.json\"]}}}}",
+        try existsAnswer(arena, "f"), // node_modules/x/package-lock.json: excluded, not hashed
         "{\"data\":{\"loadContainerFromID\":{\"withNewFile\":{\"withExec\":{\"exitCode\":0,\"stdout\":\"" ++ d1 ++ "  a/package-lock.json\\n" ++ d2 ++ "  package-lock.json\\n\",\"stderr\":\"\"}}}}}",
         try exec(arena, "C1", 0, ""),
         try exec(arena, "C2", 0, ""),
@@ -8951,22 +8991,24 @@ test "hashFiles globs the workspace, honours exclusions, and hashes the files' d
     const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
     try std.testing.expect(res.succeeded);
     const seen = fake.seen.items;
-    try std.testing.expectEqual(@as(usize, 6), seen.len);
+    try std.testing.expectEqual(@as(usize, 11), seen.len);
     for (seen) |d| try std.testing.expect(braceBalanced(d));
-    try std.testing.expect(std.mem.indexOf(u8, seen[1], "loadContainerFromID(id:\"C0\") { directory(path:\"/home/runner/work/r/r\") { p0: glob(pattern:\"**/package-lock.json\") p1: glob(pattern:\"node_modules/**\") }") != null);
-    // The directories matched are listed by path, not globbed into (`src/*/**` lists nothing).
-    try std.testing.expect(std.mem.indexOf(u8, seen[2], "c0: directory(path:\"node_modules/\") { glob(pattern:\"**\") } c1: directory(path:\"node_modules/x/\") { glob(pattern:\"**\") }") != null);
-    // node_modules is excluded; the rest is hashed in path order, in the job's container.
-    try std.testing.expect(std.mem.indexOf(u8, seen[3], "loadContainerFromID(id:\"C0\") { withNewFile(path:\"/tmp/zig-runner-hashfiles\",contents:\"a/package-lock.json\\npackage-lock.json\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen[3], "[ -d \\\"$f\\\" ] ||") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen[3], "xargs -0 -r sha256sum --") != null);
+    const ws = "/home/runner/work/r/r";
+    try std.testing.expect(std.mem.indexOf(u8, seen[1], "loadContainerFromID(id:\"C0\") { rootfs { e0: exists(path:\"" ++ ws ++ "\",doNotFollowSymlinks:true) d0: exists(path:\"" ++ ws ++ "\",expectedType:DIRECTORY_TYPE,doNotFollowSymlinks:true)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[2], "c0: entries(path:\"" ++ ws ++ "\")") != null);
+    // Byte order: a, node_modules, package-lock.json.
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "e0: exists(path:\"" ++ ws ++ "/a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "e2: exists(path:\"" ++ ws ++ "/package-lock.json\"") != null);
+    // In GitHub's order, depth-first; node_modules' file excluded. Directories are skipped there.
+    try std.testing.expect(std.mem.indexOf(u8, seen[8], "loadContainerFromID(id:\"C0\") { withNewFile(path:\"/tmp/zig-runner-hashfiles\",contents:\"a/package-lock.json\\npackage-lock.json\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[8], "[ -d \\\"$f\\\" ] ||") != null);
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     h.update(&(@as([32]u8, @splat(0x11))));
     h.update(&(@as([32]u8, @splat(0x22))));
     const want = try std.fmt.allocPrint(arena, "echo key-{s}", .{&std.fmt.bytesToHex(h.finalResult(), .lower)});
-    try std.testing.expect(std.mem.indexOf(u8, seen[4], want) != null);
-    // Nothing inside the workspace to include: "" without asking Dagger.
-    try std.testing.expect(std.mem.indexOf(u8, seen[5], "echo none-.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[9], want) != null);
+    // Nothing inside the workspace to search: "" without asking Dagger.
+    try std.testing.expect(std.mem.indexOf(u8, seen[10], "echo none-.") != null);
 }
 
 test "a local action is read from the workspace when its step runs, and is not mounted" {
