@@ -5,7 +5,11 @@
 // compares yaml.zig's tree for the same file. .github/scripts/yaml-diff.sh does all of it.
 //
 //	go run . <file>... > expected.jsonl
-//	go run . -gen 500 -seed 1 -out <dir>     write 500 random YAML files to compare instead
+//	go run . -gen 500 -seed 1 -out <dir>     write 500 random YAML files of each kind instead
+//
+// Of the random files, gen*.yml are written by Go's encoder, in every style it has, and txt*.yml as
+// text (text.go), for what the encoder never writes: quoted scalars and flow collections over
+// several lines, explicit keys, and some files that are not YAML.
 //
 // Each line is {"file": name, "tree": ...}, or {"file": name, "error": message} when Go refuses it.
 // A tree is null, a string, {"seq": [...]} or {"map": [[key, value], ...]}.
@@ -30,7 +34,7 @@ type line struct {
 }
 
 func main() {
-	gen := flag.Int("gen", 0, "write this many random YAML files to -out, and nothing else")
+	gen := flag.Int("gen", 0, "write this many random YAML files of each kind to -out, and nothing else")
 	seed := flag.Uint64("seed", 1, "random seed for -gen")
 	outDir := flag.String("out", ".", "where -gen writes")
 	flag.Parse()
@@ -136,6 +140,9 @@ func generate(n int, seed uint64, dir string) {
 			continue
 		}
 		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("gen%05d.yml", i)), out, 0o644); err != nil {
+			panic(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("txt%05d.yml", i)), generateText(r), 0o644); err != nil {
 			panic(err)
 		}
 	}

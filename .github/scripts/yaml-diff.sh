@@ -4,12 +4,15 @@
 #
 #   - the action.yml of every repository in runner/tools/yamldiff/repos.txt, fetched now from
 #     GitHub (read-only, unauthenticated) and not kept;
-#   - random YAML that runner/tools/yamldiff writes with Go's encoder, in every style it has.
+#   - random YAML that runner/tools/yamldiff writes, as many files with Go's encoder (in every
+#     style it has) as written as text (multi-line quoted scalars and flow collections, explicit
+#     keys, and some files that are not YAML at all).
 #
 # runner/tools/yamlcorpus.zig compares the trees. yaml.zig may refuse what is outside its subset
-# (it says so); reading something differently fails. Needs Go and network access; not run in CI.
+# (it says so); reading something differently, or reading what Go refuses, fails. Needs Go and
+# network access; not run in CI.
 #
-#   yaml-diff.sh [random files] [seed]     defaults: 2000, 1
+#   yaml-diff.sh [random files of each kind] [seed]     defaults: 2000, 1
 set -euo pipefail
 cd "$(dirname "$0")/../../runner"
 

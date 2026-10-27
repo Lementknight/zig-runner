@@ -5,8 +5,9 @@
 //!     yamlcorpus <expected.jsonl> <dir of the files>
 //!
 //! Prints every file where the trees differ (with the path to the first difference), every file
-//! yaml.zig refuses that Go reads (its subset, or a bug), then counts. Fails when trees differ:
-//! refusing is allowed, misreading is not.
+//! yaml.zig reads that Go refuses, every file yaml.zig refuses that Go reads (its subset, or a
+//! bug), then counts. Fails when trees differ or yaml.zig reads what Go refuses: refusing is
+//! allowed, misreading is not.
 const std = @import("std");
 const yaml = @import("yaml");
 
@@ -37,12 +38,17 @@ pub fn main(init: std.process.Init) !u8 {
         if (l.len == 0) continue;
         const want = (try std.json.parseFromSliceLeaky(std.json.Value, arena, l, .{})).object;
         const file = want.get("file").?.string;
-        if (want.get("error")) |_| {
-            go_refused += 1;
-            continue;
-        }
         const src = try dir.readFileAlloc(io, file, arena, .limited(1 << 26));
         var diag: yaml.Diag = .{};
+        if (want.get("error")) |e| {
+            go_refused += 1;
+            // Reading what Go refuses is a difference too: it is not YAML, or not in the subset.
+            if (yaml.parse(arena, src, &diag)) |_| {
+                differ += 1;
+                try out.print("ACCEPTS  {s}: Go refuses it ({s}), yaml.zig reads it\n", .{ file, e.string });
+            } else |_| {}
+            continue;
+        }
         const got = yaml.parse(arena, src, &diag) catch |e| {
             refused += 1;
             try out.print("refused  {s}: {s} at line {d}: {s}\n", .{ file, @errorName(e), diag.line, diag.message });
@@ -79,7 +85,7 @@ fn difference(arena: std.mem.Allocator, got: yaml.Node, want: std.json.Value, pa
             for (got.seq, seq.array.items, 0..) |g, w, i|
                 if (try difference(arena, g, w, try std.fmt.allocPrint(arena, "{s}[{d}]", .{ path, i }))) |d| return d;
         } else {
-            const pairs = o.get("map").?.array.items;
+            const pairs = try lastWins(arena, o.get("map").?.array.items);
             if (got != .map)
                 return try std.fmt.allocPrint(arena, "{s}: Go has a mapping, yaml.zig {s}", .{ at, try show(arena, got) });
             if (got.map.len != pairs.len)
@@ -94,6 +100,20 @@ fn difference(arena: std.mem.Allocator, got: yaml.Node, want: std.json.Value, pa
         else => unreachable,
     }
     return null;
+}
+
+/// Go's pairs as yaml.zig keeps them: a key given twice (which GitHub refuses) has its last value,
+/// where it first appeared. Go's yaml.Node keeps both.
+fn lastWins(arena: std.mem.Allocator, pairs: []std.json.Value) ![]std.json.Value {
+    var out: std.ArrayList(std.json.Value) = .empty;
+    next: for (pairs) |p| {
+        for (out.items) |*q| if (std.mem.eql(u8, q.array.items[0].string, p.array.items[0].string)) {
+            q.* = p;
+            continue :next;
+        };
+        try out.append(arena, p);
+    }
+    return out.items;
 }
 
 fn show(arena: std.mem.Allocator, n: yaml.Node) ![]const u8 {

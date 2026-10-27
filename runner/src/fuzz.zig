@@ -167,6 +167,9 @@ test "fuzz: YAML" {
             // Each once read an empty entry for ever, until memory ran out.
             &.{"a: [}]\n"},
             &.{"a: {]}\n"},
+            // Quoted scalars and flow collections over several lines, and explicit keys.
+            &.{"a: \"one  \n  two \\\n  three\n\n  four\"\nb: 'it''s\n\n  x'\n? |\n  k\n: v\n"},
+            &.{"a: [\n  x\n   y, # c\n  {? k : v, \"q\":\n   [1,\n2]},\n  z: w,\n]\nb: {a: [b, c], ? d}\n"},
         }),
     });
 }
