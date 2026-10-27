@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Expressions evaluate as GitHub''s runner does where its two evaluators differ: `case()` evaluates only the value it picks, `format()` an argument only when a placeholder needs it, and `a[k]` evaluates `k` only when `a` is an array or an object. So an error in what is never needed (`case(true, 1, fromJSON(''{''))`, `format(''{0}'', 1, fromJSON(''{''))`) is no longer an error, as on GitHub.'
-time: 2026-10-27T09:30:00.000000-04:00
