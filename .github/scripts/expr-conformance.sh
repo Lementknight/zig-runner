@@ -28,7 +28,10 @@ zig build-exe --dep expr -Mroot=tools/exprcorpus.zig -Mexpr=src/expr.zig --name 
 
 list=tools/exprcorpus-failing.txt
 case ${1:-} in
---report) exec "$scratch/exprcorpus" "$cases" ;;
+--report)
+	"$scratch/exprcorpus" "$cases"
+	exit
+	;;
 --update)
 	"$scratch/exprcorpus" "$cases" --failing | LC_ALL=C sort >"$list"
 	echo "$(wc -l <"$list") cases listed in $list"
