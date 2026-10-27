@@ -10,6 +10,10 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.11.4 - 2026-10-27
+### Fixed
+* Expressions have GitHub's memory limit, counted as GitHub counts it (1048576 bytes; a string as 26 bytes plus two per UTF-16 code unit, per level of the expression, as actions/runner's evaluator does), instead of a looser 10 MiB of strings built. An expression GitHub refuses for memory is refused here too, and one it runs runs. All 1020 of GitHub's expression test cases now pass.
+
 ## v0.11.3 - 2026-10-27
 ### Fixed
 * When a job ended, the runner closed the Dagger session's log pipe while its reader thread could still be reading it, so the reader could read another file that reused the descriptor. Found by ThreadSanitizer, which now runs over the tests in CI.
