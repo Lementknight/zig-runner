@@ -10,6 +10,10 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.11.2 - 2026-10-27
+### Security
+* A step can no longer crash the runner or make it allocate gigabytes by printing its own step marker: `echo '::zig-step::begin 4000000000'` made the log sink grow an array to about 32 GB. A marker naming no step of the job is now the step's output. Also fixed: a panic when a local action's path is 256 to 400 bytes long, and an overflow reading a corrupt log spool.
+
 ## v0.11.1 - 2026-10-27
 ### Fixed
 * `hashFiles('--follow-symbolic-links', …)` works in a job, as on GitHub: links are followed, and a link back up the tree is skipped instead of walked for ever, decided by `realpath` in the job's container (Dagger's API gives no canonical paths). It was refused before.
