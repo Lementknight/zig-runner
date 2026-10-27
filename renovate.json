@@ -1,12 +1,15 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "Keeps every pinned input current, one reviewed pull request at a time (README, \"Pipeline\"). Its branches (renovate/...) bump the patch version.",
+  "description": "Keeps every pinned input current, one pull request at a time (README, \"Pipeline\"). Its branches (renovate/...) bump the patch version. They merge on their own once their checks pass (through the merge queue); releases are batched daily (version.yml).",
   "extends": [
     "config:recommended",
     "helpers:pinGitHubActionDigests",
     "docker:pinDigests"
   ],
   "minimumReleaseAge": "7 days",
+  "automerge": true,
+  "automergeType": "pr",
+  "platformAutomerge": true,
   "labels": [
     "dependencies"
   ],

@@ -1,0 +1,46 @@
+name: automerge
+
+# Every pull request from a branch of this repository merges on its own once its checks pass: this
+# turns on auto-merge, so the merge queue takes it when it is green (README, "Pipeline"). Releases
+# are batched separately (version.yml), so merging asks the maintainer nothing.
+#
+# It needs a GitHub App's token, not GITHUB_TOKEN: GitHub starts no workflow for what that token
+# does, so a pull request it queued would wait in the merge queue for checks that never start. The
+# app (Contents and Pull requests: read and write) is installed on the repository, its ID in the
+# AUTOMERGE_APP_ID variable and its private key in the AUTOMERGE_APP_KEY secret; without them this
+# does nothing. Renovate turns on auto-merge for its own pull requests (renovate.json).
+#
+# pull_request_target, so the workflow and the key are main's and no pull request can change them;
+# nothing of the pull request is checked out or run. Pull requests from forks are left alone.
+
+on:
+  # Only main's workflow runs, with nothing of the pull request checked out or run (above).
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
+    types: [opened, reopened, ready_for_review]
+
+permissions: {}
+
+jobs:
+  enable:
+    name: Turn on auto-merge
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft &&
+      vars.AUTOMERGE_APP_ID != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app
+        with:
+          app-id: ${{ vars.AUTOMERGE_APP_ID }}
+          private-key: ${{ secrets.AUTOMERGE_APP_KEY }}
+          # What turning on auto-merge needs, and nothing else the app may have.
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Turn on auto-merge
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh pr merge --auto --merge "$PR" --repo "$GITHUB_REPOSITORY"

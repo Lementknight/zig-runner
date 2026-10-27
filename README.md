@@ -24,9 +24,11 @@ Or install `deploy/zig-runner.service` and run it under systemd, or `docker comp
 
 ## Versioning
 
-Releases follow [semantic versioning](https://semver.org/) and are cut by CI, not by hand: every
-pull request merged into `main` releases a new version, its binaries and its image. What it bumps
-comes from the branch's prefix, which CI checks:
+Releases follow [semantic versioning](https://semver.org/) and are cut by CI, not by hand. Pull
+requests merge on their own once their checks pass, and once a day (or when `version` is run by
+hand) everything merged into `main` since the last release becomes one new version, its binaries
+and its image, after the maintainer approves it. What it bumps comes from the branches' prefixes,
+which CI checks; the largest bump among them wins:
 
 | Branch | Bumps |
 | --- | --- |
@@ -52,9 +54,11 @@ decide the version, write the changelog and tag the release alongside this, disa
 [zizmor](https://docs.zizmor.sh) for security), the format, build and tests, and the database tests
 against TimescaleDB. The GitHub client's tests run over real connections to a local server
 (`src/github/testserver.zig`), so how it handles redirects and tokens is tested, not described. A merge into
-`main` goes through the merge queue, which runs `ci` again on top of `main`; the merge then runs
-`version`, which waits for approval in the `prod` environment, commits and tags the release, and
-the tag runs `release`: the binaries with [GoReleaser](https://goreleaser.com), the image after a
+`main` goes through the merge queue, which runs `ci` again on top of `main`; `automerge` turns on
+auto-merge for every pull request from a branch of this repository, so it joins the queue once its
+checks pass (Renovate does the same for its own). Once a day, `version` releases what merged since
+the last release, if anything did: it waits for approval in the `prod` environment, commits and
+tags the release, and the tag runs `release`: the binaries with [GoReleaser](https://goreleaser.com), the image after a
 [Trivy](https://trivy.dev) scan, each with signed build provenance. `scorecard` grades the
 repository weekly with [OpenSSF Scorecard](https://scorecard.dev).
 `compare` runs the comparison tools weekly
