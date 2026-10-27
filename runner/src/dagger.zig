@@ -346,8 +346,12 @@ fn writeRunScript(
         try shellQuote(w, why);
         try w.writeByte('\n');
     }
-    if (sc.write_event) try w.writeAll("if [ -n \"${" ++ event_env ++ "+x}\" ]; then mkdir -p " ++
-        event_dir ++ " && printf '%s' \"$" ++ event_env ++ "\" > " ++ event_path ++ "; fi\n");
+    // A replayable step is given the withheld payload, not this run's (`withheld_event`).
+    if (sc.write_event) try w.writeAll(if (sc.withhold_volatile)
+        "mkdir -p " ++ event_dir ++ " && printf '%s' '" ++ withheld_event ++ "' > " ++ event_path ++ "\n"
+    else
+        "if [ -n \"${" ++ event_env ++ "+x}\" ]; then mkdir -p " ++
+            event_dir ++ " && printf '%s' \"$" ++ event_env ++ "\" > " ++ event_path ++ "; fi\n");
     // The script is a file, as on GitHub: `$0`, BASH_SOURCE and error messages name it, and
     // a Python traceback names it too — hence the extension following the shell.
     const path = try scriptPath(arena, fc, sc.shell);
@@ -1010,7 +1014,7 @@ pub const Options = struct {
     /// runner turns this on (`RUNNER_PACKAGE_CACHES`, on by default).
     package_caches: bool = false,
     /// Give a step that did not name a run-specific value `volatile_sentinel` instead of the real
-    /// one (see `volatile_sentinel`). On by default: without it, such a step is replayed with an
+    /// one, and `withheld_event` instead of the event payload. On by default: without it, such a step is replayed with an
     /// earlier run's value, which proofs/Runner/Enforce.agda shows is the one hypothesis behind
     /// step caching that the runner can discharge rather than assume.
     /// `RUNNER_ENFORCE_VOLATILE=false` restores GitHub's behaviour for a workflow that needs it.
@@ -7238,11 +7242,22 @@ const volatile_env = [_][]const u8{
 /// why it is sound: an unmarked step's input becomes a function of its cache key.
 const volatile_sentinel = "zig-runner-withheld";
 
+/// What a replayable step finds at GITHUB_EVENT_PATH instead of the event payload: the payload
+/// differs on every run and is not part of the cache key, so a step that read it without naming it
+/// would be replayed with an earlier run's (issue #68: a `workflow_dispatch` input read by a script
+/// in a file). It is `volatile_sentinel` as a JSON string, so a parser reads it and anything that
+/// looks inside fails (`jq .inputs.version`: cannot index string) instead of quietly getting
+/// another run's answer. A step that names GITHUB_EVENT_PATH or the file runs every time, and gets
+/// the real one.
+const withheld_event = "\"" ++ volatile_sentinel ++ "\"";
+
 /// Whether a script names a variable whose value differs between runs while the cache key does not
-/// (the volatile ones and the event payload). Scripts the step runs from files are not looked into.
+/// (the volatile ones, and the event payload: its variable or its file). Scripts the step runs from
+/// files are not looked into; such a step is given `volatile_sentinel` and `withheld_event` instead.
 fn readsRunSpecific(script: []const u8) bool {
     for (volatile_env) |v| if (std.mem.indexOf(u8, script, v) != null) return true;
-    return std.mem.indexOf(u8, script, "GITHUB_EVENT_PATH") != null;
+    return std.mem.indexOf(u8, script, "GITHUB_EVENT_PATH") != null or
+        std.mem.indexOf(u8, script, event_path) != null;
 }
 
 fn isVolatile(name: []const u8) bool {
@@ -9868,6 +9883,38 @@ test "enforcement: a replayable step is not given the run-specific values, an al
     try std.testing.expect(std.mem.indexOf(u8, marked, volatile_sentinel) == null);
 }
 
+test "enforcement: a replayable step finds the withheld payload at GITHUB_EVENT_PATH, an always-run step the real one" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const plain = try stepScript(arena, 1, .{ .run = .{
+        .script = "./build-release.sh",
+        .shell = null,
+        .working_directory = null,
+        .env = &.{},
+        .write_event = true,
+        .withhold_volatile = true,
+    } }, "");
+    const marked = try stepScript(arena, 1, .{ .run = .{
+        .script = "jq -r .inputs.version \"$GITHUB_EVENT_PATH\"",
+        .shell = null,
+        .working_directory = null,
+        .env = &.{},
+        .write_event = true,
+        .always_run = "zig-runner runs this step every time: it reads run- or commit-specific values (run 1.1, job j1)",
+    } }, "");
+    // Issue #68: the payload is not in the key, so a replayable step must not see it. It gets a
+    // constant instead, which is in its script (so its key) and the same in every run.
+    try std.testing.expect(std.mem.indexOf(u8, plain, "printf '%s' '\"zig-runner-withheld\"' > " ++ event_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "\"$" ++ event_env ++ "\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, marked, "\"$" ++ event_env ++ "\" > " ++ event_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, marked, withheld_event) == null);
+    // Naming the variable or the file is reading the payload; a script in a file cannot be seen.
+    try std.testing.expect(readsRunSpecific("jq . \"$GITHUB_EVENT_PATH\""));
+    try std.testing.expect(readsRunSpecific("cat /github/workflow/event.json"));
+    try std.testing.expect(!readsRunSpecific("./build-release.sh"));
+}
+
 test "enforcement: off by configuration, a replayable step keeps GitHub's behaviour" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
@@ -9926,8 +9973,11 @@ test "step caching: run-specific values are volatile, steps with secrets always 
             try std.testing.expect(std.mem.indexOf(u8, base, "withVolatileVariable(name:\"RUNNER_NAME\",value:\"zig-pi-1a2b3c4d\")") != null);
             try std.testing.expect(std.mem.indexOf(u8, base, "withVolatileVariable(name:\"ZIG_RUNNER_EVENT\",value:") != null);
             try std.testing.expect(std.mem.indexOf(u8, base, "withNewFile") == null);
-            // Each step writes the event file from the volatile variable and hides the variable.
-            try std.testing.expect(std.mem.indexOf(u8, build, "printf '%s' \\\"$ZIG_RUNNER_EVENT\\\" > /github/workflow/event.json") != null);
+            // A step that always runs writes the event file from the volatile variable; a replayable
+            // one writes the withheld payload (#68). Both hide the variable.
+            try std.testing.expect(std.mem.indexOf(u8, deploy, "printf '%s' \\\"$ZIG_RUNNER_EVENT\\\" > /github/workflow/event.json") != null);
+            try std.testing.expect(std.mem.indexOf(u8, build, "printf '%s' '\\\"zig-runner-withheld\\\"' > /github/workflow/event.json") != null);
+            try std.testing.expect(std.mem.indexOf(u8, build, "$ZIG_RUNNER_EVENT") == null);
             try std.testing.expect(std.mem.indexOf(u8, build, "-u ZIG_RUNNER_EVENT ") != null);
             // Only the step with a secret is forced to run, with a value new for every job (a run's
             // matrix jobs share its id).
