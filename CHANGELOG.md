@@ -10,6 +10,8 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.13.2 - 2026-10-27
+
 ## v0.13.1 - 2026-10-27
 ### Fixed
 * A step replayed from the step cache now logs its output as the live run did: stdout and stderr in the order they were written, blank lines included, so `::add-mask::`, `::stop-commands::`, `::set-output` and problem matchers apply as they did. A step's script now sends its stderr to its stdout. And a step can no longer print another step's `::zig-step::` marker and have its lines counted as that step's, which kept a later replayed step's output (its `::set-output` lines included) from being processed: the runner's markers carry a per-job secret the step does not see. The first run after this change replays no step.
