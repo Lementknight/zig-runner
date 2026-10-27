@@ -5,6 +5,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     // Release builds for deployment drop debug info (`zig build -Doptimize=ReleaseSafe -Dstrip`).
     const strip = b.option(bool, "strip", "Omit debug information") orelse null;
+    // `zig build test -Dsanitize-thread`: ThreadSanitizer reports data races the tests run into.
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Build with ThreadSanitizer") orelse null;
 
     // The build's own version, in every job's "Set up job" and in `--version`. Answering "which
     // binary is on that machine?" by comparing file sizes and timestamps is how an hour went
@@ -21,6 +23,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .strip = strip,
+            .sanitize_thread = sanitize_thread,
             .imports = &.{
                 .{ .name = "build_version", .module = version },
                 .{ .name = "tls", .module = tls },

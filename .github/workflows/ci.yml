@@ -69,7 +69,8 @@ jobs:
 
   # The database tests, which skip themselves without a database: here against TimescaleDB, as
   # deployments use, and required to run (ZIG_TEST_REQUIRE_DB), so this job cannot pass by skipping
-  # them. On GitHub's runner, which runs service containers.
+  # them. On GitHub's runner, which runs service containers. Every test runs here, so here they run
+  # under ThreadSanitizer, which fails them on a data race.
   database:
     name: Database tests
     runs-on: ubuntu-latest
@@ -96,6 +97,7 @@ jobs:
       PGDATABASE: tsdb
       PGSSLMODE: disable
       ZIG_TEST_REQUIRE_DB: "1"
+      ZIG_TEST_SANITIZE_THREAD: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

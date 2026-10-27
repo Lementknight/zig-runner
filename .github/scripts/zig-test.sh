@@ -33,7 +33,15 @@ git -C "$scratch/tls" checkout -q FETCH_HEAD
 modules=(--dep build_version --dep tls -Mroot=src/main.zig -Mbuild_version="$scratch/version"
 	-Mtls="$scratch/tls/src/root.zig")
 
+# ZIG_TEST_SANITIZE_THREAD=1: the tests under ThreadSanitizer (build.zig's -Dsanitize-thread), which
+# fails them on a data race they run into. A per-module flag, so given before each module.
+tsan=("${modules[@]}")
+if [[ ${ZIG_TEST_SANITIZE_THREAD:-} == 1 ]]; then
+	tsan=(-fsanitize-thread --dep build_version --dep tls -Mroot=src/main.zig
+		-fsanitize-thread -Mbuild_version="$scratch/version" -fsanitize-thread -Mtls="$scratch/tls/src/root.zig")
+fi
+
 zig build-exe "${modules[@]}" --name runner -femit-bin="$scratch/runner" &
 exe=$!
-zig test "${modules[@]}"
+zig test "${tsan[@]}"
 wait "$exe"

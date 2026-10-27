@@ -2313,8 +2313,13 @@ pub fn run(
         io,
         .{ .argv = argv, .environ_map = &env, .stdin = .pipe, .stdout = .pipe, .stderr = .pipe },
     );
-    // The reader must run while we wait on queries.
-    var reader = io.concurrent(readLogs, .{ io, &sh, child.stderr.? }) catch |e| {
+    // The reader must run while we wait on queries. It owns stderr: `wait` closes the pipes the
+    // child still holds, and closing this one under the reader let it read whatever file next got
+    // the descriptor (ThreadSanitizer, `zig build test -Dsanitize-thread`).
+    const stderr = child.stderr.?;
+    child.stderr = null;
+    var reader = io.concurrent(readLogs, .{ io, &sh, stderr }) catch |e| {
+        stderr.close(io);
         child.kill(io);
         return e;
     };
@@ -2323,8 +2328,9 @@ pub fn run(
     defer {
         if (child.stdin) |f| f.close(io);
         child.stdin = null;
-        _ = child.wait(io) catch {};
         reader.await(io);
+        stderr.close(io);
+        _ = child.wait(io) catch {};
         noteReusedSteps(&sh);
         sh.flush();
     }
