@@ -98,10 +98,11 @@ jobs:
       - name: Test, with the database
         run: .github/scripts/zig-test.sh
 
-  # On this project's own runners when they are set up, so every change exercises the runner
-  # (README, "Environments"): a push to main on prod, pull requests and the merge queue on pre-prod,
-  # which the prod runner would refuse. The repository variables PROD_RUNNER and PREPROD_RUNNER
-  # hold the runs-on labels as JSON (["self-hosted","prod"]); unset, GitHub's runner stands in.
+  # A push to main runs on prod, this project's own runner, so every merge exercises it; pull
+  # requests and the merge queue run on GitHub's runner on purpose, cold every time, the worst case
+  # for a build (README, "Environments"). The repository variables PROD_RUNNER and PREPROD_RUNNER
+  # hold runs-on labels as JSON (["self-hosted","prod"]); PREPROD_RUNNER is left unset, and unset
+  # means GitHub's runner.
   test:
     name: Format, build and test
     runs-on: ${{ fromJSON(github.event_name == 'push' && (vars.PROD_RUNNER || '"ubuntu-latest"') || (vars.PREPROD_RUNNER || '"ubuntu-latest"')) }}
