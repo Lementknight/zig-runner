@@ -1,0 +1,57 @@
+name: proofs
+
+# The Lean proofs in proofs/ (proofs/README.md): `lake build` checks every theorem, and the hashFiles
+# model is compared with runner/src/glob.zig on random cases (glob-lean-diff.sh), so the proof about
+# the walk holds of the walk that ships. On changes to either side, and weekly on fresh cases. The
+# seed is the run number, and is printed: a failure reproduces locally with the same seed.
+
+on:
+  push:
+    branches: [main]
+    paths: &paths
+      - proofs/**
+      - runner/src/glob.zig
+      - runner/tools/globleancorpus.zig
+      - .github/scripts/glob-lean-diff.sh
+      - .github/scripts/install-lean.sh
+      - .github/workflows/proofs.yml
+  pull_request:
+    paths: *paths
+  schedule:
+    - cron: "41 5 * * 1" # Mondays, 05:41 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: proofs-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  proofs:
+    name: Proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Lean
+        run: .github/scripts/install-lean.sh
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      - name: Check the proofs
+        working-directory: proofs
+        run: lake build
+
+      - name: The hashFiles model against glob.zig
+        env:
+          SEED: ${{ github.run_number }}
+        run: |
+          echo "seed $SEED: reproduce with .github/scripts/glob-lean-diff.sh 20000 $SEED"
+          .github/scripts/glob-lean-diff.sh 20000 "$SEED"

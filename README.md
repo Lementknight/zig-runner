@@ -59,7 +59,10 @@ the tag runs `release`: the binaries with [GoReleaser](https://goreleaser.com), 
 repository weekly with [OpenSSF Scorecard](https://scorecard.dev).
 `compare` runs the comparison tools weekly
 (`.github/scripts/*-diff.sh`): the expression evaluator, YAML reader, `hashFiles()` and problem
-matcher regular expressions against the implementations they follow, on fresh random cases. The workflows are written to be hard to turn against the
+matcher regular expressions against the implementations they follow, on fresh random cases.
+`proofs` checks the [Lean proofs](proofs/README.md) (the step cache, the regex matcher's loops, and
+the `hashFiles()` walk) and compares the walk's model with `runner/src/glob.zig` on random cases,
+when either changes and weekly. The workflows are written to be hard to turn against the
 repository:
 
 - **Least privilege.** Each workflow grants nothing by default; each job asks for only what it
@@ -102,11 +105,13 @@ git config core.hooksPath .githooks
 - **pre-push** runs, on exactly the commits being pushed (in a temporary worktree): the branch
   name's prefix, `zig fmt` over the project, GitHub's expression cases, and the build and tests
   (`.github/scripts/zig-test.sh`; the database tests too when `PG*` or `ZIG_TEST_PG_URL` point at
-  one); actionlint and zizmor when workflows changed; `gofmt` and `go vet` for changed Go tools.
-  It takes about 20 s.
+  one); actionlint and zizmor when workflows changed; `gofmt` and `go vet` for changed Go tools;
+  the Lean proofs and the `hashFiles()` model against `glob.zig` when either changed. It takes
+  about 20 s.
 
 They need the project's Zig (`minimum_zig_version` in `runner/build.zig.zon`) first on `PATH`, or
-`ZIG=/path/to/zig`; Go for actionlint; and pipx or uv for zizmor when workflows change.
+`ZIG=/path/to/zig`; Go for actionlint; pipx or uv for zizmor when workflows change; and Lean
+(`lake`, from [elan](https://github.com/leanprover/elan)) when the proofs or `glob.zig` change.
 `--no-verify` skips them; CI checks the same things regardless.
 
 ## Environments
