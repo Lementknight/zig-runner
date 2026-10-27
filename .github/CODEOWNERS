@@ -1,8 +1,8 @@
 # Who reviews what. The workflows, the deployment and the trust and secret handling decide what
-# runs on prod and what it can see (SECURITY.md).
+# runs on prod and what it can see (docs/SECURITY.md).
 /.github/                @Lementknight
 /.githooks/              @Lementknight
 /deploy/                 @Lementknight
 /runner/src/trust.zig    @Lementknight
 /runner/src/redact.zig   @Lementknight
-/SECURITY.md             @Lementknight
+/docs/SECURITY.md        @Lementknight
