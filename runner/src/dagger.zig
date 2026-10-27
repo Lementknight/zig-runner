@@ -5612,7 +5612,9 @@ const Exec = struct {
 
     /// glob.Fs on the job's container, through Dagger's API: `exists` for what a path is (it is
     /// false for a missing path, where `stat` would fail the query) and `entries` for what is in
-    /// a directory, many paths to a query. No canonical paths, so no `--follow-symbolic-links`.
+    /// a directory, many paths to a query. Canonical paths, which `--follow-symbolic-links` needs
+    /// to break cycles as GitHub does, are not in Dagger's API: `realpath` in the job's container
+    /// gives them (only for the directories reached while following links).
     const DaggerFs = struct {
         x: *Exec,
         why: []const u8 = "",
@@ -5621,7 +5623,7 @@ const Exec = struct {
         const batch = 1000;
 
         fn fs(d: *DaggerFs) glob.Fs {
-            return .{ .ptr = d, .vtable = &.{ .stat = stat, .list = list, .realpath = null } };
+            return .{ .ptr = d, .vtable = &.{ .stat = stat, .list = list, .realpath = realpath } };
         }
 
         fn run(d: *DaggerFs, arena: Allocator, query: []const u8) glob.Fs.Error!std.json.Value {
@@ -5671,6 +5673,40 @@ const Exec = struct {
                         else if (yes(arena, data, "d", i)) .directory //
                         else if (yes(arena, data, "f", i)) .file //
                         else .other;
+                }
+            }
+            return out;
+        }
+
+        /// `realpath` over the paths in the job's container (the exec's container is not kept: the
+        /// job's is unchanged), a batch at a time. No options: busybox's realpath (Alpine) takes
+        /// none, `-z` and `--` included, and every path here is absolute, so none reads as one;
+        /// one per line, and a path with a newline in it fails the count instead of misleading.
+        fn realpath(ptr: *anyopaque, arena: Allocator, paths: []const []const u8) glob.Fs.Error![]const []const u8 {
+            const d: *DaggerFs = @ptrCast(@alignCast(ptr));
+            const out = try arena.alloc([]const u8, paths.len);
+            var start: usize = 0;
+            while (start < paths.len) : (start += batch) {
+                const end = @min(start + batch, paths.len);
+                var argv: std.ArrayList([]const u8) = .empty;
+                try argv.append(arena, "realpath");
+                try argv.appendSlice(arena, paths[start..end]);
+                var q: Query = .init(arena);
+                q.call("loadContainerFromID", .{ .id = d.x.container_id }) catch return error.OutOfMemory;
+                q.call("withExec", .{ .args = argv.items, .expect = Raw{ .text = "ANY" } }) catch return error.OutOfMemory;
+                for ([_][]const u8{ "exitCode", "stdout", "stderr" }) |f| q.leaf(f) catch return error.OutOfMemory;
+                const data = try d.run(arena, q.finish() catch return error.OutOfMemory);
+                const code = if (jsonFind(data, "exitCode")) |c| (if (c == .integer) c.integer else 1) else 1;
+                const stdout = jsonFindString(data, "stdout") orelse "";
+                var names = std.mem.splitScalar(u8, std.mem.trimEnd(u8, stdout, "\n"), '\n');
+                var i = start;
+                while (names.next()) |n| : (i += 1) {
+                    if (i >= end) break;
+                    out[i] = n;
+                }
+                if (code != 0 or i != end) {
+                    d.why = std.mem.trim(u8, jsonFindString(data, "stderr") orelse "realpath failed", " \n");
+                    return error.FsFailed;
                 }
             }
             return out;
@@ -9009,6 +9045,48 @@ test "hashFiles finds files as GitHub's script does, through Dagger, and hashes 
     try std.testing.expect(std.mem.indexOf(u8, seen[9], want) != null);
     // Nothing inside the workspace to search: "" without asking Dagger.
     try std.testing.expect(std.mem.indexOf(u8, seen[10], "echo none-.") != null);
+}
+
+test "hashFiles --follow-symbolic-links follows links, breaks a cycle by realpath in the container" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var st = testStep("");
+    st.action.script.script = .{ .expr = "format('echo key-{0}', hashFiles('--follow-symbolic-links', '**/*.txt'))" };
+    const steps = [_]job_mod.Step{st};
+    const ws = "/home/runner/work/r/r";
+    const d1 = "1111111111111111111111111111111111111111111111111111111111111111";
+    const d2 = "2222222222222222222222222222222222222222222222222222222222222222";
+    const list = "{\"data\":{\"loadContainerFromID\":{\"rootfs\":{";
+    const real = "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"exitCode\":0,\"stderr\":\"\",\"stdout\":\"";
+    const answers = [_][]const u8{
+        base_answer,
+        try existsAnswer(arena, "d"),
+        real ++ ws ++ "\\n\"}}}}",
+        list ++ "\"c0\":[\"x.txt\",\"a/\"]}}}}",
+        try existsAnswer(arena, "df"), // a, x.txt
+        real ++ ws ++ "/a\\n\"}}}}",
+        list ++ "\"c0\":[\"y.txt\",\"loop\"]}}}}",
+        try existsAnswer(arena, "df"), // a/loop (a link to the workspace, followed), a/y.txt
+        real ++ ws ++ "\\n\"}}}}", // a/loop is the workspace again: a cycle, not walked
+        "{\"data\":{\"loadContainerFromID\":{\"withNewFile\":{\"withExec\":{\"exitCode\":0,\"stdout\":\"" ++ d1 ++ "  a/y.txt\\n" ++ d2 ++ "  x.txt\\n\",\"stderr\":\"\"}}}}}",
+        try exec(arena, "C1", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    const seen = fake.seen.items;
+    try std.testing.expectEqual(@as(usize, 11), seen.len);
+    // Following links: `exists` follows them, and realpath runs in the job's container.
+    try std.testing.expect(std.mem.indexOf(u8, seen[1], "e0: exists(path:\"" ++ ws ++ "\",doNotFollowSymlinks:false)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[2], "withExec(args:[\"realpath\",\"" ++ ws ++ "\"],expect:ANY)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[8], "realpath\",\"" ++ ws ++ "/a/loop\"") != null);
+    // The cycle is not listed; the files are hashed in GitHub's order.
+    try std.testing.expect(std.mem.indexOf(u8, seen[9], "contents:\"a/y.txt\\nx.txt\"") != null);
 }
 
 test "a local action is read from the workspace when its step runs, and is not mounted" {
