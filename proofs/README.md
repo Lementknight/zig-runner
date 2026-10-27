@@ -105,7 +105,11 @@ longer able to tell them apart.
 
 What that leaves to assume is determinism and mount-blindness: two obligations instead of three.
 **It is in the runner**, on by default, as `RUNNER_ENFORCE_VOLATILE` — a step that did not name a
-run-specific value is given the constant `zig-runner-withheld` in its own `env` prefix. See
+run-specific value is given the constant `zig-runner-withheld` in its own `env` prefix. But only for
+the 16 variables in `volatile_env`: the event payload is still written to every step's
+`$GITHUB_EVENT_PATH`, and the parent shell's environment still holds the real values, so
+`volatile_clause_discharged` holds of the model and not yet of the runner (see "Against today's
+code" below, and #68). See
 [SPEC.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/SPEC.md) §9, the first
 entry in "Where this runner differs from GitHub's". Early cutoff turns out to need it too, and that
 is new: what a step exports through `$GITHUB_ENV` is in the next step's container, so an unmarked
@@ -155,7 +159,9 @@ wrongly, as 8 has it. 3 and 4 have no 8 of their own — they are open.
   points at the counterexamples; the port keeps that comment and marks the disagreement.)
 - **Replay hides flakiness by construction**, not by omission. `disciplined_deterministic` derives
   determinism from the hypothesis P1 needs, so the step cache is sound only for jobs with no flaky
-  unmarked step — and a replayed step cannot fail.
+  unmarked step — a replayed step gives the result it recorded, a pass staying a pass. (And, the
+  audit found, a failure staying a failure: failed steps are cached too, and replayed on re-run,
+  #69.)
   [RELATED.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/RELATED.md) noted we
   had never measured flakiness; this says measuring it needs the cache off.
 - **The documented gap is a correctness gap.**
@@ -173,7 +179,7 @@ session.
 
 | From | Generate | Assert |
 |---|---|---|
-| P1 | any job, twice at the same commit: `RUNNER_STEP_CACHE=false`, then on | the same step logs, file commands and conclusions; and `N of M steps replayed` is M the second time |
+| P1 | any job, twice at the same commit: `RUNNER_STEP_CACHE=false`, then on | the same step logs, file commands and conclusions; and `N of M steps replayed` is M the second time. Two known exceptions: with the cache off nothing is withheld, so a step that prints a run-specific value it did not name prints the real one off and `zig-runner-withheld` on (the model's `uncached` keeps the stamping and withholding); and a replay prints stdout then stderr, not interleaved (#71) |
 | P2 | four jobs, each changing exactly one keyed input: the script text, the step's position in the job, a file in the workspace, a non-volatile variable | the step ran — the `ZIG_RUNNER_RAN` marker is this job's |
 | P3 | two jobs differing only in a volatile value (run id, actor, commit), and two differing only in a cache volume's content | the step was replayed |
 | P4 | one job per name in `volatile_env`, whose script names it; and one using a secret, and one with `id-token: write` | the step ran, every time |
@@ -200,6 +206,27 @@ and +85% are why `Runner.Declared`'s mechanism is shelved, and no theorem in it 
 `Step.reads` is the set of names a script really consults. `readsRunSpecific` approximates it by
 looking for the name in the text, so the model's `mark` is an idealisation of the runner's, and
 counterexample 1 is exactly the distance between them.
+
+### Against today's code
+
+The model was written against `runner/src/dagger.zig` on 2026-10-16; on 2026-10-27 it was audited
+against the code again, element by element. The cache mechanism itself has barely changed since,
+and the theorems still hold of the model. Where the runner does not do what the model assumes:
+
+| Where | What the runner does | Consequence | Issue |
+|---|---|---|---|
+| `Enforce` | Withholds only the 16 `volatile_env` variables. The event payload is written in full to `$GITHUB_EVENT_PATH` before every step, from a volatile variable outside the key; the parent shell keeps the real values | A step whose script reads the payload from a file is replayed with an earlier run's payload, with default settings. `nothing_volatile_survives` is false of the runner | #68 |
+| `Output`, `Disciplined` | Failed steps are recorded (`withExec(expect: ANY)`) and replayed; `GITHUB_RUN_ATTEMPT` is volatile | A flaky failure is replayed on every re-run. The model's `Output` has no exit code | #69 |
+| `Input.mounts`, `Disciplined` | uv's venv lives in a per-ref cache volume by default (`uv_env_in_cache`) | Mount-blindness, the clause counterexample 4 breaks, is something ordinary Python jobs now depend on | #70 |
+| `Output.log` | A replay prints stdout, then stderr, without blank lines; a step can print another step's in-range marker | Workflow commands (masks, stop-commands) can apply differently in a replay | #71 |
+| `uncached` | `RUNNER_STEP_CACHE=false` turns off stamping and withholding too | P1 compares with a hypothetical stamped, withheld run, not with the cache-off runner | — |
+| `Script`, `Numbered`, `Ahead` | Composite inner steps and JavaScript pre/main/post share a step number; what keeps their scripts apart is the file-command directory in the text, plus the container's depth | The bookkeeping hypotheses are false in letter, true in substance: no two executions in a job share a stamped script | — |
+| `Subset` | Models BuildKit's cache pruning; the output store (`output_keys_days`) is a separate digest-to-bytes map the model has no object for | Store pruning is safe for another reason: the apply copies from the store and fails (so falls back) if the content is gone | — |
+| `Key` | The real key holds more: cache volume identities, action code, user and directory, the nesting flag, secret variables, the file-command paths | Only extra misses, so safe | — |
+| `mark` | The runner also marks every Docker action, every JavaScript action when a job token exists, and every step when the job has `id-token: write` | Only extra runs, so safe | — |
+
+`Enforce` is also never composed with `Build`: "P1 under enforcement" would need `exec` instantiated
+with the withheld input, which no theorem here does.
 
 ## Why the regex matcher terminates
 
