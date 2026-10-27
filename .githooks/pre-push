@@ -5,7 +5,8 @@
 #   - the branch name's prefix (CI's "Branch name"; it decides the release, README "Versioning");
 #   - zig fmt, GitHub's expression cases, and the build and tests ("Format, build and test");
 #     the database tests run too when PG* or ZIG_TEST_PG_URL point at a database;
-#   - actionlint and zizmor, when workflows changed ("Workflows");
+#   - actionlint and zizmor, when workflows changed, and shellcheck, when shell scripts did
+#     ("Workflows");
 #   - gofmt and go vet for the Go tools under runner/tools, when they changed.
 #
 # README, "Git hooks".
@@ -19,7 +20,7 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 
 zero=0000000000000000000000000000000000000000
 checked=false
-while read -r local_ref local_sha remote_ref remote_sha; do
+while read -r _local_ref local_sha remote_ref remote_sha; do
 	[[ $local_sha == "$zero" ]] && continue # a deletion
 	case $remote_ref in
 	refs/heads/*) branch=${remote_ref#refs/heads/} ;;
@@ -34,7 +35,11 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 	# What changed: against the remote branch, or where a new branch left main.
 	base=$remote_sha
 	[[ $base == "$zero" ]] && base=$(git merge-base "$local_sha" origin/main 2>/dev/null || echo "")
-	changed=$( [[ -n $base ]] && git diff --name-only "$base" "$local_sha" || git ls-tree -r --name-only "$local_sha")
+	if [[ -n $base ]]; then
+		changed=$(git diff --name-only "$base" "$local_sha")
+	else
+		changed=$(git ls-tree -r --name-only "$local_sha")
+	fi
 
 	$checked || use_zig "$top"
 	checked=true
@@ -57,6 +62,10 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 		tail -1 "$log" | sed "s/^/$hook: /" >&2
 		rm -f "$log"
 	)
+	if grep -qE '\.sh$|^\.githooks/|^deploy/zig-runner-deploy$' <<<"$changed"; then
+		say "shellcheck"
+		(cd "$tree" && .github/scripts/shellcheck.sh >/dev/null) || fail "shellcheck found problems: .github/scripts/shellcheck.sh shows them"
+	fi
 	if grep -q '^\.github/workflows/' <<<"$changed"; then
 		say "actionlint and zizmor"
 		(cd "$tree" && go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12) || fail "actionlint found problems"
@@ -65,12 +74,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 		else fail "workflows changed, and zizmor needs pipx or uv to run (CI's \"Workflows\" job runs zizmor 1.31.1)"; fi
 		(cd "$tree" && "${zizmor[@]}" .github/workflows) || fail "zizmor found problems"
 	fi
-	for mod in $(grep -o '^runner/tools/[^/]*/' <<<"$changed" | sort -u); do
-		[[ -f $tree/$mod/go.mod ]] || continue
+	while read -r mod; do
+		[[ -n $mod && -f $tree/$mod/go.mod ]] || continue
 		say "gofmt and go vet $mod"
 		[[ -z $(cd "$tree/$mod" && gofmt -l .) ]] || fail "gofmt: $mod is not formatted"
 		(cd "$tree/$mod" && go vet ./...) || fail "go vet found problems in $mod"
-	done
+	done < <(grep -o '^runner/tools/[^/]*/' <<<"$changed" | sort -u)
 	git worktree remove --force "$tree"
 	trap - EXIT
 done

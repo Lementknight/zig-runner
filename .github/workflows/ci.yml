@@ -11,6 +11,9 @@ on:
 # Nothing by default; each job asks for what it needs.
 permissions: {}
 
+# Every job has a time limit well above how long it takes: without one, a hung job holds its runner
+# for GitHub's default of six hours, and on prod that runner is the project's own.
+
 # A pull request's new push replaces the run of its old one; main's runs all finish.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.sha }}
@@ -22,6 +25,7 @@ jobs:
     name: Branch name
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Check the prefix
         env:
@@ -36,10 +40,12 @@ jobs:
               ;;
           esac
 
-  # The workflows themselves: actionlint for mistakes, zizmor for security (README, "Pipeline").
+  # The workflows themselves: actionlint for mistakes, zizmor for security; and the shell scripts
+  # they and the deployment run, with shellcheck (README, "Pipeline").
   workflows:
     name: Workflows
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read # to check out the workflows
     steps:
@@ -50,6 +56,10 @@ jobs:
       # Go's module proxy and checksum database verify what this downloads.
       - name: actionlint
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      # The image is pinned by digest. deploy/zig-runner-deploy runs on prod every minute.
+      - name: shellcheck
+        run: .github/scripts/shellcheck.sh
 
       - name: zizmor
         env:
@@ -63,6 +73,7 @@ jobs:
   database:
     name: Database tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read # to check out the code
     services:
@@ -106,6 +117,7 @@ jobs:
   test:
     name: Format, build and test
     runs-on: ${{ fromJSON(github.event_name == 'push' && (vars.PROD_RUNNER || '"ubuntu-latest"') || (vars.PREPROD_RUNNER || '"ubuntu-latest"')) }}
+    timeout-minutes: 30
     permissions:
       contents: read # to check out the code
     steps:

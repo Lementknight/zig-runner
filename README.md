@@ -74,6 +74,9 @@ repository:
   `gh attestation verify oci://ghcr.io/open-blue/zig-runner:<tag> --repo Open-Blue/zig-runner`.
 - **Scanned.** Trivy checks the Dockerfile and the image before a push; accepted findings are in
   `.trivyignore.yaml`, each with why. GitHub's secret scanning blocks pushes carrying credentials.
+- **Checked.** actionlint and zizmor check the workflows, shellcheck every shell script
+  (`.github/scripts/shellcheck.sh`), and CodeQL the workflows and the Go tools; every job has a time
+  limit. Vulnerabilities are reported privately (`SECURITY.md`).
 - **One secret, one step.** The deploy key that may push to `main` is the `prod` environment's,
   which deploys only from `main` and waits for approval; it is loaded only in the step that pushes,
   and pushes only to GitHub's pinned host key.

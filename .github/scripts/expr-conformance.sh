@@ -46,10 +46,10 @@ total=$(cat "$cases"/*.json | grep -c '"expr"')
 echo "GitHub's expression cases: $((total - $(wc -l <"$scratch/failing")))/$total pass"
 if [[ -n $new ]]; then
 	echo "Failing now, and not before (run with --report for details):"
-	sed 's/^/  /' <<<"$new"
+	while IFS= read -r l; do echo "  $l"; done <<<"$new"
 fi
 if [[ -n $fixed ]]; then
 	echo "Passing now: take these off $list (or run with --update):"
-	sed 's/^/  /' <<<"$fixed"
+	while IFS= read -r l; do echo "  $l"; done <<<"$fixed"
 fi
 [[ -z $new && -z $fixed ]]
