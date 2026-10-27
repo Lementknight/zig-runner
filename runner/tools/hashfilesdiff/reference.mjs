@@ -1,10 +1,11 @@
-// The file selection of GitHub's hashFiles(): actions/runner's
-// src/Misc/expressionFunc/hashFiles/src/hashFiles.ts, on the @actions/glob it pins (^0.7.0), with
-// the same filters, reporting the files it would hash instead of hashing them. The runner passes the
-// patterns joined by newlines and runs it in the workspace, without following symbolic links unless
-// asked to.
+// GitHub's hashFiles(): actions/runner's HashFilesFunction.cs (the arguments: a first one starting
+// with `--` is an option, the rest joined by newlines) and its hashFiles.ts script on the
+// @actions/glob it pins (^0.7.0), run in the workspace. Reports the files it hashes, in order, and
+// the hash.
 //
-//   node reference.mjs <cases.json> <workspace>    one JSON line per case: {"id", "files"}
+//   node reference.mjs <cases.json> <workspace>    one JSON line per case: {"id", "files", "hash"}
+//                                                  or {"id", "error"}
+import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as glob from '@actions/glob'
@@ -15,18 +16,26 @@ process.chdir(workspace)
 const githubWorkspace = process.cwd()
 
 for (const c of cases) {
-  const files = []
-  let error
   try {
-    const globber = await glob.create(c.patterns.join('\n'), {followSymbolicLinks: false})
+    let args = c.patterns
+    let followSymbolicLinks = false
+    if (args.length > 0 && args[0].startsWith('--')) {
+      if (args[0].toLowerCase() !== '--follow-symbolic-links') throw new Error(`Invalid glob option ${args[0]}`)
+      followSymbolicLinks = true
+      args = args.slice(1)
+    }
+    const result = crypto.createHash('sha256')
+    const files = []
+    const globber = await glob.create(args.join('\n'), {followSymbolicLinks})
     for await (const file of globber.globGenerator()) {
       if (!file.startsWith(`${githubWorkspace}${path.sep}`)) continue
       if (fs.statSync(file).isDirectory()) continue
+      result.write(crypto.createHash('sha256').update(fs.readFileSync(file)).digest())
       files.push(path.relative(githubWorkspace, file))
     }
+    result.end()
+    console.log(JSON.stringify({id: c.id, files, hash: files.length > 0 ? result.digest('hex') : ''}))
   } catch (e) {
-    error = String(e.message || e)
+    console.log(JSON.stringify({id: c.id, error: String(e.message || e).split('\n')[0]}))
   }
-  files.sort()
-  console.log(JSON.stringify(error === undefined ? {id: c.id, files} : {id: c.id, error}))
 }
