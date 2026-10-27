@@ -10,6 +10,14 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.12.0 - 2026-10-27
+### Added
+* Problem matchers read Unicode categories and blocks as GitHub's runner does (.NET 8): `\p{L}`, `\P{Lu}`, `\p{IsBasicLatin}`, in classes too (`[\p{L}\d]`), with .NET's own list of block names and Unicode 15.0's categories, as .NET 8 has them. A matcher using one went inert before. Unknown names and `\pL` are errors, as in .NET.
+### Fixed
+* The HPACK decoder for the Dagger engine's gRPC headers no longer reads freed memory when a header added to the dynamic table takes its name from an entry that adding it evicts (RFC 7541 §4.4): the name was freed before it was copied, giving a wrong header name or a crash. It also refuses a dynamic table size update after a block's first field, as RFC 7541 §4.2 requires, instead of applying it. Found by comparing with Go's HPACK (hpack-diff.sh).
+* In problem matchers, `\w` and `\b` take `İ` (U+0130) as a word character, as .NET's ECMAScript mode does; it was taken as punctuation.
+* A workflow or action file with a flow collection holding an entry that reads nothing (`a: [}]`, `{]}`, `[1, , 2]`) no longer makes the runner allocate until it runs out of memory: it is invalid YAML, as GitHub and Go's YAML reader say. Found by the new fuzz tests.
+
 ## v0.11.4 - 2026-10-27
 ### Fixed
 * Expressions have GitHub's memory limit, counted as GitHub counts it (1048576 bytes; a string as 26 bytes plus two per UTF-16 code unit, per level of the expression, as actions/runner's evaluator does), instead of a looser 10 MiB of strings built. An expression GitHub refuses for memory is refused here too, and one it runs runs. All 1020 of GitHub's expression test cases now pass.

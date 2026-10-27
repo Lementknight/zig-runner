@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'The HPACK decoder for the Dagger engine''s gRPC headers no longer reads freed memory when a header added to the dynamic table takes its name from an entry that adding it evicts (RFC 7541 §4.4): the name was freed before it was copied, giving a wrong header name or a crash. It also refuses a dynamic table size update after a block''s first field, as RFC 7541 §4.2 requires, instead of applying it. Found by comparing with Go''s HPACK (hpack-diff.sh).'
-time: 2026-10-27T01:12:53.000000-04:00
