@@ -34,5 +34,10 @@ checksum:
 changelog:
   use: github-native
 
+# A draft until release.yml has attested the binaries and attached the SBOM and the attestations:
+# published, a release is immutable (the repository's immutable releases), so it must be complete
+# first. A rerun replaces a draft left by a failed run instead of adding a second.
 release:
   name_template: "{{ .Tag }}"
+  draft: true
+  replace_existing_draft: true

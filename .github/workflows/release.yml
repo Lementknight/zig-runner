@@ -1,7 +1,8 @@
 # Release: on a version tag (pushed by the version workflow), static runner binaries (x86_64 and
 # aarch64 Linux) on a GitHub release, built by GoReleaser (.goreleaser.yaml), and the runner image
 # (linux/amd64 and linux/arm64) on GitHub's container registry. Both carry signed build provenance
-# (`gh attestation verify`); the image is scanned by Trivy before it is pushed.
+# (`gh attestation verify`), the binaries an attested SPDX SBOM too; the image is scanned by Trivy
+# before it is pushed.
 # On pull requests that touch the packaging, the same builds and scans, publishing nothing.
 # Run by hand with a tag to (re)build and push that tag's image.
 name: release
@@ -20,6 +21,7 @@ on:
       - runner/build.zig
       - deploy/**
       - .goreleaser.yaml
+      - .github/scripts/sbom.sh
       - .trivyignore.yaml
       - .github/workflows/release.yml
 
@@ -74,9 +76,37 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
 
       # SHA256SUMS names every binary with its digest, so this covers each under its release name.
-      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      - name: Attest the binaries' provenance
+        id: provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: dist/SHA256SUMS
+
+      - name: SBOM
+        run: .github/scripts/sbom.sh "$TAG" dist/SHA256SUMS > dist/zig-runner.spdx.json
+
+      - name: Attest the SBOM
+        id: sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+          sbom-path: dist/zig-runner.spdx.json
+
+      # GoReleaser left the release a draft; it is published complete, before `deploy` asks razorbill
+      # to download it (a draft's files are not public). The bundles verify offline:
+      # `gh attestation verify BINARY --repo Open-Blue/zig-runner --bundle zig-runner.provenance.jsonl`.
+      - name: Attach the SBOM and attestations, and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PROVENANCE: ${{ steps.provenance.outputs.bundle-path }}
+          SBOM_BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+        run: |
+          cp "$PROVENANCE" dist/zig-runner.provenance.jsonl
+          cp "$SBOM_BUNDLE" dist/zig-runner.sbom.jsonl
+          gh release upload "$TAG" --clobber \
+            dist/zig-runner.spdx.json dist/zig-runner.provenance.jsonl dist/zig-runner.sbom.jsonl
+          gh release edit "$TAG" --draft=false
 
   # The pull request's check of the same build: everything into dist/, nothing published.
   binaries-check:
@@ -99,6 +129,11 @@ jobs:
           distribution: goreleaser
           version: ${{ env.GORELEASER_VERSION }}
           args: release --snapshot --clean
+
+      - name: SBOM
+        run: |
+          .github/scripts/sbom.sh "$TAG" dist/SHA256SUMS > "$RUNNER_TEMP/zig-runner.spdx.json"
+          jq -e '.packages | length > 2' "$RUNNER_TEMP/zig-runner.spdx.json" > /dev/null
 
   image:
     name: Image
