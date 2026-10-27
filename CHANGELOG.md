@@ -10,6 +10,10 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.11.3 - 2026-10-27
+### Fixed
+* When a job ended, the runner closed the Dagger session's log pipe while its reader thread could still be reading it, so the reader could read another file that reused the descriptor. Found by ThreadSanitizer, which now runs over the tests in CI.
+
 ## v0.11.2 - 2026-10-27
 ### Security
 * A step can no longer crash the runner or make it allocate gigabytes by printing its own step marker: `echo '::zig-step::begin 4000000000'` made the log sink grow an array to about 32 GB. A marker naming no step of the job is now the step's output. Also fixed: a panic when a local action's path is 256 to 400 bytes long, and an overflow reading a corrupt log spool.
