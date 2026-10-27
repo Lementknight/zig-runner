@@ -489,6 +489,10 @@ const Flow = struct {
         if (f.depth > max_depth) return f.p.unsupported(f.l, "flow collections nested over 64 deep");
     }
 
+    fn unexpected(f: *Flow) Error {
+        return f.p.invalid(f.l, "unexpected character in a flow collection");
+    }
+
     fn skipSpaces(f: *Flow) void {
         while (f.i < f.s.len and f.s[f.i] == ' ') f.i += 1;
     }
@@ -510,7 +514,11 @@ const Flow = struct {
                         f.i += 1;
                         break;
                     }
+                    const at = f.i;
                     try items.append(f.p.arena, try f.value());
+                    // `[}]`: an item that reads nothing would be read again for ever, a null
+                    // each time, until memory ran out (found by fuzz.zig).
+                    if (f.i == at) return f.unexpected();
                     f.skipSpaces();
                     if (f.i < f.s.len and f.s[f.i] == ',') f.i += 1;
                 }
@@ -532,6 +540,7 @@ const Flow = struct {
                     // `{? key : value}`, an explicit key, as the block parser refuses `? key`.
                     if (f.s[f.i] == '?' and (f.i + 1 == f.s.len or f.s[f.i + 1] == ' '))
                         return f.p.unsupported(f.l, "complex mapping keys");
+                    const at = f.i;
                     const k = try f.scalarText(true);
                     f.skipSpaces();
                     var v: Node = .null;
@@ -539,6 +548,7 @@ const Flow = struct {
                         f.i += 1;
                         v = try f.value();
                     }
+                    if (f.i == at) return f.unexpected(); // `{]}`, as `[}]` above
                     try entries.append(f.p.arena, .{ .key = k, .value = v });
                     f.skipSpaces();
                     if (f.i < f.s.len and f.s[f.i] == ',') f.i += 1;
@@ -912,6 +922,21 @@ test "flow collections nested past 64 are refused, not a stack overflow" {
     try std.testing.expectError(error.UnsupportedYaml, parse(ar, deep.items, null));
     const ok = try parse(ar, "a: [[1, {b: [2]}]]\n", null);
     try std.testing.expectEqualStrings("2", ok.get("a").?.seq[0].seq[1].get("b").?.seq[0].string);
+}
+
+test "a flow entry that reads nothing is invalid, not read again until memory runs out" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // Found by fuzz.zig: each of these grew the arena without end (18 GB from a 4 KB file).
+    // An empty item, `[1, , 2]`, is invalid YAML too (Go's yaml.v3 refuses it), and went the same way.
+    for ([_][]const u8{ "a: [}]\n", "a: {]}\n", "a: [1, }]\n", "a: {b: 1, ]}\n", "a: [1, , 2]\n" }) |src| {
+        var diag: Diag = .{};
+        try std.testing.expectError(error.InvalidYaml, parse(ar, src, &diag));
+        try std.testing.expectEqualStrings("unexpected character in a flow collection", diag.message);
+    }
+    const ok = try parse(ar, "b: {c: , d}\n", null);
+    try std.testing.expectEqual(@as(usize, 2), ok.get("b").?.map.len);
 }
 
 test "what comparing with Go's YAML turned up: the null words, and explicit keys in flow" {

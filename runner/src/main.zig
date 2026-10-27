@@ -42,6 +42,7 @@ comptime {
     _ = @import("commands.zig");
     _ = @import("regex.zig");
     _ = @import("matcher.zig");
+    _ = @import("fuzz.zig");
     _ = @import("pg.zig");
     _ = @import("db.zig");
     _ = @import("pgsink.zig");
