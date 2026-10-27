@@ -36,6 +36,21 @@
         "leanprover/lean4"
       ],
       "groupName": "lean"
+    },
+    {
+      "description": "The diff tools' references run what GitHub's runner runs, so a new major is a different reference, not an update: .NET 8 (problem matchers are compiled by .NET 8's Regex, regex-diff.sh) and Node 22 (hashFiles' @actions/glob script, hashfiles-diff.sh). Minor and digest updates within them still come. Raise the major by hand when GitHub's runner does.",
+      "matchFileNames": [
+        ".github/scripts/regex-diff.sh",
+        ".github/scripts/hashfiles-diff.sh"
+      ],
+      "matchDepNames": [
+        "mcr.microsoft.com/dotnet/sdk",
+        "node"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "enabled": false
     }
   ],
   "customManagers": [
