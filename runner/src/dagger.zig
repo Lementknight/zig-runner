@@ -1973,6 +1973,14 @@ const Shared = struct {
     /// Lines logged per log step so far (guarded by `mu`): an annotation without a file points to
     /// its line in the step's log, as GitHub's runner does.
     line_counts: []u32 = &.{},
+    /// The job's secrets and `::add-mask::` values (guarded by `mu`), created by the first mask and
+    /// handed to the log, which redacts through its index (see `redact.Set`).
+    masks: ?*redact.Set = null,
+    /// Where one line of a step's output is worked on (guarded by `mu`): parsed as a command, run
+    /// through the problem matchers, formatted. Reset after each line, keeping its capacity, so the
+    /// job's arena grows only by what a line leaves behind (an annotation, an output, a mask); see
+    /// `scratchAllocator`.
+    scratch: ?std.heap.ArenaAllocator = null,
 
     const StepCommands = struct {
         stop_token: ?[]const u8 = null,
@@ -2000,11 +2008,14 @@ const Shared = struct {
         defer sh.mu.unlock(sh.io);
         if (step == 0 or step > sh.commands.len) return sh.appendLocked(step, text);
         const st = &sh.commands[step - 1];
+        const scratch = sh.scratchAllocator();
+        defer sh.resetScratch();
         // What a command keeps (an annotation, an output, a stop token) can be a slice of its line,
-        // and a direct session's line lives only as long as its log record: keep the line.
-        const line = if (std.mem.indexOf(u8, text, "::") != null) sh.arena.dupe(u8, text) catch
+        // and a direct session's line lives only as long as its log record: the line is copied,
+        // and what outlives it is copied again into the job's arena below.
+        const line = if (std.mem.indexOf(u8, text, "::") != null) scratch.dupe(u8, text) catch
             return else text;
-        const cmd = commands.parseWorkflow(sh.arena, line, st.stop_token) catch
+        const cmd = commands.parseWorkflow(scratch, line, st.stop_token) catch
             return sh.appendLocked(step, line);
         switch (cmd) {
             // Not a command: log it, then let the problem matchers see it.
@@ -2013,11 +2024,11 @@ const Shared = struct {
                 sh.matchLocked(step, text);
             },
             .add_mask => |value| sh.addMask(value),
-            .group => |title| sh.appendFmt(step, "##[group]{s}", .{title}),
+            .group => |title| sh.appendScratch(step, "##[group]{s}", .{title}),
             .endgroup => sh.appendLocked(step, "##[endgroup]"),
             .annotation => |an| {
                 var lines = std.mem.splitScalar(u8, an.message, '\n');
-                sh.appendFmt(
+                sh.appendScratch(
                     step,
                     "##[{s}]{s}",
                     .{ an.level, std.mem.trimEnd(u8, lines.first(), "\r") },
@@ -2025,18 +2036,20 @@ const Shared = struct {
                 while (lines.next()) |l| sh.appendLocked(step, std.mem.trimEnd(u8, l, "\r"));
                 sh.annotateLocked(step, an);
             },
-            .debug => |msg| if (sh.step_debug) sh.appendFmt(step, "##[debug]{s}", .{msg}),
+            .debug => |msg| if (sh.step_debug) sh.appendScratch(step, "##[debug]{s}", .{msg}),
             // GitHub logs nothing for either; the file is read between steps (see
             // `pending_matchers`).
-            .add_matcher => |path| sh.pending_matchers.append(sh.arena, path) catch {},
+            .add_matcher => |path| if (sh.arena.dupe(u8, path)) |p|
+                sh.pending_matchers.append(sh.arena, p) catch {}
+            else |_| {},
             .remove_matcher => |owner| sh.matchers.removeOwner(owner),
-            .stop => |token| st.stop_token = token,
+            .stop => |token| st.stop_token = sh.arena.dupe(u8, token) catch null,
             .resume_commands => st.stop_token = null,
-            .set_output => |kv| st.outputs.append(sh.arena, kv) catch {},
-            .save_state => |kv| st.state.append(sh.arena, kv) catch {},
+            .set_output => |kv| if (sh.keepVar(kv)) |v| st.outputs.append(sh.arena, v) catch {},
+            .save_state => |kv| if (sh.keepVar(kv)) |v| st.state.append(sh.arena, v) catch {},
             .disabled => |name| {
                 const msg = std.fmt.allocPrint(
-                    sh.arena,
+                    scratch,
                     "The `{s}` command is disabled. Please upgrade to using Environment Files " ++
                         "or opt " ++
                         "into unsecure command execution by setting the " ++
@@ -2056,12 +2069,41 @@ const Shared = struct {
     fn errorLine(sh: *Shared, step: u32, msg: []const u8) void {
         sh.mu.lockUncancelable(sh.io);
         defer sh.mu.unlock(sh.io);
+        defer sh.resetScratch();
         sh.errorLineLocked(step, msg);
     }
 
     fn errorLineLocked(sh: *Shared, step: u32, msg: []const u8) void {
-        sh.appendFmt(step, "##[error]{s}", .{msg});
+        sh.appendScratch(step, "##[error]{s}", .{msg});
         sh.annotateLocked(step, .{ .level = "error", .message = msg });
+    }
+
+    /// The allocator for work on the current line, with `mu` held; the caller resets it with
+    /// `resetScratch` before letting go of `mu`. Built on the job's arena, which it returns memory
+    /// to only when a line needs more than any line before it, so it settles at the largest line's
+    /// needs.
+    fn scratchAllocator(sh: *Shared) Allocator {
+        if (sh.scratch == null) sh.scratch = .init(sh.arena);
+        return sh.scratch.?.allocator();
+    }
+
+    fn resetScratch(sh: *Shared) void {
+        if (sh.scratch) |*s| _ = s.reset(.retain_capacity);
+    }
+
+    /// `appendFmt`, formatted in the scratch arena: for the log path, where `appendFmt` would keep
+    /// every formatted line in the job's arena.
+    fn appendScratch(sh: *Shared, step: u32, comptime fmt: []const u8, args: anytype) void {
+        const text = std.fmt.allocPrint(sh.scratchAllocator(), fmt, args) catch return;
+        sh.appendLocked(step, text);
+    }
+
+    /// An output or state value parsed from a line, copied into the job's arena.
+    fn keepVar(sh: *Shared, kv: job_mod.EnvVar) ?job_mod.EnvVar {
+        return .{
+            .name = sh.arena.dupe(u8, kv.name) catch return null,
+            .value = sh.arena.dupe(u8, kv.value) catch return null,
+        };
     }
 
     /// The matcher files steps have asked for, emptied. Called off the log path.
@@ -2104,8 +2146,12 @@ const Shared = struct {
         // a freed record corrupts the heap, and because every runner in this process shares it, the
         // crash surfaces in whatever job is unlucky: this cost a segfault in a hugo build that had
         // no matchers at all, while another job's matcher was matching.
-        const line = sh.arena.dupe(u8, std.mem.trimEnd(u8, text, "\r")) catch return;
-        const found = sh.matchers.feed(sh.arena, line) catch return;
+        //
+        // Into the scratch arena, with the matchers' work: an annotation keeps a copy of what it
+        // needs (`annotateLocked`), and the rest goes when `stepOutput` resets the scratch.
+        const scratch = sh.scratchAllocator();
+        const line = scratch.dupe(u8, std.mem.trimEnd(u8, text, "\r")) catch return;
+        const found = sh.matchers.feed(scratch, line) catch return;
         for (found) |f| sh.annotateLocked(step, .{
             .level = f.level,
             .message = f.message,
@@ -2128,8 +2174,19 @@ const Shared = struct {
             if (a.step == step and std.mem.eql(u8, a.an.level, an.level)) same += 1;
         }
         if (same >= max_annotations) return;
-        var copy = an;
-        if (an.file) |f| copy.file = if (std.mem.startsWith(
+        // Its own copy: what it was given is usually a slice of a line in the scratch arena.
+        const a = sh.arena;
+        var copy: commands.Annotation = .{
+            .level = a.dupe(u8, an.level) catch return,
+            .message = a.dupe(u8, an.message) catch return,
+            .title = dupeOpt(a, an.title) catch return,
+            .file = dupeOpt(a, an.file) catch return,
+            .line = dupeOpt(a, an.line) catch return,
+            .end_line = dupeOpt(a, an.end_line) catch return,
+            .col = dupeOpt(a, an.col) catch return,
+            .end_column = dupeOpt(a, an.end_column) catch return,
+        };
+        if (copy.file) |f| copy.file = if (std.mem.startsWith(
             u8,
             f,
             sh.workspace,
@@ -2151,15 +2208,27 @@ const Shared = struct {
     }
 
     /// Masks `value` (and each of its lines) in everything logged from now on, in every sink.
+    ///
+    /// The set keeps them longest first, so a secret that begins with another is masked whole. It
+    /// starts from the log's secrets (the job's), copied once; before it, each mask copied and
+    /// sorted the whole list again, which made 20000 masks cost 5.8 GB.
     fn addMask(sh: *Shared, value: []const u8) void {
-        var list: std.ArrayList([]const u8) = .empty;
-        list.appendSlice(sh.arena, sh.log.currentSecrets()) catch return;
-        // In every form, as the job's own secrets are (redact.forms).
-        const owned = sh.arena.dupe(u8, value) catch return;
-        list.appendSlice(sh.arena, redact.forms(sh.arena, owned) catch return) catch return;
-        // Longest first, so a secret that contains another one is masked whole.
-        redact.sortLongestFirst(list.items);
-        sh.log.setSecrets(list.items);
+        const set = sh.masks orelse set: {
+            const set = sh.arena.create(redact.Set) catch return;
+            set.* = .{};
+            for (sh.log.currentSecrets()) |s| set.add(sh.arena, s) catch return;
+            sh.masks = set;
+            break :set set;
+        };
+        // In every form, as the job's own secrets are (redact.forms). The forms are worked out in
+        // the scratch arena: the set copies the ones it has not seen.
+        const forms = redact.forms(sh.scratchAllocator(), value) catch return;
+        for (forms) |f| set.add(sh.arena, f) catch {};
+        sh.log.setSecretSet(set);
+    }
+
+    fn dupeOpt(a: Allocator, s: ?[]const u8) Allocator.Error!?[]const u8 {
+        return if (s) |t| try a.dupe(u8, t) else null;
     }
 
     /// `text` with the job's secrets and masks so far replaced, for what leaves the runner other
@@ -10768,4 +10837,127 @@ test "JavaScript pre and post: pre runs first and hands its state on, post-if is
             try std.testing.expectEqual(Outcome.success, res.extra[0].outcome);
         }
     }
+}
+
+/// A one-step job's `Shared` for the log path's memory tests, logging to a sink that discards.
+const LogPathFixture = struct {
+    disc: std.Io.Writer.Discarding,
+    log: sink.LogSink,
+    live: [1]std.atomic.Value(u32) = .{.init(0)},
+    ended: [1]std.atomic.Value(bool) = .{.init(false)},
+    replayed: [1]bool = .{false},
+    cmds: [1]Shared.StepCommands = .{.{}},
+    line_counts: [2]u32 = .{ 0, 0 },
+    buf: [256]u8 = undefined,
+    sh: Shared,
+
+    /// In place: the log and `sh` point into the fixture.
+    fn init(f: *LogPathFixture, arena: Allocator) void {
+        f.* = .{ .disc = undefined, .log = undefined, .sh = undefined };
+        f.disc = .init(&f.buf);
+        f.log = .{ .stdout = .{ .writer = &f.disc.writer } };
+        f.sh = .{
+            .io = std.testing.io,
+            .arena = arena,
+            .log = &f.log,
+            .sink_job_id = 0,
+            .live_lines = &f.live,
+            .ended = &f.ended,
+            .replayed_steps = &f.replayed,
+            .commands = &f.cmds,
+            .line_counts = &f.line_counts,
+        };
+    }
+};
+
+test "a step's output, matched or read as commands, leaves nothing in the job's arena it need not" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f: LogPathFixture = undefined;
+    f.init(a.allocator());
+    const sh = &f.sh;
+    // setup-node registers both: tsc's single pattern, and eslint-stylish, whose first pattern
+    // takes any line and carries it as the file of the next.
+    const tsc =
+        \\{"problemMatcher":[{"owner":"tsc","pattern":[{"regexp":"^([^\\s].*)[\\(:](\\d+)[,:](\\d+)(?:\\):\\s+|\\s+-\\s+)(error|warning|info)\\s+TS(\\d+)\\s*:\\s*(.*)$","file":1,"line":2,"column":3,"severity":4,"code":5,"message":6}]}]}
+    ;
+    const eslint =
+        \\{ "problemMatcher": [ { "owner": "eslint-stylish", "pattern": [
+        \\  { "regexp": "^\\s*([^\\s].*)$", "file": 1 },
+        \\  { "regexp": "^\\s+(\\d+):(\\d+)\\s+(error|warning|info)\\s+(.*)\\s\\s+(.*)$",
+        \\    "line": 1, "column": 2, "severity": 3, "message": 4, "code": 5, "loop": true } ] } ] }
+    ;
+    sh.addMatchers((try matcher.load(a.allocator(), tsc)).matchers);
+    sh.addMatchers((try matcher.load(a.allocator(), eslint)).matchers);
+
+    const lines = [_][]const u8{
+        "compiling module number 12345 of the build, nothing to see here, just a normal log line ok",
+        "see std::vector::push_back, a line with colons that is not a command",
+        "::group::Build",
+        "::endgroup::",
+        "::debug::not shown",
+        "::set-env name=X::disabled, an error line",
+    };
+    // Past the scratch arena's first growth, and past the ten annotations a step keeps.
+    for (0..20) |_| for (lines) |l| sh.stepOutput(1, l);
+    const kept = sh.annotations.items.len;
+    const before = a.queryCapacity();
+    for (0..2000) |_| for (lines) |l| sh.stepOutput(1, l);
+    // Every line's copy, its regex work and its formatted log line stayed in the job's arena:
+    // 100 MB here, 18.8 GB over 1M lines.
+    try std.testing.expect(a.queryCapacity() - before < 64 * 1024);
+    try std.testing.expectEqual(kept, sh.annotations.items.len);
+
+    // Matching still works, and what an annotation keeps outlives the lines after it.
+    sh.annotations.clearRetainingCapacity();
+    sh.stepOutput(1, "src/app.ts(3,7): error TS2322: Type 'x' is not assignable.");
+    sh.stepOutput(1, "src/app.js");
+    sh.stepOutput(1, "  12:34  error  Unexpected console statement  no-console");
+    sh.stepOutput(1, "  40:5  warning  Missing radix parameter  radix");
+    sh.stepOutput(1, "::warning file=a.c,line=2::careful");
+    for (0..10) |_| for (lines[0..2]) |l| sh.stepOutput(1, l);
+    const got = sh.annotations.items;
+    try std.testing.expectEqual(@as(usize, 4), got.len);
+    try std.testing.expectEqualStrings("src/app.ts", got[0].an.file.?);
+    try std.testing.expectEqualStrings("Type 'x' is not assignable.", got[0].an.message);
+    try std.testing.expectEqualStrings("2322", got[0].an.title.?);
+    try std.testing.expectEqualStrings("src/app.js", got[1].an.file.?);
+    try std.testing.expectEqualStrings("12", got[1].an.line.?);
+    try std.testing.expectEqualStrings("Unexpected console statement", got[1].an.message);
+    try std.testing.expectEqualStrings("no-console", got[1].an.title.?);
+    try std.testing.expectEqualStrings("src/app.js", got[2].an.file.?);
+    try std.testing.expectEqualStrings("warning", got[2].an.level);
+    try std.testing.expectEqualStrings("a.c", got[3].an.file.?);
+    try std.testing.expectEqualStrings("careful", got[3].an.message);
+}
+
+test "masks cost memory in proportion to their number, and a repeated one costs nothing" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f: LogPathFixture = undefined;
+    f.init(a.allocator());
+    const sh = &f.sh;
+    f.log.setSecrets(try redact.expand(a.allocator(), &.{"job-secret"}));
+    var buf: [64]u8 = undefined;
+    const n = 2000;
+    const before = a.queryCapacity();
+    for (0..n) |i| sh.stepOutput(1, try std.fmt.bufPrint(&buf, "::add-mask::secret-value-{d}", .{i}));
+    // About 470 bytes each (930 KB), the trie and the arena's spare room included. Each
+    // mask copied the whole list and sorted it again: 130 MB here, 5.8 GB for 20000.
+    try std.testing.expect(a.queryCapacity() - before < n * 1024);
+    const after_masks = a.queryCapacity();
+    for (0..n) |_| sh.stepOutput(1, "::add-mask::secret-value-7");
+    try std.testing.expect(a.queryCapacity() - after_masks < 16 * 1024);
+
+    // Masked as before: longest first, in every form, with the job's own secrets.
+    var out: std.Io.Writer.Allocating = .init(a.allocator());
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out.writer } };
+    log.setSecretSet(sh.masks.?);
+    try log.append(0, 1, .stdout, "secret-value-1999 secret-value-1 c2VjcmV0LXZhbHVlLTQy job-secret secret-value-");
+    try std.testing.expectEqualStrings(
+        "[job 0 step 1 stdout] *** *** *** *** secret-value-\n",
+        out.written(),
+    );
+    try std.testing.expect(sh.holdsSecret("x secret-value-12 y"));
+    try std.testing.expectEqualStrings("a *** b", try sh.redacted(a.allocator(), "a job-secret b"));
 }
