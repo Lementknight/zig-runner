@@ -10,6 +10,14 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.15.0 - 2026-10-28
+### Added
+* A memory gate (#126): a runner asks GitHub for a job only while the machine has the memory for it, reserving room for the jobs its pool's other runners may be handed at the same moment and for jobs started in the last two minutes, and holds while memory pressure (PSI) or swap growth says the machine is struggling. A held runner removes its registration and waits, logging once when it holds and once when it resumes; running jobs are never touched. On by default (RUNNER_ADMISSION, RUNNER_MIN_MEM_AVAILABLE_MB=1536, RUNNER_MEM_PER_JOB_MB=1024, RUNNER_MAX_MEM_PRESSURE=10, RUNNER_MAX_SWAP_GROWTH_MB=64), which on razorbill lets three heavy jobs start together from idle, not four. The README and compose.yaml also describe giving the engine no swap of its own (memswap_limit equal to mem_limit), and its trade-off.
+### Fixed
+* The image's provenance step no longer warns "Failed to create storage record": the Image job may record the pushed image as the attestation's artifact (artifact-metadata: write).
+* A stop (SIGTERM from systemd, Docker or a deploy) no longer waits for a running job however long it takes (#127). Running jobs get RUNNER_STOP_GRACE_SECS (10 minutes by default) to finish, then are cancelled as GitHub cancels a job: the running step stops in the engine, always() steps and post scripts get a minute, and the job is reported cancelled. The service's TimeoutStopSec and Compose's stop_grace_period go from 60 to 15 minutes to match.
+* The runner's own messages (starting, registering, listening for jobs) are logged bare instead of as `[job 0 step 0 stderr]`, which passed them off as step output.
+
 ## v0.14.1 - 2026-10-28
 ### Changed
 * The Lean proofs and the release's pull-request checks (Binaries (check), Binaries (same as zig build), Image) run on every pull request and in the merge queue, so they can be required: each skips its steps, still reporting, when the change cannot affect it (ci-scope.sh proofs and packaging). The packaging checks now also run when runner/build.zig.zon changes, which a tls.zig bump skipped before.

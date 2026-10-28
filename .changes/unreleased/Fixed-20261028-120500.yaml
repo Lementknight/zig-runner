@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'The runner''s own messages (starting, registering, listening for jobs) are logged bare instead of as `[job 0 step 0 stderr]`, which passed them off as step output.'
-time: 2026-10-28T12:05:00.000000-04:00
