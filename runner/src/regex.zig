@@ -519,7 +519,7 @@ const Parser = struct {
             '(' => return p.parseGroup(f, depth),
             '[' => {
                 p.i += 1;
-                return .{ .set = .{ .set = try p.parseClass(f.i), .fold = f.i } };
+                return .{ .set = .{ .set = try p.parseClass(f.i, 0), .fold = f.i } };
             },
             '\\' => {
                 p.i += 1;
@@ -842,7 +842,11 @@ const Parser = struct {
     }
 
     /// A class after its `[`.
-    fn parseClass(p: *Parser, fold: bool) Error!*const Set {
+    /// `depth`: the subtractions around this class (`[a-[b-[c]]]`). Each is a level of recursion here
+    /// and in `Set.has`, and a problem matcher's pattern is anyone's: 100000 of them overflowed the
+    /// stack (#98). .NET has no limit, so a pattern past `max_depth` is refused as unsupported.
+    fn parseClass(p: *Parser, fold: bool, depth: u32) Error!*const Set {
+        if (depth > max_depth) return error.Unsupported;
         const set = try p.arena.create(Set);
         set.* = .{};
         if (p.peek() == '^') {
@@ -867,7 +871,7 @@ const Parser = struct {
             if (c == '-' and p.i + 1 < p.src.len and p.src[p.i + 1] == '[') {
                 // `-[...]` subtracts, and must end the class.
                 p.i += 2;
-                set.subtract = try p.parseClass(fold);
+                set.subtract = try p.parseClass(fold, depth + 1);
                 if (p.peek() != ']') return error.BadPattern;
                 p.i += 1;
                 break;
@@ -1731,4 +1735,23 @@ test "a pathological pattern gives up instead of hanging" {
     // The classic: every split of a long run of 'a' is tried before 'b' fails.
     const re = try Regex.compile(ar, "^(a+)+b$");
     try testing.expectError(error.TooComplex, re.find(ar, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0));
+}
+
+test "class subtraction nested past max_depth is refused, not a stack overflow (#98)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // 100000 levels overflowed the stack; the depth, not the program size, must stop them, so the
+    // boundary is checked well below max_program: 70 levels refused, 10 compiled.
+    for ([_]struct { usize, bool }{ .{ 70, false }, .{ 10, true } }) |c| {
+        var deep: std.ArrayList(u8) = .empty;
+        for (0..c[0]) |_| try deep.appendSlice(ar, "[a-");
+        try deep.append(ar, 'z');
+        for (0..c[0]) |_| try deep.append(ar, ']');
+        if (c[1]) _ = try Regex.compile(ar, deep.items) else try std.testing.expectError(error.Unsupported, Regex.compile(ar, deep.items));
+    }
+    // A few levels, as real patterns have, still work: [a-z-[aeiou]] is the consonants.
+    const re = try Regex.compile(ar, "^[a-z-[aeiou]]+$");
+    try std.testing.expect(try re.find(ar, "rhythm", 0) != null);
+    try std.testing.expect(try re.find(ar, "audio", 0) == null);
 }

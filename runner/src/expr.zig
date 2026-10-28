@@ -1280,6 +1280,16 @@ fn writeJson(w: *std.Io.Writer, v: Value, depth: usize) !void {
 }
 
 pub fn fromJsonValue(arena: Allocator, j: std.json.Value) Allocator.Error!Value {
+    return fromJsonDepth(arena, j, 0);
+}
+
+/// How deeply converted values may nest: the conversion recurses per level, and 200000 levels of
+/// context data overflowed the stack (#98). `fromJSON` refuses deeper input first (`max_json_nesting`,
+/// the same bound); what comes deeper from elsewhere (GitHub's job message) is null past it.
+pub const max_value_nesting = 1000;
+
+fn fromJsonDepth(arena: Allocator, j: std.json.Value, depth: u32) Allocator.Error!Value {
+    if (depth >= max_value_nesting) return .null;
     switch (j) {
         .null => return .null,
         .bool => |b| return .{ .boolean = b },
@@ -1292,7 +1302,7 @@ pub fn fromJsonValue(arena: Allocator, j: std.json.Value) Allocator.Error!Value 
         // only equal themselves, and zero-length slices could share an address.
         .array => |a| {
             const out = (try arena.alloc(Value, @max(a.items.len, 1)))[0..a.items.len];
-            for (a.items, out) |e, *o| o.* = try fromJsonValue(arena, e);
+            for (a.items, out) |e, *o| o.* = try fromJsonDepth(arena, e, depth + 1);
             return .{ .array = out };
         },
         .object => |o| {
@@ -1301,7 +1311,7 @@ pub fn fromJsonValue(arena: Allocator, j: std.json.Value) Allocator.Error!Value 
             var i: usize = 0;
             while (it.next()) |e| : (i += 1) out[i] = .{
                 .key = e.key_ptr.*,
-                .value = try fromJsonValue(arena, e.value_ptr.*),
+                .value = try fromJsonDepth(arena, e.value_ptr.*, depth + 1),
             };
             return .{ .object = out };
         },

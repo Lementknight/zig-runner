@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'Input nested deep enough no longer overflows the stack and takes the runner down: block collections in YAML (`- - - … x` on one line, in a third party''s `action.yml`) are refused past 1000 levels, a problem matcher''s nested class subtractions (`[a-[b-[…]]]`) past 64, and context data nested past 1000 levels becomes null.'
+time: 2026-10-28T05:00:00.000000-04:00
