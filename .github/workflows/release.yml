@@ -5,7 +5,9 @@
 # from those same binaries rather than a second build. Both carry signed build provenance
 # (`gh attestation verify`), the binaries an attested SPDX SBOM too; the image is scanned by Trivy
 # before it is pushed.
-# On pull requests that touch the packaging, the same builds and scans, publishing nothing.
+# On pull requests and in the merge queue, the same builds and scans, publishing nothing: required
+# checks, which skip their steps, still reporting, on a change that cannot affect the packaging
+# (ci-scope.sh packaging), as a path filter would not report at all.
 # Run by hand with a tag to (re)build and push that tag's image, from its release's binaries: only
 # tags after v0.13.2 (#93), whose Dockerfile has the `prebuilt` stage this builds.
 name: release
@@ -19,23 +21,17 @@ on:
         description: "An existing version tag after v0.13.2 whose image to build and push (v0.14.0)"
         required: true
   pull_request:
-    paths:
-      - runner/Dockerfile
-      - runner/build.zig
-      - deploy/**
-      - .github/scripts/build-binaries.sh
-      - .github/scripts/zig-modules.sh
-      - .github/scripts/sbom.sh
-      - .trivyignore.yaml
-      - .github/workflows/release.yml
+  # The merge queue's runs; without this the required checks never report there.
+  merge_group:
 
 # Nothing by default; each job asks for what it needs.
 permissions: {}
 
-# One release of a tag at a time, run to the end.
+# One release of a tag at a time, run to the end; a pull request's new push replaces the checks of
+# its old one, as in ci.yml.
 concurrency:
   group: release-${{ inputs.tag || github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # The tag released: pushed, or given by hand.
@@ -112,32 +108,45 @@ jobs:
             dist/zig-runner.spdx.json dist/zig-runner.provenance.jsonl dist/zig-runner.sbom.jsonl
           gh release edit "$TAG" --draft=false
 
-  # The pull request's check of the same build: everything into dist/, nothing published. The
-  # binaries go to the image check; binaries-zig-build checks them against `zig build`.
+  # The pull request's (and the merge group's) check of the same build: everything into dist/,
+  # nothing published. The binaries go to the image check, with whether there are any (`run`);
+  # binaries-zig-build checks them against `zig build`.
   binaries-check:
     name: Binaries (check)
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read # to check out the code
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      - name: Whether this change can affect the packaging
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh packaging
+
       - name: Install Zig
+        if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
 
       - name: Build
+        if: steps.scope.outputs.run == 'true'
         run: .github/scripts/build-binaries.sh "$TAG" dist
 
       - name: SBOM
+        if: steps.scope.outputs.run == 'true'
         run: |
           .github/scripts/sbom.sh "$TAG" dist/SHA256SUMS > "$RUNNER_TEMP/zig-runner.spdx.json"
           jq -e '.packages | length > 2' "$RUNNER_TEMP/zig-runner.spdx.json" > /dev/null
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.scope.outputs.run == 'true'
         with:
           name: binaries
           path: dist/
@@ -149,7 +158,7 @@ jobs:
   # 100 s on an empty cache), and the image check need not wait for that. Both builds here at once.
   binaries-zig-build:
     name: Binaries (same as zig build)
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -159,10 +168,18 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Whether this change can affect the packaging
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh packaging
+
       - name: Install Zig
+        if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
 
       - name: The same as zig build
+        if: steps.scope.outputs.run == 'true'
         run: |
           .github/scripts/build-binaries.sh "$TAG" dist &
           direct=$!
@@ -172,7 +189,11 @@ jobs:
           cmp "$RUNNER_TEMP/zig-build/bin/runner" dist/zig-runner-linux-x86_64
 
   # From the release's own binaries: a tag's, once the binaries job published them (checked against
-  # SHA256SUMS and their provenance); a pull request's from its check; by hand, the tag's release.
+  # SHA256SUMS and their provenance); a pull request's or merge group's from its check; by hand, the
+  # tag's release. Each needed job is either skipped (binaries but on a tag, binaries-check on one)
+  # or must not have failed. A check that found the change cannot affect the packaging built no
+  # binaries (`run` false): the steps skip, and the job still reports. `run` is empty on a tag or by
+  # hand, where binaries-check is skipped, and everything runs.
   image:
     name: Image
     needs: [binaries, binaries-check]
@@ -184,22 +205,26 @@ jobs:
       packages: write # to push the image to ghcr.io
       id-token: write # to sign the image's provenance with Sigstore
       attestations: write # to store that provenance
+    env:
+      RUN: ${{ needs.binaries-check.outputs.run != 'false' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.RUN == 'true'
         with:
           ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: env.RUN == 'true'
 
       - name: The pull request's binaries
-        if: github.event_name == 'pull_request'
+        if: env.RUN == 'true' && env.PUBLISH != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: binaries
           path: dist
 
       - name: The release's binaries
-        if: env.PUBLISH == 'true'
+        if: env.RUN == 'true' && env.PUBLISH == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -213,6 +238,7 @@ jobs:
 
       # Where the Dockerfile's `prebuilt` stage takes them, by Docker's name for each architecture.
       - name: Into the build context
+        if: env.RUN == 'true'
         run: |
           mkdir -p runner/prebuilt
           install -m 0755 dist/zig-runner-linux-x86_64 runner/prebuilt/runner-amd64
@@ -220,17 +246,20 @@ jobs:
 
       # Registry names must be lowercase; owners often are not (Open-Blue).
       - name: Image name
+        if: env.RUN == 'true'
         env:
           OWNER: ${{ github.repository_owner }}
         run: echo "IMAGE=ghcr.io/${OWNER,,}/zig-runner" >> "$GITHUB_ENV"
 
       - name: Scan the Dockerfile
+        if: env.RUN == 'true'
         run: |
           docker run --rm -v "$PWD:/src:ro" -w /src "$TRIVY_IMAGE" config \
             --exit-code 1 --severity HIGH,CRITICAL --ignorefile .trivyignore.yaml runner/
 
       # Scanned before anything is pushed: one platform, loaded into the local Docker.
       - name: Build for the scan
+        if: env.RUN == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: runner
@@ -240,12 +269,13 @@ jobs:
           tags: zig-runner:scan
 
       - name: Scan the image
+        if: env.RUN == 'true'
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" image \
             --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed zig-runner:scan
 
       - name: Log in to the registry
-        if: env.PUBLISH == 'true'
+        if: env.RUN == 'true' && env.PUBLISH == 'true'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -254,6 +284,7 @@ jobs:
 
       - name: Build (and push, for a tag)
         id: build
+        if: env.RUN == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: runner
@@ -263,11 +294,12 @@ jobs:
           # BuildKit's own provenance and SBOM, stored with the image in the registry.
           provenance: mode=max
           sbom: true
-          # A pull request's ref (`123/merge`) is no image tag; it builds under a local name.
+          # A pull request's ref (`123/merge`) or a merge group's is no image tag; it builds under a
+          # local name.
           tags: ${{ env.PUBLISH == 'true' && format('{0}:{1},{0}:latest', env.IMAGE, env.TAG) || 'zig-runner:check' }}
 
       - name: Attest the image
-        if: env.PUBLISH == 'true'
+        if: env.RUN == 'true' && env.PUBLISH == 'true'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}

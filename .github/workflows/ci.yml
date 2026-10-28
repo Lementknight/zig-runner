@@ -99,7 +99,7 @@ jobs:
         id: scope
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
-        run: .github/scripts/ci-scope.sh
+        run: .github/scripts/ci-scope.sh tests
 
       - name: Start the database
         if: steps.scope.outputs.run == 'true'
@@ -136,7 +136,7 @@ jobs:
         id: scope
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
-        run: .github/scripts/ci-scope.sh
+        run: .github/scripts/ci-scope.sh tests
 
       - name: Install Zig
         if: steps.scope.outputs.run == 'true'
