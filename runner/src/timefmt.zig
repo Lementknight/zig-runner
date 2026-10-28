@@ -3,6 +3,8 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
+/// `ms` (milliseconds since the epoch, not before it) as ISO 8601 UTC with milliseconds
+/// ("2026-10-11T17:45:56.405Z").
 pub fn isoTime(arena: Allocator, ms: i64) Allocator.Error![]const u8 {
     const secs: u64 = @intCast(@divFloor(ms, 1000));
     const es: std.time.epoch.EpochSeconds = .{ .secs = secs };
