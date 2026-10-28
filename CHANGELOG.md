@@ -10,6 +10,10 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.16.0 - 2026-10-28
+### Added
+* The memory gate also holds on the Dagger engine container's own memory cap and swap (#142): razorbill's engine filled its 4 GB cap and swapped while the host still showed 2 GB available. The runner finds the engine's cgroup through the process listening on its unix socket, with no Docker access, and logs which one, or why it could not, in which case it holds on the host's memory only. New settings: `RUNNER_MIN_ENGINE_HEADROOM_MB` (256) and `RUNNER_ENGINE_CGROUP`.
+
 ## v0.15.3 - 2026-10-28
 ### Fixed
 * The memory gate no longer throttles short jobs: a job's memory is reserved while it ramps up or until it ends, whichever is sooner, not for two minutes regardless. A burst of short jobs went through at about 1.5 a minute on razorbill.
