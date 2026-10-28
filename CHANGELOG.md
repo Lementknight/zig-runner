@@ -10,6 +10,10 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.15.2 - 2026-10-28
+### Fixed
+* A job that logs a lot no longer grows the runner by hundreds of MB to over 1.8 GB: the image has a /tmp again, so each job's log is spooled to disk instead of kept in memory; a step's whole output is no longer asked for with every exec (the engine sent it back, and logged it again, once more than the log already had it) but only to replay a step served from the cache, up to 4 MiB; the logs uploaded at a job's end are read from the spool as they go up instead of formatted in memory; and the live log, a line without a newline and the engine's log stream each hold a bounded amount. A step whose env fails to evaluate keeps its continue-on-error.
+
 ## v0.15.1 - 2026-10-28
 ### Fixed
 * A runner the memory gate holds back logs its own name, the one it then registers under, instead of the name every runner of the pool shared.
