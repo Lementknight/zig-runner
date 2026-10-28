@@ -99,6 +99,12 @@ repository:
 - **No pull request code with secrets.** Nothing runs on `pull_request_target`; the release starts
   from a push to `main`, which only takes reviewed merges.
 
+### Code style
+
+[docs/STYLE.md](docs/STYLE.md): Zig's style guide for names, semantic compression for when to make
+an abstraction, Locality of Behaviour for where code lives, and TigerStyle for the rest, in that
+order when they disagree.
+
 ### Git hooks
 
 `.githooks` runs CI's pull-request checks before code leaves your machine. Turn them on once per

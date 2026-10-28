@@ -1,0 +1,3 @@
+kind: Added
+body: 'A style guide, docs/STYLE.md: how the runner''s code is named, when it is abstracted, where it lives, and which rule wins when they disagree.'
+time: 2026-10-28T07:00:00.000000-04:00
