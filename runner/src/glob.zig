@@ -346,28 +346,50 @@ fn parseClass(arena: Allocator, seg: []const u8, start: usize) Allocator.Error!?
 
 /// Whether `toks` match all of `s`, by code point.
 fn matchToks(toks: []const Tok, s: []const u8) bool {
-    if (toks.len == 0) return s.len == 0;
-    switch (toks[0]) {
-        .star => {
-            var i: usize = 0;
-            while (true) {
-                if (matchToks(toks[1..], s[i..])) return true;
-                if (i >= s.len) return false;
-                _ = nextRune(s, &i);
-            }
-        },
-        else => {
-            if (s.len == 0) return false;
-            var i: usize = 0;
+    var steps: usize = 0;
+    return matchToksCounted(toks, s, &steps);
+}
+
+/// `matchToks`, counting its steps (for the tests). Every token but `*` takes one code point, and
+/// every code point is read with `nextRune` from where the one before it ended, so the code points
+/// of `s` are one sequence however it is matched; on that, a `*` that fails takes one more code
+/// point for the last `*` before it, and only that one: whatever an earlier `*` could take
+/// instead, the last can too. Linear in each `*`, so O(toks × s) at worst, not exponential.
+fn matchToksCounted(toks: []const Tok, s: []const u8, steps: *usize) bool {
+    var ti: usize = 0;
+    var si: usize = 0;
+    // The token after the last `*` seen, and where that `*`'s run of code points ends.
+    var star: ?usize = null;
+    var star_end: usize = 0;
+    while (true) {
+        steps.* += 1;
+        if (ti < toks.len and toks[ti] == .star) {
+            ti += 1;
+            star = ti;
+            star_end = si;
+            continue;
+        }
+        if (ti < toks.len and si < s.len) {
+            var i = si;
             const ch = nextRune(s, &i);
-            const ok = switch (toks[0]) {
+            const ok = switch (toks[ti]) {
                 .char => |c| c == ch,
                 .any => true,
                 .class => |cl| cl.has(ch),
                 .star => unreachable,
             };
-            return ok and matchToks(toks[1..], s[i..]);
-        },
+            if (ok) {
+                ti += 1;
+                si = i;
+                continue;
+            }
+        } else if (ti == toks.len and si == s.len) return true;
+        // A mismatch, or one side used up: the last `*` takes one more code point, if any is left.
+        const after = star orelse return false;
+        if (star_end >= s.len) return false;
+        _ = nextRune(s, &star_end);
+        ti = after;
+        si = star_end;
     }
 }
 
@@ -383,35 +405,73 @@ fn matchPart(part: Part, seg: []const u8) bool {
 
 /// minimatch's `matchOne`: the path's segments against the pattern's, `partial` when only a
 /// prefix of the pattern needs to match (could something below this path match?).
-fn matchOne(file: []const []const u8, pat: []const Part, partial: bool) bool {
-    var fi: usize = 0;
-    var pi: usize = 0;
-    while (fi < file.len and pi < pat.len) : ({
-        fi += 1;
-        pi += 1;
-    }) {
-        const p = pat[pi];
-        if (p == .globstar) {
-            const pr = pi + 1;
-            if (pr == pat.len) {
-                // `**` last swallows the rest, but never `.` or `..`.
-                for (file[fi..]) |f| if (std.mem.eql(u8, f, ".") or std.mem.eql(u8, f, "..")) return false;
-                return true;
-            }
-            var fr = fi;
-            while (fr < file.len) : (fr += 1) {
-                if (matchOne(file[fr..], pat[pr..], partial)) return true;
-                const swallowee = file[fr];
-                if (std.mem.eql(u8, swallowee, ".") or std.mem.eql(u8, swallowee, "..")) break;
-            }
-            return partial and fr == file.len;
-        }
-        if (!matchPart(p, file[fi])) return false;
-    }
-    if (fi == file.len and pi == pat.len) return true;
-    if (fi == file.len) return partial;
-    return fi == file.len - 1 and file[fi].len == 0;
+fn matchOne(arena: Allocator, file: []const []const u8, pat: []const Part, partial: bool) Allocator.Error!bool {
+    var m: OneMatch = .{ .arena = arena, .file = file, .pat = pat, .partial = partial };
+    return m.from(0, 0);
 }
+
+/// One `matchOne`. Each `**` tries the rest of the pattern at every place in the path it can
+/// stop, as minimatch does, but the answer for the rest of the pattern from a place depends only
+/// on the two places: one that failed is not tried again (one that matched ends the whole match).
+/// So each pair of places is tried once, O(file² × pattern) at worst, where without that a path
+/// and a pattern with many `**` took exponential time. The cases are minimatch's, and
+/// `proofs/Glob/Match.lean`'s `matchOne`.
+const OneMatch = struct {
+    arena: Allocator,
+    file: []const []const u8,
+    pat: []const Part,
+    partial: bool,
+    /// The (path place, pattern place) pairs already tried after a `**`; empty until one is.
+    tried: std.DynamicBitSetUnmanaged = .{},
+    /// Segments compared, for the tests.
+    steps: usize = 0,
+
+    /// Whether `pat[pi0..]` matches `file[fi0..]`.
+    fn from(m: *OneMatch, fi0: usize, pi0: usize) Allocator.Error!bool {
+        const file = m.file;
+        const pat = m.pat;
+        var fi = fi0;
+        var pi = pi0;
+        while (fi < file.len and pi < pat.len) : ({
+            fi += 1;
+            pi += 1;
+        }) {
+            const p = pat[pi];
+            if (p == .globstar) {
+                const pr = pi + 1;
+                if (pr == pat.len) {
+                    // `**` last swallows the rest, but never `.` or `..`.
+                    for (file[fi..]) |f| if (std.mem.eql(u8, f, ".") or std.mem.eql(u8, f, "..")) return false;
+                    return true;
+                }
+                var fr = fi;
+                while (fr < file.len) : (fr += 1) {
+                    if (try m.firstTry(fr, pr) and try m.from(fr, pr)) return true;
+                    const swallowee = file[fr];
+                    if (std.mem.eql(u8, swallowee, ".") or std.mem.eql(u8, swallowee, "..")) break;
+                }
+                return m.partial and fr == file.len;
+            }
+            m.steps += 1;
+            if (!matchPart(p, file[fi])) return false;
+        }
+        if (fi == file.len and pi == pat.len) return true;
+        if (fi == file.len) return m.partial;
+        return fi == file.len - 1 and file[fi].len == 0;
+    }
+
+    /// Whether `pat[pi..]` against `file[fi..]` is yet to be tried, marking it tried. A try that
+    /// is asked again has failed: one that matched would have ended the whole match, and a try
+    /// only starts others further along the pattern, so never itself again before it ends.
+    fn firstTry(m: *OneMatch, fi: usize, pi: usize) Allocator.Error!bool {
+        const width = m.pat.len + 1;
+        if (m.tried.bit_length == 0) m.tried = try .initEmpty(m.arena, (m.file.len + 1) * width);
+        const k = fi * width + pi;
+        if (m.tried.isSet(k)) return false;
+        m.tried.set(k);
+        return true;
+    }
+};
 
 /// A path's segments as minimatch splits it (`/a/b/` is "", "a", "b", "").
 fn splitPath(arena: Allocator, path: []const u8) Allocator.Error![]const []const u8 {
@@ -503,7 +563,7 @@ pub const Pattern = struct {
             if (!std.mem.endsWith(u8, item, "/") and !p.is_implicit)
                 item = try std.mem.concat(arena, u8, &.{ item, "/" });
         } else item = trimTrailing(item);
-        if (matchOne(try splitPath(arena, item), p.parts, false))
+        if (try matchOne(arena, try splitPath(arena, item), p.parts, false))
             return if (p.trailing_separator) MatchKind.directory else MatchKind.all;
         return MatchKind.none;
     }
@@ -512,7 +572,7 @@ pub const Pattern = struct {
     pub fn partialMatch(p: Pattern, arena: Allocator, item_in: []const u8) Allocator.Error!bool {
         const item = trimTrailing(try normalize(arena, item_in));
         if (std.mem.eql(u8, dirname(item), item)) return std.mem.eql(u8, item, "/");
-        return matchOne(try splitPath(arena, item), p.parts, true);
+        return matchOne(arena, try splitPath(arena, item), p.parts, true);
     }
 };
 
@@ -944,4 +1004,159 @@ test "the walk: depth-first in listed order, pruned, exclusions, links not follo
     try std.testing.expect((try parse(ar, &.{ "--FOLLOW-symbolic-links", "x" }, "/w", "/")).ok.follow);
     // Following links needs canonical paths, which this file system does not give.
     try std.testing.expect(try walk(ar, mem.fs(), parsed.patterns, true, "/w", &why) == .failed);
+}
+
+/// `matchToks` as it was, backtracking on every `*`: exponential, but plainly minimatch's, so the
+/// tests check the linear one against it.
+fn matchToksBacktracking(toks: []const Tok, s: []const u8) bool {
+    if (toks.len == 0) return s.len == 0;
+    if (toks[0] == .star) {
+        var i: usize = 0;
+        while (true) {
+            if (matchToksBacktracking(toks[1..], s[i..])) return true;
+            if (i >= s.len) return false;
+            _ = nextRune(s, &i);
+        }
+    }
+    if (s.len == 0) return false;
+    var i: usize = 0;
+    const ch = nextRune(s, &i);
+    const ok = switch (toks[0]) {
+        .char => |c| c == ch,
+        .any => true,
+        .class => |cl| cl.has(ch),
+        .star => unreachable,
+    };
+    return ok and matchToksBacktracking(toks[1..], s[i..]);
+}
+
+/// `matchOne` as it was, without remembering failed tries.
+fn matchOneBacktracking(file: []const []const u8, pat: []const Part, partial: bool) bool {
+    var fi: usize = 0;
+    var pi: usize = 0;
+    while (fi < file.len and pi < pat.len) : ({
+        fi += 1;
+        pi += 1;
+    }) {
+        const p = pat[pi];
+        if (p == .globstar) {
+            const pr = pi + 1;
+            if (pr == pat.len) {
+                for (file[fi..]) |f| if (std.mem.eql(u8, f, ".") or std.mem.eql(u8, f, "..")) return false;
+                return true;
+            }
+            var fr = fi;
+            while (fr < file.len) : (fr += 1) {
+                if (matchOneBacktracking(file[fr..], pat[pr..], partial)) return true;
+                const swallowee = file[fr];
+                if (std.mem.eql(u8, swallowee, ".") or std.mem.eql(u8, swallowee, "..")) break;
+            }
+            return partial and fr == file.len;
+        }
+        if (!matchPart(p, file[fi])) return false;
+    }
+    if (fi == file.len and pi == pat.len) return true;
+    if (fi == file.len) return partial;
+    return fi == file.len - 1 and file[fi].len == 0;
+}
+
+test "stars match in linear steps, where backtracking took exponentially many" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // Backtracking tried every way to share the `a`s among 8 stars before failing: C(32, 8) ≈ 1e7
+    // ways for 24 `a`s, 18.7 s for 40.
+    const toks = (try compilePart(ar, "*a*a*a*a*a*a*a*a*b")).magic;
+    for ([_]usize{ 24, 40 }) |n| {
+        const s = try ar.alloc(u8, n + 1);
+        @memset(s, 'a');
+        s[n] = 'b';
+        var steps: usize = 0;
+        try std.testing.expect(!matchToksCounted(toks, s[0..n], &steps));
+        try std.testing.expect(steps <= 2 * toks.len * (n + 1));
+        steps = 0;
+        try std.testing.expect(matchToksCounted(toks, s, &steps));
+        try std.testing.expect(steps <= 2 * toks.len * (n + 2));
+    }
+}
+
+test "the linear star match agrees with backtracking, code points and stray bytes included" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    var prng: std.Random.DefaultPrng = .init(99);
+    const r = prng.random();
+    const pat_atoms = [_][]const u8{ "*", "*", "?", "a", "b", "é", "[ab]", "[!a]", "[[:alpha:]]", "\xc3", "\xa9", "\\*" };
+    const str_atoms = [_][]const u8{ "a", "b", "é", "\xc3", "\xa9", "*", "\xe2\x82\xac", "\xe2" };
+    for (0..20000) |_| {
+        var pat: std.ArrayList(u8) = .empty;
+        for (0..r.uintAtMost(usize, 7)) |_| try pat.appendSlice(ar, pat_atoms[r.uintLessThan(usize, pat_atoms.len)]);
+        var s: std.ArrayList(u8) = .empty;
+        for (0..r.uintAtMost(usize, 8)) |_| try s.appendSlice(ar, str_atoms[r.uintLessThan(usize, str_atoms.len)]);
+        const toks = switch (try compilePart(ar, pat.items)) {
+            .magic => |t| t,
+            else => continue,
+        };
+        std.testing.expectEqual(matchToksBacktracking(toks, s.items), matchToks(toks, s.items)) catch |e| {
+            std.debug.print("{s} vs {s}\n", .{ pat.items, s.items });
+            return e;
+        };
+    }
+}
+
+test "globstars try each place once, where backtracking tried every way" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // Six `**` with an `a` after each, against `/w/a/.../a` (no `b`): backtracking tried every way
+    // to place the six `a`s, C(30, 6) ≈ 6e5 of them at 30 deep (past 60 s at 100 deep).
+    const p = try testPattern(ar, "/w/**/a/**/a/**/a/**/a/**/a/**/a/b");
+    for ([_]usize{ 30, 100 }) |depth| {
+        var path: std.ArrayList(u8) = .empty;
+        try path.appendSlice(ar, "/w");
+        for (0..depth) |_| try path.appendSlice(ar, "/a");
+        const file = try splitPath(ar, path.items);
+        var m: OneMatch = .{ .arena = ar, .file = file, .pat = p.parts, .partial = false };
+        try std.testing.expect(!try m.from(0, 0));
+        try std.testing.expect(m.steps <= file.len * p.parts.len);
+        // As the walk asks it of a directory: something below could match.
+        m = .{ .arena = ar, .file = file, .pat = p.parts, .partial = true };
+        try std.testing.expect(try m.from(0, 0));
+        try std.testing.expect(m.steps <= file.len * p.parts.len);
+    }
+    try std.testing.expectEqual(MatchKind.all, try p.match(ar, "/w/a/x/a/a/y/a/a/z/a/b"));
+}
+
+test "remembering failed globstar tries agrees with backtracking" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    var prng: std.Random.DefaultPrng = .init(99);
+    const r = prng.random();
+    const pat_atoms = [_][]const u8{ "**", "**", "a", "b", "*", "?", "" };
+    const seg_atoms = [_][]const u8{ "a", "b", "ab", ".", "..", "" };
+    for (0..20000) |_| {
+        var pat: std.ArrayList(u8) = .empty;
+        for (0..r.uintAtMost(usize, 6)) |i| {
+            if (i > 0) try pat.append(ar, '/');
+            try pat.appendSlice(ar, pat_atoms[r.uintLessThan(usize, pat_atoms.len)]);
+        }
+        var path: std.ArrayList(u8) = .empty;
+        for (0..r.uintAtMost(usize, 7)) |i| {
+            if (i > 0) try path.append(ar, '/');
+            try path.appendSlice(ar, seg_atoms[r.uintLessThan(usize, seg_atoms.len)]);
+        }
+        var parts: std.ArrayList(Part) = .empty;
+        for (try splitPath(ar, pat.items)) |seg| try parts.append(ar, try compilePart(ar, seg));
+        const file = try splitPath(ar, path.items);
+        for ([_]bool{ false, true }) |partial| {
+            std.testing.expectEqual(
+                matchOneBacktracking(file, parts.items, partial),
+                try matchOne(ar, file, parts.items, partial),
+            ) catch |e| {
+                std.debug.print("{s} vs {s} partial={}\n", .{ pat.items, path.items, partial });
+                return e;
+            };
+        }
+    }
 }
