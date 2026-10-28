@@ -17,6 +17,7 @@
 //! that started meanwhile. Without a flusher (tests, one-off commands) lines are written inline.
 const std = @import("std");
 const pg = @import("pg.zig");
+const db = @import("db.zig");
 const sink = @import("sink.zig");
 const redact = @import("redact.zig");
 const timefmt = @import("timefmt.zig");
@@ -78,6 +79,9 @@ pub const PgSink = struct {
     flusher_stopped: std.atomic.Value(bool) = .init(false),
     /// What `close` gives the flusher to write what is left before cutting it short.
     close_wait_ms: u32 = 5000,
+
+    /// How long a failed write keeps the next one from dialling again.
+    const retry_ms = 2000;
 
     pub fn append(
         s: *PgSink,
@@ -220,13 +224,9 @@ pub const PgSink = struct {
         s.writing_since.store(t, .release);
         defer s.writing_since.store(0, .release);
         const n = s.writeRows(batch.items) catch |e| {
-            const detail = if (s.client) |c| c.lastErrorText() else "";
             s.mu.lockUncancelable(s.io);
             defer s.mu.unlock(s.io);
-            s.remember("log write failed", if (detail.len > 0) detail else @errorName(e));
-            if (s.client) |c| c.close();
-            s.client = null;
-            s.retry_after_ms = t + 2000;
+            s.writeFailed(e, t);
             // Put back, in front: the batch, then what arrived while it was being written.
             batch.appendSlice(s.gpa, s.rows.items) catch {
                 // No memory to put it back: the failed batch is lost, and counted as dropped.
@@ -262,6 +262,16 @@ pub const PgSink = struct {
         s.last_error_len = t.len;
     }
 
+    /// After a write that began at `t` failed: says why, lets the connection go (the next write
+    /// dials again) and backs off. Called with `mu` held, by the only writer there is.
+    fn writeFailed(s: *PgSink, e: anyerror, t: i64) void {
+        const detail = if (s.client) |c| c.lastErrorText() else "";
+        s.remember("log write failed", if (detail.len > 0) detail else @errorName(e));
+        if (s.client) |c| c.close();
+        s.client = null;
+        s.retry_after_ms = t + retry_ms;
+    }
+
     /// Writes the buffered rows; on failure keeps them and backs off. Called with `mu` held, and
     /// only without a flusher.
     fn flushLocked(s: *PgSink) void {
@@ -269,11 +279,7 @@ pub const PgSink = struct {
         const t = now(s.io);
         if (t < s.retry_after_ms) return;
         const n = s.writeRows(s.rows.items) catch |e| {
-            const detail = if (s.client) |c| c.lastErrorText() else "";
-            s.remember("log write failed", if (detail.len > 0) detail else @errorName(e));
-            if (s.client) |c| c.close();
-            s.client = null;
-            s.retry_after_ms = t + 2000;
+            s.writeFailed(e, t);
             return;
         };
         s.written += n;
@@ -288,13 +294,7 @@ pub const PgSink = struct {
         if (s.client == null) {
             const c = try pg.Client.connect(s.gpa, s.io, s.cfg);
             s.client = c;
-            if (s.schema) |sc| {
-                var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
-                defer arena_state.deinit();
-                var aw: Io.Writer.Allocating = .init(arena_state.allocator());
-                try @import("db.zig").writeSetSchema(&aw.writer, sc);
-                try c.exec(aw.written());
-            }
+            if (s.schema) |sc| try db.setSchema(s.gpa, c, sc);
         }
         var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena_state.deinit();
@@ -437,12 +437,7 @@ test "the buffer is capped: the oldest lines are dropped and counted when the da
     pgs.flush_ms = 1_000_000;
     pgs.last_flush_ms = Io.Clock.real.now(std.testing.io).toMilliseconds();
     defer pgs.close();
-    for (0..8) |i| {
-        _ = i;
-        var line_buf: [8]u8 = undefined;
-        _ = &line_buf;
-        try pgs.append(1, 0, .stdout, "x");
-    }
+    for (0..8) |_| try pgs.append(1, 0, .stdout, "x");
     try std.testing.expectEqual(@as(usize, 5), pgs.rows.items.len);
     try std.testing.expectEqual(@as(u64, 3), pgs.dropped);
     // seq keeps counting, so the gap is visible in the data.
@@ -468,18 +463,18 @@ test "integration: a line's number in its step reaches the database, and a runne
     defer sc.destroy();
     var console_out: Io.Writer.Allocating = .init(arena);
     var console: sink.LogSink = .{ .stdout = .{ .writer = &console_out.writer } };
-    var db: sink.LogSink = .{ .postgres = testSink(&sc, &console) };
-    defer db.postgres.close();
+    var db_sink: sink.LogSink = .{ .postgres = testSink(&sc, &console) };
+    defer db_sink.postgres.close();
 
     // As a job logs: through the collector, which numbers a line in its step and passes the number
     // down. Two steps, interleaved, so the numbering cannot be a count of the job's lines.
-    var collect: sink.LogSink = .{ .collect = .{ .arena = arena, .io = std.testing.io, .inner = &db } };
+    var collect: sink.LogSink = .{ .collect = .{ .arena = arena, .io = std.testing.io, .inner = &db_sink } };
     try collect.append(7, 1, .stdout, "step one, first");
     try collect.append(7, 2, .stdout, "step two, first");
     try collect.append(7, 1, .stdout, "step one, second");
     // As the runner logs its own messages: no step of its own, so no number in one.
-    try db.append(7, 0, .stderr, "job succeeded");
-    try db.flush();
+    try db_sink.append(7, 0, .stderr, "job succeeded");
+    try db_sink.flush();
 
     try std.testing.expectEqual(@as(u64, 4), try countLogs(&sc));
     // In the job's order the step numbers read 1, 1, 2: step two's first line falls between step
