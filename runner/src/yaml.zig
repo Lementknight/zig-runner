@@ -144,6 +144,18 @@ const Parser = struct {
     raw_null: bool = false,
     /// The source ends with a line break.
     final_break: bool,
+    /// Block collections open around the one being read. Each `- ` or `? ` on a line is a level
+    /// more, and the parser recurses into each: `- - - … x`, 70000 of them on one line (140 KB of a
+    /// third party's `action.yml`), overflowed the stack and took the runner down (#98).
+    depth: u32 = 0,
+
+    /// Far deeper than any real file, far shallower than the stack allows (40000 overflowed it).
+    const max_block_depth = 1000;
+
+    fn enter(p: *Parser, l: Line) Error!void {
+        if (p.depth >= max_block_depth) return p.unsupported(l, "block collections nested over 1000 deep");
+        p.depth += 1;
+    }
 
     fn invalid(p: *Parser, l: Line, msg: []const u8) Error {
         if (p.diag) |d| d.* = .{ .line = l.number, .message = msg };
@@ -205,6 +217,8 @@ const Parser = struct {
         const i = p.peek() orelse return .null;
         const l = p.lines[i];
         if (l.indent < min_indent) return .null;
+        try p.enter(l);
+        defer p.depth -= 1;
         p.pos = i;
         if (isSeqItem(l.text)) return p.seq(l.indent);
         if (isIndicator(l.text, '?')) return p.map(l.indent);
@@ -235,6 +249,8 @@ const Parser = struct {
     /// line, or on the lines that follow when the rest is empty.
     fn indicatorValue(p: *Parser, i: usize, indent: usize) Error!Node {
         const l = p.lines[i];
+        try p.enter(l);
+        defer p.depth -= 1;
         p.pos = i;
         const after = std.mem.trimStart(u8, l.text[1..], " ");
         if (after.len > 0 and after[0] == '\t') return p.invalid(l, tab_message);
@@ -1630,4 +1646,21 @@ test "what comparing with Go's YAML turned up: the null words, and explicit keys
     // An explicit key, not a key named "? ...".
     const e = try parse(ar, "a: {? \"multi\\nline\" : []}\n", null);
     try std.testing.expectEqual(@as(usize, 0), e.get("a").?.get("multi\nline").?.seq.len);
+}
+
+test "block collections nested on one line are refused past 1000 deep, not a stack overflow (#98)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    for ([_][]const u8{ "- ", "? " }) |indicator| {
+        var deep: std.ArrayList(u8) = .empty;
+        for (0..70_000) |_| try deep.appendSlice(ar, indicator);
+        try deep.append(ar, 'x');
+        var diag: Diag = .{};
+        try std.testing.expectError(error.UnsupportedYaml, parse(ar, deep.items, &diag));
+        try std.testing.expectEqualStrings("block collections nested over 1000 deep", diag.message);
+    }
+    // Real nesting still reads.
+    const ok = try parse(ar, "a:\n  - - - x\n", null);
+    try std.testing.expectEqualStrings("x", ok.get("a").?.seq[0].seq[0].seq[0].string);
 }

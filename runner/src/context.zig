@@ -11,6 +11,12 @@ const expr = @import("expr.zig");
 const Allocator = std.mem.Allocator;
 
 pub fn fromContextData(arena: Allocator, v: std.json.Value) Allocator.Error!expr.Value {
+    return fromContextDepth(arena, v, 0);
+}
+
+/// Bounded as `expr.fromJsonValue` is (`expr.max_value_nesting`): past it, null, not a stack overflow.
+fn fromContextDepth(arena: Allocator, v: std.json.Value, depth: u32) Allocator.Error!expr.Value {
+    if (depth >= expr.max_value_nesting) return .null;
     switch (v) {
         .null => return .null,
         .bool => |b| return .{ .boolean = b },
@@ -21,7 +27,7 @@ pub fn fromContextData(arena: Allocator, v: std.json.Value) Allocator.Error!expr
         .string => |s| return .{ .string = s },
         .array => |a| {
             const out = try arena.alloc(expr.Value, a.items.len);
-            for (a.items, out) |e, *o| o.* = try fromContextData(arena, e);
+            for (a.items, out) |e, *o| o.* = try fromContextDepth(arena, e, depth + 1);
             return .{ .array = out };
         },
         .object => |o| {
@@ -34,12 +40,12 @@ pub fn fromContextData(arena: Allocator, v: std.json.Value) Allocator.Error!expr
                     const val = item.object.get("v") orelse .null;
                     try entries.append(
                         arena,
-                        .{ .key = k.string, .value = try fromContextData(arena, val) },
+                        .{ .key = k.string, .value = try fromContextDepth(arena, val, depth + 1) },
                     );
                 }
                 return .{ .object = entries.items };
             };
-            if (o.get("a")) |a| if (a == .array) return fromContextData(arena, a);
+            if (o.get("a")) |a| if (a == .array) return fromContextDepth(arena, a, depth + 1);
             return expr.fromJsonValue(arena, v);
         },
     }
@@ -78,4 +84,17 @@ test "dictionaries, arrays, scalars and null" {
     try std.testing.expectEqualStrings("y", try expr.evalString(arena, "github.event.labels[1]", s));
     try std.testing.expectEqualStrings("", try expr.evalString(arena, "matrix.os", s));
     try std.testing.expectEqualStrings("", try expr.evalString(arena, "absent.x", s));
+}
+
+test "context data nested past expr.max_value_nesting becomes null, not a stack overflow (#98)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    var text: std.ArrayList(u8) = .empty;
+    for (0..200_000) |_| try text.append(ar, '[');
+    for (0..200_000) |_| try text.append(ar, ']');
+    const j = try std.json.parseFromSliceLeaky(std.json.Value, ar, text.items, .{});
+    const v = try fromContextData(ar, j);
+    try std.testing.expect(v == .array);
+    _ = try expr.fromJsonValue(ar, j);
 }
