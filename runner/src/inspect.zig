@@ -151,13 +151,14 @@ fn pollForMessage(
     while (polls < 6) : (polls += 1) {
         try out.print("GET message (poll {d}, long-poll ~50s) ...\n", .{polls + 1});
         try out.flush();
-        const m = try broker.call(
+        // A long poll: given longer than a request's usual deadline, as the runner's are.
+        const m = try broker.request(
             arena,
             io,
             .GET,
             try broker.messageUrl(arena, base, sid, "Online"),
-            token,
             null,
+            .{ .token = token, .deadline = .fromSeconds(90) },
         );
         try out.print(
             "GET message -> HTTP {d}, {d} body bytes\n",

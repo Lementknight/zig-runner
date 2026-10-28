@@ -6,6 +6,7 @@
 //! <text>`. Failures never block job completion: callers log the returned detail and carry on.
 const std = @import("std");
 const broker = @import("broker.zig");
+const http = @import("http.zig");
 const job_mod = @import("../job.zig");
 const sink = @import("../sink.zig");
 const timefmt = @import("../timefmt.zig");
@@ -255,8 +256,26 @@ fn putBlob(arena: Allocator, io: std.Io, url: []const u8, text: []const u8) !bro
     return broker.request(arena, io, .PUT, url, text, .{
         .content_type = "text/plain",
         .extra_headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }},
+        .deadline = blobDeadline(text.len),
     });
 }
+
+/// How long a blob upload of `bytes` may take: a request's deadline, and as long again for each
+/// `blob_rate` bytes, at most `blob_deadline_max`. A step's log is at most 1 MiB
+/// (`StepLogs.max_bytes`, 38 s), a job's up to 64 MiB (`sink.CollectSink.max_bytes`), and a
+/// Raspberry Pi on a slow uplink sends far less than a server: a fixed 30 s would cut off a big
+/// log that was still going up.
+pub fn blobDeadline(bytes: usize) std.Io.Duration {
+    const base = http.request_deadline.nanoseconds;
+    const ns = base + @as(i96, @intCast(bytes / blob_rate)) * std.time.ns_per_s;
+    return .{ .nanoseconds = @min(ns, blob_deadline_max.nanoseconds) };
+}
+
+/// The slowest upload rate, in bytes a second, that a blob upload's deadline allows for: 128 KiB/s,
+/// about 1 Mbit/s.
+const blob_rate = 128 * 1024;
+/// 64 MiB at `blob_rate` would be over 8 minutes; the job's end waits at most this long for one.
+pub const blob_deadline_max: std.Io.Duration = .fromSeconds(5 * 60);
 
 fn failed(arena: Allocator, what: []const u8, r: broker.Response) !Result {
     return .{
@@ -290,6 +309,14 @@ test "formatBlob prefixes timestamps and filters by step" {
     try std.testing.expectEqualStrings("1970-01-01T00:00:02.0000000Z hello\n1970-01-01T00:00:04.0000000Z done\n", s1.text);
     const all = try formatBlob(a.allocator(), &lines, null);
     try std.testing.expectEqual(@as(usize, 4), all.line_count);
+}
+
+test "a blob upload's deadline grows with its size, up to a cap" {
+    try std.testing.expectEqual(http.request_deadline, blobDeadline(0));
+    try std.testing.expectEqual(http.request_deadline, blobDeadline(blob_rate - 1));
+    // A step's whole log, at most.
+    try std.testing.expectEqual(std.Io.Duration.fromSeconds(38), blobDeadline(1 << 20));
+    try std.testing.expectEqual(blob_deadline_max, blobDeadline(64 << 20));
 }
 
 test "request bodies" {

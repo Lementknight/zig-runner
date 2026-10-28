@@ -47,17 +47,31 @@ pub fn staleClock(err: anyerror) bool {
     return err == error.CertificateNotYetValid or err == error.CertificateExpired;
 }
 
-/// `client.fetch`, tried again while a kept-alive connection turns out to be closed (no byte came
-/// back, so nothing was processed or written; see `broker.request`).
+/// How long one request to GitHub may take, from connecting to the last byte of its answer, before
+/// it is given up (`within`). GitHub's API and results service answer in well under a second, the
+/// slowest calls (generate-jitconfig, completejob) in a few, so 30 s is generous even for a
+/// Raspberry Pi's TLS handshake; a request with no answer by then is on a connection that died. A
+/// log upload once read a reused connection GitHub had dropped silently for 17 minutes, and its job
+/// sat "in progress" all that time (razorbill, 2026-10-28; #100). Long polls and blob uploads take
+/// longer and set their own (`broker.RequestOptions.deadline`).
+pub const request_deadline: std.Io.Duration = .fromSeconds(30);
+
+pub const FetchError = std.http.Client.FetchError || error{Timeout};
+
+/// `client.fetch` within `request_deadline`, tried again while a kept-alive connection turns out to
+/// be closed (no byte came back, so nothing was processed or written; see `broker.request`). Not
+/// tried again when the time runs out, as `broker.request` is: its callers (generate-jitconfig, the
+/// OAuth token) are tried again by the runner's cycle, and a registration sent twice makes two.
 pub fn fetch(
     c: *std.http.Client,
     options: std.http.Client.FetchOptions,
-) !std.http.Client.FetchResult {
+) FetchError!std.http.Client.FetchResult {
     var attempt: u32 = 0;
     var cl = c;
     var renewed = false;
     while (true) : (attempt += 1) {
-        return cl.fetch(options) catch |err| switch (err) {
+        const r = try within(cl.io, request_deadline, fetchOnce, .{ cl, options });
+        return (r orelse return error.Timeout) catch |err| switch (err) {
             error.HttpConnectionClosing => if (attempt < staleRetries(cl)) continue else err,
             else => if (!renewed and staleClock(err) and shared.load(.acquire) == cl) {
                 renew(cl);
@@ -69,6 +83,47 @@ pub fn fetch(
     }
 }
 
+/// `function(args)`, given up once `limit` passes: it runs next to a timer and whichever ends first
+/// cancels the other, which interrupts a blocked read or write (a request's connection is then not
+/// reused: see `broker.exchange`). Null when the time ran out. Without a task to run it in, it runs
+/// here, with no limit, as it did before there were limits.
+pub fn within(
+    io: std.Io,
+    limit: std.Io.Duration,
+    function: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(function)),
+) std.Io.Cancelable!?@typeInfo(@TypeOf(function)).@"fn".return_type.? {
+    const Ended = union(enum) {
+        done: @typeInfo(@TypeOf(function)).@"fn".return_type.?,
+        timeout: void,
+    };
+    var buf: [2]Ended = undefined;
+    var sel: std.Io.Select(Ended) = .init(io, &buf);
+    sel.concurrent(.done, function, args) catch return @call(.auto, function, args);
+    // Without a timer it is only waited for.
+    sel.concurrent(.timeout, sleep, .{ io, limit }) catch {};
+    const first = sel.await() catch |e| {
+        while (sel.cancel()) |_| {}
+        return e;
+    };
+    while (sel.cancel()) |_| {}
+    return switch (first) {
+        .done => |r| r,
+        .timeout => null,
+    };
+}
+
+fn sleep(io: std.Io, d: std.Io.Duration) void {
+    io.sleep(d, .awake) catch {};
+}
+
+fn fetchOnce(
+    c: *std.http.Client,
+    options: std.http.Client.FetchOptions,
+) std.http.Client.FetchError!std.http.Client.FetchResult {
+    return c.fetch(options);
+}
+
 /// Seconds idle before a connection is probed, between probes, and probes unanswered before it is
 /// given up: a peer that went away (the machine slept, the network dropped) is noticed within about
 /// 90 s even by a request that is only waiting to read, which nothing else would ever interrupt.
@@ -76,8 +131,16 @@ pub const keepalive_idle_secs = 60;
 pub const keepalive_interval_secs = 10;
 pub const keepalive_probes = 3;
 
-/// Turns on TCP keepalive for a connection's socket. Best effort: a socket that refuses keeps
-/// working as before.
+/// How long data sent may go unacknowledged before the kernel gives the connection up
+/// (`TCP_USER_TIMEOUT`), the same 90 s. Keepalive probes only an idle connection: a request written
+/// to a peer that had silently gone away is retransmitted instead, for as long as Linux's
+/// `tcp_retries2` allows, about 15 minutes, and a log upload read its answer for 17 (razorbill,
+/// 2026-10-28). A slow peer still acknowledges what it gets, so only a dead one is cut off.
+pub const unacked_limit_ms = (keepalive_idle_secs + keepalive_probes * keepalive_interval_secs) *
+    1000;
+
+/// Turns on TCP keepalive for a connection's socket, and the limit on unacknowledged data. Best
+/// effort: a socket that refuses keeps working as before.
 pub fn keepAlive(fd: std.posix.socket_t) void {
     if (builtin.os.tag != .linux) return;
     const linux = std.os.linux;
@@ -85,14 +148,16 @@ pub fn keepAlive(fd: std.posix.socket_t) void {
     const idle: c_int = keepalive_idle_secs;
     const interval: c_int = keepalive_interval_secs;
     const probes: c_int = keepalive_probes;
+    const unacked: c_uint = unacked_limit_ms;
     const P = std.posix;
     P.setsockopt(fd, linux.SOL.SOCKET, linux.SO.KEEPALIVE, std.mem.asBytes(&on)) catch return;
     P.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPIDLE, std.mem.asBytes(&idle)) catch {};
     P.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPINTVL, std.mem.asBytes(&interval)) catch {};
     P.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPCNT, std.mem.asBytes(&probes)) catch {};
+    P.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.USER_TIMEOUT, std.mem.asBytes(&unacked)) catch {};
 }
 
-test "keepAlive turns TCP keepalive on, with its timings" {
+test "keepAlive turns TCP keepalive on, with its timings and the limit on unacked data" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -114,6 +179,7 @@ test "keepAlive turns TCP keepalive on, with its timings" {
             .want = keepalive_interval_secs,
         },
         .{ .level = linux.IPPROTO.TCP, .name = linux.TCP.KEEPCNT, .want = keepalive_probes },
+        .{ .level = linux.IPPROTO.TCP, .name = linux.TCP.USER_TIMEOUT, .want = unacked_limit_ms },
     }) |o| {
         var got: c_int = 0;
         var len: linux.socklen_t = @sizeOf(c_int);

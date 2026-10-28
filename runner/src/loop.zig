@@ -12,6 +12,7 @@ const trust = @import("trust.zig");
 const dagger = @import("dagger.zig");
 const engine = @import("engine.zig");
 const results = @import("github/results.zig");
+const http = @import("github/http.zig");
 const db = @import("db.zig");
 const sink = @import("sink.zig");
 const redact = @import("redact.zig");
@@ -491,7 +492,8 @@ fn pollOnce(
     url: []const u8,
     token: []const u8,
 ) anyerror!broker.Response {
-    return broker.call(arena, io, .GET, url, token, null);
+    // No deadline of its own: `poll`'s timer is it.
+    return broker.request(arena, io, .GET, url, null, .{ .token = token, .deadline = null });
 }
 
 var stop_announced: std.atomic.Value(bool) = .init(false);
@@ -1598,7 +1600,11 @@ const CancelWatch = struct {
             // Stopped at the job's end by cancelling this poll, which the HTTP client can report as
             // an error other than Canceled. Without the `stop` check the watch then slept 5 s that
             // nothing interrupted, and the job's end waited it out: 5.1 s between every two jobs.
-            const m = broker.call(cc.arena, cc.io, .GET, w.session.url, token, null) catch |e| {
+            // A long poll, so a request's usual deadline would end every one (`poll_timeout`).
+            const m = broker.request(cc.arena, cc.io, .GET, w.session.url, null, .{
+                .token = token,
+                .deadline = poll_timeout,
+            }) catch |e| {
                 if (e == error.Canceled or w.stop.load(.acquire)) return;
                 cc.io.sleep(.fromSeconds(5), .awake) catch return;
                 continue;
@@ -1888,7 +1894,8 @@ fn extraShown(ids: []const []const u8, e: dagger.ExtraStep) Shown {
 /// Uploads each shown step's log that did not already go up as the step finished (`StepLogs`), the
 /// step summaries and the whole job's log, so GitHub's UI can show them, and waits for the steps'
 /// own uploads too: when this returns, every log is up or has failed. Failures are reported but
-/// never stop the job from completing.
+/// never stop the job from completing, and however many uploads hang, this returns within
+/// `Uploader.limit` (a request's deadline bounds each one already; this bounds them all).
 fn uploadLogs(
     c: Context,
     job: job_mod.Job,
@@ -1944,8 +1951,14 @@ fn uploadLogs(
             Upload.run(u, c.gpa, c.io, job, up);
     }
     // The steps' own uploads, long done but for the last ones; one that failed (or never started)
-    // goes up again now, with the rest.
-    if (early) |e| e.wait();
+    // goes up again now, with the rest. One still running after `early_wait` is given up on and
+    // goes up again too: a step's upload once hung for 17 minutes on a dead connection, and the
+    // job waited for it, "in progress" on GitHub (#100).
+    if (early) |e| if (!e.waitAtMost(up.early_wait)) try c.err.print(
+        "job {d}: a step's log upload was still running {d} s into the job's end; uploading it " ++
+            "again\n",
+        .{ job.check_run_id, @divTrunc(up.early_wait.nanoseconds, std.time.ns_per_s) },
+    );
     for (covered.items) |cv| {
         if (cv.early.result.ok) continue;
         uploads.appendAssumeCapacity(.{
@@ -1958,7 +1971,8 @@ fn uploadLogs(
         group.concurrent(c.io, Upload.run, .{ u, c.gpa, c.io, job, up }) catch
             Upload.run(u, c.gpa, c.io, job, up);
     }
-    group.await(c.io) catch {};
+    // Whatever is still running at the limit is cancelled, and reported as failed (Canceled).
+    _ = awaitAtMost(c.io, &group, up.limit);
     defer for (uploads.items) |*u| u.arena.deinit();
     for (covered.items) |cv| if (cv.early.result.ok) try c.err.print(
         "job {d}: log upload '{s}': ok, {s} (as the step finished)\n",
@@ -2011,11 +2025,41 @@ const Upload = struct {
     }
 };
 
-/// The results service's uploads, replaced in tests.
+/// The results service's uploads, and how long the job's end waits for them; replaced in tests.
 const Uploader = struct {
     log: *const @TypeOf(results.upload) = results.upload,
     summary: *const @TypeOf(results.uploadSummary) = results.uploadSummary,
+    /// How long the job's end waits for the steps' own uploads (`StepLogs`) before it uploads those
+    /// logs again itself. Twice a request's deadline: one of at most 1 MiB that is still running
+    /// then has met a dead connection (the 37 of 39 jobs of a stress test that wrapped up normally
+    /// did so 0.2-0.6 s after their last step).
+    early_wait: std.Io.Duration = default_early_wait,
+    /// How long all the uploads at the job's end may take before what is left is cancelled and
+    /// completejob goes ahead without it: `early_wait`, then the biggest blob's deadline
+    /// (`results.blob_deadline_max`) and a minute for the requests around it. A job not completed
+    /// stays "in progress" on GitHub, and its runner takes no new job.
+    limit: std.Io.Duration = .{
+        .nanoseconds = default_early_wait.nanoseconds + results.blob_deadline_max.nanoseconds +
+            60 * std.time.ns_per_s,
+    },
+
+    const default_early_wait: std.Io.Duration = .{
+        .nanoseconds = 2 * http.request_deadline.nanoseconds,
+    };
 };
+
+/// Waits for `group`, cancelling what is still running in it once `limit` passes. False when it
+/// did.
+fn awaitAtMost(io: std.Io, group: *std.Io.Group, limit: std.Io.Duration) bool {
+    // Cancelling a task in `Group.await` cancels the group's tasks too.
+    const done = http.within(io, limit, awaitGroup, .{ group, io }) catch null;
+    if (done == null) group.cancel(io);
+    return done != null;
+}
+
+fn awaitGroup(group: *std.Io.Group, io: std.Io) void {
+    group.await(io) catch {};
+}
 
 /// The bytes of a step's lines, without their timestamps: with the line count, what tells whether
 /// a log uploaded as its step finished is the step's whole log (`StepLogs.done`).
@@ -2127,13 +2171,24 @@ const StepLogs = struct {
 
     /// Waits for every upload started. No step may finish after this.
     fn wait(s: *StepLogs) void {
-        {
-            s.mu.lockUncancelable(s.io);
-            defer s.mu.unlock(s.io);
-            if (s.awaited) return;
-            s.awaited = true;
-        }
-        s.group.await(s.io) catch {};
+        if (s.stopSending()) s.group.await(s.io) catch {};
+    }
+
+    /// Waits for every upload started, cancelling those still running once `limit` passes (their
+    /// result is then a failure, so `uploadLogs` uploads them again). False when any was. No step
+    /// may finish after this.
+    fn waitAtMost(s: *StepLogs, limit: std.Io.Duration) bool {
+        if (!s.stopSending()) return true;
+        return awaitAtMost(s.io, &s.group, limit);
+    }
+
+    /// Ends `send`; false when that already happened.
+    fn stopSending(s: *StepLogs) bool {
+        s.mu.lockUncancelable(s.io);
+        defer s.mu.unlock(s.io);
+        if (s.awaited) return false;
+        s.awaited = true;
+        return true;
     }
 
     fn listener(s: *StepLogs) sink.CollectSink.Listener {
@@ -2921,6 +2976,103 @@ test "a step that finishes after the job's uploads began is uploaded at the end,
     try std.testing.expectEqual(@as(u32, 1), fake.lines.load(.monotonic));
     try std.testing.expect(o.extraStartedFn == null and o.postsFn == null);
     try std.testing.expect(logs.done(1, "a", 1, 1) == null);
+}
+
+/// The results service over a dead connection: the first upload of step "a" and every upload of
+/// the job's whole log never end until they are cancelled; the rest go up at once.
+const HungResults = struct {
+    var a_calls: std.atomic.Value(u32) = .init(0);
+
+    fn upload(
+        _: Allocator,
+        io: std.Io,
+        _: job_mod.Job,
+        which: results.Which,
+        _: results.Blob,
+    ) results.Result {
+        const hang = switch (which) {
+            .step => |id| std.mem.eql(u8, id, "a") and a_calls.fetchAdd(1, .acq_rel) == 0,
+            .job => true,
+        };
+        if (hang) io.sleep(.fromSeconds(600), .awake) catch
+            return .{ .ok = false, .detail = "Canceled" };
+        return .{ .ok = true, .detail = "up" };
+    }
+
+    fn summary(
+        _: Allocator,
+        _: std.Io,
+        _: job_mod.Job,
+        _: []const u8,
+        _: []const u8,
+    ) results.Result {
+        return .{ .ok = true, .detail = "" };
+    }
+};
+
+test "hung uploads hold up the job's end no longer than its limit, and a hung step's goes up again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var out_buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var err_buf: [4096]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+    var cfg: Config = .{ .gh_token = "", .scope = undefined };
+    const c = testContext(arena, &log, &err, &cfg);
+    HungResults.a_calls = .init(0);
+
+    const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 9, .secrets = &.{}, .steps = &.{} };
+    const ids = [_][]const u8{ "setup", "a" };
+    var fake: FakeLive = .{};
+    var logs = try StepLogs.init(
+        std.testing.allocator,
+        io,
+        &job,
+        &ids,
+        .{ .ptr = &fake, .onLine = FakeLive.onLine },
+        .{ .ptr = &fake, .startedFn = FakeLive.started, .finishedFn = FakeLive.finishedFn },
+    );
+    defer logs.deinit();
+    const up: Uploader = .{
+        .log = HungResults.upload,
+        .summary = HungResults.summary,
+        .early_wait = .fromMilliseconds(200),
+        .limit = .fromMilliseconds(600),
+    };
+    logs.up = up;
+    const kept = [_]sink.CollectedLine{
+        .{ .step = 0, .seq = 1, .ts_ms = 0, .text = "job acquired" },
+        .{ .step = 1, .seq = 2, .ts_ms = 0, .text = "one" },
+    };
+    const l = logs.listener();
+    for (kept) |k| l.onLine(l.ptr, k.step, k.seq, k.text);
+    // Step a's upload starts as it finishes, and hangs.
+    const o = logs.observer();
+    o.finishedFn(o.ptr, 1, .{ .outcome = .success });
+    try std.testing.expectEqual(@as(usize, 1), logs.sent.items.len);
+
+    const shown = [_]Shown{
+        .{ .id = "setup", .number = 0, .name = "Set up job", .log_step = 0, .conclusion = "succeeded" },
+        .{ .id = "a", .number = 1, .name = "a", .log_step = 1, .conclusion = "succeeded" },
+    };
+    const started = std.Io.Clock.awake.now(io);
+    try uploadLogs(c, job, &shown, &kept, &.{}, &.{}, &logs, up);
+    const took = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+    // Back by the limit (and not the 600 s the hung uploads would take), so completejob, next,
+    // goes ahead.
+    try std.testing.expect(took >= 600 and took < 3_000);
+
+    const said = err.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, said, "uploading it again") != null);
+    // Step a: given up as the step finished, and up at the end.
+    try std.testing.expectEqual(@as(u32, 2), HungResults.a_calls.load(.acquire));
+    try std.testing.expect(std.mem.indexOf(u8, said, "log upload 'a': ok, up (again; as the step finished: Canceled)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "log upload 'Set up job': ok, up") != null);
+    // The job's whole log: cancelled at the limit, and reported.
+    try std.testing.expect(std.mem.indexOf(u8, said, "log upload job: FAILED: Canceled") != null);
 }
 
 test "a runner short of memory stops asking for jobs, and asks again once memory is back" {
