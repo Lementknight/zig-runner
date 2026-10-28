@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The memory gate no longer throttles short jobs: a job''s memory is reserved while it ramps up or until it ends, whichever is sooner, not for two minutes regardless. A burst of short jobs went through at about 1.5 a minute on razorbill.'
+time: 2026-10-28T14:30:00.000000-04:00

@@ -133,11 +133,11 @@ pub fn pool(c: Context, n: u32) !Exit {
         break :m m;
     } else null;
     var group: std.Io.Group = .init;
-    for (slots) |*s| {
+    for (slots, 0..) |*s, i| {
         s.* = .{ .c = c };
         s.c.slow_outputs = slow;
         if (memory) |m| {
-            s.gate = .{ .pool = m };
+            s.gate = .{ .pool = m, .slot = i };
             s.c.gate = &s.gate;
         }
         group.concurrent(c.io, Slot.main, .{s}) catch |e| {
@@ -222,8 +222,12 @@ pub fn serve(c: Context) !Exit {
 
         const r = try cycle(cc);
         c.err.flush() catch {};
-        // Polling is over: the next cycle is let through, or not, afresh.
-        if (c.gate) |g| g.leave(false);
+        // Polling is over, and so is the job if there was one: the next cycle is let through, or
+        // not, afresh, and a job that ended reserves nothing any more.
+        if (c.gate) |g| {
+            g.leave(false);
+            g.ended();
+        }
         if (r == .held and !stopRequested()) continue;
         if (c.cfg.once) return switch (r) {
             .job => |ok| if (ok) .done else .github,
