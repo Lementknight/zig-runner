@@ -228,9 +228,7 @@ fn dockerRuns(arena: Allocator, runs: yaml.Node) Allocator.Error!Section(Runs) {
     } } };
 }
 
-const StepParsed = union(enum) { ok: Step, invalid: []const u8 };
-
-fn compositeStep(arena: Allocator, n: yaml.Node, index: usize) Allocator.Error!StepParsed {
+fn compositeStep(arena: Allocator, n: yaml.Node, index: usize) Allocator.Error!Section(Step) {
     if (n != .map) return .{ .invalid = try std.fmt.allocPrint(
         arena,
         "has step {d} that is not a mapping",

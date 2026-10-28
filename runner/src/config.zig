@@ -1,5 +1,7 @@
 //! Runner configuration (SPEC §2). Environment variables, overridden by flags.
 const std = @import("std");
+const pg = @import("pg.zig");
+const engine = @import("engine.zig");
 
 pub const Scope = union(enum) {
     repo: struct { owner: []const u8, name: []const u8 },
@@ -19,8 +21,6 @@ pub const Scope = union(enum) {
         return .{ .repo = .{ .owner = owner, .name = name } };
     }
 };
-
-const pg = @import("pg.zig");
 
 pub const JsRuntime = enum { bun, node };
 /// Who steps run as in the default image: `runner` (uid 1001, passwordless sudo), as on GitHub's
@@ -80,7 +80,7 @@ pub const Config = struct {
     /// is reported once and then ignored, because logging must never fail a job.
     log_spool_dir: []const u8 = "/tmp",
     /// Put uv's project environment inside its cache volume, so uv can hardlink into it instead of
-    /// copying every file (28.6 s against 0.2 s on a Raspberry Pi; see SPEC Â§6 "Package caches").
+    /// copying every file (28.6 s against 0.2 s on a Raspberry Pi; see SPEC §6 "Package caches").
     /// The workspace gets a `.venv` symlink to it, so paths into `.venv` still work. Only in jobs
     /// whose steps are not cached (`step_cache` off, or the job opted out): a replayed `uv sync`
     /// writes nothing into the volume, so later steps would run against whatever environment
@@ -93,7 +93,7 @@ pub const Config = struct {
     /// so it grows by about 50 MB for every source version built, until the engine collects it.
     zig_local_cache: bool = false,
     /// Output keys cost two walks of the job's filesystem, whatever the step changed: 25 s on a
-    /// large checkout against 1 s on a small one (STUDY.md Â§3.6). When a job spends longer than
+    /// large checkout against 1 s on a small one (STUDY.md §3.6). When a job spends longer than
     /// this on them, later jobs for that repository skip them until the runner restarts. 0 never
     /// skips.
     output_keys_max_ms: u32 = 10_000,
@@ -295,7 +295,7 @@ pub const Config = struct {
     }
 
     /// How jobs reach the engine, for `dagger.Options.engine`: null means a `dagger run` child.
-    pub fn engineEndpoint(c: *const Config) ?@import("engine.zig").Endpoint {
+    pub fn engineEndpoint(c: *const Config) ?engine.Endpoint {
         return switch (c.engine) {
             .direct => .{
                 .host = c.engine_host,
@@ -306,17 +306,20 @@ pub const Config = struct {
         };
     }
 
+    const max_millis = std.time.ms_per_hour;
+    const max_count = 1024;
+
     /// Milliseconds, up to an hour; 0 turns the limit off.
     fn millis(s: []const u8) error{InvalidNumber}!u32 {
         const n = try num(u32, s);
-        if (n > 3_600_000) return error.InvalidNumber;
+        if (n > max_millis) return error.InvalidNumber;
         return n;
     }
 
-    /// A runner count: 1 to 1024.
+    /// A count (of runners, of days): 1 to 1024.
     fn count(s: []const u8) error{InvalidNumber}!u32 {
         const n = try num(u32, s);
-        if (n < 1 or n > 1024) return error.InvalidNumber;
+        if (n < 1 or n > max_count) return error.InvalidNumber;
         return n;
     }
 

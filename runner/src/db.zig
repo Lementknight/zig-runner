@@ -135,6 +135,15 @@ pub fn writeSetSchema(w: *Io.Writer, schema: []const u8) Io.Writer.Error!void {
     try w.writeAll("\", public");
 }
 
+/// Sets `schema` as the connection's search path (`writeSetSchema`).
+pub fn setSchema(gpa: Allocator, c: *pg.Client, schema: []const u8) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var aw: Io.Writer.Allocating = .init(arena_state.allocator());
+    try writeSetSchema(&aw.writer, schema);
+    try c.exec(aw.written());
+}
+
 pub const Store = struct {
     gpa: Allocator,
     io: Io,
@@ -263,7 +272,7 @@ pub const Store = struct {
     fn dial(s: *Store) !void {
         const c = try pg.Client.connect(s.gpa, s.io, s.cfg);
         errdefer c.close();
-        if (s.schema) |sc| try execWith(s.gpa, c, writeSetSchemaFn, sc);
+        if (s.schema) |sc| try setSchema(s.gpa, c, sc);
         s.client = c;
     }
 
@@ -334,23 +343,6 @@ pub const Store = struct {
         };
     }
 };
-
-fn writeSetSchemaFn(w: *Io.Writer, schema: []const u8) Io.Writer.Error!void {
-    return writeSetSchema(w, schema);
-}
-
-fn execWith(
-    gpa: Allocator,
-    c: *pg.Client,
-    comptime build: fn (*Io.Writer, []const u8) Io.Writer.Error!void,
-    arg: []const u8,
-) !void {
-    var arena_state: std.heap.ArenaAllocator = .init(gpa);
-    defer arena_state.deinit();
-    var aw: Io.Writer.Allocating = .init(arena_state.allocator());
-    try build(&aw.writer, arg);
-    try c.exec(aw.written());
-}
 
 // --- tests ---
 

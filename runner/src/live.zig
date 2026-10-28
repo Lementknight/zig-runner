@@ -262,14 +262,16 @@ pub const Live = struct {
         };
     }
 
+    const send_interval_ms = 500;
+    const sleep_step_ms = 50;
+
     /// Sends every 500 ms, sleeping in short steps: `finish` waits for this to see `stop`, and
     /// waited out the rest of a 500 ms sleep (250 ms a job on average) before the job could end.
     fn run(l: *Live) void {
         while (!l.stop.load(.acquire)) {
             var waited: u32 = 0;
-            while (waited < 10 and !l.stop.load(.acquire)) : (waited += 1) {
-                l.io.sleep(.fromMilliseconds(50), .awake) catch return;
-            }
+            while (waited < send_interval_ms and !l.stop.load(.acquire)) : (waited += sleep_step_ms)
+                l.io.sleep(.fromMilliseconds(sleep_step_ms), .awake) catch return;
             if (l.stop.load(.acquire)) return;
             l.sendPending();
         }
@@ -449,6 +451,10 @@ fn freeLines(gpa: Allocator, lines: []const Pending) void {
     gpa.free(lines);
 }
 
+/// A step's `status`, as the results service numbers them (its protobuf enum).
+const status_in_progress = 3;
+const status_completed = 6;
+
 /// One step for `WorkflowStepsUpdate` (actions/runner's results `Step`: snake_case names, the
 /// status and conclusion as their protobuf numbers).
 fn writeStep(
@@ -466,8 +472,8 @@ fn writeStep(
     try std.json.Stringify.value(id, .{}, w);
     try w.print(",\"number\":{d},\"name\":", .{number});
     try std.json.Stringify.value(name, .{}, w);
-    // 3: in progress, 6: completed.
-    try w.print(",\"status\":{d}", .{@as(u8, if (completed) 6 else 3)});
+    const status: u8 = if (completed) status_completed else status_in_progress;
+    try w.print(",\"status\":{d}", .{status});
     if (started_ms > 0)
         try w.print(",\"started_at\":\"{s}\"", .{try timefmt.isoTime(arena, started_ms)});
     if (completed) {

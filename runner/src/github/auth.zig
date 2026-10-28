@@ -1,6 +1,7 @@
 //! Runner credentials and the OAuth client-credentials exchange (DESIGN §6 step 3).
-//! Field names are from `actions/runner` source and unverified against live GitHub.
+//! Field names are from `actions/runner` source.
 const std = @import("std");
+const http = @import("http.zig");
 const rsa_sign = @import("rsa_sign.zig");
 const jitconfig = @import("jitconfig.zig");
 
@@ -71,6 +72,9 @@ fn decodeB64(arena: Allocator, s: []const u8) Error![]u8 {
     return buf;
 }
 
+/// How long a client assertion is valid: it is exchanged for a token at once.
+const jwt_lifetime_secs = 300;
+
 /// Builds an RS256 client-assertion JWT. `now` is unix seconds.
 pub fn buildJwt(arena: Allocator, creds: Credentials, now: i64, jti: []const u8) Error![]const u8 {
     const header = "{\"alg\":\"RS256\",\"typ\":\"JWT\"}";
@@ -78,7 +82,7 @@ pub fn buildJwt(arena: Allocator, creds: Credentials, now: i64, jti: []const u8)
         arena,
         "{{\"sub\":\"{s}\",\"iss\":\"{s}\",\"aud\":\"{s}\"," ++
             "\"nbf\":{d},\"iat\":{d},\"exp\":{d},\"jti\":\"{s}\"}}",
-        .{ creds.client_id, creds.client_id, creds.authorization_url, now, now, now + 300, jti },
+        .{ creds.client_id, creds.client_id, creds.authorization_url, now, now, now + jwt_lifetime_secs, jti },
     );
 
     const h_len = b64url.Encoder.calcSize(header.len);
@@ -122,10 +126,10 @@ pub fn fetchAccessToken(
 
     var local: std.http.Client = .{ .allocator = arena, .io = io };
     defer local.deinit();
-    const client = @import("http.zig").client(&local);
+    const client = http.client(&local);
 
     var resp: std.Io.Writer.Allocating = .init(arena);
-    const result = try @import("http.zig").fetch(client, .{
+    const result = try http.fetch(client, .{
         .location = .{ .url = creds.authorization_url },
         .method = .POST,
         .payload = form,
@@ -154,7 +158,7 @@ test "parse credentials and build a verifiable JWT" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Reuse the signer's throwaway test key by re-deriving it from the same hex.
+    // The signer's throwaway test key.
     const creds: Credentials = .{
         .client_id = "cid",
         .authorization_url = "https://example.test/oauth2/token",

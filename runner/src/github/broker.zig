@@ -110,8 +110,11 @@ fn requestOnce(
         .{t},
     ) else null;
     const headers = try acceptJsonHeaders(scratch, opts.extra_headers);
-    // The default 1 KiB write buffer is smaller than the ~1.6 KiB bearer token; requests stall.
-    var local: std.http.Client = .{ .allocator = arena, .io = io, .write_buffer_size = 16 * 1024 };
+    var local: std.http.Client = .{
+        .allocator = arena,
+        .io = io,
+        .write_buffer_size = http.write_buffer_size,
+    };
     defer local.deinit();
     const client = http.client(&local);
 

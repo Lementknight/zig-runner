@@ -15,7 +15,11 @@ const Allocator = std.mem.Allocator;
 /// CertificateRequest), which Tiger Data and any Postgres configured with a CA file do. This one
 /// answers with an empty Certificate message, as RFC 8446 §4.4.2 says a client without one does.
 const tls = @import("tls");
+const http = @import("github/http.zig");
 const Io = std.Io;
+
+/// PostgreSQL's port, when the URL or PGPORT names none.
+pub const default_port = 5432;
 
 pub const SslMode = enum {
     /// Plain TCP. For local development containers.
@@ -28,7 +32,7 @@ pub const SslMode = enum {
 
 pub const Config = struct {
     host: []const u8,
-    port: u16 = 5432,
+    port: u16 = default_port,
     user: []const u8,
     password: []const u8 = "",
     database: []const u8,
@@ -73,7 +77,7 @@ pub fn parseUrl(arena: Allocator, url: []const u8) ParseError!Config {
     if (user.len == 0) return error.InvalidUrl;
 
     var host = hostport;
-    var port: u16 = 5432;
+    var port: u16 = default_port;
     if (std.mem.lastIndexOfScalar(u8, hostport, ':')) |colon| {
         host = hostport[0..colon];
         port = std.fmt.parseInt(u16, hostport[colon + 1 ..], 10) catch return error.InvalidUrl;
@@ -112,7 +116,7 @@ pub fn fromEnv(env: *const std.process.Environ.Map) ParseError!?Config {
     return .{
         .host = host,
         .port = if (env.get("PGPORT")) |p| std.fmt.parseInt(u16, p, 10) catch
-            return error.InvalidUrl else 5432,
+            return error.InvalidUrl else default_port,
         .user = user,
         .password = env.get("PGPASSWORD") orelse "",
         .database = database,
@@ -249,20 +253,18 @@ const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const Scram = struct {
-    /// The SCRAM user name. PostgreSQL ignores it (it uses the startup user), so it is empty on the
-    /// wire.
-    username: []const u8 = "",
     client_nonce: []const u8,
     /// `n=<user>,r=<nonce>`
     client_first_bare: []const u8,
 
+    /// `username` is the SCRAM user name. PostgreSQL ignores it (it uses the startup user), so the
+    /// client passes it empty.
     pub fn init(
         arena: Allocator,
         username: []const u8,
         client_nonce: []const u8,
     ) Allocator.Error!Scram {
         return .{
-            .username = username,
             .client_nonce = client_nonce,
             .client_first_bare = try std.fmt.allocPrint(
                 arena,
@@ -397,7 +399,7 @@ pub const Client = struct {
         errdefer stream.close(io);
         // A database host that went away is then noticed (in about 90 s) by a query that is only
         // waiting for its answer, which would otherwise wait for good.
-        @import("github/http.zig").keepAlive(stream.socket.handle);
+        http.keepAlive(stream.socket.handle);
 
         const sock_len = tls.input_buffer_len + tls.output_buffer_len;
         const buffers = try gpa.alloc(u8, sock_len + 2 * plain_buf_len);
@@ -439,10 +441,17 @@ pub const Client = struct {
         gpa.destroy(c);
     }
 
+    /// The SSLRequest code, in place of a protocol version: 1234 in the high 16 bits, 5679 below.
+    const ssl_request_code = 80877103;
+    /// Protocol 3.0, as the StartupMessage gives it: the major version in the high 16 bits.
+    const protocol_version = 3 << 16;
+    /// The most of a COPY's data one CopyData message carries.
+    const copy_chunk_len = 64 * 1024;
+
     fn startTls(c: *Client, cfg: Config, plain: []u8) Error!void {
-        // SSLRequest: int32 length 8, int32 code 80877103.
+        // SSLRequest: int32 length 8, int32 code.
         c.w.writeInt(u32, 8, .big) catch return error.ConnectionClosed;
-        c.w.writeInt(u32, 80877103, .big) catch return error.ConnectionClosed;
+        c.w.writeInt(u32, ssl_request_code, .big) catch return error.ConnectionClosed;
         c.w.flush() catch return error.ConnectionClosed;
         const answer = c.r.takeByte() catch return error.ConnectionClosed;
         if (answer != 'S') return error.TlsRefused;
@@ -527,7 +536,7 @@ pub const Client = struct {
     /// ending in an empty name.
     fn startupMessage(arena: std.mem.Allocator, cfg: Config) ![]const u8 {
         var body: std.Io.Writer.Allocating = .init(arena);
-        try body.writer.writeInt(u32, 196608, .big); // protocol 3.0
+        try body.writer.writeInt(u32, protocol_version, .big);
         for ([_][2][]const u8{
             .{ "user", cfg.user },
             .{ "database", cfg.database },
@@ -637,12 +646,17 @@ pub const Client = struct {
 
     /// Runs a statement and returns all rows of its last result as text. Rows live in `arena`.
     pub fn query(c: *Client, arena: Allocator, sql: []const u8) Error!Rows {
+        try c.sendQuery(arena, sql);
+        return c.readResults(arena);
+    }
+
+    /// A Query message: `sql`, NUL-terminated, sent at once.
+    fn sendQuery(c: *Client, arena: Allocator, sql: []const u8) Error!void {
         var q: std.Io.Writer.Allocating = .init(arena);
         q.writer.writeAll(sql) catch return error.OutOfMemory;
         q.writer.writeByte(0) catch return error.OutOfMemory;
         c.sendMessage('Q', q.written()) catch return error.ConnectionClosed;
         c.flush() catch return error.ConnectionClosed;
-        return c.readResults(arena);
     }
 
     fn readResults(c: *Client, arena: Allocator) Error!Rows {
@@ -676,12 +690,7 @@ pub const Client = struct {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-
-        var q: std.Io.Writer.Allocating = .init(arena);
-        q.writer.writeAll(sql) catch return error.OutOfMemory;
-        q.writer.writeByte(0) catch return error.OutOfMemory;
-        c.sendMessage('Q', q.written()) catch return error.ConnectionClosed;
-        c.flush() catch return error.ConnectionClosed;
+        try c.sendQuery(arena, sql);
 
         // Wait for CopyInResponse ('G'); an error here means the statement was rejected.
         while (true) {
@@ -698,7 +707,7 @@ pub const Client = struct {
         }
         var off: usize = 0;
         while (off < data.len) {
-            const n = @min(data.len - off, 64 * 1024);
+            const n = @min(data.len - off, copy_chunk_len);
             c.sendMessage('d', data[off .. off + n]) catch return error.ConnectionClosed;
             off += n;
         }

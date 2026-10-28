@@ -8,6 +8,10 @@ const builtin = @import("builtin");
 /// tests and one-off commands, where each request gets its own client. `renew` replaces it.
 pub var shared: std.atomic.Value(?*std.http.Client) = .init(null);
 
+/// The write buffer of every client that sends a bearer token: std's default of 1 KiB is smaller
+/// than the ~1.6 KiB token, and requests stall.
+pub const write_buffer_size = 16 * 1024;
+
 /// The shared client, or `local` (owned by the caller) when there is none.
 pub fn client(local: *std.http.Client) *std.http.Client {
     return shared.load(.acquire) orelse local;
@@ -33,7 +37,8 @@ pub fn renew(stale: *std.http.Client) void {
 /// connections to api.github.com, all closed by GitHub a minute later: the next request found 8
 /// dead ones in a row and failed (the stale-registration sweep's listing, every time).
 pub fn staleRetries(c: ?*std.http.Client) u32 {
-    const kept: usize = if (c) |cl| cl.connection_pool.free_size else 32;
+    const default_pool: std.http.Client.ConnectionPool = .{};
+    const kept: usize = if (c) |cl| cl.connection_pool.free_size else default_pool.free_size;
     return @intCast(kept + 1);
 }
 

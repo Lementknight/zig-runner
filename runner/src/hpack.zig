@@ -7,12 +7,19 @@ const Allocator = std.mem.Allocator;
 
 pub const Error = error{ BadHpack, OutOfMemory };
 
+/// The dynamic table's size until the encoder says otherwise, and the most it may ask for: the
+/// SETTINGS_HEADER_TABLE_SIZE this side never raises (RFC 7541 §4.2, RFC 9113 §6.5.2).
+const default_table_size = 4096;
+
+/// What an entry costs in the table beyond its name and value (RFC 7541 §4.1).
+const entry_overhead = 32;
+
 pub const Decoder = struct {
     gpa: Allocator,
     /// Newest first: dynamic index 62 is `entries.items[len - 1]`.
     entries: std.ArrayList([2][]u8) = .empty,
     size: usize = 0,
-    max_size: usize = 4096,
+    max_size: usize = default_table_size,
 
     pub fn deinit(d: *Decoder) void {
         for (d.entries.items) |e| {
@@ -41,7 +48,7 @@ pub const Decoder = struct {
                 // Table size updates come before the block's first field (RFC 7541 §4.2).
                 if (fields) return error.BadHpack;
                 const size = try int(block, &i, 5);
-                if (size > 4096) return error.BadHpack;
+                if (size > default_table_size) return error.BadHpack;
                 d.max_size = size;
                 d.evict(0);
                 continue;
@@ -87,7 +94,7 @@ pub const Decoder = struct {
 
     /// `name` may be an entry's that the eviction frees (RFC 7541 §4.4), so it is copied first.
     fn add(d: *Decoder, name: []const u8, value: []const u8) Error!void {
-        const size = name.len + value.len + 32;
+        const size = name.len + value.len + entry_overhead;
         if (size > d.max_size) return d.evict(size);
         const n = try d.gpa.dupe(u8, name);
         errdefer d.gpa.free(n);
@@ -103,7 +110,7 @@ pub const Decoder = struct {
     fn evict(d: *Decoder, extra: usize) void {
         while (d.entries.items.len > 0 and d.size + extra > d.max_size) {
             const e = d.entries.orderedRemove(0);
-            d.size -= e[0].len + e[1].len + 32;
+            d.size -= e[0].len + e[1].len + entry_overhead;
             d.gpa.free(e[0]);
             d.gpa.free(e[1]);
         }

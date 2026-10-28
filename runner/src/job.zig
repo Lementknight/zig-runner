@@ -138,8 +138,7 @@ pub const Job = struct {
     steps: []const Step,
 };
 
-/// From the `SystemVssConnection` endpoint's `data`, and the `actions_uses_cache_service_v2`
-/// variable. A `services:` entry: a container that runs next to the job's steps for the whole job.
+/// A `services:` entry: a container that runs next to the job's steps for the whole job.
 pub const Service = struct {
     /// The key under `services:`: the name the steps reach it by, and `job.services.<name>`.
     name: []const u8,
@@ -155,6 +154,8 @@ pub const Service = struct {
     volumes: []const Template = &.{},
 };
 
+/// From the `SystemVssConnection` endpoint's `data`, and the `actions_uses_cache_service_v2`
+/// variable.
 pub const Runtime = struct {
     pipelines_url: []const u8 = "",
     cache_url: []const u8 = "",
@@ -388,19 +389,9 @@ fn parseImageReference(arena: Allocator, sv: Value, o: std.json.ObjectMap) Error
         const none: Action = .{ .unsupported = "uses: docker:// names no image" };
         return .{ .action = none, .uses_label = uses_label };
     }
-    var kv: []const Input = &.{};
-    if (o.get("inputs")) |iv| if (iv != .null) {
-        kv = mappingInputs(arena, iv) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Unsupported => {
-                const why = try std.fmt.allocPrint(
-                    arena,
-                    "uses: {s}: inputs must be strings or expressions",
-                    .{uses_label},
-                );
-                return .{ .action = .{ .unsupported = why }, .uses_label = uses_label };
-            },
-        };
+    const kv = try usesInputs(arena, o.get("inputs")) orelse {
+        const why = try badUsesInputs(arena, uses_label);
+        return .{ .action = .{ .unsupported = why }, .uses_label = uses_label };
     };
     return .{
         .action = .{ .docker = .{ .image = image, .inputs = kv } },
@@ -472,18 +463,24 @@ fn parseUses(
             "uses: {s} is not a valid action reference",
             .{label},
         ) };
-    var kv: []const Input = &.{};
-    if (inputs) |iv| if (iv != .null) {
-        kv = mappingInputs(arena, iv) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Unsupported => return .{ .unsupported = try std.fmt.allocPrint(
-                arena,
-                "uses: {s}: inputs must be strings or expressions",
-                .{label},
-            ) },
-        };
-    };
+    const kv = try usesInputs(arena, inputs) orelse
+        return .{ .unsupported = try badUsesInputs(arena, label) };
     return .{ .uses = .{ .owner = owner, .name = repo, .path = dir, .ref = ref, .inputs = kv } };
+}
+
+/// A `uses:` step's `with:` inputs, none when it has none; null when they are not all strings or
+/// expressions (`badUsesInputs` says so).
+fn usesInputs(arena: Allocator, inputs: ?Value) Allocator.Error!?[]const Input {
+    const iv = inputs orelse return &.{};
+    if (iv == .null) return &.{};
+    return mappingInputs(arena, iv) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unsupported => null,
+    };
+}
+
+fn badUsesInputs(arena: Allocator, label: []const u8) Allocator.Error![]const u8 {
+    return std.fmt.allocPrint(arena, "uses: {s}: inputs must be strings or expressions", .{label});
 }
 
 /// The directory of `uses: ./dir`, relative to the workspace ("" for its root); null when it would
@@ -505,17 +502,8 @@ fn parseLocalUses(arena: Allocator, local: []const u8, inputs: ?Value) Error!Act
             "uses: {s}: a local action must be inside the workspace",
             .{local},
         ) };
-    var kv: []const Input = &.{};
-    if (inputs) |iv| if (iv != .null) {
-        kv = mappingInputs(arena, iv) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Unsupported => return .{ .unsupported = try std.fmt.allocPrint(
-                arena,
-                "uses: {s}: inputs must be strings or expressions",
-                .{local},
-            ) },
-        };
-    };
+    const kv = try usesInputs(arena, inputs) orelse
+        return .{ .unsupported = try badUsesInputs(arena, local) };
     return .{ .uses = .{
         .owner = "",
         .name = "",
@@ -684,13 +672,7 @@ fn inList(list: []const []const u8, name: []const u8) bool {
 /// `contextData.github` is `{t, d:[{k, v}]}` with plain string values.
 fn githubContext(arena: Allocator, root: Value) Github {
     var g: Github = .{};
-    const cd = root.object.get("contextData") orelse return g;
-    if (cd != .object) return g;
-    const gh = cd.object.get("github") orelse return g;
-    if (gh != .object) return g;
-    const d = gh.object.get("d") orelse return g;
-    if (d != .array) return g;
-    for (d.array.items) |e| {
+    for (contextEntries(root, "github")) |e| {
         if (e != .object) continue;
         const k = e.object.get("k") orelse continue;
         const v = e.object.get("v") orelse continue;
@@ -724,7 +706,7 @@ fn githubContext(arena: Allocator, root: Value) Github {
 
 /// A mapping token as inputs: keys must be literal; values are literals or expressions.
 fn mappingInputs(arena: Allocator, v: Value) error{ OutOfMemory, Unsupported }![]const Input {
-    if (tokenType(v) != 2) return error.Unsupported;
+    if (tokenType(v) != Token.mapping) return error.Unsupported;
     var out: std.ArrayList(Input) = .empty;
     const map = v.object.get("map") orelse return out.items;
     if (map != .array) return error.Unsupported;
@@ -742,7 +724,7 @@ fn mappingInputs(arena: Allocator, v: Value) error{ OutOfMemory, Unsupported }![
 /// `jobServiceContainers`: a mapping of name to a mapping (`image`, `env`, `ports`, `options`,
 /// `credentials`, `volumes`), or to just the image.
 fn parseServices(arena: Allocator, v: Value) error{ OutOfMemory, Unsupported }![]const Service {
-    if (tokenType(v) != 2) return error.Unsupported;
+    if (tokenType(v) != Token.mapping) return error.Unsupported;
     var out: std.ArrayList(Service) = .empty;
     const map = v.object.get("map") orelse return out.items;
     if (map != .array) return error.Unsupported;
@@ -762,36 +744,34 @@ fn parseService(
     name: []const u8,
     body: Value,
 ) error{ OutOfMemory, Unsupported }!Service {
-    {
-        if (tokenTemplate(body)) |image| return .{ .name = name, .image = image };
-        if (tokenType(body) != 2) return error.Unsupported;
-        var svc: Service = .{ .name = name, .image = .{ .lit = "" } };
-        const fields = body.object.get("map") orelse return error.Unsupported;
-        if (fields != .array) return error.Unsupported;
-        for (fields.array.items) |f| {
-            if (f != .object) return error.Unsupported;
-            const key = literal(f.object.get("Key") orelse return error.Unsupported) orelse
-                return error.Unsupported;
-            const val = f.object.get("Value") orelse return error.Unsupported;
-            if (std.mem.eql(u8, key, "image")) {
-                svc.image = tokenTemplate(val) orelse return error.Unsupported;
-            } else if (std.mem.eql(u8, key, "env")) {
-                svc.env = try mappingInputs(arena, val);
-            } else if (std.mem.eql(u8, key, "ports")) {
-                svc.ports = try sequenceTemplates(arena, val);
-            } else if (std.mem.eql(u8, key, "volumes")) {
-                svc.volumes = try sequenceTemplates(arena, val);
-            } else if (std.mem.eql(u8, key, "options")) {
-                svc.options = tokenTemplate(val) orelse return error.Unsupported;
-            } else if (std.mem.eql(u8, key, "credentials")) {
-                for (try mappingInputs(arena, val)) |c| {
-                    if (std.mem.eql(u8, c.name, "username")) svc.username = c.value;
-                    if (std.mem.eql(u8, c.name, "password")) svc.password = c.value;
-                }
+    if (tokenTemplate(body)) |image| return .{ .name = name, .image = image };
+    if (tokenType(body) != Token.mapping) return error.Unsupported;
+    var svc: Service = .{ .name = name, .image = .{ .lit = "" } };
+    const fields = body.object.get("map") orelse return error.Unsupported;
+    if (fields != .array) return error.Unsupported;
+    for (fields.array.items) |f| {
+        if (f != .object) return error.Unsupported;
+        const key = literal(f.object.get("Key") orelse return error.Unsupported) orelse
+            return error.Unsupported;
+        const val = f.object.get("Value") orelse return error.Unsupported;
+        if (std.mem.eql(u8, key, "image")) {
+            svc.image = tokenTemplate(val) orelse return error.Unsupported;
+        } else if (std.mem.eql(u8, key, "env")) {
+            svc.env = try mappingInputs(arena, val);
+        } else if (std.mem.eql(u8, key, "ports")) {
+            svc.ports = try sequenceTemplates(arena, val);
+        } else if (std.mem.eql(u8, key, "volumes")) {
+            svc.volumes = try sequenceTemplates(arena, val);
+        } else if (std.mem.eql(u8, key, "options")) {
+            svc.options = tokenTemplate(val) orelse return error.Unsupported;
+        } else if (std.mem.eql(u8, key, "credentials")) {
+            for (try mappingInputs(arena, val)) |c| {
+                if (std.mem.eql(u8, c.name, "username")) svc.username = c.value;
+                if (std.mem.eql(u8, c.name, "password")) svc.password = c.value;
             }
         }
-        return svc;
     }
+    return svc;
 }
 
 /// A sequence token of literals or expressions.
@@ -799,7 +779,7 @@ fn sequenceTemplates(
     arena: Allocator,
     v: Value,
 ) error{ OutOfMemory, Unsupported }![]const Template {
-    if (tokenType(v) != 1) return error.Unsupported;
+    if (tokenType(v) != Token.sequence) return error.Unsupported;
     var out: std.ArrayList(Template) = .empty;
     const seq = v.object.get("seq") orelse return out.items;
     if (seq != .array) return error.Unsupported;
@@ -823,6 +803,17 @@ fn jobEnv(arena: Allocator, root: Value) Error![]const Input {
     return out.items;
 }
 
+/// The template-token types, as the top of this file describes them.
+const Token = struct {
+    const string = 0;
+    const sequence = 1;
+    const mapping = 2;
+    const expression = 3;
+    const boolean = 5;
+    const number = 6;
+};
+
+/// A token's `type`, string when it has none; -1 for what is not a token.
 fn tokenType(v: Value) i64 {
     if (v != .object) return -1;
     const t = v.object.get("type") orelse return 0;
@@ -833,11 +824,11 @@ fn tokenType(v: Value) i64 {
 fn literal(v: Value) ?[]const u8 {
     if (v != .object) return null;
     switch (tokenType(v)) {
-        0 => {
+        Token.string => {
             const l = v.object.get("lit") orelse return "";
             return if (l == .string) l.string else null;
         },
-        5 => {
+        Token.boolean => {
             const b = v.object.get("bool") orelse return null;
             return if (b == .bool) (if (b.bool) "true" else "false") else null;
         },
@@ -848,7 +839,7 @@ fn literal(v: Value) ?[]const u8 {
 /// A literal or an expression token as a `Template`; null for containers and null.
 pub fn tokenTemplate(v: Value) ?Template {
     if (literal(v)) |l| return .{ .lit = l };
-    if (v == .object and tokenType(v) == 3) {
+    if (v == .object and tokenType(v) == Token.expression) {
         const e = v.object.get("expr") orelse return null;
         if (e == .string) return .{ .expr = e.string };
     }
@@ -858,7 +849,7 @@ pub fn tokenTemplate(v: Value) ?Template {
 /// A number token (`{"type":6,"num":1}`, how GitHub sends `timeout-minutes: 1`) as text; other
 /// tokens as `tokenTemplate` reads them.
 fn numberTemplate(arena: Allocator, v: Value) Allocator.Error!?Template {
-    if (v == .object and tokenType(v) == 6) {
+    if (v == .object and tokenType(v) == Token.number) {
         const n = v.object.get("num") orelse return null;
         return .{ .lit = switch (n) {
             .integer => |i| try std.fmt.allocPrint(arena, "{d}", .{i}),
@@ -908,9 +899,7 @@ fn collectSecretVars(arena: Allocator, root: Value) Allocator.Error![]const EnvV
     var it = vars.object.iterator();
     while (it.next()) |e| {
         const v = e.value_ptr.*;
-        if (v != .object) continue;
-        const secret = v.object.get("isSecret") orelse continue;
-        if (secret != .bool or !secret.bool) continue;
+        if (!isSecretVariable(v)) continue;
         const name = e.key_ptr.*;
         if (std.mem.startsWith(u8, name, "system.")) continue;
         const val = path(v, &.{"value"}) orelse continue;
@@ -928,23 +917,22 @@ fn collectSecrets(arena: Allocator, root: Value) Allocator.Error![]const []const
     var it = vars.object.iterator();
     while (it.next()) |e| {
         const v = e.value_ptr.*;
-        if (v != .object) continue;
-        const secret = v.object.get("isSecret") orelse continue;
-        if (secret != .bool or !secret.bool) continue;
+        if (!isSecretVariable(v)) continue;
         if (path(v, &.{"value"})) |val| if (val.len > 0) try out.append(arena, val);
     }
     return out.items;
 }
 
+/// Whether an entry of `variables` is flagged `isSecret`.
+fn isSecretVariable(v: Value) bool {
+    if (v != .object) return false;
+    const secret = v.object.get("isSecret") orelse return false;
+    return secret == .bool and secret.bool;
+}
+
 /// `contextData.job` is `{"t":N,"d":[{"k":"check_run_id","v":123},...]}`.
 fn checkRunId(root: Value) u64 {
-    const cd = root.object.get("contextData") orelse return 0;
-    if (cd != .object) return 0;
-    const job = cd.object.get("job") orelse return 0;
-    if (job != .object) return 0;
-    const d = job.object.get("d") orelse return 0;
-    if (d != .array) return 0;
-    for (d.array.items) |e| {
+    for (contextEntries(root, "job")) |e| {
         if (e != .object) continue;
         const k = e.object.get("k") orelse continue;
         if (k != .string or !std.mem.eql(u8, k.string, "check_run_id")) continue;
@@ -954,15 +942,22 @@ fn checkRunId(root: Value) u64 {
     return 0;
 }
 
+/// The entries of a dictionary in `contextData` (`{"t":2,"d":[{"k":..,"v":..}]}`); none when the
+/// context is absent or is not one.
+fn contextEntries(root: Value, name: []const u8) []const Value {
+    const cd = root.object.get("contextData") orelse return &.{};
+    if (cd != .object) return &.{};
+    const context = cd.object.get(name) orelse return &.{};
+    if (context != .object) return &.{};
+    const d = context.object.get("d") orelse return &.{};
+    return if (d == .array) d.array.items else &.{};
+}
+
 fn runtime(root: Value) Runtime {
     var r: Runtime = .{};
     if (variable(root, "actions_uses_cache_service_v2")) |v|
         r.cache_v2 = std.ascii.eqlIgnoreCase(v, "true");
-    const res = root.object.get("resources") orelse return r;
-    if (res != .object) return r;
-    const eps = res.object.get("endpoints") orelse return r;
-    if (eps != .array) return r;
-    for (eps.array.items) |ep| {
+    for (endpoints(root)) |ep| {
         if (!std.mem.eql(u8, path(ep, &.{"name"}) orelse "", "SystemVssConnection")) continue;
         r.pipelines_url = path(
             ep,
@@ -977,14 +972,18 @@ fn runtime(root: Value) Runtime {
 }
 
 fn jobToken(root: Value) ?[]const u8 {
-    const eps = (root.object.get("resources") orelse return null);
-    if (eps != .object) return null;
-    const list = eps.object.get("endpoints") orelse return null;
-    if (list != .array) return null;
-    for (list.array.items) |ep| {
+    for (endpoints(root)) |ep| {
         if (path(ep, &.{ "authorization", "parameters", "AccessToken" })) |t| return t;
     }
     return null;
+}
+
+/// `resources.endpoints`; none when absent.
+fn endpoints(root: Value) []const Value {
+    const res = root.object.get("resources") orelse return &.{};
+    if (res != .object) return &.{};
+    const eps = res.object.get("endpoints") orelse return &.{};
+    return if (eps == .array) eps.array.items else &.{};
 }
 
 const fixture =
