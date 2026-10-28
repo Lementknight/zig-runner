@@ -205,6 +205,7 @@ jobs:
       packages: write # to push the image to ghcr.io
       id-token: write # to sign the image's provenance with Sigstore
       attestations: write # to store that provenance
+      artifact-metadata: write # to record the pushed image as the attestation's artifact
     env:
       RUN: ${{ needs.binaries-check.outputs.run != 'false' }}
     steps:

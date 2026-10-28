@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The image''s provenance step no longer warns "Failed to create storage record": the Image job may record the pushed image as the attestation''s artifact (artifact-metadata: write).'
+time: 2026-10-28T09:15:00.000000-04:00
