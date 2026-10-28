@@ -95,8 +95,13 @@ version per global cache. In a job that cache is the `zig` cache volume, keyed b
 whether the pull request comes from a fork and by the step user, so each of those pays it once per
 Zig version, and again whenever the engine's cache is lost: it is part of the 249 s after the reboot
 above. On razorbill's slower cores it is likely most of the 185 s Test phase in the first table,
-though that run was not split this way. GitHub's runners start with no cache, so CI's fallback and
-the release jobs probably pay it on every run; that was not measured.
+though that run was not split this way. GitHub's runners start with no cache, so CI's test jobs
+there and the release paid it on every run: the hosted test steps took 81-116 s, and a release
+compiled it three times (the image twice from source, 175 s and 187 s; the binaries once more,
+110 s). Both now call the compiler directly with `build.zig`'s module graph instead
+(`.github/scripts/zig-test.sh`, `build-binaries.sh`): the tests took 14.5 s cold on the laptop
+against 118.7 s through `zig build`. Only a pull request that touches the packaging still pays it,
+once, to check that `zig build` makes the same binary.
 
 ## Earlier measurements
 

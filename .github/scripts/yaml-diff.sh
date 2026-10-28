@@ -10,7 +10,7 @@
 #
 # runner/tools/yamlcorpus.zig compares the trees. yaml.zig may refuse what is outside its subset
 # (it says so); reading something differently, or reading what Go refuses, fails. Needs Go and
-# network access; not run in CI.
+# network access; CI runs it weekly (compare.yml), not on pull requests.
 #
 #   yaml-diff.sh [random files of each kind] [seed]     defaults: 2000, 1
 set -euo pipefail

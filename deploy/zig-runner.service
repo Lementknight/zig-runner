@@ -1,5 +1,6 @@
 # The runner as a systemd service, next to a Dagger engine started with a unix socket
-# (docs/DEPLOY.md, "Without containers"). Install:
+# (the deployment guide's "As a systemd service",
+# https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/DEPLOY.md). Install:
 #
 #   sudo install -m 0755 runner /usr/local/bin/zig-runner
 #   sudo install -m 0600 runner.env /etc/zig-runner.env
