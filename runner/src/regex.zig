@@ -56,6 +56,8 @@
 //! together (`(a+)+b` against a long run of `a`), and this is handed patterns from actions and
 //! lines from builds. Past the budget a match fails with `error.TooComplex` rather than hanging the
 //! runner, and the caller makes the matcher inert. (GitHub's runner sets a timeout for the same.)
+//! A backreference costs a step per character it compares, and memory grows with the steps taken
+//! and the number of groups, never with a group's number.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -961,17 +963,19 @@ const Inst = union(enum) {
     any: struct { dotall: bool, back: bool },
     set: struct { set: *const Set, fold: bool, back: bool },
     assert: Assert,
-    /// The text group `n` matched (the empty string when it took part in no match).
+    /// The text the group at index `n` matched (the empty string when it took part in no match).
     backref: struct { n: u32, fold: bool, back: bool },
     /// Try `a` first, then `b` from the same position.
     split: struct { a: usize, b: usize },
     jmp: usize,
-    /// Record the current position in capture slot `n` (group g uses 2g and 2g+1).
+    /// Record the current position in capture slot `n` (the group at index g uses 2g and 2g+1).
     save: usize,
-    /// Record where group `g` is opening, in its pending slot; `close` makes it the group's.
+    /// Record where the group at index `g` is opening, in its pending slot; `close` makes it the
+    /// group's.
     open: struct { g: u32, pending: usize },
-    /// Group `g` closes here: its capture is the pending position and this one. Until then a
-    /// backreference inside it still sees the previous iteration's (ECMAScript's self-reference).
+    /// The group at index `g` closes here: its capture is the pending position and this one. Until
+    /// then a backreference inside it still sees the previous iteration's (ECMAScript's
+    /// self-reference).
     close: struct { g: u32, pending: usize, back: bool },
     /// Record the position at the start of a loop iteration, in slot `n`.
     mark: usize,
@@ -982,7 +986,7 @@ const Inst = union(enum) {
     look: struct { behind: bool, negate: bool, body: usize, next: usize },
     /// Match `body` once, keep where it ended, never backtrack into it.
     atomic: struct { body: usize, next: usize },
-    /// Group `n` matched: go on; else to `no`.
+    /// The group at index `n` matched: go on; else to `no`.
     cond_group: struct { n: u32, no: usize },
     /// `body` (a lookahead) matches here: go on; else to `no`.
     cond_look: struct { body: usize, no: usize },
@@ -994,6 +998,9 @@ const Inst = union(enum) {
 const Compiler = struct {
     arena: Allocator,
     caps: []const Cap,
+    /// Group number to its index among the groups (1-based, 0 being the whole match): slots go by
+    /// index, so `(?<100000000>a)` needs as few as `(a)`.
+    index: *const std.AutoHashMapUnmanaged(u32, u32),
     prog: std.ArrayList(Inst) = .empty,
     /// Where loop slots start: after the capture slots.
     loop_slot_base: usize,
@@ -1056,9 +1063,9 @@ const Compiler = struct {
             .any => |a| try c.emit(.{ .any = .{ .dotall = a.dotall, .back = back } }),
             .set => |s| try c.emit(.{ .set = .{ .set = s.set, .fold = s.fold, .back = back } }),
             .assert => |a| try c.emit(.{ .assert = a }),
-            .backref => |r| try c.emit(.{ .backref = .{ .n = r.ref.number, .fold = r.fold, .back = back } }),
+            .backref => |r| try c.emit(.{ .backref = .{ .n = c.index.get(r.ref.number).?, .fold = r.fold, .back = back } }),
             .group => |g| {
-                const num: ?u32 = if (g.cap) |ci| c.caps[ci].number else null;
+                const num: ?u32 = if (g.cap) |ci| c.index.get(c.caps[ci].number).? else null;
                 const pending = if (num) |gi| c.pending_base + gi else 0;
                 if (num) |gi| try c.emit(.{ .open = .{ .g = gi, .pending = pending } });
                 try c.compileAlts(g.alts, back);
@@ -1082,7 +1089,7 @@ const Compiler = struct {
             .cond => |cd| {
                 const at = c.here();
                 if (cd.cond.ref) |r| {
-                    try c.emit(.{ .cond_group = .{ .n = r.number, .no = 0 } });
+                    try c.emit(.{ .cond_group = .{ .n = c.index.get(r.number).?, .no = 0 } });
                 } else {
                     // The lookahead's body sits after a jump over it.
                     try c.emit(.{ .cond_look = .{ .body = 0, .no = 0 } });
@@ -1172,11 +1179,20 @@ pub const Span = struct {
 /// (or a number no group has) is null, which is how `(?:(\d+):(\d+):)?` reports an absent line.
 pub const Captures = struct {
     whole: Span,
+    /// The pattern's group numbers, ascending, and each one's capture.
+    numbers: []const u32,
     groups: []const ?Span,
 
     pub fn group(c: Captures, n: usize) ?Span {
         if (n == 0) return c.whole;
-        return if (n <= c.groups.len) c.groups[n - 1] else null;
+        // Numbered 1 to N, as nearly every pattern is: the number is the place.
+        if (n <= c.numbers.len and c.numbers[n - 1] == n) return c.groups[n - 1];
+        const i = std.sort.binarySearch(u32, c.numbers, n, orderNumber) orelse return null;
+        return c.groups[i];
+    }
+
+    fn orderNumber(n: usize, x: u32) std.math.Order {
+        return std.math.order(n, x);
     }
 
     /// The text of group `n`, or null: what a problem matcher reads for `file`, `line` and so on.
@@ -1189,6 +1205,8 @@ pub const Regex = struct {
     prog: []const Inst,
     /// The highest group number.
     group_count: usize,
+    /// Every group number, ascending; a group's index (its slots) is its place here, plus one.
+    numbers: []const u32,
     /// Capture slots plus one per loop.
     slot_count: usize,
 
@@ -1205,15 +1223,26 @@ pub const Regex = struct {
         if (p.i != pattern.len) return error.BadPattern;
         const top = try p.resolve();
 
+        // Groups by index, not number: numbers may be sparse (`(?<100000000>a)`), and slots sized by
+        // the highest would be gigabytes per `find`.
+        var numbers: std.ArrayList(u32) = .empty;
+        var index: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        for (p.caps.items) |cap| if (!index.contains(cap.number)) {
+            try index.put(arena, cap.number, 0);
+            try numbers.append(arena, cap.number);
+        };
+        std.mem.sortUnstable(u32, numbers.items, {}, std.sort.asc(u32));
+        for (numbers.items, 1..) |n, i| index.putAssumeCapacity(n, @intCast(i));
+
         // Slots: the captures (2 per group, 0 for the whole match), each group's pending start, then
         // one per loop.
-        const groups = @as(usize, top) + 1;
-        var c: Compiler = .{ .arena = arena, .caps = p.caps.items, .pending_base = 2 * groups, .loop_slot_base = 3 * groups };
+        const groups = numbers.items.len + 1;
+        var c: Compiler = .{ .arena = arena, .caps = p.caps.items, .index = &index, .pending_base = 2 * groups, .loop_slot_base = 3 * groups };
         try c.emit(.{ .save = 0 });
         try c.compileAlts(alts, false);
         try c.emit(.{ .save = 1 });
         try c.emit(.match);
-        return .{ .prog = c.prog.items, .group_count = top, .slot_count = c.loop_slot_base + c.loops };
+        return .{ .prog = c.prog.items, .group_count = top, .numbers = numbers.items, .slot_count = c.loop_slot_base + c.loops };
     }
 
     /// The leftmost match at or after `from`, as .NET's `Regex.Match` finds it: start offsets are
@@ -1221,18 +1250,19 @@ pub const Regex = struct {
     pub fn find(re: Regex, arena: Allocator, input: []const u8, from: usize) Error!?Captures {
         const slots = try arena.alloc(?usize, re.slot_count);
         var steps: usize = 0;
-        var vm: Vm = .{ .input = input, .prog = re.prog, .slots = slots, .arena = arena, .steps = &steps, .search_start = from };
+        var levels: std.ArrayList(Vm.Level) = .empty;
+        var vm: Vm = .{ .input = input, .prog = re.prog, .slots = slots, .arena = arena, .steps = &steps, .search_start = from, .levels = &levels };
         var start = from;
         while (start <= input.len) {
             @memset(slots, null);
             if (try vm.run(0, start) != null) {
-                const groups = try arena.alloc(?Span, re.group_count);
+                const groups = try arena.alloc(?Span, re.numbers.len);
                 for (groups, 0..) |*g, i| {
                     const s = slots[2 * (i + 1)];
                     const e = slots[2 * (i + 1) + 1];
                     g.* = if (s != null and e != null and s.? <= e.?) .{ .start = s.?, .end = e.? } else null;
                 }
-                return .{ .whole = .{ .start = slots[0].?, .end = slots[1].? }, .groups = groups };
+                return .{ .whole = .{ .start = slots[0].?, .end = slots[1].? }, .numbers = re.numbers, .groups = groups };
             }
             start += if (decodeAt(input, start)) |d| d.len else 1;
         }
@@ -1252,6 +1282,10 @@ const Undo = struct { slot: usize, old: ?usize };
 /// is O(input length) for `.*` over a long line. Backtracking points live on the heap, and captures
 /// are undone from a trail. Nested bodies (lookaround, atomic groups) recurse once per nesting
 /// level of the pattern, which the parser bounds.
+///
+/// **Memory is bounded by the step budget**: a nested body runs on the same slots, with a stack and
+/// trail kept per nesting level and reused, so it allocates nothing per step; copying every slot
+/// for each lookaround took gigabytes with thousands of groups.
 const Vm = struct {
     input: []const u8,
     prog: []const Inst,
@@ -1261,6 +1295,14 @@ const Vm = struct {
     search_start: usize,
     stack: std.ArrayList(Backtrack) = .empty,
     trail: std.ArrayList(Undo) = .empty,
+    /// The backtracking stack and trail of each nesting level below the top one, kept for reuse.
+    levels: *std.ArrayList(Level),
+    depth: usize = 0,
+
+    const Level = struct {
+        stack: std.ArrayList(Backtrack) = .empty,
+        trail: std.ArrayList(Undo) = .empty,
+    };
 
     /// Runs from `start_pc` at `start_pos` to `match` or `done`; where it ended, or null.
     fn run(vm: *Vm, start_pc: usize, start_pos: usize) Error!?usize {
@@ -1327,16 +1369,14 @@ const Vm = struct {
                     break :blk if (stalled) g.exit else pc + 1;
                 },
                 .look => |l| blk: {
+                    // A positive lookaround's captures stand; a negative one has none (when its body
+                    // matched, this path fails and backtracking undoes them).
                     const got = try vm.nested(l.body, pos);
                     if ((got != null) == l.negate) break :blk null;
-                    // A positive lookaround's captures stand; a negative one has none.
-                    if (got) |g| try vm.adopt(g.slots);
                     break :blk l.next;
                 },
                 .atomic => |a| blk: {
-                    const got = try vm.nested(a.body, pos) orelse break :blk null;
-                    try vm.adopt(got.slots);
-                    pos = got.pos;
+                    pos = try vm.nested(a.body, pos) orelse break :blk null;
                     break :blk a.next;
                 },
                 .cond_group => |cg| blk: {
@@ -1345,8 +1385,7 @@ const Vm = struct {
                     break :blk if (s != null and e != null) pc + 1 else cg.no;
                 },
                 .cond_look => |cl| blk: {
-                    const got = try vm.nested(cl.body, pos) orelse break :blk cl.no;
-                    try vm.adopt(got.slots);
+                    _ = try vm.nested(cl.body, pos) orelse break :blk cl.no;
                     break :blk pc + 1;
                 },
             };
@@ -1370,45 +1409,66 @@ const Vm = struct {
         vm.slots[slot] = pos;
     }
 
-    /// A body run on its own from `pos`, with a copy of the captures; where it ended and its
-    /// captures, or null.
-    fn nested(vm: *Vm, pc: usize, pos: usize) Error!?struct { pos: usize, slots: []?usize } {
+    /// A body run on its own from `pos`, never backtracked into: where it ended, or null. On the same
+    /// slots, with the next level's stack and trail. When it matched, its captures are made this
+    /// path's (its trail joins this one, to be undone with it); when not, they are undone.
+    fn nested(vm: *Vm, pc: usize, pos: usize) Error!?usize {
+        const d = vm.depth;
+        if (vm.levels.items.len <= d) try vm.levels.append(vm.arena, .{});
+        const level = vm.levels.items[d];
         var child: Vm = .{
             .input = vm.input,
             .prog = vm.prog,
-            .slots = try vm.arena.dupe(?usize, vm.slots),
+            .slots = vm.slots,
             .arena = vm.arena,
             .steps = vm.steps,
             .search_start = vm.search_start,
+            .stack = level.stack,
+            .trail = level.trail,
+            .levels = vm.levels,
+            .depth = d + 1,
         };
-        const end = try child.run(pc, pos) orelse return null;
-        return .{ .pos = end, .slots = child.slots };
-    }
-
-    /// A nested body's captures, made this path's (and undone with it).
-    fn adopt(vm: *Vm, slots: []const ?usize) Error!void {
-        for (slots, 0..) |s, i| {
-            if (!std.meta.eql(s, vm.slots[i])) {
-                try vm.trail.append(vm.arena, .{ .slot = i, .old = vm.slots[i] });
-                vm.slots[i] = s;
+        const end = try child.run(pc, pos);
+        vm.levels.items[d] = .{ .stack = child.stack, .trail = child.trail };
+        const trail = child.trail.items;
+        if (end == null) {
+            var i = trail.len;
+            while (i > 0) {
+                i -= 1;
+                vm.slots[trail[i].slot] = trail[i].old;
             }
+            return null;
         }
+        try vm.trail.appendSlice(vm.arena, trail);
+        return end;
     }
 
-    /// `text` at `pos` (or, backwards, ending there), case folded when `fold`: where it ends.
+    /// `text` at `pos` (or, backwards, ending there), case folded when `fold`: where it ends. Each
+    /// character compared is a step (bytes, unfolded), so a long backreference tried at every
+    /// position, `(.*)\1b`, runs into the budget instead of costing one step each.
     fn matchText(vm: *Vm, text: []const u8, pos: usize, fold: bool, back: bool) ?usize {
         if (!fold) {
-            if (back) {
-                if (pos < text.len or !std.mem.eql(u8, vm.input[pos - text.len .. pos], text)) return null;
-                return pos - text.len;
-            }
-            if (!std.mem.startsWith(u8, vm.input[pos..], text)) return null;
-            return pos + text.len;
+            // The bytes that match, before the first that does not (or the input's end).
+            const room = if (back) pos else vm.input.len - pos;
+            const n = @min(text.len, room);
+            const there = if (back) vm.input[pos - n .. pos] else vm.input[pos..][0..n];
+            const want = if (back) text[text.len - n ..] else text[0..n];
+            const same = if (back) blk: {
+                var k: usize = 0;
+                while (k < n and there[n - 1 - k] == want[n - 1 - k]) k += 1;
+                break :blk k;
+            } else std.mem.indexOfDiff(u8, there, want) orelse n;
+            vm.steps.* += same;
+            if (same < text.len) return null;
+            return if (back) pos - text.len else pos + text.len;
         }
+        var compared: usize = 0;
+        defer vm.steps.* += compared;
         if (back) {
             var at = pos;
             var j = text.len;
             while (j > 0) {
+                compared += 1;
                 const want = decodeBefore(text, j).?;
                 const got = decodeBefore(vm.input, at) orelse return null;
                 if (!foldEq(want.c, got.c)) return null;
@@ -1420,6 +1480,7 @@ const Vm = struct {
         var at = pos;
         var j: usize = 0;
         while (j < text.len) {
+            compared += 1;
             const want = decodeAt(text, j).?;
             const got = decodeAt(vm.input, at) orelse return null;
             if (!foldEq(want.c, got.c)) return null;
@@ -1754,4 +1815,56 @@ test "class subtraction nested past max_depth is refused, not a stack overflow (
     const re = try Regex.compile(ar, "^[a-z-[aeiou]]+$");
     try std.testing.expect(try re.find(ar, "rhythm", 0) != null);
     try std.testing.expect(try re.find(ar, "audio", 0) == null);
+}
+
+fn repeat(arena: Allocator, s: []const u8, n: usize) ![]const u8 {
+    const out = try arena.alloc(u8, s.len * n);
+    for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+    return out;
+}
+
+test "a sparse group number costs no more than a small one, and is still read by its number" {
+    var a: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // Slots sized by the highest number took 48 MB per `find` for this one, 7 GB for 100000000.
+    const re = try Regex.compile(ar, "(b)?(?<1000000>a)\\k<1000000>(?(1000000)c|d)");
+    const m = (try re.find(ar, "aac", 0)).?;
+    try testing.expect(a.queryCapacity() < 64 * 1024);
+    try testing.expectEqual(1000000, re.group_count);
+    try testing.expectEqual(null, m.group(1));
+    try testing.expectEqual(null, m.group(2));
+    try testing.expectEqual(null, m.group(999999));
+    try testing.expectEqual(null, m.group(1000001));
+    try testing.expectEqualStrings("a", m.text(1000000, "aac").?);
+    try testing.expectEqualStrings("aac", m.text(0, "aac").?);
+}
+
+test "lookaround with many groups allocates nothing per step" {
+    var a: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // Copying every slot for each lookahead took 4.4 GB for 3000 groups on a 40 KB line.
+    const pattern = try std.mem.concat(ar, u8, &.{ try repeat(ar, "()", 1000), "(?:(?=.)(?>.))*$" });
+    const line = try repeat(ar, "a", 4000);
+    const re = try Regex.compile(ar, pattern);
+    const before = a.queryCapacity();
+    try testing.expect((try re.find(ar, line, 0)) != null);
+    try testing.expect(a.queryCapacity() - before < 4 * 1024 * 1024);
+}
+
+test "a backreference costs a step per character it compares" {
+    var a: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // A few thousand steps, comparing 300 000 characters or more: within the budget only if each
+    // comparison counted once. (`(?i)(.*)\1b` took 2 s on a 30 KB line.)
+    const run = try repeat(ar, "a", 2000);
+    const line = try std.mem.concat(ar, u8, &.{ run, "b", try repeat(ar, try std.mem.concat(ar, u8, &.{ run, "c" }), 150) });
+    for ([_][]const u8{ "^(a*)b(?:\\1c)*$", "(?i)^(a*)b(?:\\1c)*$", "^(a*)b(?:\\1(?<=\\1)c)*$", "(?i)^(a*)b(?:\\1(?<=\\1)c)*$" }) |pattern| {
+        const re = try Regex.compile(ar, pattern);
+        try testing.expectError(error.TooComplex, re.find(ar, line, 0));
+        // Short ones are as they were.
+        try testing.expect((try re.find(ar, "aabaacaac", 0)) != null);
+    }
 }
