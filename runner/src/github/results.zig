@@ -16,8 +16,22 @@ const Allocator = std.mem.Allocator;
 pub const service = "results.services.receiver.Receiver";
 
 pub const Blob = struct {
-    text: []const u8,
+    text: []const u8 = "",
     line_count: usize,
+    /// Written out as it is uploaded, in place of `text` (`KeptBlob`).
+    stream: ?broker.Body = null,
+
+    fn len(b: Blob) usize {
+        return if (b.stream) |s| s.len else b.text.len;
+    }
+
+    /// The blob's text, written out if it is streamed: for tests, which look at what went up.
+    pub fn textAlloc(b: Blob, arena: Allocator) ![]const u8 {
+        const s = b.stream orelse return b.text;
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        try s.writeFn(s.ptr, &aw.writer);
+        return aw.written();
+    }
 };
 
 /// Lines of one step (`step` set) or of the whole job (`step` null), in arrival order.
@@ -30,12 +44,89 @@ pub fn formatBlob(
     var n: usize = 0;
     for (lines) |l| {
         if (step) |s| if (l.step != s) continue;
-        const ts = try timefmt.isoTime7(arena, l.ts_ms);
+        var ts_buf: [64]u8 = undefined;
+        const ts = timefmt.isoTime7Buf(&ts_buf, l.ts_ms);
         aw.writer.print("{s} {s}\n", .{ ts, l.text }) catch return error.OutOfMemory;
         n += 1;
     }
     return .{ .text = aw.written(), .line_count = n };
 }
+
+/// One step's log (`step` set) or the whole job's (`step` null) as `formatBlob` writes it, read
+/// from the job's kept log (`sink.Kept`) as it is uploaded rather than held: the job's is up to
+/// the 64 MiB the log keeps, and with a step's beside it, both formatted in memory, a 200 MB log
+/// grew the runner by over 1 GB at the job's end.
+pub const KeptBlob = struct {
+    kept: *const sink.Kept,
+    io: std.Io,
+    step: ?u32,
+    /// Read buffer, at least a spool record's header (`Kept.iterate`).
+    buf: []u8,
+    /// The bytes it writes (`count`).
+    len: usize,
+
+    /// Each step's line count, text bytes and blob size, and the whole job's (`all`), in one read
+    /// of the log. `steps.len` is the number of log steps; a line of a step past it counts only in
+    /// `all`.
+    pub fn count(kept: *const Kept, io: std.Io, buf: []u8, steps: []Size) !Size {
+        @memset(steps, .{});
+        var all: Size = .{};
+        var it = kept.iterate(io, buf);
+        while (try it.next()) |l| {
+            var ts_buf: [64]u8 = undefined;
+            const size: Size = .{
+                .lines = 1,
+                .text_bytes = it.textLen(),
+                .bytes = timefmt.isoTime7Buf(&ts_buf, l.ts_ms).len + 1 + it.textLen() + 1,
+            };
+            all.add(size);
+            if (l.step < steps.len) steps[l.step].add(size);
+        }
+        return all;
+    }
+
+    pub const Size = struct {
+        lines: usize = 0,
+        /// The lines' text alone, as `StepLogs` counts it.
+        text_bytes: usize = 0,
+        /// The blob: each line's timestamp, a space, its text and a newline.
+        bytes: usize = 0,
+
+        fn add(s: *Size, o: Size) void {
+            s.lines += o.lines;
+            s.text_bytes += o.text_bytes;
+            s.bytes += o.bytes;
+        }
+    };
+
+    pub fn blob(b: *const KeptBlob, line_count: usize) Blob {
+        return .{
+            .line_count = line_count,
+            .stream = .{ .len = b.len, .ptr = b, .writeFn = write },
+        };
+    }
+
+    fn write(ptr: *const anyopaque, w: *std.Io.Writer) anyerror!void {
+        const b: *const KeptBlob = @ptrCast(@alignCast(ptr));
+        var it = b.kept.iterate(b.io, b.buf);
+        var written: usize = 0;
+        while (try it.next()) |l| {
+            if (b.step) |s| if (l.step != s) continue;
+            var ts_buf: [64]u8 = undefined;
+            const ts = timefmt.isoTime7Buf(&ts_buf, l.ts_ms);
+            // The log is only appended to, and `count` read the same part of it; a line that
+            // would go past `len` all the same ends the upload, not the runner (`broker.Body`).
+            written += ts.len + 1 + it.textLen() + 1;
+            if (written > b.len) return error.LogChangedWhileUploaded;
+            try w.writeAll(ts);
+            try w.writeByte(' ');
+            try it.writeText(w);
+            try w.writeByte('\n');
+        }
+    }
+};
+
+const Kept = sink.Kept;
 
 pub const Result = struct {
     ok: bool,
@@ -115,7 +206,7 @@ fn uploadInner(arena: Allocator, io: std.Io, job: job_mod.Job, which: Which, blo
         .detail = try std.fmt.allocPrint(arena, "{s}: no logs_url in response", .{get_method}),
     };
 
-    const put = try putBlob(arena, io, logs_url, blob.text);
+    const put = try putBlob(arena, io, logs_url, blob);
     if (put.status.class() != .success) return failed(arena, "blob upload", put);
 
     const uploaded_at = try timefmt.isoTime(arena, std.Io.Clock.real.now(io).toMilliseconds());
@@ -179,7 +270,7 @@ fn uploadSummaryInner(
         .ok = false,
         .detail = "GetStepSummarySignedBlobURL: no summary_url in response",
     };
-    const put = try putBlob(arena, io, url, markdown);
+    const put = try putBlob(arena, io, url, .{ .text = markdown, .line_count = 0 });
     if (put.status.class() != .success) return failed(arena, "summary upload", put);
     const uploaded_at = try timefmt.isoTime(arena, std.Io.Clock.real.now(io).toMilliseconds());
     // The ids, then the size and time (the object's closing brace is replaced).
@@ -250,13 +341,15 @@ fn updateStepsInner(
     return .{ .ok = true, .detail = "" };
 }
 
-/// PUTs `text` to a signed blob URL: no bearer token (the URL is the authorization), but Azure needs
-/// the blob type.
-fn putBlob(arena: Allocator, io: std.Io, url: []const u8, text: []const u8) !broker.Response {
+/// PUTs a blob to a signed blob URL: no bearer token (the URL is the authorization), but Azure
+/// needs the blob type.
+fn putBlob(arena: Allocator, io: std.Io, url: []const u8, blob: Blob) !broker.Response {
+    const text: ?[]const u8 = if (blob.stream == null) blob.text else null;
     return broker.request(arena, io, .PUT, url, text, .{
         .content_type = "text/plain",
         .extra_headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }},
-        .deadline = blobDeadline(text.len),
+        .deadline = blobDeadline(blob.len()),
+        .body = blob.stream,
     });
 }
 
@@ -309,6 +402,95 @@ test "formatBlob prefixes timestamps and filters by step" {
     try std.testing.expectEqualStrings("1970-01-01T00:00:02.0000000Z hello\n1970-01-01T00:00:04.0000000Z done\n", s1.text);
     const all = try formatBlob(a.allocator(), &lines, null);
     try std.testing.expectEqual(@as(usize, 4), all.line_count);
+}
+
+test "a kept log's blobs are read as they go up, as formatBlob makes them, through one buffer" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "spool", .{ .read = true });
+    defer file.close(io);
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var dbuf: [256]u8 = undefined;
+    var disc: std.Io.Writer.Discarding = .init(&dbuf);
+    var inner: sink.LogSink = .{ .stdout = .{ .writer = &disc.writer } };
+    var spool: sink.Spool = .{ .file = file, .io = io };
+    var log: sink.LogSink = .{ .collect = .{
+        .arena = arena,
+        .io = io,
+        .inner = &inner,
+        .spool = &spool,
+    } };
+
+    // Lines of three steps, interleaved; the last ones in memory after the spool stopped taking
+    // writes. Some lines are long, one has a newline in it, one is empty.
+    const long: [3000]u8 = @splat('y');
+    for (0..2000) |i| {
+        const step: u32 = @intCast(i % 3);
+        const text: []const u8 = switch (i) {
+            5 => "two\nlines",
+            6 => "",
+            else => if (i % 7 == 0) &long else "line",
+        };
+        if (i == 1500) spool.broken = true;
+        try log.append(1, step, .stdout, text);
+    }
+    const lines = log.collect.collected(arena);
+    try std.testing.expectEqual(@as(usize, 2000), lines.len);
+
+    const kept = log.collect.kept();
+    var buf: [64 * 1024]u8 = undefined;
+    var sizes: [3]KeptBlob.Size = undefined;
+    const all = try KeptBlob.count(&kept, io, &buf, &sizes);
+    for ([_]?u32{ 0, 1, 2, null }) |step| {
+        const want = try formatBlob(arena, lines, step);
+        const size = if (step) |s| sizes[s] else all;
+        try std.testing.expectEqual(want.line_count, size.lines);
+        try std.testing.expectEqual(want.text.len, size.bytes);
+        var blob_buf: [64 * 1024]u8 = undefined;
+        const kb: KeptBlob = .{
+            .kept = &kept,
+            .io = io,
+            .step = step,
+            .buf = &blob_buf,
+            .len = size.bytes,
+        };
+        try std.testing.expectEqualStrings(want.text, try kb.blob(size.lines).textAlloc(arena));
+    }
+
+    // 16 MB of log goes up through the 64 KiB buffer, and is never held.
+    const big_file = try tmp.dir.createFile(io, "big", .{ .read = true });
+    defer big_file.close(io);
+    var big_spool: sink.Spool = .{ .file = big_file, .io = io };
+    var big_log: sink.LogSink = .{ .collect = .{
+        .arena = arena,
+        .io = io,
+        .inner = &inner,
+        .spool = &big_spool,
+    } };
+    const line: [4096]u8 = @splat('z');
+    for (0..4096) |_| try big_log.append(1, 1, .stdout, &line);
+    const big = big_log.collect.kept();
+    var big_sizes: [2]KeptBlob.Size = undefined;
+    const big_all = try KeptBlob.count(&big, io, &buf, &big_sizes);
+    try std.testing.expectEqual(@as(usize, 4096), big_sizes[1].lines);
+    const kb: KeptBlob = .{ .kept = &big, .io = io, .step = 1, .buf = &buf, .len = big_all.bytes };
+    var sent: std.Io.Writer.Discarding = .init(&dbuf);
+    const stream = kb.blob(big_sizes[1].lines).stream.?;
+    try stream.writeFn(stream.ptr, &sent.writer);
+    try std.testing.expectEqual(@as(u64, big_all.bytes), sent.fullCount());
+
+    // And into a request, over a real connection.
+    const TestServer = @import("testserver.zig").Server;
+    var server: TestServer = undefined;
+    try server.start();
+    defer server.stop();
+    var url_buf: [64]u8 = undefined;
+    const url = server.url(&url_buf, "127.0.0.1", "/same");
+    const put = try broker.request(arena, io, .PUT, url, null, .{ .body = stream });
+    try std.testing.expectEqual(std.http.Status.found, put.status);
 }
 
 test "a blob upload's deadline grows with its size, up to a cap" {

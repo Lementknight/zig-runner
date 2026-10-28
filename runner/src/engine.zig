@@ -212,14 +212,33 @@ pub fn readHead(in: *In) !Head {
 
 /// Reads a whole body (fixed length, chunked, or none for 1xx/204/304).
 pub fn readBody(arena: Allocator, in: *In, head: Head) ![]u8 {
+    return readBodyAtMost(arena, in, head, no_limit);
+}
+
+/// The limit of a body read whole, whatever its size (`readBodyAtMost`).
+pub const no_limit = std.math.maxInt(usize);
+
+/// As `readBody`, failing with `error.ResponseTooLarge` once the body is past `limit` bytes,
+/// before more than that is held: what a step printed comes back in a body as large as its output
+/// (`Exec.recordedOutput`), and a 200 MB log read whole grew the runner by gigabytes. The rest of
+/// the body is left unread, so the connection must be closed.
+pub fn readBodyAtMost(arena: Allocator, in: *In, head: Head, limit: usize) ![]u8 {
     if (head.status / 100 == 1 or head.status == 204 or head.status == 304) return &.{};
     var out: std.ArrayList(u8) = .empty;
+    // Handed back: in an arena, the last allocation is reused.
+    errdefer out.deinit(arena);
     if (head.chunked) {
         var body: Chunked = .{ .in = in };
-        while (try body.next()) |part| try out.appendSlice(arena, part);
+        while (try body.next()) |part| {
+            if (part.len > limit - out.items.len) return error.ResponseTooLarge;
+            try out.appendSlice(arena, part);
+        }
         return out.items;
     }
     var left = head.content_length orelse return error.UnsupportedResponse;
+    if (left > limit) return error.ResponseTooLarge;
+    // Its length is known: one allocation, not a list doubling its way there in an arena.
+    try out.ensureTotalCapacityPrecise(arena, left);
     while (left > 0) {
         const part = try in.takeSome(left);
         if (part.len == 0) return error.EndOfStream;
@@ -521,6 +540,20 @@ pub const LogHandler = struct {
 pub const Sse = struct {
     line: std.ArrayList(u8) = .empty,
     data: std.ArrayList(u8) = .empty,
+    /// The event being read is past `max_event_bytes`: the rest of it is skipped.
+    skipping: bool = false,
+    /// While skipping: the current line had something in it (so it does not end the event).
+    skipped_line: bool = false,
+    /// The current line is a `data:` line: what follows of it goes to `data`.
+    in_data: bool = false,
+
+    /// The largest event read. The engine repeats a `stdout` field's value on the log stream (a
+    /// verbose record, `LogRecord.verbose`), one record however long the output: a 200 MB log
+    /// arrived as one event, read whole, then parsed whole, and the runner grew by over 1 GB to
+    /// skip it. Far above a batch of a step's ordinary output, which is never cut.
+    pub const max_event_bytes = 64 * 1024 * 1024;
+    /// What the buffers keep between events; a larger one's memory is handed back after it.
+    const retained_bytes = 1024 * 1024;
 
     /// Feeds body bytes; calls `onData` with each complete event's data.
     pub fn feed(
@@ -530,21 +563,69 @@ pub const Sse = struct {
         ctx: anytype,
         comptime onData: fn (@TypeOf(ctx), []const u8) void,
     ) !void {
-        for (bytes) |b| {
-            if (b != '\n') {
-                try s.line.append(gpa, b);
-                continue;
-            }
-            const line = std.mem.trimEnd(u8, s.line.items, "\r");
-            if (line.len == 0) {
-                if (s.data.items.len > 0) onData(ctx, s.data.items);
-                s.data.clearRetainingCapacity();
-            } else if (std.mem.startsWith(u8, line, "data:")) {
-                if (s.data.items.len > 0) try s.data.append(gpa, '\n');
-                try s.data.appendSlice(gpa, std.mem.trimStart(u8, line["data:".len..], " "));
-            }
-            s.line.clearRetainingCapacity();
+        var rest = bytes;
+        while (rest.len > 0) {
+            const nl = std.mem.indexOfScalar(u8, rest, '\n');
+            try s.take(gpa, rest[0 .. nl orelse rest.len]);
+            rest = rest[if (nl) |i| i + 1 else rest.len..];
+            if (nl == null) break;
+            s.endLine(gpa, ctx, onData);
         }
+    }
+
+    /// Part of a line. A `data:` line's bytes go to `data` as they arrive: read into `line` first,
+    /// then copied, a large event (a fast step's batch of output) was held twice.
+    fn take(s: *Sse, gpa: Allocator, piece: []const u8) !void {
+        if (s.skipping) {
+            if (std.mem.trim(u8, piece, "\r").len > 0) s.skipped_line = true;
+            return;
+        }
+        if (s.line.items.len + s.data.items.len + piece.len > max_event_bytes) {
+            s.skipping = true;
+            s.skipped_line = true;
+            s.in_data = false;
+            s.line.clearAndFree(gpa);
+            s.data.clearAndFree(gpa);
+            return;
+        }
+        if (s.in_data) return s.data.appendSlice(gpa, piece);
+        // The field's name may be split across pieces: gathered in `line` until it is known.
+        const field_line = if (s.line.items.len == 0) piece else blk: {
+            try s.line.appendSlice(gpa, piece);
+            break :blk s.line.items;
+        };
+        if (std.mem.startsWith(u8, field_line, "data:")) {
+            s.in_data = true;
+            if (s.data.items.len > 0) try s.data.append(gpa, '\n');
+            try s.data.appendSlice(gpa, std.mem.trimStart(u8, field_line["data:".len..], " "));
+            s.line.clearRetainingCapacity();
+        } else if (s.line.items.len == 0) try s.line.appendSlice(gpa, piece);
+    }
+
+    /// A line ended: a blank one ends the event.
+    fn endLine(
+        s: *Sse,
+        gpa: Allocator,
+        ctx: anytype,
+        comptime onData: fn (@TypeOf(ctx), []const u8) void,
+    ) void {
+        defer s.line.clearRetainingCapacity();
+        if (s.skipping) {
+            if (!s.skipped_line) s.skipping = false;
+            s.skipped_line = false;
+            return;
+        }
+        if (s.in_data) {
+            s.in_data = false;
+            if (std.mem.endsWith(u8, s.data.items, "\r")) s.data.items.len -= 1;
+            return;
+        }
+        // Any other field (`event:`, `id:`) is not used.
+        if (std.mem.trimEnd(u8, s.line.items, "\r").len > 0) return;
+        if (s.data.items.len > 0) onData(ctx, s.data.items);
+        if (s.data.capacity > retained_bytes) s.data.clearAndFree(gpa);
+        if (s.line.capacity > retained_bytes) s.line.clearAndFree(gpa);
+        s.data.clearRetainingCapacity();
     }
 
     pub fn deinit(s: *Sse, gpa: Allocator) void {
@@ -889,7 +970,7 @@ pub const Session = struct {
 
         var arena_state: std.heap.ArenaAllocator = .init(gpa);
         defer arena_state.deinit();
-        const init = try s.request(arena_state.allocator(), "POST", "/init", "");
+        const init = try s.request(arena_state.allocator(), "POST", "/init", "", no_limit);
         if (init.status / 100 != 2) return error.SessionInitFailed;
 
         if (log_handler != null) {
@@ -947,6 +1028,7 @@ pub const Session = struct {
         method: []const u8,
         path: []const u8,
         body: []const u8,
+        limit: usize,
     ) !Response {
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
@@ -964,7 +1046,7 @@ pub const Session = struct {
                     .{ "Content-Type", "application/json" },
                 }, body) catch |e| break :blk e;
                 const head = readHead(&c.in) catch |e| break :blk e;
-                const resp = readBody(arena, &c.in, head) catch |e| break :blk e;
+                const resp = readBodyAtMost(arena, &c.in, head, limit) catch |e| break :blk e;
                 break :blk .{ .status = head.status, .body = resp };
             };
             s.query_mu.lockUncancelable(s.io);
@@ -999,13 +1081,13 @@ pub const Session = struct {
         return true;
     }
 
-    /// A GraphQL query; the response body.
-    pub fn query(s: *Session, arena: Allocator, doc: []const u8) ![]const u8 {
+    /// A GraphQL query; the response body, `error.ResponseTooLarge` past `limit` bytes.
+    pub fn query(s: *Session, arena: Allocator, doc: []const u8, limit: usize) ![]const u8 {
         var body: Io.Writer.Allocating = .init(arena);
         try body.writer.writeAll("{\"query\":");
         try std.json.Stringify.value(doc, .{}, &body.writer);
         try body.writer.writeByte('}');
-        const r = try s.request(arena, "POST", "/query", body.written());
+        const r = try s.request(arena, "POST", "/query", body.written(), limit);
         if (r.status / 100 != 2 and r.body.len == 0) return error.QueryFailed;
         return r.body;
     }
@@ -1017,7 +1099,7 @@ pub const Session = struct {
         s.closed = true;
         var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena_state.deinit();
-        _ = s.request(arena_state.allocator(), "POST", "/shutdown", "") catch {};
+        _ = s.request(arena_state.allocator(), "POST", "/shutdown", "", no_limit) catch {};
         if (s.logs_task) |*t| {
             // The engine ends the stream once the session is gone; don't wait forever if it
             // doesn't.
@@ -1101,6 +1183,29 @@ test "HTTP responses: fixed length, chunked, 204 and 101" {
     const h4 = try readHead(&in);
     try std.testing.expectEqual(@as(u16, 101), h4.status);
     try std.testing.expectEqualStrings("rest", try in.take(4));
+}
+
+test "a body read at most so many bytes fails past them, fixed length or chunked" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var src: SliceSource = .{ .data = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello" ++
+        "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nhello!" };
+    var in = src.in();
+    const fits = try readBodyAtMost(arena, &in, try readHead(&in), 5);
+    try std.testing.expectEqualStrings("hello", fits);
+    try std.testing.expectError(
+        error.ResponseTooLarge,
+        readBodyAtMost(arena, &in, try readHead(&in), 5),
+    );
+
+    var chunked: SliceSource = .{ .data = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n" };
+    var in2 = chunked.in();
+    try std.testing.expectError(
+        error.ResponseTooLarge,
+        readBodyAtMost(arena, &in2, try readHead(&in2), 5),
+    );
 }
 
 test "Docker multiplexing: stdout frames are payload, stderr is kept for errors" {
@@ -1210,6 +1315,41 @@ test "server-sent events of OTLP log records" {
     try std.testing.expectEqualStrings("abc123|1|hi\n;abc123|2|oops;abc123|1||eof;def|0|hi\n|verbose;", got.list.items);
 }
 
+test "a server-sent event past max_event_bytes is skipped, not held, and the next one read" {
+    const gpa = std.testing.allocator;
+    const Count = struct {
+        events: usize = 0,
+        last: [16]u8 = undefined,
+        last_len: usize = 0,
+        fn onData(c: *@This(), data: []const u8) void {
+            c.events += 1;
+            c.last_len = @min(data.len, c.last.len);
+            @memcpy(c.last[0..c.last_len], data[0..c.last_len]);
+        }
+    };
+    var count: Count = .{};
+    var sse: Sse = .{};
+    defer sse.deinit(gpa);
+    // A verbose record of a step's whole output, in pieces as chunks arrive.
+    try sse.feed(gpa, "data: {\"resourceLogs\":\"", &count, Count.onData);
+    const piece: [1024 * 1024]u8 = @splat('x');
+    for (0..Sse.max_event_bytes / piece.len + 2) |_| {
+        try sse.feed(gpa, &piece, &count, Count.onData);
+        try std.testing.expect(sse.line.capacity + sse.data.capacity <= 2 * Sse.max_event_bytes);
+    }
+    try std.testing.expect(sse.skipping);
+    try std.testing.expectEqual(@as(usize, 0), sse.line.capacity);
+    // Its end, a second data line of it, and its blank line; then an event read as ever.
+    try sse.feed(gpa, "\"}\r\ndata: more of it\r\n\r\ndata: next\n\n", &count, Count.onData);
+    try std.testing.expectEqual(@as(usize, 1), count.events);
+    try std.testing.expectEqualStrings("next", count.last[0..count.last_len]);
+    // A field's name split across pieces, two data lines, and CRLF line ends.
+    for ([_][]const u8{ "id: 2\r\nda", "ta: a", "b\r\ndata:c\r", "\n\r", "\n" }) |p|
+        try sse.feed(gpa, p, &count, Count.onData);
+    try std.testing.expectEqual(@as(usize, 2), count.events);
+    try std.testing.expectEqualStrings("ab\nc", count.last[0..count.last_len]);
+}
+
 // Live, against the local engine: `ZIG_RUNNER_ENGINE_TEST=1 zig build test`.
 test "live: a session runs a query and streams its exec's output" {
     var env = try std.process.Environ.createMap(std.testing.environ, std.testing.allocator);
@@ -1240,7 +1380,7 @@ test "live: a session runs a query and streams its exec's output" {
     var nonce: [8]u8 = undefined;
     io.random(&nonce);
     const doc = try std.fmt.allocPrint(a.allocator(), "{{ container {{ from(address:\"alpine:3.22\") {{ withEnvVariable(name:\"N\",value:\"{x}\") {{ withExec(args:[\"sh\",\"-c\",\"echo out-line; echo err-line >&2; sleep 6; echo after-sleep\"]) {{ stdout }} }} }} }} }}", .{&nonce});
-    const resp = try s.query(a.allocator(), doc);
+    const resp = try s.query(a.allocator(), doc, no_limit);
     std.debug.print("\nquery response: {s}\n", .{resp});
     try std.testing.expect(std.mem.indexOf(u8, resp, "after-sleep") != null);
     // The health checks (every 5 s) kept the session alive through the sleep.

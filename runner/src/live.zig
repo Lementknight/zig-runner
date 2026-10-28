@@ -36,6 +36,8 @@ pub const Live = struct {
     /// collector dropped at its cap still used one, so counting arrivals here would renumber
     /// everything after it.
     pending: []std.ArrayList(Pending),
+    /// The text in `pending` (guarded by `mu`), at most `max_pending_bytes`.
+    pending_bytes: usize = 0,
     /// The steps GitHub has been told of, in the order they started (guarded by `mu`).
     steps: std.ArrayList(Step) = .empty,
     steps_changed: bool = false,
@@ -143,9 +145,23 @@ pub const Live = struct {
         l.mu.lockUncancelable(l.io);
         defer l.mu.unlock(l.io);
         if (l.finished) return;
+        // Past the cap the line is left out of the live view; the log uploaded at the step's end
+        // has it. The lines of a batch stay consecutive: after the first one left out, every line
+        // is until the next send, whose batch starts at its own line's number.
+        if (text.len > max_pending_bytes - l.pending_bytes) {
+            l.pending_bytes = max_pending_bytes;
+            return;
+        }
         const copy = l.gpa.dupe(u8, text) catch return;
-        l.pending[step].append(l.gpa, .{ .seq = seq, .text = copy }) catch l.gpa.free(copy);
+        l.pending[step].append(l.gpa, .{ .seq = seq, .text = copy }) catch return l.gpa.free(copy);
+        l.pending_bytes += text.len;
     }
+
+    /// The most text waiting for the feed. A step that logs faster than the feed sends (a million
+    /// lines in a few seconds) kept every line in memory, twice once its message was built, and
+    /// the runner grew by hundreds of MB; the feed is sent every `send_interval_ms`, so this still
+    /// shows 2 MB a second live.
+    const max_pending_bytes = 1 << 20;
 
     /// Steps that will not run (the job failed in "Set up job") still have their numbers in the
     /// final step list, so the steps after them start later.
@@ -308,6 +324,7 @@ pub const Live = struct {
                     continue;
                 };
             }
+            l.pending_bytes = 0;
         }
         if (steps_json) |js| {
             const r = results.updateSteps(arena, l.io, l.job.*, js, order);
@@ -423,10 +440,7 @@ pub const Live = struct {
         l.finished = true;
         for (l.steps.items) |s| l.gpa.free(s.name);
         l.steps.deinit(l.gpa);
-        for (l.pending) |*p| {
-            freeLines(l.gpa, p.items);
-            p.deinit(l.gpa);
-        }
+        for (l.pending) |*p| freePending(l.gpa, p);
     }
 
     pub const Final = struct {
@@ -449,6 +463,13 @@ pub const Live = struct {
 fn freeLines(gpa: Allocator, lines: []const Pending) void {
     for (lines) |line| gpa.free(line.text);
     gpa.free(lines);
+}
+
+/// A step's lines not sent, and its list. (`freeLines` is for a list's owned slice: its items
+/// alone are not its allocation.)
+fn freePending(gpa: Allocator, p: *std.ArrayList(Pending)) void {
+    for (p.items) |line| gpa.free(line.text);
+    p.deinit(gpa);
 }
 
 /// A step's `status`, as the results service numbers them (its protobuf enum).
@@ -518,4 +539,37 @@ test "steps update: in progress, then completed with a conclusion" {
     aw.clearRetainingCapacity();
     try writeStep(a.allocator(), &aw.writer, "id", 2, "Build", true, .failure, 1000, 2000);
     try std.testing.expectEqualStrings("{\"external_id\":\"id\",\"number\":2,\"name\":\"Build\",\"status\":6,\"started_at\":\"1970-01-01T00:00:01.000Z\",\"conclusion\":3,\"completed_at\":\"1970-01-01T00:00:02.000Z\"}", aw.written());
+}
+
+test "lines waiting for the feed are capped, and a batch stays consecutive past the cap" {
+    const gpa = std.testing.allocator;
+    const job: job_mod.Job = .{
+        .plan_id = "p",
+        .job_id = "j",
+        .job_token = "t",
+        .check_run_id = 9,
+        .secrets = &.{},
+        .steps = &.{},
+    };
+    var pending = [_]std.ArrayList(Pending){ .empty, .empty };
+    var l: Live = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .job = &job,
+        .log = undefined,
+        .ids = &.{ "a", "b" },
+        .pending = &pending,
+    };
+    defer for (&pending) |*p| freePending(gpa, p);
+    // A step logging 8 MB faster than the feed sends: 1 MB of it waits.
+    const line: [1000]u8 = @splat('x');
+    var seq: u64 = 1;
+    while (seq <= 8 * 1024) : (seq += 1) Live.onLine(&l, 1, seq, &line);
+    try std.testing.expect(l.pending_bytes <= Live.max_pending_bytes);
+    const kept = pending[1].items;
+    try std.testing.expectEqual(Live.max_pending_bytes / line.len, kept.len);
+    for (kept, 1..) |p, want| try std.testing.expectEqual(@as(u64, want), p.seq);
+    // A short line after the cap is left out too, so the batch has no gap in it.
+    Live.onLine(&l, 1, seq, "short");
+    try std.testing.expectEqual(Live.max_pending_bytes / line.len, pending[1].items.len);
 }

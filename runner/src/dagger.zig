@@ -907,6 +907,11 @@ const max_service_log_lines = 10_000;
 /// The largest step summary GitHub accepts (its `soft_size_limit`).
 const max_summary_bytes = 1024 * 1024;
 
+/// The largest answer to an exec's query read with its recorded output in it (`Exec.Recorded`): a
+/// step served from the cache with more output than this is not replayed. The answer is held about
+/// three times over while it is read and parsed, so this keeps a step's cost in the low tens of MB.
+const max_recorded_bytes = 4 * 1024 * 1024;
+
 /// Per level and step, as GitHub's runner limits them.
 const max_annotations = 10;
 
@@ -935,13 +940,19 @@ pub fn logSteps(n: usize) usize {
 /// Sends one GraphQL document to the Dagger session and returns the response body.
 pub const Transport = struct {
     ptr: *anyopaque,
-    sendFn: *const fn (ptr: *anyopaque, arena: Allocator, doc: []const u8) anyerror![]const u8,
+    /// The answer to `doc`, or `error.ResponseTooLarge` once it is past `limit` bytes.
+    sendFn: *const fn (
+        ptr: *anyopaque,
+        arena: Allocator,
+        doc: []const u8,
+        limit: usize,
+    ) anyerror![]const u8,
     /// Ends the document being sent, from another task, so `send` fails; false when none was in
     /// flight. Null when the transport cannot (the `dagger run` CLI): steps then run to their end.
     abortFn: ?*const fn (ptr: *anyopaque) bool = null,
 
-    fn send(t: Transport, arena: Allocator, doc: []const u8) ![]const u8 {
-        return t.sendFn(t.ptr, arena, doc);
+    fn send(t: Transport, arena: Allocator, doc: []const u8, limit: usize) ![]const u8 {
+        return t.sendFn(t.ptr, arena, doc, limit);
     }
 
     fn abort(t: Transport) bool {
@@ -1135,7 +1146,7 @@ const HttpTransport = struct {
     url: []const u8,
     auth: []const u8,
 
-    fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8) anyerror![]const u8 {
+    fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8, limit: usize) anyerror![]const u8 {
         const self: *HttpTransport = @ptrCast(@alignCast(ptr));
         var body: std.Io.Writer.Allocating = .init(arena);
         try body.writer.writeAll("{\"query\":");
@@ -1145,6 +1156,7 @@ const HttpTransport = struct {
             .extra_headers = &.{.{ .name = "Authorization", .value = self.auth }},
             // A query runs as long as what it runs (a step's exec); the job's cancel ends it.
             .deadline = null,
+            .max_body = limit,
         });
         // GraphQL errors can arrive with a non-2xx status; the body says what was wrong.
         if (r.status.class() != .success and r.body.len == 0) return error.DaggerSessionHttpError;
@@ -1169,7 +1181,20 @@ fn jsonFindString(v: std.json.Value, key: []const u8) ?[]const u8 {
 
 /// Runs a document and returns the parsed `data`, or the first GraphQL error message.
 fn gql(arena: Allocator, t: Transport, doc: []const u8, err_msg: *[]const u8) !std.json.Value {
-    const body = t.send(arena, doc) catch |e| {
+    return gqlAtMost(arena, t, doc, engine.no_limit, err_msg);
+}
+
+/// As `gql`, failing with `error.ResponseTooLarge` (and no `err_msg`) when the answer is past
+/// `limit` bytes, before more than that is held.
+fn gqlAtMost(
+    arena: Allocator,
+    t: Transport,
+    doc: []const u8,
+    limit: usize,
+    err_msg: *[]const u8,
+) !std.json.Value {
+    const body = t.send(arena, doc, limit) catch |e| {
+        if (e == error.ResponseTooLarge) return e;
         err_msg.* = try std.fmt.allocPrint(
             arena,
             "could not reach the Dagger session: {s}",
@@ -2018,6 +2043,10 @@ const Shared = struct {
     /// seen.
     live_lines: []std.atomic.Value(u32),
     ended: []std.atomic.Value(bool),
+    /// The step whose live output said Bun refused to load the program (`bun_load_errors`), 0 for
+    /// none: an exec's recorded output, where this was looked for, is no longer read back unless
+    /// it is replayed (`Exec.Recorded`). Cleared as each exec begins.
+    bun_refused: std.atomic.Value(u32) = .init(0),
     /// This job's `mark_env` value: a `begin` or `end` marker without it is a step's output.
     /// Set before the log reader starts, and never changed.
     mark: []const u8 = "",
@@ -2381,6 +2410,8 @@ const Shared = struct {
     fn emitLive(sh: *Shared, step: u32, text: []const u8) void {
         if (step >= 1 and step <= sh.live_lines.len)
             _ = sh.live_lines[step - 1].fetchAdd(1, .monotonic);
+        for (bun_load_errors) |e| if (std.mem.indexOf(u8, text, e) != null)
+            sh.bun_refused.store(step, .release);
         if (sh.swallowIfReplayed(step, text)) return;
         sh.stepOutput(step, text);
     }
@@ -2870,9 +2901,9 @@ fn envContext(
 const SessionTransport = struct {
     s: *engine.Session,
 
-    fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8) anyerror![]const u8 {
+    fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8, limit: usize) anyerror![]const u8 {
         const t: *SessionTransport = @ptrCast(@alignCast(ptr));
-        return t.s.query(arena, doc);
+        return t.s.query(arena, doc, limit);
     }
 
     fn abort(ptr: *anyopaque) bool {
@@ -2899,6 +2930,9 @@ const SpanDemux = struct {
         partial: std.ArrayList(u8) = .empty,
     };
 
+    /// The longest line joined from a span's pieces (`onRecord`).
+    const max_line_bytes = 1024 * 1024;
+
     fn onRecord(ptr: *anyopaque, rec: engine.LogRecord) void {
         const d: *SpanDemux = @ptrCast(@alignCast(ptr));
         if (rec.verbose) return;
@@ -2920,6 +2954,12 @@ const SpanDemux = struct {
             start = nl + 1;
         }
         span.partial.replaceRangeAssumeCapacity(0, start, &.{});
+        // Output with no newline in it (`head -c 200M /dev/zero`) is a line that never ends: past
+        // `max_line_bytes` what has come is a line of its own, rather than all of it held here.
+        if (span.partial.items.len >= max_line_bytes) {
+            d.line(span, span.partial.items);
+            span.partial.clearAndFree(d.gpa);
+        }
         if (rec.eof and span.partial.items.len > 0) {
             d.line(span, span.partial.items);
             span.partial.clearRetainingCapacity();
@@ -3349,7 +3389,11 @@ fn runStep(
     // 2. Step env and continue-on-error, then the step's own inputs.
     const step_env = ev.renderEnv(step.env, sc0) catch {
         const msg = try std.fmt.allocPrint(arena, "could not evaluate env: {s}", .{ev.diag});
-        try failStep(ev, x.sh, x.observer, step, res, num, msg, false);
+        // Still the step's failure, so its continue-on-error holds, read without its env: the
+        // job went on to fail, and skipped the steps after one that hit the expression memory
+        // limit on purpose.
+        const coe = std.mem.eql(u8, ev.render(step.continue_on_error, sc0) catch "false", "true");
+        try failStep(ev, x.sh, x.observer, step, res, num, msg, coe);
         return null;
     };
     const sc1 = try ev.scope(step_env);
@@ -4431,7 +4475,7 @@ const Exec = struct {
             try q.splice(env.fragment());
             try writeActionSecrets(arena, &q, secret_env);
             try q.splice(mount_nodes.fragment());
-            try x.writeScriptExec(&q, script, fc, secret_env);
+            const output_at = try x.writeScriptExec(&q, script, fc, secret_env);
             // A step whose output may key the next steps: what `outputKeyed` needs of the container
             // before it comes in the same query, as a field of its own (nothing is run for it).
             const keyed = x.output_keys != null and resolved == .run and
@@ -4442,8 +4486,8 @@ const Exec = struct {
             }
 
             x.beginExec(num);
-            const answer = gql(arena, x.transport, try q.finish(), &x.err_msg) catch
-                return error.EngineFailed;
+            const doc = try q.finish();
+            const answer = gql(arena, x.transport, doc, &x.err_msg) catch return error.EngineFailed;
             // The exec's own answer; with `keyed`, the container before it is beside it.
             const data = if (keyed and answer == .object)
                 answer.object.get("loadContainerFromID") orelse answer
@@ -4459,7 +4503,7 @@ const Exec = struct {
                 continue;
             }
             if (jsonFindString(data, "id")) |id| x.container_id = id;
-            const out = try x.collect(num, data);
+            const out = try x.collect(num, data, .{ .doc = doc, .at = output_at });
             // Any `::add-matcher::` this step emitted: read the files from the container it just
             // produced, which is where the paths it printed are valid.
             x.loadPendingMatchers(num);
@@ -4575,17 +4619,17 @@ const Exec = struct {
         };
     }
 
-    /// The exec itself and what is read back: exit code and output, the combined file commands, and
-    /// the container id — taken after the step's secrets are removed, so the next step starts
-    /// without them. Nesting gives the step's `dagger` CLI a session on this engine, sharing its
-    /// cache.
+    /// The exec itself and what is read back: exit code, the combined file commands, and the
+    /// container id — taken after the step's secrets are removed, so the next step starts without
+    /// them. Nesting gives the step's `dagger` CLI a session on this engine, sharing its cache.
+    /// Returns where its recorded output would be asked for (`Recorded`).
     fn writeScriptExec(
         x: *Exec,
         q: *Query,
         script: []const u8,
         fc: u32,
         secret_env: []const SecretRef,
-    ) !void {
+    ) !usize {
         const arena = x.arena;
         const nesting: ?bool = if (x.nesting) true else null;
         try q.call("withExec", .{
@@ -4594,15 +4638,59 @@ const Exec = struct {
             .experimentalPrivilegedNesting = nesting,
         });
         try q.leaf("exitCode");
-        try q.leaf("stdout");
-        try q.leaf("stderr");
+        const output_at = Recorded.position(q);
         try q.callAs("fc_all", "file", .{ .path = try fcPath(arena, "all", fc) });
         try q.leaf("contents");
         try q.close(1);
         for (secret_env, 0..) |_, i|
             try q.call("withoutSecretVariable", .{ .name = try secretAlias(arena, i) });
         try q.leaf("id");
+        return output_at;
     }
+
+    /// An exec's recorded output (`stdout`, `stderr`), asked for only when it is needed: when none
+    /// of the step's lines arrived live, because the engine served the exec from its cache. Asked
+    /// for with every exec, a 200 MB log came back in the answer, and the engine repeated it on the
+    /// log stream as well (a `stdout` field's value is logged, marked verbose): the runner grew by
+    /// 1.8 GB. The exec's document is sent again with the fields put in, which the engine answers
+    /// from its cache without running the exec again, and an answer past `max_recorded_bytes` is
+    /// not read.
+    const Recorded = struct {
+        /// The exec's document, and where in it the fields go (`position`).
+        doc: []const u8,
+        at: usize,
+
+        /// Where the fields would go: the current position, in the exec's selection.
+        fn position(q: *Query) usize {
+            // The document has begun (the exec was called), so this is an offset into what
+            // `finish` returns.
+            std.debug.assert(q.began);
+            return q.out.written().len;
+        }
+
+        const Output = struct { stdout: []const u8, stderr: []const u8 };
+
+        /// The output, or why it could not be had.
+        fn read(r: Recorded, x: *Exec) union(enum) { ok: Output, failed: []const u8 } {
+            const arena = x.arena;
+            const doc = std.mem.concat(arena, u8, &.{
+                r.doc[0..r.at],
+                "stdout stderr ",
+                r.doc[r.at..],
+            }) catch return .{ .failed = "out of memory" };
+            var err_msg: []const u8 = "";
+            const data = gqlAtMost(arena, x.transport, doc, max_recorded_bytes, &err_msg) catch |e|
+                return .{ .failed = if (e == error.ResponseTooLarge)
+                    std.fmt.comptimePrint("it is over the {d} MiB that is replayed", .{
+                        max_recorded_bytes / (1024 * 1024),
+                    })
+                else if (err_msg.len > 0) err_msg else @errorName(e) };
+            return .{ .ok = .{
+                .stdout = jsonFindString(data, "stdout") orelse "",
+                .stderr = jsonFindString(data, "stderr") orelse "",
+            } };
+        }
+    };
 
     /// Reads the matcher files a step asked for, and registers what they define.
     ///
@@ -5035,21 +5123,40 @@ const Exec = struct {
             x.sh.live_lines[num - 1].store(0, .monotonic);
             x.sh.ended[num - 1].store(false, .release);
         }
+        x.sh.bun_refused.store(0, .release);
         x.execs[num - 1] += 1;
     }
 
-    /// An exec's result (`exitCode stdout stderr fc_<kind> { contents }`): its output, replayed if
-    /// it was cached, and its file commands applied.
-    fn collect(x: *Exec, num: u32, data: std.json.Value) !ExecOut {
+    /// An exec's result (`exitCode fc_<kind> { contents }`): its output, replayed if it was cached
+    /// (`Recorded`), and its file commands applied.
+    fn collect(x: *Exec, num: u32, data: std.json.Value, recorded: Recorded) !ExecOut {
         const arena = x.arena;
         const ev = x.ev;
         var code = exitCode(data);
-        const stdout = jsonFindString(data, "stdout") orelse "";
-        const stderr = jsonFindString(data, "stderr") orelse "";
         // A cached step prints no log lines. Wait briefly for a live stream, then replay the
-        // result. Without step caching nothing is replayed from an earlier job: run-specific
-        // values are part of every key.
-        _ = awaitLiveOrReplay(x.io, x.sh, num, stdout, stderr, x.ranThisRun(data));
+        // recorded output. Without step caching nothing is replayed from an earlier job:
+        // run-specific values are part of every key.
+        var output: Recorded.Output = .{ .stdout = "", .stderr = "" };
+        if (!awaitLive(x.io, x.sh, num)) {
+            const ran = x.ranThisRun(data);
+            // An answer that has it already (a test's) is not asked again; a step that ran here
+            // and printed nothing has nothing to show.
+            if (jsonFind(data, "stdout") != null) output = .{
+                .stdout = jsonFindString(data, "stdout") orelse "",
+                .stderr = jsonFindString(data, "stderr") orelse "",
+            } else if (servedFromCache(x.sh, num, ran)) switch (recorded.read(x)) {
+                .ok => |o| output = o,
+                .failed => |why| x.sh.append(num, try std.fmt.allocPrint(
+                    arena,
+                    "##[warning]This step's output cannot be shown: its recorded output " ++
+                        "could not be read back ({s}).",
+                    .{why},
+                )),
+            };
+            _ = replayNotLive(x.sh, num, output.stdout, output.stderr, ran);
+        }
+        const stdout = output.stdout;
+        const stderr = output.stderr;
 
         // File commands: outputs for `steps.<id>.outputs`, env and PATH for the steps that follow.
         var outputs: []const job_mod.EnvVar = &.{};
@@ -5093,11 +5200,12 @@ const Exec = struct {
                 "process the GITHUB_STATE file command: {s}", .{why})),
         };
         // Bun's message is on stderr, which the step's script sends to its stdout
-        // (`stream_prologue`).
-        const refused = code != 0 and for (bun_load_errors) |e| {
-            if (std.mem.indexOf(u8, stdout, e) != null or std.mem.indexOf(u8, stderr, e) != null)
-                break true;
-        } else false;
+        // (`stream_prologue`): in a line that arrived live, or in the recorded output replayed.
+        const refused = code != 0 and (x.sh.bun_refused.load(.acquire) == num or
+            for (bun_load_errors) |e| {
+                const in_out = std.mem.indexOf(u8, stdout, e) != null;
+                if (in_out or std.mem.indexOf(u8, stderr, e) != null) break true;
+            } else false);
         return .{ .code = code, .outputs = outputs, .state = state, .bun_refused = refused };
     }
 
@@ -6766,8 +6874,7 @@ const Exec = struct {
             .experimentalPrivilegedNesting = nesting,
         });
         try q.leaf("exitCode");
-        try q.leaf("stdout");
-        try q.leaf("stderr");
+        const output_at = Recorded.position(&q);
         try q.callAs("fc_all", "file", .{ .path = try fcPath(arena, "all", fc) });
         try q.leaf("contents");
         try q.close(1);
@@ -6779,9 +6886,9 @@ const Exec = struct {
         try q.close(1);
 
         x.beginExec(num);
-        const data = gql(arena, x.transport, try q.finish(), &x.err_msg) catch
-            return error.EngineFailed;
-        const out = try x.collect(num, data);
+        const doc = try q.finish();
+        const data = gql(arena, x.transport, doc, &x.err_msg) catch return error.EngineFailed;
+        const out = try x.collect(num, data, .{ .doc = doc, .at = output_at });
         try x.takeWorkspaceBack(num, data, out);
         return out;
     }
@@ -8158,17 +8265,34 @@ fn awaitLiveOrReplay(
     stderr: []const u8,
     ran: ?bool,
 ) bool {
+    if (awaitLive(io, sh, step)) return false;
+    return replayNotLive(sh, step, stdout, stderr, ran);
+}
+
+/// Whether any of the step's lines arrived live, given a moment to.
+fn awaitLive(io: std.Io, sh: *Shared, step: u32) bool {
     const idx = step - 1;
     var waited: u32 = 0;
     while (waited < live_grace_ms and !sh.ended[idx].load(.acquire)) : (waited += 10) {
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
-    if (sh.live_lines[idx].load(.monotonic) > 0) return false;
+    return sh.live_lines[idx].load(.monotonic) > 0;
+}
+
+/// Whether a step none of whose lines arrived live was served from the cache: its marker says it
+/// did not run in this job, or, without one, its end marker never arrived either.
+fn servedFromCache(sh: *Shared, step: u32, ran: ?bool) bool {
+    return if (ran) |r| !r else !sh.ended[step - 1].load(.acquire);
+}
+
+/// The rest of `awaitLiveOrReplay`, once none of the step's lines arrived live.
+fn replayNotLive(sh: *Shared, step: u32, stdout: []const u8, stderr: []const u8, ran: ?bool) bool {
+    const idx = step - 1;
     // The step ran (its end marker arrived) but none of its lines did. Before a step's stderr went
     // to its stdout (`stream_prologue`), a program's stderr could arrive after the marker when it
     // failed at once (Bun refusing an action's bundle, on Linux), and so belonged to no step. Show
     // the result's output, which has them, as the step's own.
-    const cached = if (ran) |r| !r else !sh.ended[idx].load(.acquire);
+    const cached = servedFromCache(sh, step, ran);
     if (cached) {
         sh.mu.lockUncancelable(sh.io);
         defer sh.mu.unlock(sh.io);
@@ -8334,7 +8458,7 @@ const FakeAbort = struct {
     in_flight: bool = false,
     aborted: u32 = 0,
 
-    fn send(_: *anyopaque, _: Allocator, _: []const u8) anyerror![]const u8 {
+    fn send(_: *anyopaque, _: Allocator, _: []const u8, _: usize) anyerror![]const u8 {
         return "";
     }
     fn abort(ptr: *anyopaque) bool {
@@ -8642,11 +8766,12 @@ const FakeSession = struct {
     seen: std.ArrayList([]const u8) = .empty,
     arena: Allocator,
 
-    fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8) anyerror![]const u8 {
+    fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8, limit: usize) anyerror![]const u8 {
         const self: *FakeSession = @ptrCast(@alignCast(ptr));
         try self.seen.append(self.arena, try arena.dupe(u8, doc));
         defer self.next += 1;
         if (self.next >= self.answers.len) return error.NoMoreAnswers;
+        if (self.answers[self.next].len > limit) return error.ResponseTooLarge;
         return self.answers[self.next];
     }
 
@@ -9798,6 +9923,35 @@ test "a marker a step prints itself, naming no step of the job, is output, not a
     try std.testing.expect(std.mem.indexOf(u8, out, "still step 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "step 4000000000") == null);
     try std.testing.expect(ended[0].load(.acquire));
+}
+
+test "output with no newline is cut into lines of max_line_bytes, not held whole" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var log: sink.LogSink = .{ .stdout = .{ .writer = undefined } };
+    // No step is open, so the lines are noise: kept in `tail`, not logged.
+    var live = [_]std.atomic.Value(u32){.init(0)};
+    var ended = [_]std.atomic.Value(bool){.init(false)};
+    var sh: Shared = .{
+        .io = std.testing.io,
+        .arena = a.allocator(),
+        .log = &log,
+        .sink_job_id = 0,
+        .live_lines = &live,
+        .ended = &ended,
+    };
+    var sd: SpanDemux = .{ .sh = &sh, .gpa = std.testing.allocator };
+    defer sd.deinit();
+    // 3.5 MiB in 64 KiB pieces, none of them ending a line.
+    const piece: [64 * 1024]u8 = @splat('x');
+    for (0..56) |_| {
+        SpanDemux.onRecord(&sd, .{ .span = "s1", .stream = 1, .text = &piece });
+        const span = sd.spans.get("s1").?;
+        try std.testing.expect(span.partial.capacity <= 2 * SpanDemux.max_line_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 3), sh.tail_len);
+    const left = sd.spans.get("s1").?.partial.items.len;
+    try std.testing.expectEqual(SpanDemux.max_line_bytes / 2, left);
 }
 
 test "a marker a step prints for another step of the job is output, not a marker" {
@@ -11003,6 +11157,28 @@ test "a step is noted as reused only if none of its live lines ever arrived" {
     try std.testing.expect(std.mem.indexOf(u8, got, "step 3") == null);
 }
 
+test "Bun refusing a program is seen in the step's live lines" {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var live = [_]std.atomic.Value(u32){ .init(0), .init(0) };
+    var ended = [_]std.atomic.Value(bool){ .init(false), .init(false) };
+    var sh: Shared = .{
+        .io = std.testing.io,
+        .arena = a.allocator(),
+        .log = &log,
+        .sink_job_id = 0,
+        .live_lines = &live,
+        .ended = &ended,
+    };
+    sh.emitLive(1, "an ordinary line");
+    try std.testing.expectEqual(@as(u32, 0), sh.bun_refused.load(.acquire));
+    sh.emitLive(2, "1 | import x from 'y'\n" ++ bun_load_errors[0] ++ " (CommonJS)");
+    try std.testing.expectEqual(@as(u32, 2), sh.bun_refused.load(.acquire));
+}
+
 test "a step that ran but streamed no lines shows its result's output, not as reused" {
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -11292,7 +11468,7 @@ const AutoSession = struct {
     stdout: []const [2][]const u8 = &.{},
     ids: u32 = 0,
 
-    fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8) anyerror![]const u8 {
+    fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8, _: usize) anyerror![]const u8 {
         const self: *AutoSession = @ptrCast(@alignCast(ptr));
         try self.seen.append(self.arena, try self.arena.dupe(u8, doc));
         var p: Answer = .{ .s = doc, .self = self, .arena = arena };
@@ -11409,7 +11585,18 @@ const AutoSession = struct {
                 p.self.ids += 1;
                 return p.out.print(w, "\"ID{d}\"", .{p.self.ids});
             }
-            if (eql(u8, field, "exitCode")) return p.out.appendSlice(w, "0");
+            if (eql(u8, field, "exitCode")) {
+                try p.out.appendSlice(w, "0");
+                // An exec's output comes with it, asked for or not, as in the scripted answers:
+                // it stands in for the live stream these tests have none of, which would
+                // otherwise send every step's document again for its output (`Exec.Recorded`).
+                const rest = p.s[p.i..];
+                const selected = rest[0 .. std.mem.indexOfScalar(u8, rest, '}') orelse rest.len];
+                if (std.mem.indexOf(u8, selected, "stdout") != null) return;
+                try p.out.appendSlice(w, ",\"stdout\":");
+                try p.leaf("stdout", file);
+                return p.out.appendSlice(w, ",\"stderr\":\"\"");
+            }
             if (eql(u8, field, "entries")) return p.out.appendSlice(w, "[\"action.yml\"]");
             if (eql(u8, field, "digest")) return p.out.appendSlice(w, "\"sha256:0123abcd\"");
             if (eql(u8, field, "removedPaths") or eql(u8, field, "entrypoint"))
@@ -11573,6 +11760,114 @@ test "round trips: a matcher file that cannot be read is read alone, and the oth
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "Could not read the problem matcher '/missing.json'") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Could not read the problem matcher '/m1.json'") == null);
+}
+
+test "an exec's recorded output is asked for only to replay it, and never past max_recorded_bytes" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{ testStep("biglog"), testStep("b") };
+    // Answers without the output, which the exec's document no longer asks for.
+    const lean = "{{\"data\":{{\"loadContainerFromID\":{{\"withExec\":" ++
+        "{{\"id\":\"C{d}\",\"exitCode\":0}}}}}}}}";
+    // Step 1 printed more than is read back: the transport stops at the limit.
+    const big = try arena.alloc(u8, max_recorded_bytes);
+    @memset(big, 'x');
+    const answers = [_][]const u8{
+        base_answer,
+        try std.fmt.allocPrint(arena, lean, .{1}),
+        try exec(arena, "C1", 0, big),
+        try std.fmt.allocPrint(arena, lean, .{2}),
+        try exec(arena, "C2", 0, "replayed line"),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+        .step_cache = true,
+    }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    const seen = fake.seen.items;
+    try std.testing.expectEqual(@as(usize, 5), seen.len);
+    // The exec asks for no output: asking made the engine log all of it again (verbose).
+    try std.testing.expect(std.mem.indexOf(u8, seen[1], "stdout") == null);
+    // None of its lines arrived live (there is no stream here) and nothing says it ran, so it was
+    // served from the cache and its output is asked for: the same document, which the engine
+    // answers from its cache, with the fields put in.
+    const fields = "stdout stderr ";
+    try std.testing.expectEqual(seen[1].len + fields.len, seen[2].len);
+    const at = std.mem.indexOf(u8, seen[2], "exitCode " ++ fields).? + "exitCode ".len;
+    try std.testing.expectEqualStrings(seen[1][0..at], seen[2][0..at]);
+    try std.testing.expectEqualStrings(seen[1][at..], seen[2][at + fields.len ..]);
+    // Past the limit it is not read on, and the log says why the step shows nothing.
+    const note = "could not be read back (it is over the 4 MiB that is replayed)";
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), note) != null);
+    // The next step continues from the exec's container; its output, small, is replayed.
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "loadContainerFromID(id:\"C1\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[4], fields) != null);
+    const replayed = "step 2 stdout] replayed line";
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), replayed) != null);
+}
+
+test "a step that ran and printed nothing does not ask for its output" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{ testStep("true"), testStep("true") };
+    // Without step caching every step runs in this job: one with no line live printed none.
+    const answers = [_][]const u8{
+        base_answer,
+        "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"id\":\"C1\",\"exitCode\":0}}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"id\":\"C2\",\"exitCode\":0}}}}",
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+    }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    try std.testing.expectEqual(@as(usize, 3), fake.seen.items.len);
+    for (fake.seen.items) |d| try std.testing.expect(std.mem.indexOf(u8, d, "stdout") == null);
+}
+
+test "a step whose env fails to evaluate keeps its continue-on-error" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    // 20 characters, 8^5 times: past GitHub's 1 MiB expression memory.
+    const f8 = "format('{0}{0}{0}{0}{0}{0}{0}{0}', ";
+    var huge = testStep("huge");
+    huge.env = &.{.{
+        .name = "HUGE",
+        .value = .{ .expr = f8 ++ f8 ++ f8 ++ f8 ++ f8 ++ "'xxxxxxxxxxxxxxxxxxxx')))))" },
+    }};
+    huge.continue_on_error = .{ .lit = "true" };
+    const steps = [_]job_mod.Step{ huge, testStep("b") };
+    const answers = [_][]const u8{ base_answer, try exec(arena, "C2", 0, "") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+    }, testJob(&steps), &log);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "could not evaluate env: the " ++
+        "expression needs more than the 1048576 bytes") != null);
+    // The step failed and the job went on: the next step ran, and the job succeeded.
+    try std.testing.expect(res.succeeded);
+    try std.testing.expectEqual(@as(usize, 2), fake.seen.items.len);
+    try std.testing.expectEqual(Outcome.failure, res.steps[0].outcome);
+    try std.testing.expect(res.steps[0].continued);
 }
 
 test "round trips: the job setup's query is sent again without the secrets when it fails with them" {

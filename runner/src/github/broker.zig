@@ -59,6 +59,19 @@ pub const RequestOptions = struct {
     /// request itself or a request that lasts as long as something else does (a Dagger query runs
     /// as long as its step).
     deadline: ?std.Io.Duration = http.request_deadline,
+    /// The most of the body read, decompressed; past it the request fails with
+    /// `error.ResponseTooLarge` (a Dagger query whose answer is a step's whole output).
+    max_body: usize = std.math.maxInt(usize),
+    /// The request's body written out as it is sent, in place of `payload`: one too big to hold
+    /// (a job's log, `results.upload`).
+    body: ?Body = null,
+};
+
+/// A body of `len` bytes that `writeFn` writes, as many times as the request is sent.
+pub const Body = struct {
+    len: usize,
+    ptr: *const anyopaque,
+    writeFn: *const fn (ptr: *const anyopaque, w: *std.Io.Writer) anyerror!void,
 };
 
 pub fn request(
@@ -181,6 +194,8 @@ fn requestOnce(
             .bearer = bearer,
             .headers = headers,
             .content_type = opts.content_type,
+            .max_body = opts.max_body,
+            .body = opts.body,
         })) {
             .done => |r| return r,
             .redirect => |r| r,
@@ -205,6 +220,8 @@ const Exchange = struct {
     bearer: ?[]const u8,
     headers: []const std.http.Header,
     content_type: []const u8,
+    max_body: usize,
+    body: ?Body,
 };
 
 const Redirect = struct { uri: std.Uri, see_other: bool };
@@ -216,7 +233,10 @@ fn exchange(x: Exchange) !union(enum) { done: Response, redirect: Redirect } {
     var req = try x.client.request(x.method, x.uri, .{
         .headers = .{
             .authorization = if (x.bearer) |b| .{ .override = b } else .default,
-            .content_type = if (x.payload != null) .{ .override = x.content_type } else .default,
+            .content_type = if (x.payload != null or x.body != null)
+                .{ .override = x.content_type }
+            else
+                .default,
         },
         .extra_headers = x.headers,
         .redirect_behavior = .unhandled,
@@ -232,7 +252,7 @@ fn exchange(x: Exchange) !union(enum) { done: Response, redirect: Redirect } {
     };
 
     if (trace) std.debug.print("trace: connected\n", .{});
-    send(&req, x.payload) catch |e| return canceledOr(&req, e);
+    send(&req, x.payload, x.body) catch |e| return canceledOr(&req, e);
     if (trace) std.debug.print("trace: request sent\n", .{});
 
     var response = req.receiveHead(&.{}) catch |e| return canceledOr(&req, e);
@@ -242,7 +262,7 @@ fn exchange(x: Exchange) !union(enum) { done: Response, redirect: Redirect } {
         response.head.transfer_encoding == .chunked,
     });
 
-    if (x.payload == null and response.head.status.class() == .redirect) {
+    if (x.payload == null and x.body == null and response.head.status.class() == .redirect) {
         if (response.head.location) |location| {
             // The location is copied out first: reading past the head (the body) overwrites it.
             const buf = try x.scratch.alloc(u8, redirect_buffer_len);
@@ -266,7 +286,8 @@ fn exchange(x: Exchange) !union(enum) { done: Response, redirect: Redirect } {
         return .{ .done = .{ .status = response.head.status, .body = "" } };
     }
 
-    const body = readBody(x.scratch, &response) catch |e| return canceledOr(&req, e);
+    const body = readBody(x.scratch, &response, x.max_body) catch |e|
+        return canceledOr(&req, e);
     if (trace) std.debug.print("trace: body {d} bytes\n", .{body.len});
     return .{ .done = .{ .status = response.head.status, .body = try x.arena.dupe(u8, body) } };
 }
@@ -311,8 +332,19 @@ fn acceptJsonHeaders(scratch: Allocator, extra: []const std.http.Header) ![]std.
     return headers;
 }
 
-/// The request line and headers, then `payload` as the body when there is one.
-fn send(req: *std.http.Client.Request, payload: ?[]const u8) !void {
+/// The request line and headers, then `payload` or `body` as the body when there is one.
+fn send(req: *std.http.Client.Request, payload: ?[]const u8, body_in: ?Body) !void {
+    if (body_in) |b| {
+        req.transfer_encoding = .{ .content_length = b.len };
+        var body = try req.sendBodyUnflushed(&.{});
+        // The writer stops short of `len` rather than past it (std's body writer would underflow);
+        // short of it, `end` would trip its assertion and take the process down.
+        try b.writeFn(b.ptr, &body.writer);
+        try body.writer.flush();
+        if (body.state.content_length != 0) return error.BodyShorterThanItsLength;
+        try body.end();
+        return req.connection.?.flush();
+    }
     const p = payload orelse return req.sendBodiless();
     req.transfer_encoding = .{ .content_length = p.len };
     var body = try req.sendBodyUnflushed(&.{});
@@ -321,18 +353,17 @@ fn send(req: *std.http.Client.Request, payload: ?[]const u8) !void {
     try req.connection.?.flush();
 }
 
-/// The whole body, decompressed, on `scratch`.
-fn readBody(scratch: Allocator, response: *std.http.Client.Response) ![]const u8 {
-    var resp: std.Io.Writer.Allocating = .init(scratch);
+/// The whole body, decompressed, on `scratch`; `error.ResponseTooLarge` past `limit` bytes.
+fn readBody(scratch: Allocator, response: *std.http.Client.Response, limit: usize) ![]const u8 {
     var transfer_buffer: [64]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
     const decompress_buffer = try scratch.alloc(u8, std.compress.flate.max_window_len);
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-    _ = reader.streamRemaining(&resp.writer) catch |err| switch (err) {
+    return reader.allocRemaining(scratch, .limited(limit)) catch |err| switch (err) {
         error.ReadFailed => return response.bodyErr().?,
+        error.StreamTooLong => return error.ResponseTooLarge,
         else => |e| return e,
     };
-    return resp.written();
 }
 
 /// The machine's architecture as GitHub names it (`runner.arch`, RUNNER_ARCH): the runner, the
@@ -409,6 +440,26 @@ test "over real connections: the token stays on its host, and only bodiless requ
     // A request with a body gets the redirect as it came.
     const posted = try request(a, io, .POST, server.url(&buf, "127.0.0.1", "/same"), "{}", t);
     try std.testing.expectEqual(std.http.Status.found, posted.status);
+    // So does one whose body is written as it is sent; one that writes less than it said it would
+    // fails, rather than tripping the body writer's assertion and taking the process down.
+    const Written = struct {
+        text: []const u8,
+        fn write(ptr: *const anyopaque, w: *std.Io.Writer) anyerror!void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            try w.writeAll(self.text);
+        }
+    };
+    const whole: Written = .{ .text = "{}" };
+    var streamed = t;
+    streamed.body = .{ .len = 2, .ptr = &whole, .writeFn = Written.write };
+    const sent = try request(a, io, .POST, server.url(&buf, "127.0.0.1", "/same"), null, streamed);
+    try std.testing.expectEqual(std.http.Status.found, sent.status);
+    const short: Written = .{ .text = "{" };
+    streamed.body = .{ .len = 2, .ptr = &short, .writeFn = Written.write };
+    try std.testing.expectError(
+        error.BodyShorterThanItsLength,
+        request(a, io, .POST, server.url(&buf, "127.0.0.1", "/same"), null, streamed),
+    );
     // A loop ends.
     try std.testing.expectError(
         error.TooManyHttpRedirects,

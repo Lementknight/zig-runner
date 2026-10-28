@@ -210,7 +210,7 @@ pub const CollectSink = struct {
             return;
         }
         s.bytes += text.len;
-        var kept: CollectedLine = .{
+        var line_kept: CollectedLine = .{
             .step = step_number,
             .seq = seq,
             .ts_ms = std.Io.Clock.real.now(s.io).toMilliseconds(),
@@ -218,12 +218,12 @@ pub const CollectSink = struct {
         };
         if (s.spool) |sp| {
             if (!sp.broken) {
-                sp.write(kept);
+                sp.write(line_kept);
                 if (!sp.broken) return;
             }
         }
-        kept.text = try s.arena.dupe(u8, text);
-        try s.lines.append(s.arena, kept);
+        line_kept.text = try s.arena.dupe(u8, text);
+        try s.lines.append(s.arena, line_kept);
     }
 
     pub fn flush(s: *CollectSink) Error!void {
@@ -244,10 +244,115 @@ pub const CollectSink = struct {
         return all;
     }
 
+    /// What the sink has kept so far, to be read back line by line (`Kept`) rather than all at
+    /// once as `collected` does. Lines logged after this are not in it.
+    pub fn kept(s: *CollectSink) Kept {
+        const sp = s.spool orelse return .{ .memory = s.lines.items };
+        return .{ .spool = sp, .spool_bytes = sp.file_bytes, .memory = s.lines.items };
+    }
+
     /// The inner sink is owned by the caller.
     pub fn close(s: *CollectSink) void {
         _ = s;
     }
+};
+
+/// A job's kept log, read back one line at a time: from the spool, then the lines memory holds
+/// (all of them without a spool, the ones after a failed spool write otherwise). Reading the whole
+/// spool into memory at the job's end (`CollectSink.collected`), then formatting it once for a
+/// step and again for the job, grew the runner by over 1 GB after a 200 MB log; this holds one
+/// line's header at a time, and its text goes from the file to wherever it is written.
+pub const Kept = struct {
+    spool: ?*Spool = null,
+    /// The spool's length when this was taken: what was written after it is not read.
+    spool_bytes: usize = 0,
+    memory: []const CollectedLine = &.{},
+
+    pub fn iterate(k: *const Kept, io: std.Io, buf: []u8) Iterator {
+        return .{
+            .kept = k,
+            .reader = if (k.spool) |sp| sp.file.reader(io, buf) else null,
+            .spool_left = k.spool_bytes,
+        };
+    }
+
+    /// The lines in order. After `next`, the line's text is read with `writeText` or `textIs`, or
+    /// skipped by the next `next`.
+    pub const Iterator = struct {
+        kept: *const Kept,
+        /// Positional: each iterator reads the file from its start, whatever else reads or writes
+        /// it.
+        reader: ?std.Io.File.Reader,
+        spool_left: usize,
+        memory_next: usize = 0,
+        /// Text of the current line not read yet (from the spool), and the newline after it.
+        text_left: usize = 0,
+        current: CollectedLine = undefined,
+
+        /// The next line; its `text` is set only when it is held in memory.
+        pub fn next(it: *Iterator) !?CollectedLine {
+            if (it.reader) |*r| {
+                try it.skipText();
+                if (it.spool_left > 0) {
+                    const header = try r.interface.takeDelimiterInclusive('\n');
+                    it.spool_left -|= header.len;
+                    var fields = std.mem.tokenizeScalar(u8, header[0 .. header.len - 1], ' ');
+                    const step = try headerField(u32, &fields);
+                    const seq = try headerField(u64, &fields);
+                    const ts = try headerField(i64, &fields);
+                    const len = try headerField(usize, &fields);
+                    if (len >= it.spool_left) return error.BadSpool;
+                    it.spool_left -= len + 1;
+                    it.text_left = len + 1;
+                    it.current = .{ .step = step, .seq = seq, .ts_ms = ts, .text = "" };
+                    return it.current;
+                }
+            }
+            if (it.memory_next == it.kept.memory.len) return null;
+            it.current = it.kept.memory[it.memory_next];
+            it.memory_next += 1;
+            return it.current;
+        }
+
+        /// The current line's text's length.
+        pub fn textLen(it: *const Iterator) usize {
+            return if (it.text_left == 0) it.current.text.len else it.text_left - 1;
+        }
+
+        /// The current line's text, written to `w`.
+        pub fn writeText(it: *Iterator, w: *std.Io.Writer) !void {
+            if (it.text_left == 0) return w.writeAll(it.current.text);
+            // Through the reader's buffer, not `streamExact`: a file reader streams into the
+            // writer's buffer, and an HTTP request's body writer has none (`broker.send`), which
+            // fails an assertion (`Writer.defaultRebase`) and took the runner down.
+            const r = &it.reader.?.interface;
+            var left = it.text_left - 1;
+            while (left > 0) {
+                const piece = try r.take(@min(left, r.buffer.len));
+                try w.writeAll(piece);
+                left -= piece.len;
+            }
+            try r.discardAll(1);
+            it.text_left = 0;
+        }
+
+        /// Whether the current line's text is `s`.
+        pub fn textIs(it: *Iterator, s: []const u8) !bool {
+            if (it.text_left == 0) return std.mem.eql(u8, it.current.text, s);
+            if (it.text_left != s.len + 1) return false;
+            return std.mem.eql(u8, try it.reader.?.interface.peek(s.len), s);
+        }
+
+        fn skipText(it: *Iterator) !void {
+            if (it.text_left == 0) return;
+            try it.reader.?.interface.discardAll(it.text_left);
+            it.text_left = 0;
+        }
+
+        fn headerField(comptime T: type, fields: *std.mem.TokenIterator(u8, .scalar)) !T {
+            return std.fmt.parseInt(T, fields.next() orelse return error.BadSpool, 10);
+        }
+    };
 };
 
 /// Closed set of implementations; dispatch is a switch, so no vtable or allocation.

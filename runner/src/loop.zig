@@ -1031,7 +1031,7 @@ fn handleJob(c: Context, session: Listening, body: []const u8) !Cycle {
     }
     try reportCacheAndKeys(c, job, log, result);
     const shown = try shownSteps(c.arena, live.ids, job, result, job_started_ms, completion);
-    const lines = log.collect.collected(c.arena);
+    const kept = log.collect.kept();
     {
         // The live view ends with the steps as completejob reports them, while the logs go up:
         // its last requests (the lines left, the final step list) and the uploads are
@@ -1045,7 +1045,7 @@ fn handleJob(c: Context, session: Listening, body: []const u8) !Cycle {
             null;
         defer if (finishing) |*f| f.await(c.io);
         if (finishing == null) live.finish(finals);
-        try uploadLogs(c, job, shown, lines, result.summaries, log.currentSecrets(), &step_logs, .{});
+        try uploadLogs(c, job, shown, &kept, result.summaries, log.currentSecrets(), &step_logs, .{});
     }
 
     const conclusion = jobConclusion(result);
@@ -1318,9 +1318,12 @@ fn reportCacheAndKeys(
 ) !void {
     if (c.cfg.step_cache and job.steps.len > 0) {
         var replayed: usize = 0;
-        for (log.collect.collected(c.arena)) |l| {
+        // Read a line at a time, not held: the log can be the 64 MiB it keeps.
+        const kept = log.collect.kept();
+        var it = kept.iterate(c.io, try keptBuffer(c));
+        while (it.next() catch null) |l| {
             if (l.step >= 1 and l.step <= job.steps.len and
-                std.mem.eql(u8, l.text, dagger.reused_note)) replayed += 1;
+                (it.textIs(dagger.reused_note) catch false)) replayed += 1;
         }
         try c.err.print(
             "job {d}: {d} of {d} steps replayed from the cache\n",
@@ -1900,21 +1903,34 @@ fn uploadLogs(
     c: Context,
     job: job_mod.Job,
     shown: []const Shown,
-    lines: []const sink.CollectedLine,
+    kept: *const sink.Kept,
     summaries: []const []const u8,
     secrets: []const []const u8,
     /// The steps' logs uploaded as each step finished, when they were.
     early: ?*StepLogs,
     up: Uploader,
 ) !void {
+    // Every blob's size from one read of the log; each blob is read again as it goes up.
+    var log_steps: usize = 0;
+    for (shown) |s| log_steps = @max(log_steps, s.log_step + 1);
+    const sizes = try c.arena.alloc(results.KeptBlob.Size, log_steps);
+    const job_size: results.KeptBlob.Size =
+        results.KeptBlob.count(kept, c.io, try keptBuffer(c), sizes) catch |e| blk: {
+            try c.err.print("job {d}: the job's log could not be read back ({s}); it is not " ++
+                "uploaded\n", .{ job.check_run_id, @errorName(e) });
+            @memset(sizes, .{});
+            break :blk .{};
+        };
+
     var uploads: std.ArrayList(Upload) = .empty;
     // Steps whose log went up as they finished: only reported, or uploaded again if that failed.
     const Covered = struct { early: *StepLogs.Early, name: []const u8, blob: results.Blob };
     var covered: std.ArrayList(Covered) = .empty;
     for (shown) |s| {
-        const blob = try results.formatBlob(c.arena, lines, s.log_step);
-        if (blob.line_count == 0) continue;
-        if (early) |e| if (e.done(s.log_step, s.id, blob.line_count, textBytes(lines, s.log_step))) |d| {
+        const size = sizes[s.log_step];
+        if (size.lines == 0) continue;
+        const blob = try keptBlob(c, kept, s.log_step, size);
+        if (early) |e| if (e.done(s.log_step, s.id, size.lines, size.text_bytes)) |d| {
             try covered.append(c.arena, .{ .early = d, .name = s.name, .blob = blob });
             continue;
         };
@@ -1936,8 +1952,10 @@ fn uploadLogs(
             .markdown = masked.written(),
         });
     }
-    const all = try results.formatBlob(c.arena, lines, null);
-    if (all.line_count > 0) try uploads.append(c.arena, .{ .what = .{ .log = .job }, .blob = all });
+    if (job_size.lines > 0) try uploads.append(
+        c.arena,
+        .{ .what = .{ .log = .job }, .blob = try keptBlob(c, kept, null, job_size) },
+    );
 
     // Each upload is three requests one after another (a signed URL, the blob, its metadata), and
     // they were made one upload after another too: 30 round trips, 1.5 s, before the job could end.
@@ -2061,14 +2079,29 @@ fn awaitGroup(group: *std.Io.Group, io: std.Io) void {
     group.await(io) catch {};
 }
 
-/// The bytes of a step's lines, without their timestamps: with the line count, what tells whether
-/// a log uploaded as its step finished is the step's whole log (`StepLogs.done`).
-fn textBytes(lines: []const sink.CollectedLine, log_step: u32) usize {
-    var n: usize = 0;
-    for (lines) |l| if (l.step == log_step) {
-        n += l.text.len;
+/// One step's log (`log_step` set) or the job's, read from `kept` as it goes up. Each upload reads
+/// with a buffer of its own: they run at once.
+fn keptBlob(
+    c: Context,
+    kept: *const sink.Kept,
+    log_step: ?u32,
+    size: results.KeptBlob.Size,
+) !results.Blob {
+    const b = try c.arena.create(results.KeptBlob);
+    b.* = .{
+        .kept = kept,
+        .io = c.io,
+        .step = log_step,
+        .buf = try keptBuffer(c),
+        .len = size.bytes,
     };
-    return n;
+    return b.blob(size.lines);
+}
+
+/// Room for reading the kept log: a spool record's header has to fit (a few dozen bytes); more
+/// only means fewer reads.
+fn keptBuffer(c: Context) ![]u8 {
+    return c.arena.alloc(u8, 64 * 1024);
 }
 
 /// Each step's log, uploaded in the background as soon as the step finishes, as actions/runner
@@ -2795,8 +2828,9 @@ const FakeResults = struct {
         var call: Call = .{ .lines = blob.line_count };
         call.id_len = @min(id.len, call.id.len);
         @memcpy(call.id[0..call.id_len], id[0..call.id_len]);
-        call.text_len = @min(blob.text.len, call.text.len);
-        @memcpy(call.text[0..call.text_len], blob.text[0..call.text_len]);
+        const text = blob.textAlloc(arena) catch "";
+        call.text_len = @min(text.len, call.text.len);
+        @memcpy(call.text[0..call.text_len], text[0..call.text_len]);
         calls[n] = call;
         n += 1;
         if (first_post) return .{ .ok = false, .detail = "HTTP 500" };
@@ -2918,7 +2952,8 @@ test "each step's log goes up as the step finishes, and the job's end uploads on
         .{ .id = "post", .number = 4, .name = "Post a", .log_step = 4, .conclusion = "succeeded" },
         .{ .id = "complete", .number = 5, .name = "Complete job", .log_step = 5, .conclusion = "succeeded" },
     };
-    try uploadLogs(c, job, &shown, kept.items, &.{}, &.{}, &logs, FakeResults.uploader);
+    const up = FakeResults.uploader;
+    try uploadLogs(c, job, &shown, &.{ .memory = kept.items }, &.{}, &.{}, &logs, up);
 
     // Every upload is done once uploadLogs returns, so before completejob.
     var got: [4]usize = undefined;
@@ -3059,7 +3094,7 @@ test "hung uploads hold up the job's end no longer than its limit, and a hung st
         .{ .id = "a", .number = 1, .name = "a", .log_step = 1, .conclusion = "succeeded" },
     };
     const started = std.Io.Clock.awake.now(io);
-    try uploadLogs(c, job, &shown, &kept, &.{}, &.{}, &logs, up);
+    try uploadLogs(c, job, &shown, &.{ .memory = &kept }, &.{}, &.{}, &logs, up);
     const took = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
     // Back by the limit (and not the 600 s the hung uploads would take), so completejob, next,
     // goes ahead.

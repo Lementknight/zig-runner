@@ -15,10 +15,15 @@
 # Pinned by digest, which a moved tag cannot change; Renovate moves the pin.
 FROM --platform=$BUILDPLATFORM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 AS certs
 RUN apk add --no-cache ca-certificates
+# An empty /tmp for the image, which has none: each job's log is spooled there
+# (`RUNNER_LOG_SPOOL_DIR`). Without it every job kept its log in memory instead, up to 64 MB of
+# lines and as much again in bookkeeping: a job that logged 200 MB grew the runner by 170 MB.
+RUN mkdir -m 1777 /image-tmp
 
 FROM scratch AS prebuilt
 ARG TARGETARCH
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=certs --chmod=1777 /image-tmp /tmp
 COPY prebuilt/runner-${TARGETARCH} /runner
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/runner"]
@@ -59,6 +64,7 @@ RUN case "$TARGETARCH" in \
 
 FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=certs --chmod=1777 /image-tmp /tmp
 COPY --from=build /out/bin/runner /runner
 # SIGTERM (docker stop) lets running jobs finish; give it time (see stop_grace_period in compose).
 STOPSIGNAL SIGTERM
