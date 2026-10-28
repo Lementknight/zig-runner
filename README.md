@@ -241,6 +241,25 @@ purpose: after the reboot the engine stays down while the runners come back, and
 with no engine socket. Start it again (`docker start <engine container>`), then check that
 `/run/dagger/engine.sock` exists and the engine's log has no `unclean` or `wiping` line.
 
+### Memory
+
+Four heavy jobs taken at once on razorbill filled the engine's 4 GB, then the Pi's 2 GB of swap, and
+the machine thrashed for hours (#126). Two things keep that from happening again:
+
+- **The runner's memory gate**, on by default. A runner asks GitHub for a job only while the
+  machine has the memory for it, reserving room for the jobs its pool's other runners may be
+  handed at the same moment, and stops while memory pressure or swap growth says the machine is
+  struggling. A held runner removes its registration, so GitHub gives the job to another runner;
+  running jobs are never touched. The limits and why they are what they are are in
+  `deploy/runner.env.example` (`RUNNER_MIN_MEM_AVAILABLE_MB` and the rest; `RUNNER_ADMISSION=false`
+  turns it off). The gate sees only its own process's runners: run one pool per machine.
+- **No swap for the engine**, optional. With `--memory 4g` alone, Docker lets a container swap as
+  much again; `--memory-swap` equal to `--memory` (`memswap_limit` in compose) gives it none. A
+  job that outgrows the engine then fails inside it, killed by the kernel, instead of the whole
+  machine slowing to a crawl. The trade-off is a failed job in place of a slow one, and the risk
+  that the process killed is the engine itself, whose unclean restart wipes its cache: check which
+  process the kernel picks before relying on it. razorbill does not use it today.
+
 ## Benchmarks
 
 [BENCHMARKS.md](BENCHMARKS.md) has what was measured on the reference machine, a Raspberry Pi 5:

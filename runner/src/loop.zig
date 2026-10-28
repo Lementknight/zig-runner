@@ -17,6 +17,7 @@ const sink = @import("sink.zig");
 const redact = @import("redact.zig");
 const timefmt = @import("timefmt.zig");
 const Live = @import("live.zig").Live;
+const admission = @import("admission.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -55,6 +56,9 @@ pub const Context = struct {
     /// Where `serve` keeps the next cycle's registration, started while this cycle's job finishes
     /// (`Registering`); null registers each cycle in its turn, as tests and `--once` do.
     next: ?*?*Registering = null,
+    /// This runner's place at the memory gate (`admission.zig`); null takes jobs whatever the
+    /// machine's memory, as tests and `RUNNER_ADMISSION=false` do.
+    gate: ?*admission.Gate = null,
 };
 
 /// Output keys cost two walks of the job's filesystem whatever the step changed, so they are cheap
@@ -106,6 +110,9 @@ pub const Cycle = union(enum) {
     failed: struct { exit: Exit, retry: bool = true },
     /// A stop was requested while the runner waited for a job.
     stopped,
+    /// The machine was short of memory before a poll (`admission.zig`): the cycle ended, and with
+    /// it the registration, so GitHub does not hand a job to a runner that is not asking for one.
+    held,
 };
 
 /// Runs `n` runners in this process as concurrent tasks (`std.Io.Group`), each serving jobs one
@@ -117,10 +124,20 @@ pub fn pool(c: Context, n: u32) !Exit {
     // One per process, so what one runner learns about a repository the others use too.
     const slow = try c.arena.create(SlowOutputs);
     slow.* = .{ .io = c.io, .gpa = c.gpa };
+    // One per process too, so each runner counts the others' jobs before it takes one.
+    const memory: ?*admission.Admission = if (c.cfg.admission) m: {
+        const m = try c.arena.create(admission.Admission);
+        m.* = .init(c.io, c.cfg.admission_limits, try c.arena.alloc(i64, n));
+        break :m m;
+    } else null;
     var group: std.Io.Group = .init;
     for (slots) |*s| {
         s.* = .{ .c = c };
         s.c.slow_outputs = slow;
+        if (memory) |m| {
+            s.gate = .{ .pool = m };
+            s.c.gate = &s.gate;
+        }
         group.concurrent(c.io, Slot.main, .{s}) catch |e| {
             try c.err.print("could not start {d} runners: {s}\n", .{ n, @errorName(e) });
             group.cancel(c.io);
@@ -141,6 +158,7 @@ pub fn pool(c: Context, n: u32) !Exit {
 const Slot = struct {
     c: Context,
     exit: Exit = .done,
+    gate: admission.Gate = undefined,
     err_buf: [4096]u8 = undefined,
 
     fn main(s: *Slot) void {
@@ -167,7 +185,18 @@ pub fn serve(c: Context) !Exit {
     // A registration made for a cycle that will not run is removed, as an idle one must be.
     defer if (next) |r| r.discard(c);
     var failures: u32 = 0;
+    defer if (c.gate) |g| g.leave(false);
     while (true) {
+        // The memory gate (#126): register only once the machine has the memory for one more job.
+        if (c.gate) |g| if (g.check()) |hold| {
+            // A registration made while the last job finished would sit idle: a runner GitHub can
+            // hand a job to, that is not asking for one.
+            if (next) |r| {
+                next = null;
+                r.discard(c);
+            }
+            if (!try admit(c, g, hold)) return .done;
+        };
         var cycle_arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer cycle_arena.deinit();
         var cc = c;
@@ -178,15 +207,18 @@ pub fn serve(c: Context) !Exit {
 
         const r = try cycle(cc);
         c.err.flush() catch {};
+        // Polling is over: the next cycle is let through, or not, afresh.
+        if (c.gate) |g| g.leave(false);
+        if (r == .held and !stopRequested()) continue;
         if (c.cfg.once) return switch (r) {
             .job => |ok| if (ok) .done else .github,
             .failed => |f| f.exit,
-            .stopped => .done,
+            .stopped, .held => .done,
         };
-        if (r == .stopped or stopRequested()) return .done;
+        if (r == .stopped or r == .held or stopRequested()) return .done;
         switch (r) {
             .job => failures = 0,
-            .stopped => unreachable,
+            .stopped, .held => unreachable,
             .failed => |f| {
                 if (!f.retry) return f.exit;
                 failures += 1;
@@ -205,6 +237,41 @@ pub fn serve(c: Context) !Exit {
             },
         }
     }
+}
+
+/// Waits, held at the memory gate for `hold`, until the machine has the memory for one more job:
+/// true then, false if a stop is requested first. The hold and its end are each logged once, not
+/// at every look.
+fn admit(c: Context, g: *admission.Gate, hold: admission.Hold) !bool {
+    holdingBack(c, g, hold);
+    while (true) {
+        // In steps, so a stop is not kept waiting.
+        var left = g.pool.recheck.toMilliseconds();
+        while (left > 0) : (left -= @min(left, 200)) {
+            if (stopRequested()) return false;
+            c.io.sleep(.fromMilliseconds(@min(left, 200)), .awake) catch {};
+        }
+        if (stopRequested()) return false;
+        if (g.check() == null) break;
+    }
+    sayUnallocated(c, "'{s}': memory is back; taking jobs again", .{c.name});
+    g.announced = false;
+    return true;
+}
+
+/// Logs a hold, unless this one already was (`listen` finds it, `admit` waits it out).
+fn holdingBack(c: Context, g: *admission.Gate, hold: admission.Hold) void {
+    if (g.announced) return;
+    sayUnallocated(c, "'{s}' holding back from new jobs: {f}", .{ c.name, hold });
+    g.announced = true;
+}
+
+/// As `say`, on the stack: `serve`'s context has the process's arena, which a line for every hold
+/// would grow for as long as the runner runs.
+fn sayUnallocated(c: Context, comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    c.log.append(0, 0, .stderr, text) catch {};
 }
 
 /// A new registration name: the prefix and a random suffix.
@@ -568,17 +635,36 @@ pub fn cycle(c: Context) !Cycle {
         session = .{ .base = base, .sid = sid };
     }
     try say(c, "'{s}' listening for jobs (labels: {s})", .{ c.name, c.cfg.labels });
+    return listen(c, creds, base, sid, &token, &token_at);
+}
 
+/// Polls the session until a job comes, and runs it. Before each poll the runner checks that the
+/// machine still has the memory for a job (`admission.zig`); when it does not, the cycle ends
+/// rather than sit registered and silent, and `serve` waits for memory before registering again.
+/// `token` is kept fresh for the cycle's end, which deletes the session with it.
+fn listen(
+    c: Context,
+    creds: auth.Credentials,
+    base: []const u8,
+    sid: []const u8,
+    token: *[]const u8,
+    token_at: *i64,
+) !Cycle {
+    var status: std.http.Status = .ok;
     while (true) {
         if (stopRequested()) return .stopped;
+        if (c.gate) |g| if (g.check()) |hold| {
+            holdingBack(c, g, hold);
+            return .held;
+        };
         const now = std.Io.Clock.real.now(c.io).toSeconds();
-        if (now - token_at > token_refresh_secs) {
-            token = mintToken(c, creds, &status) catch |e|
+        if (now - token_at.* > token_refresh_secs) {
+            token.* = mintToken(c, creds, &status) catch |e|
                 return failHttp(c, "oauth token refresh", e, status);
-            token_at = now;
+            token_at.* = now;
         }
         const url = try broker.messageUrl(c.arena, base, sid, "Online");
-        const m = switch (try poll(c, url, token, poll_timeout)) {
+        const m = switch (try poll(c, url, token.*, poll_timeout)) {
             .stop => return .stopped,
             .timeout => {
                 // Not a failure: the next poll goes out on a new connection. If the session did
@@ -601,10 +687,12 @@ pub fn cycle(c: Context) !Cycle {
         }
         const inner = jsonString(c.arena, m.body, "body") orelse
             return fail(c, "job request", error.BadResponse);
+        // Its memory is reserved in the other runners' checks while it ramps up.
+        if (c.gate) |g| g.leave(true);
         return handleJob(c, .{
             .creds = creds,
-            .token = token,
-            .token_at = token_at,
+            .token = token.*,
+            .token_at = token_at.*,
             .url = try broker.messageUrl(c.arena, base, sid, "Busy"),
         }, inner);
     }
@@ -2727,6 +2815,93 @@ test "a step that finishes after the job's uploads began is uploaded at the end,
     try std.testing.expectEqual(@as(u32, 1), fake.lines.load(.monotonic));
     try std.testing.expect(o.extraStartedFn == null and o.postsFn == null);
     try std.testing.expect(logs.done(1, "a", 1, 1) == null);
+}
+
+test "a runner short of memory stops asking for jobs, and asks again once memory is back" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    // The broker: every poll is handed a job, whose acquirejob then answers 404.
+    var server: @import("github/testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    var url_buf: [64]u8 = undefined;
+    const base = try arena.dupe(u8, server.url(&url_buf, "127.0.0.1", "/broker/"));
+
+    // The machine: plenty of memory, but under pressure (PSI) until the test says otherwise.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fs.path.join(arena, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const thrashing = "some avg10=50.00 avg60=20.00 avg300=5.00 total=900\n";
+    const calm = "some avg10=0.00 avg60=0.00 avg300=0.00 total=900\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 8388608 kB\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pressure", .data = thrashing });
+    var started: [1]i64 = undefined;
+    var memory: admission.Admission = .init(io, .{}, &started);
+    memory.paths = .{
+        .meminfo = try std.fs.path.join(arena, &.{ dir, "meminfo" }),
+        .pressure = try std.fs.path.join(arena, &.{ dir, "pressure" }),
+    };
+    memory.recheck = .fromMilliseconds(10);
+    var gate: admission.Gate = .{ .pool = &memory };
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var err_buf: [1024]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+    var cfg: Config = .{ .gh_token = "", .scope = undefined };
+    var c = testContext(arena, &log, &err, &cfg);
+    c.gate = &gate;
+    // A token minted now is not refreshed, so the credentials are never read.
+    const creds: auth.Credentials = undefined;
+    var token: []const u8 = "tok";
+    var token_at = std.Io.Clock.real.now(io).toSeconds();
+
+    // Under pressure the cycle ends before its first poll: nothing asked, nothing counted.
+    try std.testing.expectEqual(Cycle.held, try listen(c, creds, base, "s", &token, &token_at));
+    try std.testing.expectEqual(@as(u32, 0), server.polls.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), memory.polling);
+
+    // `serve` then waits, looking again every 10 ms, and still asks for nothing.
+    const Waiter = struct {
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(w: *@This(), cc: Context, g: *admission.Gate, h: admission.Hold) anyerror!bool {
+            defer w.done.store(true, .release);
+            return admit(cc, g, h);
+        }
+    };
+    var waiter: Waiter = .{};
+    var waiting = try io.concurrent(Waiter.run, .{ &waiter, c, &gate, gate.check().? });
+    io.sleep(.fromMilliseconds(150), .awake) catch {};
+    try std.testing.expect(!waiter.done.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), server.polls.load(.acquire));
+
+    // The pressure goes: the runner is let through and takes the job it is handed.
+    try tmp.dir.writeFile(io, .{ .sub_path = "pressure", .data = calm });
+    try std.testing.expect(try waiting.await(io));
+    try std.testing.expectEqual(@as(u32, 1), memory.polling);
+    const r = try listen(c, creds, base, "s", &token, &token_at);
+    try std.testing.expect(r == .failed);
+    try std.testing.expectEqual(@as(u32, 1), server.polls.load(.acquire));
+    try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "acquirejob") != null);
+    // No longer polling, and its job reserved while it ramps up.
+    try std.testing.expectEqual(@as(u32, 0), memory.polling);
+    try std.testing.expect(started[0] > std.math.minInt(i64));
+
+    // The hold and its end were each said once, though the gate was looked at many times.
+    const said = out.buffered();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, said, "holding back"));
+    try std.testing.expect(std.mem.indexOf(u8, said, "memory pressure 50.00%") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, said, "taking jobs again"));
+
+    // A runner held when a stop comes stops at once.
+    try tmp.dir.writeFile(io, .{ .sub_path = "pressure", .data = thrashing });
+    stop_signals.store(1, .release);
+    defer stop_signals.store(0, .release);
+    const hold = gate.check().?;
+    try std.testing.expect(!try admit(c, &gate, hold));
 }
 
 test "a poll that is never answered is given up after its timeout" {

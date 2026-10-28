@@ -20,6 +20,7 @@ comptime {
     _ = @import("yaml.zig");
     _ = @import("action.zig");
     _ = @import("config.zig");
+    _ = @import("admission.zig");
     _ = @import("github/jitconfig.zig");
     _ = @import("github/rsa_sign.zig");
     _ = @import("github/auth.zig");

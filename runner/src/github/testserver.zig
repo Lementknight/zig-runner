@@ -11,6 +11,8 @@
 //!   /see-other   303 to /echo
 //!   /loop        302 to /loop
 //!   /unavailable/...  503
+//!   /broker/message?...  200, a `RunnerJobRequest` whose run service is /nowhere (so acquirejob
+//!                answers 404); each one counted in `Server.polls`
 //!   anything else 404
 const std = @import("std");
 const Io = std.Io;
@@ -19,6 +21,8 @@ pub const Server = struct {
     listener: Io.net.Server,
     port: u16,
     thread: std.Thread,
+    /// Requests to /broker/message so far.
+    polls: std.atomic.Value(u32),
 
     /// Listens and serves on a thread of its own until `stop`.
     pub fn start(s: *Server) !void {
@@ -26,6 +30,7 @@ pub const Server = struct {
         const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
         s.listener = try addr.listen(io, .{ .reuse_address = true });
         s.port = s.listener.socket.address.getPort();
+        s.polls = .init(0);
         s.thread = try std.Thread.spawn(.{}, serve, .{s});
     }
 
@@ -54,7 +59,7 @@ pub const Server = struct {
         while (true) {
             const conn = s.listener.accept(std.testing.io) catch return;
             defer conn.close(std.testing.io);
-            if (!answer(s.port, conn)) return;
+            if (!answer(s, conn)) return;
         }
     }
 };
@@ -65,8 +70,9 @@ fn connect(port: u16) !Io.net.Stream {
 }
 
 /// One request on `conn`, answered and the connection closed. False for /quit.
-fn answer(port: u16, conn: Io.net.Stream) bool {
+fn answer(s: *Server, conn: Io.net.Stream) bool {
     const io = std.testing.io;
+    const port = s.port;
     var rb: [4096]u8 = undefined;
     var r = conn.reader(io, &rb);
     const first = r.interface.takeDelimiterInclusive('\n') catch return true;
@@ -113,6 +119,16 @@ fn answer(port: u16, conn: Io.net.Stream) bool {
         respond(out, "302 Found", "/loop", "");
     } else if (std.mem.startsWith(u8, path, "/unavailable/")) {
         respond(out, "503 Service Unavailable", null, "");
+    } else if (std.mem.startsWith(u8, path, "/broker/message?")) {
+        _ = s.polls.fetchAdd(1, .acq_rel);
+        var body_buf: [256]u8 = undefined;
+        const body = std.fmt.bufPrint(
+            &body_buf,
+            "{{\"messageType\":\"RunnerJobRequest\",\"body\":\"{{\\\"runner_request_id\\\":" ++
+                "\\\"r\\\",\\\"run_service_url\\\":\\\"http://127.0.0.1:{d}/nowhere\\\"}}\"}}",
+            .{port},
+        ) catch return true;
+        respond(out, "200 OK", null, body);
     } else {
         respond(out, "404 Not Found", null, "");
     }
