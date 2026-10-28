@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A runner the memory gate holds back logs its own name, the one it then registers under, instead of the name every runner of the pool shared.'
+time: 2026-10-28T10:00:00.000000-04:00

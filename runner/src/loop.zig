@@ -187,6 +187,10 @@ pub fn serve(c: Context) !Exit {
     defer if (next) |r| r.discard(c);
     var failures: u32 = 0;
     defer if (c.gate) |g| g.leave(false);
+    // The name the next cycle registers under, chosen before the memory gate so that a held runner
+    // logs its own name: `c.name` is the pool's, shared by every runner of it.
+    var held_name_buf: [256]u8 = undefined;
+    var held_name: ?[]const u8 = null;
     while (true) {
         // The memory gate (#126): register only once the machine has the memory for one more job.
         if (c.gate) |g| if (g.check()) |hold| {
@@ -196,7 +200,10 @@ pub fn serve(c: Context) !Exit {
                 next = null;
                 r.discard(c);
             }
-            if (!try admit(c, g, hold)) return .done;
+            held_name = try runnerNameBuf(&held_name_buf, c);
+            var hc = c;
+            hc.name = held_name.?;
+            if (!try admit(hc, g, hold)) return .done;
         };
         var cycle_arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer cycle_arena.deinit();
@@ -204,7 +211,13 @@ pub fn serve(c: Context) !Exit {
         cc.arena = cycle_arena.allocator();
         cc.ending = &ending;
         if (!c.cfg.once) cc.next = &next;
-        cc.name = if (next) |r| try cc.arena.dupe(u8, r.name) else try runnerName(cc.arena, c);
+        cc.name = if (next) |r|
+            try cc.arena.dupe(u8, r.name)
+        else if (held_name) |n|
+            try cc.arena.dupe(u8, n)
+        else
+            try runnerName(cc.arena, c);
+        held_name = null;
 
         const r = try cycle(cc);
         c.err.flush() catch {};
@@ -277,9 +290,14 @@ fn sayUnallocated(c: Context, comptime fmt: []const u8, args: anytype) void {
 
 /// A new registration name: the prefix and a random suffix.
 fn runnerName(arena: Allocator, c: Context) ![]const u8 {
+    var buf: [256]u8 = undefined;
+    return arena.dupe(u8, try runnerNameBuf(&buf, c));
+}
+
+fn runnerNameBuf(buf: []u8, c: Context) ![]const u8 {
     var suffix: [4]u8 = undefined;
     c.io.random(&suffix);
-    return std.fmt.allocPrint(arena, "{s}-{x}", .{ c.cfg.name_prefix, suffix });
+    return std.fmt.bufPrint(buf, "{s}-{x}", .{ c.cfg.name_prefix, suffix });
 }
 
 /// The next cycle's JIT registration, made in the background while this cycle's job finishes
