@@ -501,7 +501,6 @@ fn dumpGithubContext(out: *std.Io.Writer, job: std.json.Value) !void {
         "workflow",
         "event",
         "triggering_actor",
-        "head_ref",
         "retention_days",
         "repository_id",
         "graphql_url",

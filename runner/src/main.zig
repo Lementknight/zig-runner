@@ -318,11 +318,13 @@ fn installStopSignals() void {
     std.posix.sigaction(.INT, &act, null);
 }
 
-/// Dev helper: runs a saved acquirejob response through the Dagger executor.
+/// The first signal asks the runners to stop; a second exits at once, with the shell's code for a
+/// process ended by SIGINT (128 + 2).
 fn onStopSignal(_: std.posix.SIG) callconv(.c) void {
     if (loop.stop_signals.fetchAdd(1, .acq_rel) >= 1) std.process.exit(130);
 }
 
+/// `--exec-job`, a dev helper: runs a saved acquirejob response through the Dagger executor.
 fn execJobFile(
     init: std.process.Init,
     cfg: *const Config,
