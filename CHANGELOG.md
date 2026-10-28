@@ -10,6 +10,11 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.15.1 - 2026-10-28
+### Fixed
+* A runner the memory gate holds back logs its own name, the one it then registers under, instead of the name every runner of the pool shared.
+* A request to GitHub on a connection that died without a word no longer holds up a job's end: every request has a deadline (30 s; blob uploads longer with their size, up to 5 minutes; long polls 90 s) and is tried once more on a new connection, connections give up unacknowledged data after 90 s, and the job's end waits for its log uploads at most about 7 minutes before completejob, instead of the 17 minutes a step's upload once read a dead connection for (#100).
+
 ## v0.15.0 - 2026-10-28
 ### Added
 * A memory gate (#126): a runner asks GitHub for a job only while the machine has the memory for it, reserving room for the jobs its pool's other runners may be handed at the same moment and for jobs started in the last two minutes, and holds while memory pressure (PSI) or swap growth says the machine is struggling. A held runner removes its registration and waits, logging once when it holds and once when it resumes; running jobs are never touched. On by default (RUNNER_ADMISSION, RUNNER_MIN_MEM_AVAILABLE_MB=1536, RUNNER_MEM_PER_JOB_MB=1024, RUNNER_MAX_MEM_PRESSURE=10, RUNNER_MAX_SWAP_GROWTH_MB=64), which on razorbill lets three heavy jobs start together from idle, not four. The README and compose.yaml also describe giving the engine no swap of its own (memswap_limit equal to mem_limit), and its trade-off.
