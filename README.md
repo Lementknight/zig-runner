@@ -52,17 +52,23 @@ decide the version, write the changelog and tag the release alongside this, disa
 
 `ci` checks every pull request: the branch name, the workflows (actionlint, and
 [zizmor](https://docs.zizmor.sh) for security), the format, build and tests, and the database tests
-against TimescaleDB; on a change that cannot affect them (documentation, the proofs, the deployment
-files, other workflows: `.github/scripts/ci-scope.sh`) the build and test jobs report without
-running. The GitHub client's tests run over real connections to a local server
+against TimescaleDB; `proofs` checks the Lean proofs and `release` the packaging (below). Every one
+of these is a required check, and reports on every pull request and in the merge queue: on a change
+that cannot affect what a job checks, it reports without running its steps
+(`.github/scripts/ci-scope.sh tests|proofs|packaging`, each with the list of files that can; the
+build and tests run for any file it does not know, the proofs and the packaging only for the files
+they read). A path filter would instead leave the check unreported, and the merge queue waiting for
+it. The GitHub client's tests run over real connections to a local server
 (`src/github/testserver.zig`), so how it handles redirects and tokens is tested, not described. A merge into
-`main` goes through the merge queue, which runs `ci` again on top of `main`; `automerge` turns on
+`main` goes through the merge queue, which runs these checks again on top of `main`; `automerge` turns on
 auto-merge for every pull request from a branch of this repository, so it joins the queue once its
 checks pass (Renovate does the same for its own). Once a day, `version` releases what merged since
 the last release, if anything did: it waits for approval in the `prod` environment, commits and
 tags the release, and the tag runs `release`: the binaries (compiled directly,
 `.github/scripts/build-binaries.sh`), the image from those same binaries after a
-[Trivy](https://trivy.dev) scan, each with signed build provenance. `scorecard` grades the
+[Trivy](https://trivy.dev) scan, each with signed build provenance. On pull requests and in the
+merge queue, `release` builds and scans the same, publishing nothing ("Binaries (check)", "Binaries
+(same as zig build)" and "Image"), when the change touches the packaging. `scorecard` grades the
 repository weekly with [OpenSSF Scorecard](https://scorecard.dev).
 `compare` runs the comparison tools weekly
 (`.github/scripts/*-diff.sh`): the expression evaluator, YAML reader, `hashFiles()`, problem
@@ -70,7 +76,7 @@ matcher regular expressions, HPACK decoder and RS256 signing against the impleme
 follow, on fresh random cases.
 `proofs` checks the [Lean proofs](proofs/README.md) (the step cache, the regex matcher's loops, and
 the `hashFiles()` walk) and compares the walk's model with `runner/src/glob.zig` on random cases,
-when either changes and weekly. The workflows are written to be hard to turn against the
+when either changes and weekly ("Proofs"). The workflows are written to be hard to turn against the
 repository:
 
 - **Least privilege.** Each workflow grants nothing by default; each job asks for only what it

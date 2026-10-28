@@ -2,21 +2,17 @@ name: proofs
 
 # The Lean proofs in proofs/ (proofs/README.md): `lake build` checks every theorem, and the hashFiles
 # model is compared with runner/src/glob.zig on random cases (glob-lean-diff.sh), so the proof about
-# the walk holds of the walk that ships. On changes to either side, and weekly on fresh cases. The
-# seed is the run number, and is printed: a failure reproduces locally with the same seed.
+# the walk holds of the walk that ships. On every pull request, merge group and push to main, and
+# weekly on fresh cases. The seed is the run number, and is printed: a failure reproduces locally
+# with the same seed. A required check: on a pull request or merge group that changes neither side
+# the job skips its steps and still reports (ci-scope.sh proofs), which a path filter would not.
 
 on:
   push:
     branches: [main]
-    paths: &paths
-      - proofs/**
-      - runner/src/glob.zig
-      - runner/tools/globleancorpus.zig
-      - .github/scripts/glob-lean-diff.sh
-      - .github/scripts/install-lean.sh
-      - .github/workflows/proofs.yml
   pull_request:
-    paths: *paths
+  # The merge queue's runs; without this the required check never reports there.
+  merge_group:
   schedule:
     - cron: "41 5 * * 1" # Mondays, 05:41 UTC
   workflow_dispatch:
@@ -39,17 +35,27 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Whether this change can affect the proofs
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh proofs
+
       - name: Install Lean
+        if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-lean.sh
 
       - name: Install Zig
+        if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
 
       - name: Check the proofs
+        if: steps.scope.outputs.run == 'true'
         working-directory: proofs
         run: lake build
 
       - name: The hashFiles model against glob.zig
+        if: steps.scope.outputs.run == 'true'
         env:
           SEED: ${{ github.run_number }}
         run: |
