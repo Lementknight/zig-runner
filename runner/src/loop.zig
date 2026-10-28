@@ -91,7 +91,7 @@ pub const SlowOutputs = struct {
 
 fn say(c: Context, comptime fmt: []const u8, args: anytype) !void {
     const text = try std.fmt.allocPrint(c.arena, fmt, args);
-    try c.log.append(0, 0, .stderr, text);
+    try c.log.say(text);
 }
 
 /// Poll responses are 202 when idle. A fresh token is minted before the old one can expire.
@@ -1439,7 +1439,7 @@ const Renewer = struct {
     fn say(r: *Renewer, arena: Allocator, comptime fmt: []const u8, args: anytype) void {
         const text = std.fmt.allocPrint(arena, "job {d}: " ++ fmt, .{r.log_job} ++ args) catch
             return;
-        r.c.log.append(0, 0, .stderr, text) catch {};
+        r.c.log.say(text) catch {};
     }
 };
 
