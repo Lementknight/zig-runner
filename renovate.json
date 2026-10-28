@@ -84,18 +84,6 @@
       "extractVersionTemplate": "^v(?<version>.*)$"
     },
     {
-      "description": "GoReleaser, pinned by version in release.yml.",
-      "customType": "regex",
-      "managerFilePatterns": [
-        "/^\\.github/workflows/release\\.yml$/"
-      ],
-      "matchStrings": [
-        "GORELEASER_VERSION: (?<currentValue>v\\S+)"
-      ],
-      "depNameTemplate": "goreleaser/goreleaser",
-      "datasourceTemplate": "github-releases"
-    },
-    {
       "description": "Trivy's image, pinned by digest in release.yml.",
       "customType": "regex",
       "managerFilePatterns": [

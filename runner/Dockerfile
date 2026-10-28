@@ -7,7 +7,23 @@
 #   docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/zig-runner runner/
 #
 # Steps run in the Dagger engine, not here; see docs/DEPLOY.md for running the two together.
+#
+# The release workflow builds `--target prebuilt` instead, from the release's own binaries
+# (checked and attested) in prebuilt/runner-<amd64|arm64>, so the image holds exactly the binaries
+# the release does, without compiling them a second time.
+
 # Pinned by digest, which a moved tag cannot change; Renovate moves the pin.
+FROM --platform=$BUILDPLATFORM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 AS certs
+RUN apk add --no-cache ca-certificates
+
+FROM scratch AS prebuilt
+ARG TARGETARCH
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY prebuilt/runner-${TARGETARCH} /runner
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/runner"]
+
+# From source, the default.
 FROM --platform=$BUILDPLATFORM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 AS build
 # The checksums ziglang.org publishes for this version (.github/scripts/install-zig.sh has the same).
 ARG ZIG_VERSION=0.17.0
