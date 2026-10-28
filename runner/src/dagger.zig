@@ -4094,6 +4094,14 @@ const Exec = struct {
         mounts: []const Mount,
     ) !ExecOut {
         const arena = x.arena;
+        // What the runner adds for the step, apart from its secrets: the variables earlier steps
+        // set, which the container before this step lacks, and the mounts. `outputKeyed` reuses
+        // it. Built once: writePendingEnv hands the exports on and forgets them, and a step run
+        // again (below) needs them as much as the first try did.
+        var env: Query = .initFragment(arena);
+        try x.writePendingEnv(&env);
+        var mount_nodes: Query = .initFragment(arena);
+        try writeMounts(&mount_nodes, mounts);
         // Set when the cache answered with a failure: the step runs again, for real (below).
         var rerun: ?[]const u8 = null;
         while (true) {
@@ -4106,13 +4114,6 @@ const Exec = struct {
                 &.{ x.forward_prelude, try stepScriptFc(arena, num, fc, resolved, action_name) },
             );
             const before = x.container_id;
-            // What the runner adds for the step, apart from its secrets: the variables earlier
-            // steps set, which the container before this step lacks, and the mounts.
-            // `outputKeyed` reuses it.
-            var env: Query = .initFragment(arena);
-            try x.writePendingEnv(&env);
-            var mount_nodes: Query = .initFragment(arena);
-            try writeMounts(&mount_nodes, mounts);
             var pre: Query = .initFragment(arena);
             try pre.splice(env.fragment());
             try pre.splice(mount_nodes.fragment());
@@ -8285,6 +8286,36 @@ fn execRan(arena: Allocator, id: []const u8, code: i32, out: []const u8, ran: []
             "\"exitCode\":{d},\"stdout\":\"{s}\",\"stderr\":\"\",\"fc_ran\":{{\"contents\":\"{s}\"}}}}}}}}}}",
         .{ id, code, out, ran },
     );
+}
+
+test "step caching: a step run again after a replayed failure keeps the exports of the step before" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{ testStep("setup"), testStep("./test.sh") };
+    // The step before exports MODE (GITHUB_ENV); the step's first answer is an earlier job's
+    // failure, so it runs again, and that second try must start from MODE too, as must what
+    // follows (the audit of #80 found the second try without it).
+    const answers = [_][]const u8{
+        base_answer,
+        "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"id\":\"C1\",\"exitCode\":0,\"stdout\":\"\",\"stderr\":\"\"," ++
+            "\"fc_ran\":{\"contents\":\"j1\"},\"fc_env\":{\"contents\":\"MODE=ci\\n\"}}}}}",
+        try execRan(arena, "C2", 1, "failed", "earlier-job"),
+        try execRan(arena, "C3", 0, "passed", "j1"),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .test_ran_marker = "j1", .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    const seen = fake.seen.items;
+    try std.testing.expectEqual(@as(usize, 4), seen.len);
+    const mode = "withEnvVariable(name:\"MODE\",value:\"ci\")";
+    try std.testing.expect(std.mem.indexOf(u8, seen[2], mode) != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "its earlier run failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], mode) != null);
 }
 
 test "step caching: a failure the cache kept from an earlier run is not replayed, the step runs again" {
