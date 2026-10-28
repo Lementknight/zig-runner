@@ -10,6 +10,14 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.14.1 - 2026-10-28
+### Changed
+* The Lean proofs and the release's pull-request checks (Binaries (check), Binaries (same as zig build), Image) run on every pull request and in the merge queue, so they can be required: each skips its steps, still reporting, when the change cannot affect it (ci-scope.sh proofs and packaging). The packaging checks now also run when runner/build.zig.zon changes, which a tls.zig bump skipped before.
+* A release deploys to razorbill only once CI has passed on its tagged commit (Format, build and test, Database tests, Workflows, Binaries and Image): the deploy job waits up to 40 minutes for them, fails naming any that did not succeed, and lists them as the deployment's required contexts. A maintainer can still deploy by hand (README, "Deploying releases").
+### Fixed
+* A release deploys to razorbill again: the deploy job was skipped because a pull-request-only job before the image job is skipped on a tag (v0.14.0 was released and never deployed).
+* The release workflow's Image check no longer fails in the merge queue when the queue has already deleted its temporary branch: it checks out the commit, not the branch.
+
 ## v0.14.0 - 2026-10-28
 ### Added
 * A style guide, docs/STYLE.md: how the runner's code is named, when it is abstracted, where it lives, and which rule wins when they disagree.

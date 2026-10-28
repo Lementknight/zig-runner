@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'The release workflow''s Image check no longer fails in the merge queue when the queue has already deleted its temporary branch: it checks out the commit, not the branch.'
-time: 2026-10-28T09:00:00.000000-04:00

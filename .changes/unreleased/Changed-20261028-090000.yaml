@@ -1,3 +1,0 @@
-kind: Changed
-body: 'The Lean proofs and the release''s pull-request checks (Binaries (check), Binaries (same as zig build), Image) run on every pull request and in the merge queue, so they can be required: each skips its steps, still reporting, when the change cannot affect it (ci-scope.sh proofs and packaging). The packaging checks now also run when runner/build.zig.zon changes, which a tls.zig bump skipped before.'
-time: 2026-10-28T09:00:00.000000-04:00
