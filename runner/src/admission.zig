@@ -61,14 +61,14 @@ pub const Admission = struct {
     recheck: std.Io.Duration = .fromSeconds(5),
     /// Runners let through to poll for a job: each may be handed one at any moment.
     polling: u32 = 0,
-    /// When the pool's latest jobs started (awake clock, ms), as a ring as long as the pool: a
-    /// runner runs one job at a time, so an entry overwritten is never a job still ramping up
-    /// that the others are not.
+    /// When each runner's job started (awake clock, ms), one entry per runner (`Gate.slot`): a
+    /// runner runs one job at a time. Cleared when the job ends, so a job that is over reserves
+    /// nothing, however soon it ended.
     started: []i64,
-    next_start: usize = 0,
     swap: SwapGrowth = .{},
 
-    /// `started` must have one entry for each runner in the pool.
+    /// `started` must have one entry for each runner in the pool, and each runner's `Gate.slot`
+    /// a different index into it.
     pub fn init(io: std.Io, limits: Limits, started: []i64) Admission {
         @memset(started, std.math.minInt(i64));
         return .{ .io = io, .limits = limits, .started = started };
@@ -88,6 +88,8 @@ pub const Admission = struct {
 /// lets it through until it leaves: when it takes a job, or its cycle ends.
 pub const Gate = struct {
     pool: *Admission,
+    /// This runner's entry in `pool.started`.
+    slot: usize = 0,
     /// Counted in `pool.polling`.
     claimed: bool = false,
     /// Held at the last check: the resume thresholds apply.
@@ -118,7 +120,7 @@ pub const Gate = struct {
     }
 
     /// The runner stops polling; `took_job` when because it was handed a job, whose memory is then
-    /// reserved for `ramp_ms`.
+    /// reserved for `ramp_ms`, or until the job ends (`ended`) if that is sooner.
     pub fn leave(g: *Gate, took_job: bool) void {
         const a = g.pool;
         a.mu.lockUncancelable(a.io);
@@ -126,8 +128,17 @@ pub const Gate = struct {
         if (g.claimed) a.polling -= 1;
         g.claimed = false;
         if (!took_job) return;
-        a.started[a.next_start] = std.Io.Clock.awake.now(a.io).toMilliseconds();
-        a.next_start = (a.next_start + 1) % a.started.len;
+        a.started[g.slot] = std.Io.Clock.awake.now(a.io).toMilliseconds();
+    }
+
+    /// The runner's job is over: its memory is no longer reserved. Without this a job reserved its
+    /// memory for the whole `ramp_ms` however short it was, so a burst of short jobs went through
+    /// at most (available - floor) / per-job every two minutes: 1.5 jobs a minute on razorbill.
+    pub fn ended(g: *Gate) void {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        a.started[g.slot] = std.math.minInt(i64);
     }
 };
 
@@ -403,7 +414,8 @@ test "the pool reserves memory for runners polling and jobs just started" {
     var started: [4]i64 = undefined;
     var pool: Admission = .init(io, .{}, &started);
     pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
-    var gates: [4]Gate = @splat(.{ .pool = &pool });
+    var gates: [4]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
     // 5500 MB: three runners may poll (1536 + 3 * 1024 = 4608), a fourth may not (5632).
     for (gates[0..3]) |*g| try std.testing.expect(g.check() == null);
     try std.testing.expectEqual(@as(u32, 3), pool.polling);
@@ -420,4 +432,32 @@ test "the pool reserves memory for runners polling and jobs just started" {
     gates[2].leave(false);
     try std.testing.expectEqual(@as(u32, 0), pool.polling);
     try std.testing.expect(gates[3].check() == null);
+}
+
+test "a job that is over reserves nothing, however soon it ended" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 5632000 kB\n" });
+    var path_buf: [256]u8 = undefined;
+    const meminfo = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/meminfo", .{tmp.sub_path});
+
+    var started: [4]i64 = undefined;
+    var pool: Admission = .init(io, .{}, &started);
+    pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
+    var gates: [4]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    // Three runners take a job each; while those ramp up, a fourth is held.
+    for (gates[0..3]) |*g| {
+        try std.testing.expect(g.check() == null);
+        g.leave(true);
+    }
+    try std.testing.expect(gates[3].check() != null);
+    // The jobs end at once (short jobs): their reservations go with them, well within ramp_ms.
+    for (gates[0..3]) |*g| g.ended();
+    try std.testing.expect(gates[3].check() == null);
+    // A runner's next job takes its own entry again, not another runner's.
+    gates[3].leave(true);
+    gates[3].ended();
+    try std.testing.expectEqual(std.math.minInt(i64), started[3]);
 }
