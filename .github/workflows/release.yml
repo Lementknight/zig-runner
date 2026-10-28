@@ -280,7 +280,12 @@ jobs:
   deploy:
     name: Deploy to razorbill
     needs: [binaries, image]
-    if: startsWith(github.ref, 'refs/tags/')
+    # Explicit results, not the implicit success(): that also requires every job before these to
+    # have succeeded, and on a tag "Binaries (check)", which the image job waits for, is skipped.
+    # Without this, v0.14.0 was released and never deployed.
+    if: >-
+      ${{ !cancelled() && startsWith(github.ref, 'refs/tags/')
+      && needs.binaries.result == 'success' && needs.image.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
