@@ -115,6 +115,10 @@ pub const Config = struct {
     /// Ask for a job only while the machine has the memory for it (`admission.zig`, #126).
     admission: bool = true,
     admission_limits: admission.Limits = .{},
+    /// The engine container's cgroup directory, whose memory cap the gate holds on too
+    /// (`admission.Engine`, #142). Empty: found from `engine_host`'s unix socket; `none`: not
+    /// looked for.
+    engine_cgroup: []const u8 = "",
     /// Seconds a running job may go on after a stop signal before the runner cancels it, as GitHub
     /// cancels one: its step stopped, `if: always()` steps and post scripts still run, the job
     /// reported cancelled. The deploy agent restarts the runner on every release and expects jobs
@@ -220,6 +224,9 @@ pub const Config = struct {
         if (environ.get("RUNNER_MEM_PER_JOB_MB")) |v| l.per_job_mb = try num(u32, v);
         if (environ.get("RUNNER_MAX_MEM_PRESSURE")) |v| l.max_pressure = try percent(v);
         if (environ.get("RUNNER_MAX_SWAP_GROWTH_MB")) |v| l.max_swap_growth_mb = try num(u32, v);
+        if (environ.get("RUNNER_MIN_ENGINE_HEADROOM_MB")) |v|
+            l.min_engine_headroom_mb = try num(u32, v);
+        if (environ.get("RUNNER_ENGINE_CGROUP")) |v| c.engine_cgroup = v;
         if (environ.get("RUNNER_STOP_GRACE_SECS")) |v| c.stop_grace_secs = try secs(v);
         if (environ.get("RUNNER_TRUSTED_REFS")) |v| c.trusted_refs = v;
         if (environ.get("RUNNER_TRUSTED_EVENTS")) |v| c.trusted_events = v;
@@ -274,6 +281,8 @@ pub const Config = struct {
         else if (eq(key, "mem-per-job-mb")) l.per_job_mb = try num(u32, val) //
         else if (eq(key, "max-mem-pressure")) l.max_pressure = try percent(val) //
         else if (eq(key, "max-swap-growth-mb")) l.max_swap_growth_mb = try num(u32, val) //
+        else if (eq(key, "min-engine-headroom-mb")) l.min_engine_headroom_mb = try num(u32, val) //
+        else if (eq(key, "engine-cgroup")) c.engine_cgroup = val //
         else if (eq(key, "stop-grace-secs")) c.stop_grace_secs = try secs(val) //
         else if (eq(key, "trusted-refs")) c.trusted_refs = val //
         else if (eq(key, "trusted-events")) c.trusted_events = val //
@@ -560,13 +569,23 @@ test "the memory gate is on by default, with limits from the environment or flag
     try env.put("RUNNER_MEM_PER_JOB_MB", "0");
     try env.put("RUNNER_MAX_MEM_PRESSURE", "20");
     try env.put("RUNNER_MAX_SWAP_GROWTH_MB", "128");
+    try env.put("RUNNER_MIN_ENGINE_HEADROOM_MB", "512");
+    const scope = "/sys/fs/cgroup/system.slice/docker-e.scope";
+    try env.put("RUNNER_ENGINE_CGROUP", scope);
     const set = try Config.load(&env, &.{ "runner", "--max-mem-pressure=5" });
     try std.testing.expectEqual(admission.Limits{
         .min_available_mb = 2048,
         .per_job_mb = 0,
         .max_pressure = 5,
         .max_swap_growth_mb = 128,
+        .min_engine_headroom_mb = 512,
     }, set.admission_limits);
+    try std.testing.expectEqualStrings(scope, set.engine_cgroup);
+    const flags = try Config.load(&env, &.{
+        "runner", "--engine-cgroup=none", "--min-engine-headroom-mb=0",
+    });
+    try std.testing.expectEqualStrings("none", flags.engine_cgroup);
+    try std.testing.expectEqual(@as(u32, 0), flags.admission_limits.min_engine_headroom_mb);
     try std.testing.expectError(error.InvalidNumber, Config.load(&env, &.{ "runner", "--max-mem-pressure=101" }));
     try env.put("RUNNER_ADMISSION", "false");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).admission);

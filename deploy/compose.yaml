@@ -54,6 +54,9 @@ services:
     env_file: runner.env
     environment:
       RUNNER_ENGINE_HOST: unix:///run/dagger/engine.sock
+    # In its own PID namespace the runner cannot see the engine's process, so its memory gate holds
+    # on the machine's memory only, not on a cap given to the engine (it logs "the engine's cgroup
+    # was not found (EngineProcessNotVisible)"). A runner on the host sees both (#142).
     volumes:
       - engine-socket:/run/dagger
     depends_on:
