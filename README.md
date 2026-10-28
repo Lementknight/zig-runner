@@ -174,8 +174,28 @@ outside contributors' pull requests also wait for approval before they run at al
 
 ## Deploying releases
 
-A release deploys itself to razorbill. Once its binaries and image are built, `release` records a
-GitHub deployment of the version to the `razorbill` environment. On razorbill,
+A release deploys itself to razorbill. Once its binaries and image are built, and CI has passed on
+the tagged commit, `release` records a GitHub deployment of the version to the `razorbill`
+environment. The tagged commit is the release commit `version` pushes to `main`, which the merge
+queue never checked; the push starts `ci` on it, on prod, at the same time as `release`. So the
+deploy job waits, up to 40 minutes, until "Format, build and test", "Database tests", "Workflows",
+"Binaries" and "Image" have each completed on that commit, and fails, naming the check, as soon as
+one has not succeeded or once the wait runs out. (The deployment cannot list them as
+`required_contexts`: GitHub matches those against commit statuses only, not Actions check runs.)
+Once the check passes (re-run it), re-run the release's failed jobs: that is the deploy job alone.
+
+When CI cannot pass for a reason that is not the release's (a prod runner that is down, perhaps
+because the release before broke it), a maintainer deploys by hand, with a token that can write
+deployments and no checks required; the agent on razorbill still checks the binary's checksum and
+provenance:
+
+```sh
+jq -n --arg ref v1.2.3 '{ref: $ref, environment: "razorbill", auto_merge: false,
+  required_contexts: [], description: ("zig-runner " + $ref + ", by hand")}' |
+  gh api -X POST repos/Open-Blue/zig-runner/deployments --input -
+```
+
+On razorbill,
 `zig-runner-deploy.timer` asks every minute; for a new deployment `deploy/zig-runner-deploy`:
 
 1. downloads the release's binary, checks it against `SHA256SUMS`, and checks its provenance:

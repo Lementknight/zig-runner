@@ -277,6 +277,10 @@ jobs:
   # The release, recorded as a deployment to razorbill: the agent there (deploy/zig-runner-deploy)
   # installs it once its checksum and provenance check out, restarts the runners, and reports back
   # to the deployment (README, "Deploying releases"). Not on a run by hand, which rebuilds an image.
+  # Only once CI has passed on the tagged commit: the release commit, which version.yml pushes to
+  # main with the deploy key, and which nothing checked before it was tagged (the merge queue
+  # checked what merged, not the commit that adds the version and the changelog to it). That push,
+  # unlike one with GITHUB_TOKEN, starts ci.yml's push run on the commit, at the same time as this.
   deploy:
     name: Deploy to razorbill
     needs: [binaries, image]
@@ -287,14 +291,75 @@ jobs:
       ${{ !cancelled() && startsWith(github.ref, 'refs/tags/')
       && needs.binaries.result == 'success' && needs.image.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The wait for the checks (WAIT_MINUTES), and a little.
+    timeout-minutes: 45
     permissions:
+      checks: read # to wait for the tagged commit's checks
       deployments: write # to record the deployment
+    env:
+      # What must have passed on the tagged commit, one per line: ci.yml's jobs that run on a push
+      # to main (not "Branch name", pull requests' only, which is skipped here), and this run's
+      # Binaries and Image, which this job needs, so they are done before it starts. A name that
+      # never runs on a push to main would hold every deploy for the whole wait, then fail it.
+      REQUIRED_CHECKS: |-
+        Format, build and test
+        Database tests
+        Workflows
+        Binaries
+        Image
     steps:
+      # ci.yml's build and tests run on prod, and are usually done before the image is; otherwise
+      # this waits, up to WAIT_MINUTES. A check that completed without success fails the job at
+      # once; one still queued or running at the end, or never started, fails it then. Each is
+      # named. Only GitHub Actions' check runs count (another app could name one the same), from
+      # every page, and for each name the latest (the highest id): a re-run is a new check run
+      # under the same name. Once they pass, re-running this job deploys (README, "Deploying
+      # releases").
+      - name: Wait for the tagged commit's checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WAIT_MINUTES: "40"
+        run: |
+          mapfile -t checks <<<"$REQUIRED_CHECKS"
+          deadline=$((SECONDS + WAIT_MINUTES * 60))
+          while :; do
+            runs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" \
+              --jq '.check_runs[] | select(.app.slug == "github-actions") | {id, name, status, conclusion}' |
+              jq -s .) || {
+              # A failed request counts as none found yet, so a passing GitHub hiccup costs a poll.
+              echo "::warning::could not list the check runs on $GITHUB_SHA"
+              runs='[]'
+            }
+            waiting=()
+            for name in "${checks[@]}"; do
+              state=$(jq -r --arg name "$name" '[.[] | select(.name == $name)] | max_by(.id)
+                // {status: "missing"} | if .status == "completed" then .conclusion else .status end' <<<"$runs")
+              case $state in
+              success) ;;
+              missing | queued | in_progress | waiting | requested | pending) waiting+=("$name ($state)") ;;
+              *)
+                echo "::error::$name: $state on $GITHUB_SHA, so $TAG is not deployed (README, \"Deploying releases\")"
+                exit 1
+                ;;
+              esac
+            done
+            ((${#waiting[@]} > 0)) || break
+            if ((SECONDS >= deadline)); then
+              echo "::error::still waiting after $WAIT_MINUTES minutes for: ${waiting[*]}; $TAG is not deployed (README, \"Deploying releases\")"
+              exit 1
+            fi
+            echo "waiting for: ${waiting[*]}"
+            sleep 30
+          done
+          echo "passed on $GITHUB_SHA: ${checks[*]}"
+
+      # required_contexts: none, because the step above is the check. GitHub matches
+      # required_contexts against commit statuses only, not Actions check runs: tried on 2026-10-28,
+      # a deployment requiring a check that had passed 30 times was refused (409) like one requiring
+      # a check that does not exist.
       - name: Record the deployment
         env:
           GH_TOKEN: ${{ github.token }}
-        # required_contexts: none: the release's checks already passed, before its tag existed.
         run: |
           jq -n --arg ref "$TAG" '{
             ref: $ref, environment: "razorbill", auto_merge: false, required_contexts: [],
