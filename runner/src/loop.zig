@@ -787,7 +787,8 @@ fn handleJob(c: Context, session: Listening, body: []const u8) !Cycle {
     };
     // Everything the job logs is also kept (redacted, timestamped) so it can be uploaded to GitHub.
     var collect: sink.LogSink = .{ .collect = .{ .arena = c.arena, .io = c.io, .inner = c.log } };
-    collect.setSecrets(try std.mem.concat(c.arena, []const u8, &.{ c.secrets, job.secrets }));
+    // Each secret in every form it can take in output (redact.forms): a multi-line one line by line.
+    collect.setSecrets(try redact.expand(c.arena, try std.mem.concat(c.arena, []const u8, &.{ c.secrets, job.secrets })));
     const log = &collect;
     const spool = try openSpool(c, job, &collect);
     defer if (spool) |sp| sp.close(c.io);
@@ -825,7 +826,7 @@ fn handleJob(c: Context, session: Listening, body: []const u8) !Cycle {
     live.finish(try liveFinals(c.arena, shown));
 
     const conclusion = jobConclusion(result);
-    if (try completeJobWithRetry(c, jr, job, conclusion, shown, result)) |failed| return failed;
+    if (try completeJobWithRetry(c, jr, job, conclusion, shown, result, log.currentSecrets())) |failed| return failed;
     try sayJob(log, c.arena, job, "job {s}", .{@tagName(conclusion)});
     return .{ .job = result.succeeded };
 }
@@ -1155,9 +1156,11 @@ fn completeJobWithRetry(
     conclusion: runservice.Conclusion,
     shown: []const Shown,
     result: dagger.Result,
+    /// The job's secrets and masks, which annotations are redacted with.
+    secrets: []const []const u8,
 ) !?Cycle {
     const step_json = try stepResultsJson(c.arena, shown);
-    const annotations_json = try annotationsJson(c.arena, shown, result.annotations);
+    const annotations_json = try annotationsJson(c.arena, shown, result.annotations, secrets);
     var done = completeJob(
         c,
         jr,
@@ -1718,10 +1721,24 @@ const Upload = struct {
 /// FAILURE / WARNING / NOTICE, the message, and where it points (a repository path and lines and
 /// columns) when the workflow command said, with the number of the step it came from. An annotation
 /// without a file is shown by GitHub on the job's line in the workflow file.
+/// `text` cut to at most `max` bytes, at a UTF-8 character boundary.
+fn cutUtf8(text: []const u8, max: usize) []const u8 {
+    if (text.len <= max) return text;
+    var end = max;
+    while (end > 0 and text[end] & 0xc0 == 0x80) end -= 1;
+    return text[0..end];
+}
+
+/// GitHub's runner cuts an annotation's message at this many characters (`_maxIssueMessageLength`).
+const max_annotation_message = 4096;
+
+/// The annotations for completejob, masked as the log is (GitHub's runner masks them too; the run
+/// page shows them to anyone who can read the repository) and cut as GitHub cuts them.
 pub fn annotationsJson(
     arena: Allocator,
     shown: []const Shown,
     annotations: []const dagger.Annotation,
+    secrets: []const []const u8,
 ) ![]const u8 {
     const Item = struct {
         level: []const u8,
@@ -1746,9 +1763,9 @@ pub fn annotationsJson(
                 an.level,
                 "error",
             )) "FAILURE" else if (std.mem.eql(u8, an.level, "warning")) "WARNING" else "NOTICE",
-            .message = an.message,
-            .title = if (an.title) |t| (if (t.len > 0) t else null) else null,
-            .path = if (an.file) |f| (if (f.len > 0) f else null) else null,
+            .message = cutUtf8(try redact.alloc(arena, an.message, secrets), max_annotation_message),
+            .title = if (an.title) |t| (if (t.len > 0) try redact.alloc(arena, t, secrets) else null) else null,
+            .path = if (an.file) |f| (if (f.len > 0) try redact.alloc(arena, f, secrets) else null) else null,
             .startLine = line,
             .endLine = propertyNumber(an.end_line) orelse line,
             .startColumn = col,
@@ -1775,10 +1792,31 @@ test "annotations: GitHub's levels, the place they point to, and the step they c
     const json = try annotationsJson(a.allocator(), &shown, &.{
         .{ .step = 1, .an = .{ .level = "error", .message = "bad", .file = "src/a.zig", .line = "3", .col = "5", .title = "T" } },
         .{ .step = 1, .an = .{ .level = "notice", .message = "fyi", .line = "x" } },
-    });
+    }, &.{});
     try std.testing.expectEqualStrings(
         \\[{"level":"FAILURE","message":"bad","title":"T","path":"src/a.zig","startLine":3,"endLine":3,"startColumn":5,"endColumn":5,"stepNumber":2,"isInfrastructureIssue":false},{"level":"NOTICE","message":"fyi","stepNumber":2,"isInfrastructureIssue":false}]
     , json);
+}
+
+test "annotations are masked as the log is, and cut where GitHub cuts them" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const shown = [_]Shown{.{ .id = "b", .number = 1, .name = "Build", .log_step = 1, .conclusion = "failed" }};
+    // `::warning title=key s3cr3t::using s3cr3t`: the log line is masked, and now the annotation too.
+    const secrets = try redact.expand(ar, &.{"s3cr3t"});
+    const long = try ar.alloc(u8, 5000);
+    @memset(long, 'x');
+    long[4095] = 0xc3; // the first byte of a two-byte character across the cut
+    long[4096] = 0xa9;
+    const json = try annotationsJson(ar, &shown, &.{
+        .{ .step = 1, .an = .{ .level = "warning", .message = "using s3cr3t", .title = "key s3cr3t" } },
+        .{ .step = 1, .an = .{ .level = "error", .message = long } },
+    }, secrets);
+    try std.testing.expect(std.mem.indexOf(u8, json, "s3cr3t") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"message\":\"using ***\",\"title\":\"key ***\"") != null);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, ar, json, .{});
+    try std.testing.expectEqual(@as(usize, 4095), parsed.array.items[1].object.get("message").?.string.len);
 }
 
 pub fn stepResultsJson(arena: Allocator, shown: []const Shown) ![]const u8 {

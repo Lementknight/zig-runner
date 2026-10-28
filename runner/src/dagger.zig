@@ -25,6 +25,7 @@
 const std = @import("std");
 const job_mod = @import("job.zig");
 const sink = @import("sink.zig");
+const redact = @import("redact.zig");
 const broker = @import("github/broker.zig");
 const build_version = @import("version.zig");
 const expr = @import("expr.zig");
@@ -2153,21 +2154,30 @@ const Shared = struct {
     fn addMask(sh: *Shared, value: []const u8) void {
         var list: std.ArrayList([]const u8) = .empty;
         list.appendSlice(sh.arena, sh.log.currentSecrets()) catch return;
-        var lines = std.mem.splitScalar(u8, value, '\n');
-        while (lines.next()) |l| {
-            const v = std.mem.trim(u8, l, " \t\r");
-            if (v.len > 0) list.append(sh.arena, sh.arena.dupe(u8, v) catch return) catch return;
-        }
-        const whole = std.mem.trim(u8, value, " \t\r\n");
-        if (whole.len > 0 and std.mem.indexOfScalar(u8, whole, '\n') != null)
-            list.append(sh.arena, sh.arena.dupe(u8, whole) catch return) catch return;
+        // In every form, as the job's own secrets are (redact.forms).
+        const owned = sh.arena.dupe(u8, value) catch return;
+        list.appendSlice(sh.arena, redact.forms(sh.arena, owned) catch return) catch return;
         // Longest first, so a secret that contains another one is masked whole.
-        std.mem.sort([]const u8, list.items, {}, struct {
-            fn longer(_: void, a: []const u8, b: []const u8) bool {
-                return a.len > b.len;
-            }
-        }.longer);
+        redact.sortLongestFirst(list.items);
         sh.log.setSecrets(list.items);
+    }
+
+    /// `text` with the job's secrets and masks so far replaced, for what leaves the runner other
+    /// than through the log (a step's evaluated name, a job output).
+    fn redacted(sh: *Shared, arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
+        sh.mu.lockUncancelable(sh.io);
+        defer sh.mu.unlock(sh.io);
+        return redact.alloc(arena, text, sh.log.currentSecrets());
+    }
+
+    /// Whether `text` holds one of the job's secrets or masks.
+    fn holdsSecret(sh: *Shared, text: []const u8) bool {
+        sh.mu.lockUncancelable(sh.io);
+        defer sh.mu.unlock(sh.io);
+        for (sh.log.currentSecrets()) |s| {
+            if (s.len > 0 and std.mem.indexOf(u8, text, s) != null) return true;
+        }
+        return false;
     }
 
     /// State a step saved with the deprecated `::save-state`, since the last call.
@@ -3269,7 +3279,8 @@ fn stepCondition(x: *Exec, step: job_mod.Step, res: *StepResult, num: u32) !?exp
     const arena = x.arena;
     ev.diag = "";
     const sc0 = try ev.scope(&.{});
-    if (step.name_expr) |ne| res.name = expr.evalString(arena, ne, sc0) catch step.name;
+    // Evaluated with `secrets` in scope, and shown on GitHub, in the live view and in the database.
+    if (step.name_expr) |ne| res.name = try x.sh.redacted(arena, expr.evalString(arena, ne, sc0) catch step.name);
     const should_run = expr.evalCondition(arena, step.condition, sc0) catch {
         const msg = try std.fmt.allocPrint(
             arena,
@@ -3832,7 +3843,7 @@ fn finishJob(x: *Exec, opts: Options, results: []StepResult) !Result {
     };
     result.next_log_step = x.next_log_step;
     result.summaries = x.summaries;
-    try jobOutputs(arena, x.ev, job.*, &result);
+    try jobOutputs(arena, x.ev, x.sh, job.*, &result);
     return result;
 }
 
@@ -3840,7 +3851,7 @@ fn finishJob(x: *Exec, opts: Options, results: []StepResult) !Result {
 /// contexts (the steps' outputs and outcomes), each output a string. One that would carry a secret
 /// is dropped with GitHub's warning (later jobs could read it); one that cannot be evaluated is
 /// dropped with the reason.
-fn jobOutputs(arena: Allocator, ev: *Evaluator, job: job_mod.Job, result: *Result) !void {
+fn jobOutputs(arena: Allocator, ev: *Evaluator, sh: *Shared, job: job_mod.Job, result: *Result) !void {
     if (job.outputs.len == 0) return;
     var outs: std.ArrayList(job_mod.EnvVar) = .empty;
     var lines: std.ArrayList([]const u8) = .empty;
@@ -3856,7 +3867,9 @@ fn jobOutputs(arena: Allocator, ev: *Evaluator, job: job_mod.Job, result: *Resul
             );
             continue;
         };
-        if (containsSecret(job, value)) {
+        // Against every secret and mask, in every form (`::add-mask::` values too: an OIDC-minted
+        // token is one), as GitHub's runner checks job outputs.
+        if (containsSecret(job, value) or sh.holdsSecret(value)) {
             try lines.append(
                 arena,
                 try std.fmt.allocPrint(arena, "##[warning]Skip output '{s}' since it may " ++
@@ -9870,6 +9883,40 @@ test "logs read like GitHub's: Set up job, then each step's header with its shel
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "printf '%s' 'echo one\\necho two' > /tmp/zig-runner-step-3.sh") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "\\\"$zig_shell\\\" '-e' '/tmp/zig-runner-step-3.sh'") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[5], "'sh' '-e' '/tmp/zig-runner-step-") != null);
+}
+
+test "masks a step sets, and the job's secrets, keep a job output and a step's name from leaving unmasked" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    // The step's name names a secret; the step masks an OIDC-style token and outputs it (#96).
+    var st = testStep("mint");
+    st.context_name = "m";
+    st.name_expr = "format('Deploy with {0}', 'hunter2-secret')";
+    const steps = [_]job_mod.Step{st};
+    var job = testJob(&steps);
+    job.secrets = &.{"hunter2-secret"};
+    job.outputs = &.{
+        .{ .name = "token", .value = .{ .expr = "steps.m.outputs.token" } },
+        .{ .name = "fine", .value = .{ .lit = "ok" } },
+    };
+    const answers = [_][]const u8{
+        base_answer,
+        "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"id\":\"C1\",\"exitCode\":0,\"stdout\":\"::add-mask::minted-token-123\\n\",\"stderr\":\"\",\"fc_output\":{\"contents\":\"token=minted-token-123\\n\"}}}}}",
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    // As loop.zig sets the job's secrets before its steps run.
+    log.setSecrets(try redact.expand(arena, job.secrets));
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    try std.testing.expect(res.succeeded);
+    try std.testing.expectEqualStrings("Deploy with ***", res.steps[0].name);
+    try std.testing.expectEqual(@as(usize, 1), res.outputs.len);
+    try std.testing.expectEqualStrings("fine", res.outputs[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "minted-token-123") == null);
 }
 
 test "job outputs are evaluated after the steps; one carrying a secret is skipped" {
