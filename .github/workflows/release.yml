@@ -6,7 +6,8 @@
 # (`gh attestation verify`), the binaries an attested SPDX SBOM too; the image is scanned by Trivy
 # before it is pushed.
 # On pull requests that touch the packaging, the same builds and scans, publishing nothing.
-# Run by hand with a tag to (re)build and push that tag's image.
+# Run by hand with a tag to (re)build and push that tag's image, from its release's binaries: only
+# tags after v0.13.2 (#93), whose Dockerfile has the `prebuilt` stage this builds.
 name: release
 
 on:
@@ -15,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "An existing version tag whose image to build and push (v0.1.0)"
+        description: "An existing version tag after v0.13.2 whose image to build and push (v0.14.0)"
         required: true
   pull_request:
     paths:

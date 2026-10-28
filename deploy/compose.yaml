@@ -1,4 +1,5 @@
-# A pool of runners and the Dagger engine their jobs run in, on one machine (docs/DEPLOY.md).
+# A pool of runners and the Dagger engine their jobs run in, on one machine (the deployment guide,
+# https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/DEPLOY.md).
 #
 #   cp deploy/runner.env.example deploy/runner.env   # then fill it in
 #   docker compose -f deploy/compose.yaml up -d --build
@@ -15,13 +16,13 @@ services:
     command: ["--addr", "unix:///run/dagger/engine.sock"]
     environment:
       # The engine is a Go program: collecting garbage a quarter as often costs about 200 MB more
-      # memory and saves 6-13% of its CPU per job (measured; docs/DEPLOY.md "Sizing").
+      # memory and saves 6-13% of its CPU per job (measured; the deployment guide's "Sizing").
       GOGC: "400"
     volumes:
       - engine-state:/var/lib/dagger
       - engine-socket:/run/dagger
-      # Caps the engine's cache on disk (docs/DEPLOY.md "Sizing"): Dagger's default lets it grow
-      # to about three quarters of the disk.
+      # Caps the engine's cache on disk (the deployment guide's "Sizing"): Dagger's default lets it
+      # grow to about three quarters of the disk.
       - ./engine.json:/etc/dagger/engine.json:ro
     restart: unless-stopped
     # Docker kills a container 10 s after asking it to stop. The engine needs longer (22 s on a

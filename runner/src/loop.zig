@@ -412,7 +412,8 @@ var stop_announced: std.atomic.Value(bool) = .init(false);
 
 fn waitForStop(c: Context) void {
     while (!stopRequested()) c.io.sleep(.fromMilliseconds(200), .awake) catch return;
-    // No allocation: the poll may be using the cycle's arena at the same time.
+    // A fixed message, so nothing to allocate. (The cycle's arena would do even with the poll using
+    // it at the same time: std's ArenaAllocator is thread-safe over a thread-safe gpa.)
     if (!stop_announced.swap(true, .acq_rel)) c.log.append(
         0,
         0,

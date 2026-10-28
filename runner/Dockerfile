@@ -6,7 +6,7 @@
 #   docker build -t zig-runner runner/
 #   docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/zig-runner runner/
 #
-# Steps run in the Dagger engine, not here; see docs/DEPLOY.md for running the two together.
+# Steps run in the Dagger engine, not here; deploy/compose.yaml runs the two together.
 #
 # The release workflow builds `--target prebuilt` instead, from the release's own binaries
 # (checked and attested) in prebuilt/runner-<amd64|arm64>, so the image holds exactly the binaries
@@ -32,7 +32,8 @@ ARG ZIG_SHA256_AARCH64=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f6
 ARG TARGETARCH
 # What `--version` and every job's "Set up job" report. The build context holds no `.git`, so the
 # version cannot be derived here: unset, the binary falls back to the package version, which says
-# nothing about which build it is. The release workflow passes the tag.
+# nothing about which build it is. Pass `--build-arg VERSION=...`; the release's image is
+# `prebuilt`, whose binaries carry theirs.
 ARG VERSION=
 RUN apk add --no-cache curl xz ca-certificates
 RUN arch="$(uname -m)" \

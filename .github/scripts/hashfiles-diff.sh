@@ -9,7 +9,7 @@
 #
 # Both read the same directories, so the files must be the same, in the same order, with the same
 # hash. In a job, glob.zig reads the container through Dagger's API instead (dagger.zig, DaggerFs).
-# Needs Go and Docker. Not run in CI.
+# Needs Go and Docker. CI runs it weekly (compare.yml), not on pull requests.
 #
 #   hashfiles-diff.sh [cases] [seed]     defaults: 400, 1
 set -euo pipefail

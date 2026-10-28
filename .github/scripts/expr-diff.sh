@@ -7,8 +7,9 @@
 #
 # Every disagreement is printed with both answers. actionslib is not GitHub: settle each one against
 # GitHub's implementation (actions/languageservices, expressions/src), and where actionslib is the
-# one that is wrong, steer the generator clear of it (see the comment in exprdiff/main.go). Not run
-# in CI: it is a search for cases GitHub's own (expr-conformance.sh) do not cover.
+# one that is wrong, steer the generator clear of it (see the comment in exprdiff/main.go). CI runs
+# it weekly (compare.yml), not on pull requests: it is a search for cases GitHub's own
+# (expr-conformance.sh) do not cover.
 set -euo pipefail
 cd "$(dirname "$0")/../../runner"
 

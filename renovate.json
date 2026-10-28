@@ -41,6 +41,22 @@
       "groupName": "lean"
     },
     {
+      "description": "tls.zig, pinned by commit in runner/build.zig.zon's URL: its own pull request for each new commit on its main branch (commits have no release dates, so no week's wait). The zon's .hash must follow, which Renovate cannot compute: it is updated by hand (`zig fetch` the new URL), which CI enforces by failing until it is (zig-modules.sh compares it with the fetched commit's, as `zig build` does), as for Zig's checksums.",
+      "matchDepNames": [
+        "https://github.com/ianic/tls.zig"
+      ],
+      "groupName": "tls.zig",
+      "minimumReleaseAge": null
+    },
+    {
+      "description": "GitHub's expression test cases (actions/languageservices), pinned by commit in expr-conformance.sh: their own pull request (commits have no release dates, so no week's wait). A case the runner newly fails, or a listed one it now passes, fails CI until runner/tools/exprcorpus-failing.txt is updated (`expr-conformance.sh --update`, after a look at what changed).",
+      "matchDepNames": [
+        "https://github.com/actions/languageservices"
+      ],
+      "groupName": "expression test cases",
+      "minimumReleaseAge": null
+    },
+    {
       "description": "The diff tools' references run what GitHub's runner runs, so a new major is a different reference, not an update: .NET 8 (problem matchers are compiled by .NET 8's Regex, regex-diff.sh) and Node 22 (hashFiles' @actions/glob script, hashfiles-diff.sh). Minor and digest updates within them still come. Raise the major by hand when GitHub's runner does.",
       "matchFileNames": [
         ".github/scripts/regex-diff.sh",
@@ -151,6 +167,32 @@
       ],
       "depNameTemplate": "zizmor",
       "datasourceTemplate": "pypi"
+    },
+    {
+      "description": "tls.zig, the runner's one Zig dependency: the commit its GitHub archive URL names in runner/build.zig.zon, followed on its main branch.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^runner/build\\.zig\\.zon$/"
+      ],
+      "matchStrings": [
+        "\\.url = \"https://github\\.com/ianic/tls\\.zig/archive/(?<currentDigest>[0-9a-f]{40})\\.tar\\.gz\""
+      ],
+      "depNameTemplate": "https://github.com/ianic/tls.zig",
+      "currentValueTemplate": "main",
+      "datasourceTemplate": "git-refs"
+    },
+    {
+      "description": "GitHub's expression test cases: LANGUAGESERVICES_REV in expr-conformance.sh, followed on actions/languageservices' main branch.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/scripts/expr-conformance\\.sh$/"
+      ],
+      "matchStrings": [
+        "LANGUAGESERVICES_REV=(?<currentDigest>[0-9a-f]{40})"
+      ],
+      "depNameTemplate": "https://github.com/actions/languageservices",
+      "currentValueTemplate": "main",
+      "datasourceTemplate": "git-refs"
     }
   ]
 }

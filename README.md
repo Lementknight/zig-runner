@@ -16,7 +16,7 @@ Build and run, with Zig 0.17 and Docker on the machine:
 ```sh
 cd runner
 zig build -Doptimize=ReleaseSafe
-cp deploy/runner.env.example /etc/zig-runner.env   # then fill in GH_TOKEN and GH_SCOPE
+cp ../deploy/runner.env.example /etc/zig-runner.env   # then fill in GH_TOKEN and GH_SCOPE
 zig-out/bin/runner
 ```
 
@@ -38,8 +38,8 @@ which CI checks; the largest bump among them wins:
 
 `feature/*` is for larger features, `feat/*` for small ones; neither breaks anything unless the
 pull request carries the `breaking` label. In a stack, each pull request merged into `main`
-releases its own version; one merged into another's branch instead counts toward that one's bump
-when it reaches `main`. The release commits the version to `runner/build.zig.zon`
+counts toward the next release; one merged into another's branch instead counts toward that one's
+bump when it reaches `main`. The release commits the version to `runner/build.zig.zon`
 and the changelog on `main`, and tags that commit.
 
 [semantic-release](https://github.com/semantic-release/semantic-release) and
@@ -77,8 +77,13 @@ repository:
   needs, with a comment saying why. Checkouts keep no credentials for later steps.
 - **Pinned inputs.** Actions are pinned by commit and images by digest, not by tag, which their
   owner (or whoever takes their repository) can move; [Renovate](https://docs.renovatebot.com)
-  proposes updates a week after their release. Zig and changie are checked against pinned checksums
-  before they run; a Renovate pull request for a new one fails until its checksums are updated.
+  proposes updates a week after their release. The exception is the Dagger engine in
+  `deploy/compose.yaml`, pinned by tag and held there on purpose: the runner speaks one engine
+  version's protocol, and a new engine starts with an empty cache. tls.zig and GitHub's expression
+  test cases are pinned by commit. Zig and changie are checked against pinned checksums before they
+  run, tls.zig against its `.hash` as well; a Renovate pull request for a new Zig or tls.zig fails
+  until its checksums are updated. changie's is checked only when the release installs it, so a
+  pull request for a new one passes regardless: update its checksum before it merges.
 - **Verifiable releases.** Every binary and image has a signed provenance attestation saying which
   workflow built it from which commit:
   `gh attestation verify zig-runner-linux-x86_64 --repo Open-Blue/zig-runner`, or
@@ -90,14 +95,17 @@ repository:
 - **Scanned.** Trivy checks the Dockerfile and the image before a push; accepted findings are in
   `.trivyignore.yaml`, each with why. GitHub's secret scanning blocks pushes carrying credentials.
 - **Checked.** actionlint and zizmor check the workflows, shellcheck every shell script
-  (`.github/scripts/shellcheck.sh`), and CodeQL the workflows and the Go tools; every job has a time
-  limit. The Database tests job runs every test under ThreadSanitizer
-  (`zig build test -Dsanitize-thread` locally). Vulnerabilities are reported privately ([docs/SECURITY.md](docs/SECURITY.md)).
+  (`.github/scripts/shellcheck.sh`), and CodeQL the workflows, the Go tools and the Python
+  generators; every job has a time limit. The Database tests job runs every test under
+  ThreadSanitizer (`zig build test -Dsanitize-thread` locally). Vulnerabilities are reported privately ([docs/SECURITY.md](docs/SECURITY.md)).
 - **One secret, one step.** The deploy key that may push to `main` is the `prod` environment's,
   which deploys only from `main` and waits for approval; it is loaded only in the step that pushes,
   and pushes only to GitHub's pinned host key.
-- **No pull request code with secrets.** Nothing runs on `pull_request_target`; the release starts
-  from a push to `main`, which only takes reviewed merges.
+- **No pull request code with secrets.** The one workflow on `pull_request_target`, `automerge`,
+  runs `main`'s copy and checks out and runs nothing of the pull request; its app key only turns on
+  auto-merge. The release starts from `version`, `main`'s workflow on a schedule or by hand, and
+  waits for the maintainer's approval. Merges themselves are not reviewed: what reaches `main` is
+  what passed CI, and approving the release is the human check.
 
 ### Code style
 
@@ -151,12 +159,14 @@ Pushes to `main` run CI on prod, so every merge exercises the runner; the reposi
 gh variable set PROD_RUNNER --body '["self-hosted","prod"]'
 ```
 
-Pull requests therefore do not exercise the runner itself, which is the price of the cold builds;
-the release checks ("Binaries (same as zig build)" and "Image" in `release.yml`) still build it with `zig build`
-on every pull request. A self-hosted pre-prod remains possible (`PREPROD_RUNNER`, and
+Pull requests therefore do not exercise the runner itself, which is the price of the cold builds.
+Most do not run `zig build` either: on GitHub's runners CI calls the compiler directly
+(`.github/scripts/zig-test.sh`), and only a pull request that touches the packaging runs "Binaries
+(same as zig build)" in `release.yml`, which builds the x86_64 binary with `zig build` and checks it
+is byte for byte the release's. A self-hosted pre-prod remains possible (`PREPROD_RUNNER`, and
 `deploy/runner.preprod.env.example` for a runner with no trusted refs, no secrets and no access to
-its Dagger engine from steps; the engine is built for `linux/amd64` and `linux/arm64` only), but
-the project leaves it unset. The release still builds on GitHub's runners.
+its Dagger engine from steps; the engine is built for `linux/amd64` and `linux/arm64` only), but the
+project leaves it unset. The release still builds on GitHub's runners.
 
 Workflows name `prod` (or `pre-prod`, should one exist), never just `zig`, which any of this project's
 runners carries. Workflows from

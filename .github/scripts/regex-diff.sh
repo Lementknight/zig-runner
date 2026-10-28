@@ -8,7 +8,8 @@
 #
 # Each with inputs the patterns were built to match, mutations of them, and log lines. .NET runs in
 # the dotnet SDK container (runner/tools/regexdiff/reference); runner/tools/regexcorpus.zig runs
-# regex.zig and prints every disagreement. Needs Go, Docker and network access; not run in CI.
+# regex.zig and prints every disagreement. Needs Go, Docker and network access; CI runs it weekly
+# (compare.yml), not on pull requests.
 #
 #   regex-diff.sh [random patterns] [seed]     defaults: 2000, 1
 set -euo pipefail

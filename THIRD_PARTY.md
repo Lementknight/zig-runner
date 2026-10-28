@@ -12,7 +12,7 @@ time. The project's own license is in [LICENSE](LICENSE).
 
 ## Dependencies
 
-Fetched at build time from `runner/build.zig.zon`, pinned by hash, and compiled into the runner:
+Fetched at build time from `runner/build.zig.zon`, pinned there by commit (the archive URL names it) and by Zig's package hash (`.hash`), and compiled into the runner. `zig build` checks both; CI's tests and the release's binaries, which call the compiler directly, fetch the commit with git and check the hash themselves (`.github/scripts/zig-modules.sh`):
 
 | Package | Used for | License |
 |---|---|---|
@@ -33,24 +33,21 @@ The Dagger engine pulls these images when jobs run; none of them is part of this
 - `oven/bun` (MIT) and `node` (MIT), the JavaScript runtimes for actions;
 - whatever images and actions workflows themselves name.
 
-The optional `api/` and `web/` depend on npm packages listed in their `package-lock.json` files, all under open-source licenses (MIT, Apache-2.0, BSD, ISC, MPL-2.0 and similar).
-
 CI also fetches GitHub's expression test cases from [actions/languageservices](https://github.com/actions/languageservices) (`expressions/testdata`, MIT, Copyright GitHub) at a pinned commit, to check `runner/src/expr.zig` against them (`.github/scripts/expr-conformance.sh`); only case names are kept here, in `runner/tools/exprcorpus-failing.txt`.
 
-A fourth, `runner/tools/regexdiff` (run by `.github/scripts/regex-diff.sh`), runs a small C# program (`reference/`, this project's own) in Microsoft's [.NET SDK](https://github.com/dotnet/sdk) container (MIT) to compare `runner/src/regex.zig` with .NET's regular expressions; `matchers.txt` lists the problem matcher files on GitHub it reads patterns from, fetched when it runs and not kept.
+The proofs in `proofs/` are checked with [Lean](https://lean-lang.org) 4 (Apache-2.0), which CI (`proofs.yml`) downloads from its GitHub release by pinned checksum (`.github/scripts/install-lean.sh`); they use no Lean library beyond Lean's own. They were ported from Agda proofs written for this runner in [zig-actions-runner](https://github.com/Lementknight/zig-actions-runner) (this project's own).
 
-The proofs in `proofs/` are checked with [Lean](https://lean-lang.org) 4 (Apache-2.0), which CI downloads from its GitHub release by pinned checksum (`.github/scripts/install-lean.sh`); they use no Lean library beyond Lean's own. They were ported from Agda proofs written for this runner in [zig-actions-runner](https://github.com/Lementknight/zig-actions-runner) (this project's own).
-
-A development tool, `runner/tools/exprdiff` (Go, run by `.github/scripts/expr-diff.sh`, not in CI or any build), uses Gitea's [actionslib](https://gitea.com/gitea/actionslib) (MIT), pinned in its `go.mod`, to compare expression results on random expressions.
+A development tool, `runner/tools/exprdiff` (Go, run by `.github/scripts/expr-diff.sh`), uses Gitea's [actionslib](https://gitea.com/gitea/actionslib) (MIT), pinned in its `go.mod`, to compare expression results on random expressions.
 
 Another, `runner/tools/yamldiff` (Go, run by `.github/scripts/yaml-diff.sh`), uses [go.yaml.in/yaml/v3](https://github.com/yaml/go-yaml) (MIT and Apache-2.0), pinned in its `go.mod`, to compare `runner/src/yaml.zig` with it; the `action.yml` files it compares are fetched when it runs and not kept, and `runner/tools/yamldiff/repos.txt` lists only the repositories' names.
 
 A third, `runner/tools/hashfilesdiff` (run by `.github/scripts/hashfiles-diff.sh`), runs [@actions/glob](https://github.com/actions/toolkit/tree/main/packages/glob) (MIT), installed in a `node` container when it runs, under `reference.mjs`, which follows actions/runner's hashFiles script (MIT), to compare with `runner/src/glob.zig`. `glob.zig` itself is a port of @actions/glob 0.7.0 and the part of [minimatch](https://github.com/isaacs/minimatch) (ISC) it uses, written new in Zig from their source.
 
+A fourth, `runner/tools/regexdiff` (run by `.github/scripts/regex-diff.sh`), runs a small C# program (`reference/`, this project's own) in Microsoft's [.NET SDK](https://github.com/dotnet/sdk) container (MIT) to compare `runner/src/regex.zig` with .NET's regular expressions; `matchers.txt` lists the problem matcher files on GitHub it reads patterns from, fetched when it runs and not kept.
+
 Two more, `runner/tools/hpackdiff` and `runner/tools/rsadiff` (Go, run by `.github/scripts/hpack-diff.sh` and `rsa-diff.sh`), compare `runner/src/hpack.zig` with [golang.org/x/net/http2/hpack](https://pkg.go.dev/golang.org/x/net/http2/hpack) (BSD-3-Clause, Copyright The Go Authors), pinned in its `go.mod`, and `runner/src/github/rsa_sign.zig` with Go's standard library `crypto/rsa` (BSD-3-Clause).
 
-CI downloads one more tool, which is in no build: the [Agda](https://github.com/agda/agda) release binary of the pinned version (`AGDA_VERSION` in `.github/workflows/ci.yml`, by checksum), to type-check `proofs/`. Agda is under BSD-style terms, and its statically linked build carries the notices of what it links (GMP under LGPL-3.0 among them). `proofs/` is this project's own code and uses no Agda library.
-
+CI runs these six weekly (`.github/workflows/compare.yml`); none of them is in any build.
 ## actions/runner's license
 
 ```
