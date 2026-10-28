@@ -1,3 +1,0 @@
-kind: Security
-body: 'Secrets are masked in every form they take, and wherever they leave the runner. A multi-line secret (a PEM key, a JSON key file) or one saved with a trailing newline was never masked in logs, since logs are masked line by line: now each line of it is, along with the whole value, its JSON-escaped, base64 and URL-encoded forms, longest first. Annotations (`::error`, `::warning`, problem matchers) were sent to GitHub unmasked, and so were step names that named a secret; both are now masked as the log is, and annotation messages cut at 4096 bytes as GitHub cuts them. A job output holding an `::add-mask::` value is now skipped like one holding a secret.'
-time: 2026-10-28T03:00:00.000000-04:00

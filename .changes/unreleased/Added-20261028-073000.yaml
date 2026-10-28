@@ -1,3 +1,0 @@
-kind: Added
-body: 'README: how to reboot a runner machine without losing the engine''s cache, and why the engine must be started again afterwards (its restart policy leaves it down after a `docker stop`).'
-time: 2026-10-28T07:30:00.000000-04:00

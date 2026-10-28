@@ -1,3 +1,0 @@
-kind: Fixed
-body: '`join()`, `toJSON()` and `${{ }}` in `action.yml` files now count what they build as GitHub''s runner does and stop at its limit, instead of building it all first: a 110 KB expression no longer takes 1.8 GB, deeply nested `toJSON()` 700 MB, or a text of many expressions 800 MB and more. Everything under the limits evaluates as before.'
-time: 2026-10-28T05:17:00.000000-04:00

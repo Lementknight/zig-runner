@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'With step caching, a step run again because the cache answered with an earlier run''s failure (v0.13.x) lost what the step before it exported through `GITHUB_ENV` and `GITHUB_PATH`, and so did every step after it. The second try now starts from them, as the first did.'
-time: 2026-10-28T02:00:00.000000-04:00

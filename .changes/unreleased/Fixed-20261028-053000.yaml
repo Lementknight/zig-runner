@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'An action.yml with very many keys in one mapping no longer takes minutes to read (each key was compared with every key before it: 100,000 keys took 15 s), and a `hashFiles()` pattern with many `*` or `**` no longer takes exponential time that cancelling the job could not stop (`*a*a*a*a*a*a*a*a*b` against a name of 40 `a`s took 19 s, `**/a` six times over a directory 100 deep over a minute); both are now linear or close to it, matching exactly as before.'
-time: 2026-10-28T05:30:00.000000-04:00
