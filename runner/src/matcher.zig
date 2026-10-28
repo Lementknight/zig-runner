@@ -161,6 +161,41 @@ pub const Set = struct {
         progress: usize = 0,
         /// What earlier patterns in the current sequence captured.
         carried: Carried = .{},
+        /// Where `carried` keeps its text: its own copy, not slices of the lines it came from, so
+        /// a caller may give each line, and the allocator `feed` works in, a lifetime of one line.
+        /// Two buffers, used in turn: the next copy is made from the one in use into the other.
+        held: [2]std.ArrayList(u8) = .{ .empty, .empty },
+        held_cur: u1 = 0,
+        /// The allocator of `add`, which `held` grows in.
+        keep: Allocator,
+
+        /// Copies what `carried` points at into `held`, for a sequence that goes on to another
+        /// line. Each buffer grows to the largest carried text and is then reused.
+        fn own(e: *Entry) Allocator.Error!void {
+            const c = &e.carried;
+            const fields = [_]*?[]const u8{
+                &c.file,     &c.line, &c.end_line, &c.col,       &c.end_column,
+                &c.severity, &c.code, &c.message,  &c.from_path,
+            };
+            var total: usize = 0;
+            for (fields) |f| if (f.*) |t| {
+                total += t.len;
+            };
+            const next = &e.held[~e.held_cur];
+            next.clearRetainingCapacity();
+            next.ensureTotalCapacity(e.keep, total) catch |err| {
+                // Nothing may be left pointing at the line: the sequence starts again.
+                e.carried = .{};
+                e.progress = 0;
+                return err;
+            };
+            for (fields) |f| if (f.*) |t| {
+                const at = next.items.len;
+                next.appendSliceAssumeCapacity(t);
+                f.* = next.items[at..];
+            };
+            e.held_cur = ~e.held_cur;
+        }
     };
 
     const Carried = struct {
@@ -187,7 +222,7 @@ pub const Set = struct {
     pub fn add(s: *Set, arena: Allocator, matchers: []const Matcher) Allocator.Error!void {
         for (matchers) |m| {
             s.removeOwner(m.owner);
-            try s.entries.append(arena, .{ .matcher = m });
+            try s.entries.append(arena, .{ .matcher = m, .keep = arena });
         }
     }
 
@@ -210,6 +245,12 @@ pub const Set = struct {
     /// Matchers are tried in the order they were registered, and the first to *advance* on this
     /// line takes it: a line consumed by one matcher's sequence is not also offered to the next,
     /// which is what keeps two matchers for the same tool from doubling every annotation.
+    ///
+    /// `arena` holds the result and the regex engine's work, and need only last until the result
+    /// has been read: the runner resets it after every line, and the job's memory stays flat however
+    /// long the output is (it grew by 18.8 GB over 1M lines with setup-node's tsc matcher when every
+    /// line's work stayed in the job's arena). What a sequence carries to its next line is copied
+    /// into the set's own buffers. `line` itself must outlive the result, which may point into it.
     pub fn feed(s: *Set, arena: Allocator, line: []const u8) Error![]const Found {
         var out: std.ArrayList(Found) = .empty;
         for (s.entries.items) |*e| {
@@ -245,18 +286,21 @@ pub const Set = struct {
         const on_last = at == last;
         if (!on_last) {
             e.progress = at + 1;
+            try e.own();
             return true;
         }
 
+        // In `arena`: what was carried is overwritten by the lines after this one.
+        const c = e.carried;
         try out.append(arena, .{
-            .level = e.carried.severity orelse e.matcher.severity,
-            .message = e.carried.message orelse line,
-            .file = resolveFile(arena, e.carried.file, e.carried.from_path),
-            .line = e.carried.line,
-            .end_line = e.carried.end_line,
-            .col = e.carried.col,
-            .end_column = e.carried.end_column,
-            .code = e.carried.code,
+            .level = try dupeOpt(arena, c.severity) orelse e.matcher.severity,
+            .message = try dupeOpt(arena, c.message) orelse line,
+            .file = resolveFile(arena, try dupeOpt(arena, c.file), c.from_path),
+            .line = try dupeOpt(arena, c.line),
+            .end_line = try dupeOpt(arena, c.end_line),
+            .col = try dupeOpt(arena, c.col),
+            .end_column = try dupeOpt(arena, c.end_column),
+            .code = try dupeOpt(arena, c.code),
             .owner = e.matcher.owner,
         });
 
@@ -265,6 +309,7 @@ pub const Set = struct {
             // from eslint-stylish's first pattern belongs to every error line under it.
             e.progress = pats.len;
             e.carried.message = null;
+            try e.own();
         } else {
             e.progress = 0;
             e.carried = .{};
@@ -301,6 +346,10 @@ fn resolveFile(arena: Allocator, file: ?[]const u8, from_path: ?[]const u8) ?[]c
     // resolvePosix answers with a rooted path; the annotation wants it workspace-relative, as the
     // matcher reported it.
     return if (joined.len > 1 and joined[0] == '/') joined[1..] else f;
+}
+
+fn dupeOpt(arena: Allocator, s: ?[]const u8) Allocator.Error!?[]const u8 {
+    return if (s) |t| try arena.dupe(u8, t) else null;
 }
 
 /// Copies this pattern's captures into the sequence's carried values. A pattern that names a group

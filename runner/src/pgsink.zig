@@ -46,6 +46,7 @@ pub const PgSink = struct {
     schema: ?[]const u8 = null,
     inner: *sink.LogSink,
     secrets: []const []const u8 = &.{},
+    index: ?*const redact.Set = null,
     flush_lines: usize = 200,
     flush_ms: u32 = 500,
     max_buffered: usize = 100_000,
@@ -106,7 +107,7 @@ pub const PgSink = struct {
 
         var aw: Io.Writer.Allocating = .init(s.gpa);
         defer aw.deinit();
-        try redact.write(&aw.writer, line, s.secrets);
+        try redact.writeWith(&aw.writer, line, s.secrets, s.index);
         const owned = try s.gpa.dupe(u8, aw.written());
         errdefer s.gpa.free(owned);
 

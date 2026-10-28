@@ -23,6 +23,122 @@ pub fn write(
     }
 }
 
+/// `write` with `index` when there is one (the same result, faster), and `secrets` otherwise.
+pub fn writeWith(
+    w: *std.Io.Writer,
+    text: []const u8,
+    secrets: []const []const u8,
+    index: ?*const Set,
+) std.Io.Writer.Error!void {
+    if (index) |ix| return ix.write(w, text);
+    return write(w, text, secrets);
+}
+
+/// A job's secrets as it adds masks (`::add-mask::`): a list kept longest first without
+/// duplicates, and a trie of them that `write` walks at each position of a line.
+///
+/// It replaces copying the whole list and sorting it again for each mask, then trying every secret
+/// at every position of every line: 20000 masks cost 5.8 GB that way, quadratic in their number.
+/// GitHub's runner sets no limit on masks, and neither does this, since a mask dropped is a secret
+/// shown. Adding one is now a binary search and an insertion, and a position of a line costs as
+/// many steps as the longest secret prefix found there, whatever the number of secrets. (Indexing
+/// the list by first byte instead still cost 13 ms a line when every mask began alike.)
+///
+/// `write` gives what `redact.write` gives with `all`: the first match in a longest-first list is
+/// the longest secret starting at the position, which is the deepest end the walk passes.
+pub const Set = struct {
+    /// Every secret, longest first: the list the sinks report as their secrets.
+    all: std.ArrayList([]const u8) = .empty,
+    /// The trie's first level, by byte: a node, or 0 for none.
+    root: [256]u32 = @splat(0),
+    /// The deeper levels: `node << 8 | byte` to the node it leads to.
+    edges: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    /// Whether a secret ends at each node (index 0 is the root, where none does).
+    ends: std.ArrayList(bool) = .empty,
+
+    /// Adds a copy of `secret`, owned by the set. An empty one, or one already present, is ignored.
+    pub fn add(set: *Set, gpa: std.mem.Allocator, secret: []const u8) std.mem.Allocator.Error!void {
+        if (secret.len == 0 or set.contains(secret)) return;
+        // Everything that can fail first, so a secret is in both or in neither.
+        try set.all.ensureUnusedCapacity(gpa, 1);
+        try set.ends.ensureUnusedCapacity(gpa, secret.len + 1);
+        try set.edges.ensureUnusedCapacity(gpa, @intCast(secret.len));
+        const owned = try gpa.dupe(u8, secret);
+        if (set.ends.items.len == 0) set.ends.appendAssumeCapacity(false);
+        const first = &set.root[owned[0]];
+        if (first.* == 0) first.* = set.newNode();
+        var node = first.*;
+        for (owned[1..]) |b| {
+            const gop = set.edges.getOrPutAssumeCapacity(edge(node, b));
+            if (!gop.found_existing) gop.value_ptr.* = set.newNode();
+            node = gop.value_ptr.*;
+        }
+        set.ends.items[node] = true;
+        set.all.insertAssumeCapacity(longestFirstAt(set.all.items, owned.len), owned);
+    }
+
+    fn newNode(set: *Set) u32 {
+        set.ends.appendAssumeCapacity(false);
+        return @intCast(set.ends.items.len - 1);
+    }
+
+    fn edge(node: u32, b: u8) u64 {
+        return @as(u64, node) << 8 | b;
+    }
+
+    /// The length of the longest secret `text` starts with, or 0.
+    fn longestAt(set: *const Set, text: []const u8) usize {
+        var node = set.root[text[0]];
+        var best: usize = 0;
+        var j: usize = 1;
+        while (node != 0) : (j += 1) {
+            if (set.ends.items[node]) best = j;
+            if (j == text.len) break;
+            node = set.edges.get(edge(node, text[j])) orelse break;
+        }
+        return best;
+    }
+
+    fn contains(set: *const Set, secret: []const u8) bool {
+        if (set.ends.items.len == 0) return false;
+        var node = set.root[secret[0]];
+        for (secret[1..]) |b| {
+            if (node == 0) return false;
+            node = set.edges.get(edge(node, b)) orelse return false;
+        }
+        return node != 0 and set.ends.items[node];
+    }
+
+    /// As `redact.write` with `all`.
+    pub fn write(set: *const Set, w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
+        var plain: usize = 0; // the start of the text not written yet
+        var i: usize = 0;
+        while (i < text.len) {
+            const n = set.longestAt(text[i..]);
+            if (n == 0) {
+                i += 1;
+                continue;
+            }
+            try w.writeAll(text[plain..i]);
+            try w.writeAll(mask);
+            i += n;
+            plain = i;
+        }
+        try w.writeAll(text[plain..]);
+    }
+};
+
+/// Where a secret of length `len` goes in a longest-first list: after every one at least as long.
+fn longestFirstAt(list: []const []const u8, len: usize) usize {
+    var lo: usize = 0;
+    var hi: usize = list.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (list[mid].len >= len) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
 /// `text` with every secret replaced by `***`, as a new string (`text` itself when nothing matched).
 pub fn alloc(arena: std.mem.Allocator, text: []const u8, secrets: []const []const u8) std.mem.Allocator.Error![]const u8 {
     var found = false;
@@ -120,4 +236,32 @@ test "redacts all occurrences" {
     var w: std.Io.Writer = .fixed(&buf);
     try write(&w, "tok=abc123 url=pg://abc123@h", &.{ "abc123", "" });
     try std.testing.expectEqualStrings("tok=*** url=pg://***@h", w.buffered());
+}
+
+test "a set masks as write does with its list, longest first, whatever order masks arrive in" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    var set: Set = .{};
+    // Secrets that begin with one another, one twice, and an empty one.
+    for ([_][]const u8{ "ab", "abcd", "", "b", "abc", "ab", "xyz", "bcd" }) |s| try set.add(ar, s);
+    try std.testing.expectEqual(@as(usize, 6), set.all.items.len);
+    for (set.all.items[1..], set.all.items[0 .. set.all.items.len - 1]) |s, prev|
+        try std.testing.expect(prev.len >= s.len);
+    // Random text over the secrets' alphabet, against the plain loop.
+    var prng: std.Random.DefaultPrng = .init(99);
+    const r = prng.random();
+    var text: [200]u8 = undefined;
+    for (0..500) |_| {
+        const len = r.uintAtMost(usize, text.len);
+        for (text[0..len]) |*c| c.* = "abcdxyz "[r.uintLessThan(usize, 8)];
+        var want: std.Io.Writer.Allocating = .init(ar);
+        var got: std.Io.Writer.Allocating = .init(ar);
+        try write(&want.writer, text[0..len], set.all.items);
+        try set.write(&got.writer, text[0..len]);
+        try std.testing.expectEqualStrings(want.written(), got.written());
+    }
+    var got: std.Io.Writer.Allocating = .init(ar);
+    try set.write(&got.writer, "abcde bc abx");
+    try std.testing.expectEqualStrings("***e ***c ***x", got.written());
 }

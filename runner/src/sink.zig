@@ -11,6 +11,8 @@ pub const Error = std.Io.Writer.Error || std.mem.Allocator.Error;
 pub const StdoutSink = struct {
     writer: *std.Io.Writer,
     secrets: []const []const u8 = &.{},
+    /// `secrets` indexed, when they came from a `redact.Set` (see `LogSink.setSecretSet`).
+    index: ?*const redact.Set = null,
     /// Set when several runners in the process share the sink: each line is written whole.
     io: ?std.Io = null,
     mu: std.Io.Mutex = .init,
@@ -26,7 +28,7 @@ pub const StdoutSink = struct {
         if (s.io) |io| s.mu.lockUncancelable(io);
         defer if (s.io) |io| s.mu.unlock(io);
         try s.writer.print("[job {d} step {d} {s}] ", .{ job_id, step_number, @tagName(stream) });
-        try redact.write(s.writer, line, s.secrets);
+        try redact.writeWith(s.writer, line, s.secrets, s.index);
         try s.writer.writeByte('\n');
         // Dev sink: show lines as they arrive so streaming is visible.
         try s.writer.flush();
@@ -134,7 +136,14 @@ pub const CollectSink = struct {
     io: std.Io,
     inner: *LogSink,
     secrets: []const []const u8 = &.{},
+    index: ?*const redact.Set = null,
     lines: std.ArrayList(CollectedLine) = .empty,
+    /// The line being logged, redacted. Reused, so a line costs memory only when it is kept in
+    /// `lines`: redacting into the arena kept a copy of every line, past the cap and spooled ones
+    /// too, and logging 200 MB grew the arena by 280 MB.
+    redacted: std.ArrayList(u8) = .empty,
+    /// What is kept, in bytes of text: `max_bytes`, smaller in tests.
+    cap: usize = max_bytes,
     /// Where the lines go instead of `lines`, when the runner could open one.
     spool: ?*Spool = null,
     /// The last result of `collected`, so reading the spool twice at the end of a job reads the
@@ -175,8 +184,10 @@ pub const CollectSink = struct {
         stream: Stream,
         line: []const u8,
     ) Error!void {
-        var aw: std.Io.Writer.Allocating = .init(s.arena);
-        try redact.write(&aw.writer, line, s.secrets);
+        s.redacted.clearRetainingCapacity();
+        var aw: std.Io.Writer.Allocating = .fromArrayList(s.arena, &s.redacted);
+        defer s.redacted = aw.toArrayList();
+        try redact.writeWith(&aw.writer, line, s.secrets, s.index);
         const text = aw.written();
         s.cache = null;
         const seq = s.nextSeq(step_number);
@@ -184,12 +195,12 @@ pub const CollectSink = struct {
         // the same one rather than two counters that happen to agree.
         try s.inner.appendStep(job_id, step_number, seq, stream, text);
         if (s.listener) |l| l.onLine(l.ptr, step_number, seq, text);
-        if (s.bytes + text.len > max_bytes) {
+        if (s.bytes + text.len > s.cap) {
             s.dropped += 1;
             return;
         }
         s.bytes += text.len;
-        const kept: CollectedLine = .{
+        var kept: CollectedLine = .{
             .step = step_number,
             .seq = seq,
             .ts_ms = std.Io.Clock.real.now(s.io).toMilliseconds(),
@@ -201,6 +212,7 @@ pub const CollectSink = struct {
                 if (!sp.broken) return;
             }
         }
+        kept.text = try s.arena.dupe(u8, text);
         try s.lines.append(s.arena, kept);
     }
 
@@ -273,12 +285,35 @@ pub const LogSink = union(enum) {
     /// Replaces the redaction list (e.g. with a job's secrets once it is known).
     pub fn setSecrets(s: *LogSink, secrets: []const []const u8) void {
         switch (s.*) {
-            .collect => |*c| c.secrets = secrets,
+            .collect => |*c| {
+                c.secrets = secrets;
+                c.index = null;
+            },
             .postgres => |*p| {
                 p.secrets = secrets;
+                p.index = null;
                 p.inner.setSecrets(secrets);
             },
-            inline else => |*impl| impl.secrets = secrets,
+            inline else => |*impl| {
+                impl.secrets = secrets;
+                impl.index = null;
+            },
+        }
+    }
+
+    /// Replaces the redaction list with `set`'s, redacting through its index. Called again after
+    /// each change to `set`, which can move its list.
+    pub fn setSecretSet(s: *LogSink, set: *const redact.Set) void {
+        switch (s.*) {
+            .postgres => |*p| {
+                p.secrets = set.all.items;
+                p.index = set;
+                p.inner.setSecretSet(set);
+            },
+            inline else => |*impl| {
+                impl.secrets = set.all.items;
+                impl.index = set;
+            },
         }
     }
 
@@ -468,4 +503,49 @@ test "a spool is read once for two callers, and again after a new line" {
     try sink.append(1, 1, .stdout, "two");
     const after = sink.collect.collected(a.allocator());
     try std.testing.expectEqual(@as(usize, 2), after.len);
+}
+
+test "the collector's memory is what it keeps: nothing past the cap, nothing it spools" {
+    var dbuf: [256]u8 = undefined;
+    var disc: std.Io.Writer.Discarding = .init(&dbuf);
+    var inner: LogSink = .{ .stdout = .{ .writer = &disc.writer } };
+    var line: [100]u8 = undefined;
+    @memset(&line, 'x');
+    @memcpy(line[0..6], "s3cret");
+    var want: [97]u8 = undefined;
+    @memcpy(want[0..3], "***");
+    @memset(want[3..], 'x');
+
+    // In memory, with a cap of ten lines: the 1990 lines past it are forwarded and counted.
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var sink: LogSink = .{ .collect = .{ .arena = a.allocator(), .io = std.testing.io, .inner = &inner, .cap = 1000 } };
+    sink.setSecrets(&.{"s3cret"});
+    try sink.append(1, 1, .stdout, &line);
+    const before = a.queryCapacity();
+    for (1..2000) |_| try sink.append(1, 1, .stdout, &line);
+    try std.testing.expectEqual(@as(usize, 10), sink.collect.lines.items.len);
+    try std.testing.expectEqual(@as(usize, 1990), sink.collect.dropped);
+    try std.testing.expectEqualStrings(&want, sink.collect.lines.items[9].text);
+    // Each line was redacted into the arena before the cap was checked: 300 KB here, 280 MB for
+    // 200 MB logged.
+    try std.testing.expect(a.queryCapacity() - before < 16 * 1024);
+
+    // Spooled: nothing stays in memory, however much is logged.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "spool", .{ .read = true });
+    defer file.close(std.testing.io);
+    var b: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer b.deinit();
+    var spool: Spool = .{ .file = file, .io = std.testing.io };
+    var spooled: LogSink = .{ .collect = .{ .arena = b.allocator(), .io = std.testing.io, .inner = &inner, .spool = &spool } };
+    spooled.setSecrets(&.{"s3cret"});
+    try spooled.append(1, 1, .stdout, &line);
+    const spool_before = b.queryCapacity();
+    for (1..2000) |_| try spooled.append(1, 1, .stdout, &line);
+    try std.testing.expect(b.queryCapacity() - spool_before < 16 * 1024);
+    const back = spooled.collect.collected(b.allocator());
+    try std.testing.expectEqual(@as(usize, 2000), back.len);
+    try std.testing.expectEqualStrings(&want, back[1999].text);
 }
