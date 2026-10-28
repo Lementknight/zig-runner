@@ -1,6 +1,8 @@
 # Release: on a version tag (pushed by the version workflow), static runner binaries (x86_64 and
-# aarch64 Linux) on a GitHub release, built by GoReleaser (.goreleaser.yaml), and the runner image
-# (linux/amd64 and linux/arm64) on GitHub's container registry. Both carry signed build provenance
+# aarch64 Linux) on a GitHub release, built by the compiler directly (build-binaries.sh: `zig build`
+# would first spend about 100 s compiling Zig's build system, on runners whose cache is always
+# empty), and the runner image (linux/amd64 and linux/arm64) on GitHub's container registry, made
+# from those same binaries rather than a second build. Both carry signed build provenance
 # (`gh attestation verify`), the binaries an attested SPDX SBOM too; the image is scanned by Trivy
 # before it is pushed.
 # On pull requests that touch the packaging, the same builds and scans, publishing nothing.
@@ -20,7 +22,8 @@ on:
       - runner/Dockerfile
       - runner/build.zig
       - deploy/**
-      - .goreleaser.yaml
+      - .github/scripts/build-binaries.sh
+      - .github/scripts/zig-modules.sh
       - .github/scripts/sbom.sh
       - .trivyignore.yaml
       - .github/workflows/release.yml
@@ -37,7 +40,6 @@ env:
   # The tag released: pushed, or given by hand.
   TAG: ${{ inputs.tag || github.ref_name }}
   PUBLISH: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
-  GORELEASER_VERSION: v2.18.3
   # Trivy's own image; the digest is what is pinned, the tag says which release it is.
   TRIVY_IMAGE: aquasec/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222
 
@@ -54,27 +56,27 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0 # GoReleaser reads the tag and the one before it
           persist-credentials: false
 
       - name: Install Zig
         run: .github/scripts/install-zig.sh
 
-      # The version's changie notes; GoReleaser's GitHub-generated ones for a tag cut without them.
-      - name: Release notes
-        id: notes
-        run: |
-          if [[ -f ".changes/$TAG.md" ]]; then
-            echo "args=--release-notes=.changes/$TAG.md" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Build
+        run: .github/scripts/build-binaries.sh "$TAG" dist
 
-      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
-        with:
-          distribution: goreleaser
-          version: ${{ env.GORELEASER_VERSION }}
-          args: release --clean ${{ steps.notes.outputs.args }}
+      # A draft until it is attested and complete (below). A draft a failed run left is replaced.
+      # The version's changie notes, or GitHub's generated ones for a tag cut without them.
+      - name: Draft the release
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [[ $(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null) == true ]]; then
+            gh release delete "$TAG" --yes
+          fi
+          if [[ -f ".changes/$TAG.md" ]]; then notes=(--notes-file ".changes/$TAG.md"); else notes=(--generate-notes); fi
+          gh release create "$TAG" --draft --verify-tag --title "$TAG" "${notes[@]}" \
+            dist/zig-runner-linux-x86_64 dist/zig-runner-linux-aarch64 dist/SHA256SUMS
 
       # SHA256SUMS names every binary with its digest, so this covers each under its release name.
       - name: Attest the binaries' provenance
@@ -93,7 +95,7 @@ jobs:
           subject-checksums: dist/SHA256SUMS
           sbom-path: dist/zig-runner.spdx.json
 
-      # GoReleaser left the release a draft; it is published complete, before `deploy` asks razorbill
+      # The release is published complete, before `deploy` asks razorbill
       # to download it (a draft's files are not public). The bundles verify offline:
       # `gh attestation verify BINARY --repo Open-Blue/zig-runner --bundle zig-runner.provenance.jsonl`.
       - name: Attach the SBOM and attestations, and publish
@@ -109,7 +111,9 @@ jobs:
             dist/zig-runner.spdx.json dist/zig-runner.provenance.jsonl dist/zig-runner.sbom.jsonl
           gh release edit "$TAG" --draft=false
 
-  # The pull request's check of the same build: everything into dist/, nothing published.
+  # The pull request's check of the same build: everything into dist/, nothing published. The
+  # binaries go to the image check; and the x86_64 one must be byte for byte what `zig build` makes,
+  # so the module graph build-binaries.sh gives the compiler cannot drift from build.zig's.
   binaries-check:
     name: Binaries (check)
     if: github.event_name == 'pull_request'
@@ -120,29 +124,42 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
 
       - name: Install Zig
         run: .github/scripts/install-zig.sh
 
-      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
-        with:
-          distribution: goreleaser
-          version: ${{ env.GORELEASER_VERSION }}
-          args: release --snapshot --clean
+      - name: Build
+        run: .github/scripts/build-binaries.sh "$TAG" dist
+
+      - name: The same as zig build
+        working-directory: runner
+        run: |
+          zig build -Doptimize=ReleaseSafe -Dstrip -Dtarget=x86_64-linux-musl -Dversion="$TAG" \
+            --prefix "$RUNNER_TEMP/zig-build"
+          cmp "$RUNNER_TEMP/zig-build/bin/runner" ../dist/zig-runner-linux-x86_64
 
       - name: SBOM
         run: |
           .github/scripts/sbom.sh "$TAG" dist/SHA256SUMS > "$RUNNER_TEMP/zig-runner.spdx.json"
           jq -e '.packages | length > 2' "$RUNNER_TEMP/zig-runner.spdx.json" > /dev/null
 
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaries
+          path: dist/
+          retention-days: 1
+
+  # From the release's own binaries: a tag's, once the binaries job published them (checked against
+  # SHA256SUMS and their provenance); a pull request's from its check; by hand, the tag's release.
   image:
     name: Image
+    needs: [binaries, binaries-check]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
-      contents: read # to check out the code
+      contents: read # to check out the code, and download the release's binaries
       packages: write # to push the image to ghcr.io
       id-token: write # to sign the image's provenance with Sigstore
       attestations: write # to store that provenance
@@ -152,6 +169,33 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: The pull request's binaries
+        if: github.event_name == 'pull_request'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: binaries
+          path: dist
+
+      - name: The release's binaries
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release download "$TAG" -D dist -p 'zig-runner-linux-*' -p SHA256SUMS
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+          for f in dist/zig-runner-linux-*; do
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" >/dev/null
+          done
+
+      # Where the Dockerfile's `prebuilt` stage takes them, by Docker's name for each architecture.
+      - name: Into the build context
+        run: |
+          mkdir -p runner/prebuilt
+          install -m 0755 dist/zig-runner-linux-x86_64 runner/prebuilt/runner-amd64
+          install -m 0755 dist/zig-runner-linux-aarch64 runner/prebuilt/runner-arm64
 
       # Registry names must be lowercase; owners often are not (Open-Blue).
       - name: Image name
@@ -164,17 +208,15 @@ jobs:
           docker run --rm -v "$PWD:/src:ro" -w /src "$TRIVY_IMAGE" config \
             --exit-code 1 --severity HIGH,CRITICAL --ignorefile .trivyignore.yaml runner/
 
-      # Scanned before anything is pushed: one platform, loaded into the local Docker. The
-      # publishing build below reuses its layers from this builder.
+      # Scanned before anything is pushed: one platform, loaded into the local Docker.
       - name: Build for the scan
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: runner
+          target: prebuilt
           platforms: linux/amd64
           load: true
           tags: zig-runner:scan
-          build-args: |
-            VERSION=${{ env.TAG }}
 
       - name: Scan the image
         run: |
@@ -194,13 +236,12 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: runner
+          target: prebuilt
           platforms: linux/amd64,linux/arm64
           push: ${{ env.PUBLISH == 'true' }}
           # BuildKit's own provenance and SBOM, stored with the image in the registry.
           provenance: mode=max
           sbom: true
-          build-args: |
-            VERSION=${{ env.TAG }}
           # A pull request's ref (`123/merge`) is no image tag; it builds under a local name.
           tags: ${{ env.PUBLISH == 'true' && format('{0}:{1},{0}:latest', env.IMAGE, env.TAG) || 'zig-runner:check' }}
 

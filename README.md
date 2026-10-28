@@ -58,7 +58,8 @@ against TimescaleDB. The GitHub client's tests run over real connections to a lo
 auto-merge for every pull request from a branch of this repository, so it joins the queue once its
 checks pass (Renovate does the same for its own). Once a day, `version` releases what merged since
 the last release, if anything did: it waits for approval in the `prod` environment, commits and
-tags the release, and the tag runs `release`: the binaries with [GoReleaser](https://goreleaser.com), the image after a
+tags the release, and the tag runs `release`: the binaries (compiled directly,
+`.github/scripts/build-binaries.sh`), the image from those same binaries after a
 [Trivy](https://trivy.dev) scan, each with signed build provenance. `scorecard` grades the
 repository weekly with [OpenSSF Scorecard](https://scorecard.dev).
 `compare` runs the comparison tools weekly

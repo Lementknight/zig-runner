@@ -47,3 +47,6 @@ zig-pkg/
 # .NET builds of runner/tools/regexdiff/reference, which editors with C# support make on their own.
 runner/tools/regexdiff/reference/bin/
 runner/tools/regexdiff/reference/obj/
+
+# The release binaries the image build takes (release.yml, the Dockerfile's prebuilt stage).
+runner/prebuilt/
