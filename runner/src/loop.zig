@@ -130,6 +130,13 @@ pub fn pool(c: Context, n: u32) !Exit {
     const memory: ?*admission.Admission = if (c.cfg.admission) m: {
         const m = try c.arena.create(admission.Admission);
         m.* = .init(c.io, c.cfg.admission_limits, try c.arena.alloc(i64, n));
+        const cgroup = c.cfg.engine_cgroup;
+        m.engine.source = if (std.mem.eql(u8, cgroup, "none"))
+            .off
+        else if (cgroup.len > 0)
+            .{ .cgroup = cgroup }
+        else
+            .{ .host = c.cfg.engine_host };
         break :m m;
     } else null;
     var group: std.Io.Group = .init;
@@ -194,7 +201,7 @@ pub fn serve(c: Context) !Exit {
     var held_name: ?[]const u8 = null;
     while (true) {
         // The memory gate (#126): register only once the machine has the memory for one more job.
-        if (c.gate) |g| if (g.check()) |hold| {
+        if (c.gate) |g| if (checkGate(c, g)) |hold| {
             // A registration made while the last job finished would sit idle: a runner GitHub can
             // hand a job to, that is not asking for one.
             if (next) |r| {
@@ -271,11 +278,20 @@ fn admit(c: Context, g: *admission.Gate, hold: admission.Hold) !bool {
             c.io.sleep(.fromMilliseconds(@min(left, 200)), .awake) catch {};
         }
         if (stopRequested()) return false;
-        if (g.check() == null) break;
+        if (checkGate(c, g) == null) break;
     }
     sayUnallocated(c, "'{s}': memory is back; taking jobs again", .{c.name});
     g.announced = false;
     return true;
+}
+
+/// `Gate.check`, and what it learned about the engine's cgroup when that changed: found at start,
+/// or not and why, which tells an operator whether the engine's cap is being watched.
+fn checkGate(c: Context, g: *admission.Gate) ?admission.Hold {
+    const hold = g.check();
+    var buf: [512]u8 = undefined;
+    if (g.pool.engineNews(&buf)) |news| sayUnallocated(c, "{s}", .{news});
+    return hold;
 }
 
 /// Logs a hold, unless this one already was (`listen` finds it, `admit` waits it out).
@@ -678,7 +694,7 @@ fn listen(
     var status: std.http.Status = .ok;
     while (true) {
         if (stopRequested()) return .stopped;
-        if (c.gate) |g| if (g.check()) |hold| {
+        if (c.gate) |g| if (checkGate(c, g)) |hold| {
             holdingBack(c, g, hold);
             return .held;
         };
@@ -3199,6 +3215,67 @@ test "a runner short of memory stops asking for jobs, and asks again once memory
     defer stop_signals.store(0, .release);
     const hold = gate.check().?;
     try std.testing.expect(!try admit(c, &gate, hold));
+}
+
+test "a runner holds while the engine is near its own cap, though the machine has memory" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var server: @import("github/testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    var url_buf: [64]u8 = undefined;
+    const base = try arena.dupe(u8, server.url(&url_buf, "127.0.0.1", "/broker/"));
+
+    // The machine: 8 GB available, calm. The engine (#142): 3.6 of its 4 GB in use.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fs.path.join(arena, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 8388608 kB\n" });
+    try tmp.dir.createDirPath(io, "cg/docker-e.scope");
+    var scope = try tmp.dir.openDir(io, "cg/docker-e.scope", .{});
+    defer scope.close(io);
+    try scope.writeFile(io, .{ .sub_path = "memory.max", .data = "4294967296\n" });
+    try scope.writeFile(io, .{ .sub_path = "memory.current", .data = "3774873600\n" });
+    try scope.writeFile(io, .{ .sub_path = "memory.stat", .data = "inactive_file 0\n" });
+    var started: [1]i64 = undefined;
+    var memory: admission.Admission = .init(io, .{}, &started);
+    memory.paths = .{
+        .meminfo = try std.fs.path.join(arena, &.{ dir, "meminfo" }),
+        .pressure = "/nonexistent",
+        .cgroup_root = try std.fs.path.join(arena, &.{ dir, "cg" }),
+    };
+    const cgroup = try std.fs.path.join(arena, &.{ dir, "cg", "docker-e.scope" });
+    memory.engine.source = .{ .cgroup = cgroup };
+    memory.recheck = .fromMilliseconds(10);
+    var gate: admission.Gate = .{ .pool = &memory };
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var err_buf: [1024]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+    var cfg: Config = .{ .gh_token = "", .scope = undefined };
+    var c = testContext(arena, &log, &err, &cfg);
+    c.gate = &gate;
+    const creds: auth.Credentials = undefined;
+    var token: []const u8 = "tok";
+    var token_at = std.Io.Clock.real.now(io).toSeconds();
+
+    try std.testing.expectEqual(Cycle.held, try listen(c, creds, base, "s", &token, &token_at));
+    try std.testing.expectEqual(@as(u32, 0), server.polls.load(.acquire));
+    const hold = gate.check().?;
+    try std.testing.expect(hold == .engine);
+    // A job's compiles end: the engine is back to 1 GB, and the runner takes jobs again.
+    try scope.writeFile(io, .{ .sub_path = "memory.current", .data = "1073741824\n" });
+    try std.testing.expect(try admit(c, &gate, hold));
+    const said = out.buffered();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, said, "the engine's cgroup is"));
+    try std.testing.expect(std.mem.indexOf(u8, said, "capped at 4.0 GB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "engine 3.5 GB of 4.0 GB in use") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, said, "taking jobs again"));
+    try std.testing.expectEqual(@as(u32, 1), memory.polling);
 }
 
 test "a poll that is never answered is given up after its timeout" {
