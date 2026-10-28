@@ -1,0 +1,3 @@
+kind: Changed
+body: 'A release deploys to razorbill only once CI has passed on its tagged commit (Format, build and test, Database tests, Workflows, Binaries and Image): the deploy job waits up to 40 minutes for them, fails naming any that did not succeed, and lists them as the deployment''s required contexts. A maintainer can still deploy by hand (README, "Deploying releases").'
+time: 2026-10-28T09:15:00.000000-04:00
