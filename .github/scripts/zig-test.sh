@@ -27,7 +27,16 @@ if [[ ${ZIG_TEST_SANITIZE_THREAD:-} == 1 ]]; then
 	tests=("${modules[@]}")
 fi
 
+# ZIG_TEST_WAIT_FOR_DB=1: between compiling the tests and running them, wait for the database
+# ci-database.sh started, which comes up while they compile (CI's Database tests job).
+run=()
+if [[ ${ZIG_TEST_WAIT_FOR_DB:-} == 1 ]]; then
+	# shellcheck disable=SC2016 # expanded by that bash, not this one
+	run=(--test-cmd bash --test-cmd -c --test-cmd '"$0" wait && exec "$@"'
+		--test-cmd "$(realpath ../.github/scripts/ci-database.sh)" --test-cmd-bin)
+fi
+
 zig build-exe "${plain[@]}" --name runner -femit-bin="$scratch/runner" &
 exe=$!
-zig test "${tests[@]}"
+zig test "${tests[@]}" "${run[@]}"
 wait "$exe"

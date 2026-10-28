@@ -69,26 +69,17 @@ jobs:
 
   # The database tests, which skip themselves without a database: here against TimescaleDB, as
   # deployments use, and required to run (ZIG_TEST_REQUIRE_DB), so this job cannot pass by skipping
-  # them. On GitHub's runner, which runs service containers. Every test runs here, so here they run
-  # under ThreadSanitizer, which fails them on a data race.
+  # them. On GitHub's runner. Every test runs here, so here they run under ThreadSanitizer, which
+  # fails them on a data race. The database is started by a step, not as a service container, which
+  # GitHub would start (about 25 s) before the first step: so it comes up while the tests compile,
+  # and is waited for just before they run (ci-database.sh). Skipped, still reporting, on a change
+  # that cannot affect the tests (ci-scope.sh).
   database:
     name: Database tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read # to check out the code
-    services:
-      postgres:
-        image: timescale/timescaledb:latest-pg17@sha256:b56a3f51991df1f79d0c1a0841cad5c5fa8058fdd6a3ee6886394a6d4c174538
-        env:
-          POSTGRES_PASSWORD: ci-only
-          POSTGRES_DB: tsdb
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 2s
-          --health-timeout 5s
-          --health-retries 30
     env:
       PGHOST: 127.0.0.1
       PGPORT: "5432"
@@ -98,17 +89,30 @@ jobs:
       PGSSLMODE: disable
       ZIG_TEST_REQUIRE_DB: "1"
       ZIG_TEST_SANITIZE_THREAD: "1"
+      ZIG_TEST_WAIT_FOR_DB: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      - name: Whether this change can affect the tests
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh
+
+      - name: Start the database
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/ci-database.sh start
+
       - name: Install Zig
+        if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
 
       # Without `zig build`, whose first step here would be compiling Zig's build system (about
       # 100 s): this job's cache always starts empty (zig-test.sh).
       - name: Test, with the database
+        if: steps.scope.outputs.run == 'true'
         run: .github/scripts/zig-test.sh
 
   # A push to main runs on prod, this project's own runner, so every merge exercises it; pull
@@ -127,23 +131,34 @@ jobs:
         with:
           persist-credentials: false
 
+      # Skipped, still reporting, on a change that cannot affect them (ci-scope.sh); never on main.
+      - name: Whether this change can affect the build and tests
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh
+
       - name: Install Zig
+        if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
 
       # Named, not `.`: zig-pkg/ holds the dependencies once anything has built, in their own style.
       - name: Format check
+        if: steps.scope.outputs.run == 'true'
         working-directory: runner
         run: zig fmt --check build.zig build.zig.zon src tools
 
       # runner/src/expr.zig against GitHub's own expression test cases (actions/languageservices):
       # fails on a case that broke, or on one that now passes and is still listed as failing.
       - name: Expressions against GitHub's test cases
+        if: steps.scope.outputs.run == 'true'
         run: .github/scripts/expr-conformance.sh
 
       # The database tests skip themselves here: the Database tests job runs them. On GitHub's
       # runners, whose cache always starts empty, without `zig build` (zig-test.sh); on the
       # project's own, whose cache is kept, through it, as developers build.
       - name: Test
+        if: steps.scope.outputs.run == 'true'
         working-directory: runner
         run: |
           if [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then

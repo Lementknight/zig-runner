@@ -52,7 +52,9 @@ decide the version, write the changelog and tag the release alongside this, disa
 
 `ci` checks every pull request: the branch name, the workflows (actionlint, and
 [zizmor](https://docs.zizmor.sh) for security), the format, build and tests, and the database tests
-against TimescaleDB. The GitHub client's tests run over real connections to a local server
+against TimescaleDB; on a change that cannot affect them (documentation, the proofs, the deployment
+files, other workflows: `.github/scripts/ci-scope.sh`) the build and test jobs report without
+running. The GitHub client's tests run over real connections to a local server
 (`src/github/testserver.zig`), so how it handles redirects and tokens is tested, not described. A merge into
 `main` goes through the merge queue, which runs `ci` again on top of `main`; `automerge` turns on
 auto-merge for every pull request from a branch of this repository, so it joins the queue once its
@@ -144,7 +146,7 @@ gh variable set PROD_RUNNER --body '["self-hosted","prod"]'
 ```
 
 Pull requests therefore do not exercise the runner itself, which is the price of the cold builds;
-the release checks ("Binaries (check)" and "Image" in `release.yml`) still build it with `zig build`
+the release checks ("Binaries (same as zig build)" and "Image" in `release.yml`) still build it with `zig build`
 on every pull request. A self-hosted pre-prod remains possible (`PREPROD_RUNNER`, and
 `deploy/runner.preprod.env.example` for a runner with no trusted refs, no secrets and no access to
 its Dagger engine from steps; the engine is built for `linux/amd64` and `linux/arm64` only), but
