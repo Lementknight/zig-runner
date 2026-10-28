@@ -198,6 +198,23 @@ sudo cp deploy/zig-runner-deploy.service deploy/zig-runner-deploy.timer /etc/sys
 sudo systemctl daemon-reload && sudo systemctl enable --now zig-runner-deploy.timer
 ```
 
+### Rebooting the machine
+
+The engine keeps its cache across a restart only if it is allowed to mark it clean first (see
+[BENCHMARKS.md](BENCHMARKS.md)), and Docker gives a container 10 s at shutdown. So stop the runner
+instances (each finishes its running jobs), then the engine with time to spare, then reboot:
+
+```sh
+sudo systemctl stop zig-runner.service 'zig-runner@*.service'
+docker stop -t 300 <engine container>
+sudo reboot
+```
+
+The engine's restart policy is `unless-stopped`, and Docker counts a `docker stop` as stopped on
+purpose: after the reboot the engine stays down while the runners come back, and every job fails
+with no engine socket. Start it again (`docker start <engine container>`), then check that
+`/run/dagger/engine.sock` exists and the engine's log has no `unclean` or `wiping` line.
+
 ## Benchmarks
 
 [BENCHMARKS.md](BENCHMARKS.md) has what was measured on the reference machine, a Raspberry Pi 5:
