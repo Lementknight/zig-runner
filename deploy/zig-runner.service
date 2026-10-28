@@ -14,9 +14,13 @@ Wants=network-online.target
 EnvironmentFile=/etc/zig-runner.env
 Environment=RUNNER_ENGINE_HOST=unix:///run/dagger/engine.sock
 ExecStart=/usr/local/bin/zig-runner
-# SIGTERM: waiting runners stop and remove their registrations; running jobs finish first.
+# SIGTERM: waiting runners stop and remove their registrations; running jobs get
+# RUNNER_STOP_GRACE_SECS (10 minutes by default) to finish, then are cancelled as GitHub cancels a
+# job: the running step stops, always() steps and post scripts get 1 minute, the job is reported.
+# 15 minutes leaves that, and the reports, room; past it systemd kills the runner, the engine
+# stops its steps, and GitHub fails its jobs once their hold runs out. Raise both together.
 KillSignal=SIGTERM
-TimeoutStopSec=60min
+TimeoutStopSec=15min
 Restart=on-failure
 RestartSec=10
 # Exit 1 (configuration) and 2 (GitHub refused the token or scope) need a fix, not a restart.

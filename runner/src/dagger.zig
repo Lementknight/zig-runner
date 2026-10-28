@@ -949,12 +949,25 @@ pub const Transport = struct {
     }
 };
 
-/// Set by the runner when GitHub cancels the job (a `JobCancellation` message), read by the job.
+/// Set by the runner when the job is cancelled (GitHub's `JobCancellation` message, GitHub no
+/// longer having the job, or the runner stopping), read by the job.
 pub const Cancel = struct {
     requested: std.atomic.Value(bool) = .init(false),
     /// When whatever still runs is stopped too (the grace period GitHub gives after a cancel), in
     /// ms since the epoch; 0 for none.
     hard_deadline_ms: std.atomic.Value(i64) = .init(0),
+
+    /// Cancels the job, with whatever still runs after it stopped at `hard_deadline_ms`. Called
+    /// from the runner's tasks, possibly more than once (GitHub cancels, then the runner stops):
+    /// the earliest deadline holds, so a later, longer grace period never extends a shorter one.
+    pub fn request(c: *Cancel, hard_deadline_ms: i64) void {
+        var cur = c.hard_deadline_ms.load(.acquire);
+        while (cur == 0 or hard_deadline_ms < cur) {
+            cur = c.hard_deadline_ms.cmpxchgWeak(cur, hard_deadline_ms, .acq_rel, .acquire) orelse
+                break;
+        }
+        c.requested.store(true, .release);
+    }
 };
 
 /// Stops a step that runs past its `timeout-minutes`, or that is running when the job is cancelled,
@@ -8384,6 +8397,17 @@ test "a cancel stops the running step, not the always() steps after it, until th
     w.tick(10_001);
     try std.testing.expectEqual(@as(u32, 2), f.aborted);
     try std.testing.expectEqual(Watch.Interrupt.cancelled, w.end());
+}
+
+test "a second cancel can shorten the grace period, never lengthen it" {
+    var c: Cancel = .{};
+    c.request(10_000);
+    try std.testing.expect(c.requested.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 10_000), c.hard_deadline_ms.load(.acquire));
+    c.request(50_000); // GitHub's 5 minutes, after the runner's stop cancelled the job
+    try std.testing.expectEqual(@as(i64, 10_000), c.hard_deadline_ms.load(.acquire));
+    c.request(2_000); // GitHub no longer has the job: nothing runs on
+    try std.testing.expectEqual(@as(i64, 2_000), c.hard_deadline_ms.load(.acquire));
 }
 
 test "a cancel between steps does not stop the next step" {

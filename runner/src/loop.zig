@@ -25,7 +25,8 @@ const Allocator = std.mem.Allocator;
 pub const Exit = enum(u8) { done = 0, config = 1, github = 2, db = 3 };
 
 /// SIGTERM / SIGINT received so far (`main` installs the handlers). The first asks the runners to
-/// stop: waiting ones stop at once, running jobs finish first. The second exits immediately.
+/// stop: waiting ones stop at once, running jobs get `Config.stop_grace_secs` to finish and are
+/// then cancelled (`StopDeadline`). The second exits immediately.
 pub var stop_signals: std.atomic.Value(u32) = .init(0);
 
 pub fn stopRequested() bool {
@@ -271,7 +272,7 @@ fn holdingBack(c: Context, g: *admission.Gate, hold: admission.Hold) void {
 fn sayUnallocated(c: Context, comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    c.log.append(0, 0, .stderr, text) catch {};
+    c.log.say(text) catch {};
 }
 
 /// A new registration name: the prefix and a random suffix.
@@ -479,15 +480,15 @@ var stop_announced: std.atomic.Value(bool) = .init(false);
 
 fn waitForStop(c: Context) void {
     while (!stopRequested()) c.io.sleep(.fromMilliseconds(200), .awake) catch return;
-    // A fixed message, so nothing to allocate. (The cycle's arena would do even with the poll using
-    // it at the same time: std's ArenaAllocator is thread-safe over a thread-safe gpa.)
-    if (!stop_announced.swap(true, .acq_rel)) c.log.append(
-        0,
-        0,
-        .stderr,
-        "stopping: waiting runners stop now, running jobs finish first " ++
-            "(a second signal exits at once)",
-    ) catch {};
+    if (stop_announced.swap(true, .acq_rel)) return;
+    // On the stack. (The cycle's arena would do even with the poll using it at the same time: std's
+    // ArenaAllocator is thread-safe over a thread-safe gpa.)
+    sayUnallocated(
+        c,
+        "stopping: waiting runners stop now, running jobs get {d} s to finish before they are " ++
+            "cancelled (a second signal exits at once)",
+        .{c.cfg.stop_grace_secs},
+    );
 }
 
 /// Deletes the cycle's runner registration, trying again (after 1 s, then 2 s) when GitHub refuses
@@ -959,6 +960,14 @@ fn handleJob(c: Context, session: Listening, body: []const u8) !Cycle {
     var watching: ?std.Io.Future(void) = c.io.concurrent(CancelWatch.run, .{&watcher}) catch null;
     defer if (watching) |*f| {
         watcher.stop.store(true, .release);
+        f.cancel(c.io);
+    };
+    // The runner stopping cancels the job too, once it has had its time to finish.
+    var deadline: StopDeadline = .{ .c = c, .cancel = &cancel, .log_job = job.check_run_id };
+    var stopping: ?std.Io.Future(void) = c.io.concurrent(StopDeadline.run, .{&deadline}) catch
+        null;
+    defer if (stopping) |*f| {
+        deadline.stop.store(true, .release);
         f.cancel(c.io);
     };
     // Everything the job logs is also kept (redacted, timestamped) so it can be uploaded to GitHub.
@@ -1500,11 +1509,7 @@ const Renewer = struct {
             if (resp.status == .not_found) {
                 // Seen when a cancelled job's grace period ran out: GitHub closed the job itself.
                 r.say(arena, "GitHub no longer has the job (renewjob: HTTP 404); stopping it", .{});
-                r.cancel.hard_deadline_ms.store(
-                    std.Io.Clock.real.now(r.c.io).toMilliseconds(),
-                    .release,
-                );
-                r.cancel.requested.store(true, .release);
+                r.cancel.request(std.Io.Clock.real.now(r.c.io).toMilliseconds());
                 return;
             }
             if (resp.status.class() != .success) {
@@ -1593,18 +1598,14 @@ const CancelWatch = struct {
             if (!std.mem.eql(u8, id, w.job_id)) continue;
             const grace_ms = timeSpanMs(jsonString(cc.arena, inner, "timeout") orelse "") orelse
                 default_grace_ms;
-            w.cancel.hard_deadline_ms.store(
-                std.Io.Clock.real.now(cc.io).toMilliseconds() + grace_ms,
-                .release,
-            );
-            w.cancel.requested.store(true, .release);
+            w.cancel.request(std.Io.Clock.real.now(cc.io).toMilliseconds() + grace_ms);
             const text = std.fmt.allocPrint(
                 cc.arena,
                 "job {d}: cancelled by GitHub; stopping the running step ({d} s for what still " ++
                     "runs)",
                 .{ w.log_job, @divTrunc(grace_ms, 1000) },
             ) catch return;
-            w.c.log.append(0, 0, .stderr, text) catch {};
+            w.c.log.say(text) catch {};
             return;
         }
     }
@@ -1612,6 +1613,46 @@ const CancelWatch = struct {
     /// GitHub's default `cancel-timeout-minutes`.
     const default_grace_ms = 5 * 60 * 1000;
 };
+
+/// Cancels the job once the runner has been asked to stop (SIGTERM from systemd, Docker or a
+/// deploy) and the job has had `Config.stop_grace_secs` to finish on its own. Before, a stop
+/// waited for a running job however long it took: a stuck one held `systemctl stop` until the
+/// unit's `TimeoutStopSec`, and the engine ran its step all that time (#127). The cancel is
+/// GitHub's: the running step is stopped, `if: always()` steps and post scripts get
+/// `stop_cancel_ms`, and the job is reported cancelled.
+const StopDeadline = struct {
+    c: Context,
+    cancel: *dagger.Cancel,
+    log_job: u64,
+    stop: std.atomic.Value(bool) = .init(false),
+
+    fn run(s: *StopDeadline) void {
+        // In short steps, as `waitForStop` does: the job's end waits for this to see `stop`.
+        while (!stopRequested()) {
+            if (s.stop.load(.acquire)) return;
+            s.c.io.sleep(.fromMilliseconds(200), .awake) catch return;
+        }
+        const grace_ms = @as(i64, s.c.cfg.stop_grace_secs) * std.time.ms_per_s;
+        const stopping_at = std.Io.Clock.awake.now(s.c.io).toMilliseconds();
+        while (std.Io.Clock.awake.now(s.c.io).toMilliseconds() - stopping_at < grace_ms) {
+            if (s.stop.load(.acquire)) return;
+            s.c.io.sleep(.fromMilliseconds(200), .awake) catch return;
+        }
+        if (s.stop.load(.acquire)) return;
+        s.cancel.request(std.Io.Clock.real.now(s.c.io).toMilliseconds() + stop_cancel_ms);
+        sayUnallocated(
+            s.c,
+            "job {d}: the runner is stopping and the job did not finish within {d} s; " ++
+                "cancelling it ({d} s for what still runs)",
+            .{ s.log_job, s.c.cfg.stop_grace_secs, @divTrunc(stop_cancel_ms, 1000) },
+        );
+    }
+};
+
+/// What a job cancelled by the runner's stop still gets for `if: always()` steps and post scripts,
+/// before whatever runs is stopped too: GitHub gives a cancelled job 5 minutes
+/// (`CancelWatch.default_grace_ms`), but a stop is bounded by the unit's `TimeoutStopSec`.
+const stop_cancel_ms = 60 * std.time.ms_per_s;
 
 /// A .NET TimeSpan as GitHub writes one (`[d.]hh:mm:ss[.fffffff]`) in milliseconds; null when it
 /// is not one.
@@ -2435,6 +2476,53 @@ test "a job's cancel watch stops at once when the job ends, mid-poll" {
     const took = std.Io.Clock.awake.now(io).toMilliseconds() - started;
     try std.testing.expect(took < 1000);
     try std.testing.expect(!cancel.requested.load(.acquire));
+}
+
+test "a stop cancels a running job once its grace has passed, and not a job that ended first" {
+    const io = std.testing.io;
+    var out_buf: [1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var cfg: Config = .{ .gh_token = "", .scope = undefined, .stop_grace_secs = 0 };
+    const c: Context = .{
+        .arena = undefined,
+        .gpa = std.testing.allocator,
+        .io = io,
+        .environ = undefined,
+        .cfg = &cfg,
+        .log = &log,
+        .err = undefined,
+        .secrets = &.{},
+        .name = "t",
+    };
+    stop_signals.store(1, .release);
+    defer stop_signals.store(0, .release);
+
+    // Past its grace: cancelled, with a minute for what still runs.
+    var cancel: dagger.Cancel = .{};
+    var deadline: StopDeadline = .{ .c = c, .cancel = &cancel, .log_job = 7 };
+    const before = std.Io.Clock.real.now(io).toMilliseconds();
+    var running = try io.concurrent(StopDeadline.run, .{&deadline});
+    running.await(io);
+    try std.testing.expect(cancel.requested.load(.acquire));
+    const hard = cancel.hard_deadline_ms.load(.acquire);
+    try std.testing.expect(hard >= before + stop_cancel_ms);
+    try std.testing.expect(hard <= std.Io.Clock.real.now(io).toMilliseconds() + stop_cancel_ms);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "job 7: the runner is stopping") !=
+        null);
+
+    // A job that ends within its grace is left alone, and its end is not kept waiting.
+    cfg.stop_grace_secs = 60;
+    var left: dagger.Cancel = .{};
+    var ending: StopDeadline = .{ .c = c, .cancel = &left, .log_job = 8 };
+    var waiting = try io.concurrent(StopDeadline.run, .{&ending});
+    try io.sleep(.fromMilliseconds(300), .awake);
+    const started = std.Io.Clock.awake.now(io).toMilliseconds();
+    // As handleJob ends it.
+    ending.stop.store(true, .release);
+    waiting.cancel(io);
+    try std.testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - started < 1000);
+    try std.testing.expect(!left.requested.load(.acquire));
 }
 
 test "backoffSecs doubles from 5s up to 5 minutes" {

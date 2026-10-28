@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A stop (SIGTERM from systemd, Docker or a deploy) no longer waits for a running job however long it takes (#127). Running jobs get RUNNER_STOP_GRACE_SECS (10 minutes by default) to finish, then are cancelled as GitHub cancels a job: the running step stops in the engine, always() steps and post scripts get a minute, and the job is reported cancelled. The service''s TimeoutStopSec and Compose''s stop_grace_period go from 60 to 15 minutes to match.'
+time: 2026-10-28T10:00:00.000000-04:00

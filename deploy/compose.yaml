@@ -59,10 +59,11 @@ services:
     depends_on:
       - engine
     restart: unless-stopped
-    # On `docker compose stop` / `down`, waiting runners stop at once and running jobs finish first.
-    # Jobs that may run longer need a longer grace period; past it Docker kills the runner, and
-    # GitHub fails its jobs ("lost communication") once their hold runs out.
-    stop_grace_period: 60m
+    # On `docker compose stop` / `down`, waiting runners stop at once and running jobs get
+    # RUNNER_STOP_GRACE_SECS (10 minutes by default) to finish, then are cancelled and reported, as
+    # GitHub cancels a job. 15 minutes leaves room for that; past it Docker kills the runner, and
+    # GitHub fails its jobs ("lost communication") once their hold runs out. Raise both together.
+    stop_grace_period: 15m
 
 volumes:
   # The engine's cache: images, layers, and the step and package caches that make reruns fast.

@@ -115,6 +115,12 @@ pub const Config = struct {
     /// Ask for a job only while the machine has the memory for it (`admission.zig`, #126).
     admission: bool = true,
     admission_limits: admission.Limits = .{},
+    /// Seconds a running job may go on after a stop signal before the runner cancels it, as GitHub
+    /// cancels one: its step stopped, `if: always()` steps and post scripts still run, the job
+    /// reported cancelled. The deploy agent restarts the runner on every release and expects jobs
+    /// to finish, but a stop must not wait on a stuck one (#127). 0 cancels at once. The service's
+    /// `TimeoutStopSec` leaves room for this and the cancel (`loop.stop_cancel_ms`).
+    stop_grace_secs: u32 = 600,
     /// Connect to the configured database, report what is there, and exit (no GitHub credentials
     /// needed).
     db_check: bool = false,
@@ -214,6 +220,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_MEM_PER_JOB_MB")) |v| l.per_job_mb = try num(u32, v);
         if (environ.get("RUNNER_MAX_MEM_PRESSURE")) |v| l.max_pressure = try percent(v);
         if (environ.get("RUNNER_MAX_SWAP_GROWTH_MB")) |v| l.max_swap_growth_mb = try num(u32, v);
+        if (environ.get("RUNNER_STOP_GRACE_SECS")) |v| c.stop_grace_secs = try secs(v);
         if (environ.get("RUNNER_TRUSTED_REFS")) |v| c.trusted_refs = v;
         if (environ.get("RUNNER_TRUSTED_EVENTS")) |v| c.trusted_events = v;
     }
@@ -267,6 +274,7 @@ pub const Config = struct {
         else if (eq(key, "mem-per-job-mb")) l.per_job_mb = try num(u32, val) //
         else if (eq(key, "max-mem-pressure")) l.max_pressure = try percent(val) //
         else if (eq(key, "max-swap-growth-mb")) l.max_swap_growth_mb = try num(u32, val) //
+        else if (eq(key, "stop-grace-secs")) c.stop_grace_secs = try secs(val) //
         else if (eq(key, "trusted-refs")) c.trusted_refs = val //
         else if (eq(key, "trusted-events")) c.trusted_events = val //
         else return error.UnknownFlag;
@@ -329,6 +337,13 @@ pub const Config = struct {
     fn millis(s: []const u8) error{InvalidNumber}!u32 {
         const n = try num(u32, s);
         if (n > max_millis) return error.InvalidNumber;
+        return n;
+    }
+
+    /// Seconds, up to a day.
+    fn secs(s: []const u8) error{InvalidNumber}!u32 {
+        const n = try num(u32, s);
+        if (n > std.time.s_per_day) return error.InvalidNumber;
         return n;
     }
 
@@ -453,6 +468,19 @@ test "the output-keys limit: milliseconds, and 0 turns it off" {
     // one, the flag wins.
     try env.put("RUNNER_OUTPUT_KEYS_MAX_MS", "9000");
     try std.testing.expectEqual(@as(u32, 2500), (try Config.load(&env, &.{ "runner", "--output-keys-max-ms=2500" })).output_keys_max_ms);
+}
+
+test "the stop grace: ten minutes by default, in seconds, 0 for none, at most a day" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try std.testing.expectEqual(@as(u32, 600), (try Config.load(&env, &.{"runner"})).stop_grace_secs);
+    try env.put("RUNNER_STOP_GRACE_SECS", "0");
+    try std.testing.expectEqual(@as(u32, 0), (try Config.load(&env, &.{"runner"})).stop_grace_secs);
+    try std.testing.expectEqual(@as(u32, 90), (try Config.load(&env, &.{ "runner", "--stop-grace-secs=90" })).stop_grace_secs);
+    try env.put("RUNNER_STOP_GRACE_SECS", "86401");
+    try std.testing.expectError(error.InvalidNumber, Config.load(&env, &.{"runner"}));
 }
 
 test "dagger nesting is on by default and can be turned off" {
