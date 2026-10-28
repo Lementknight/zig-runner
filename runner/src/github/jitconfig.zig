@@ -3,8 +3,15 @@ const std = @import("std");
 const Config = @import("../config.zig").Config;
 const Scope = @import("../config.zig").Scope;
 const broker = @import("broker.zig");
+const http = @import("http.zig");
 
 const Allocator = std.mem.Allocator;
+
+/// The REST API version every call here asks for.
+const api_version_header: std.http.Header = .{
+    .name = "X-GitHub-Api-Version",
+    .value = "2022-11-28",
+};
 
 pub const File = struct {
     name: []const u8,
@@ -56,7 +63,7 @@ pub fn deleteRunner(
     );
     const r = try broker.request(arena, io, .DELETE, url, null, .{
         .token = cfg.gh_token,
-        .extra_headers = &.{.{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" }},
+        .extra_headers = &.{api_version_header},
     });
     return r.status;
 }
@@ -93,10 +100,10 @@ pub fn generate(
 
     var local: std.http.Client = .{ .allocator = arena, .io = io };
     defer local.deinit();
-    const client = @import("http.zig").client(&local);
+    const client = http.client(&local);
 
     var resp: std.Io.Writer.Allocating = .init(arena);
-    const result = try @import("http.zig").fetch(client, .{
+    const result = try http.fetch(client, .{
         .location = .{ .url = url },
         .method = .POST,
         .payload = body.written(),
@@ -106,7 +113,7 @@ pub fn generate(
         },
         .extra_headers = &.{
             .{ .name = "Accept", .value = "application/vnd.github+json" },
-            .{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" },
+            api_version_header,
         },
         .response_writer = &resp.writer,
     });
@@ -159,8 +166,7 @@ pub fn parseResponse(arena: Allocator, body: []const u8) Error!Jit {
     };
 }
 
-/// `encoded_jit_config` is base64 JSON `{ "<filename>": "<base64 content>" }` (unverified against
-/// live GitHub).
+/// `encoded_jit_config` is base64 JSON `{ "<filename>": "<base64 content>" }`.
 pub fn decode(arena: Allocator, encoded: []const u8) ![]const File {
     const dec = std.base64.standard.Decoder;
     const json_bytes = try arena.alloc(u8, try dec.calcSizeForSlice(encoded));
@@ -230,7 +236,7 @@ pub fn movedRepo(arena: Allocator, io: std.Io, cfg: *const Config) ?Scope {
     ) catch return null;
     const resp = broker.request(arena, io, .GET, url, null, .{
         .token = cfg.gh_token,
-        .extra_headers = &.{.{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" }},
+        .extra_headers = &.{api_version_header},
     }) catch return null;
     if (resp.status.class() != .success) return null;
     return currentName(arena, cfg.scope, resp.body);
@@ -270,7 +276,7 @@ pub fn staleRegistrations(arena: Allocator, io: std.Io, cfg: *const Config) ![]c
             );
             const resp = try broker.request(g.arena, g.io, .GET, url, null, .{
                 .token = g.cfg.gh_token,
-                .extra_headers = &.{.{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" }},
+                .extra_headers = &.{api_version_header},
             });
             if (resp.status.class() != .success) return error.GithubRejected;
             return resp.body;
@@ -356,9 +362,10 @@ fn staleIds(
     return .{ .ids = ids.items, .listed = list.runners.len };
 }
 
-/// Whether `name` is one this runner gives its registrations: `<prefix>-` and 8 hex digits.
+/// Whether `name` is one this runner gives its registrations: `<prefix>-` and 8 hex digits (four
+/// random bytes, as `main.runnerName` writes them).
 fn ownName(name: []const u8, prefix: []const u8) bool {
-    if (name.len != prefix.len + 9) return false;
+    if (name.len != prefix.len + "-".len + 8) return false;
     if (!std.mem.startsWith(u8, name, prefix) or name[prefix.len] != '-') return false;
     for (name[prefix.len + 1 ..]) |c| if (!std.ascii.isHex(c)) return false;
     return true;

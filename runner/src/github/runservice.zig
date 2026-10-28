@@ -3,6 +3,7 @@
 //! `actions/runner` source; live findings are recorded in SPEC §3.
 const std = @import("std");
 const broker = @import("broker.zig");
+const EnvVar = @import("../job.zig").EnvVar;
 
 const Allocator = std.mem.Allocator;
 
@@ -97,7 +98,7 @@ pub fn complete(
     /// JSON array of step results (see `loop.zig`).
     step_results: []const u8,
     /// The job's outputs, read by later jobs as `needs.<job>.outputs.<name>`.
-    outputs: []const @import("../job.zig").EnvVar,
+    outputs: []const EnvVar,
     /// JSON array of annotations (see `loop.annotationsJson`).
     annotations: []const u8,
 ) !broker.Response {

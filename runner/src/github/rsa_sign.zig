@@ -8,26 +8,12 @@ const Modulus = ff.Modulus(max_bits);
 
 /// DER prefix of DigestInfo for SHA-256 (RFC 8017 §9.2 note 1).
 const digest_info_prefix = [_]u8{
-    0x30,
-    0x31,
-    0x30,
-    0x0d,
-    0x06,
-    0x09,
-    0x60,
-    0x86,
-    0x48,
-    0x01,
-    0x65,
-    0x03,
-    0x04,
-    0x02,
-    0x01,
-    0x05,
-    0x00,
-    0x04,
-    0x20,
+    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+    0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
 };
+
+/// The least padding EMSA-PKCS1-v1_5 allows: 0x00 0x01, eight 0xff bytes, 0x00 (RFC 8017 §9.2).
+const min_padding_len = 11;
 
 pub const Error = error{ ModulusTooSmall, InvalidKey, BufferTooSmall };
 
@@ -39,7 +25,7 @@ pub fn signSha256(out: []u8, n_be: []const u8, d_be: []const u8, msg: []const u8
     if (n.len > max_bits / 8) return error.InvalidKey;
     if (out.len < n.len) return error.BufferTooSmall;
     const t_len = digest_info_prefix.len + Sha256.digest_length;
-    if (n.len < t_len + 11) return error.ModulusTooSmall;
+    if (n.len < t_len + min_padding_len) return error.ModulusTooSmall;
 
     var em_buf: [max_bits / 8]u8 = undefined;
     const em = em_buf[0..n.len];

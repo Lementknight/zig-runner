@@ -105,7 +105,7 @@ pub fn main(init: std.process.Init) !u8 {
     var client: std.http.Client = .{
         .allocator = init.gpa,
         .io = io,
-        .write_buffer_size = 16 * 1024,
+        .write_buffer_size = http.write_buffer_size,
     };
     defer client.deinit();
     http.shared.store(&client, .release);

@@ -7,6 +7,17 @@ const http = @import("http.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// The frame opcodes the runner sends (RFC 6455 §5.2).
+const Opcode = struct {
+    const continuation = 0x0;
+    const text = 0x1;
+    const close = 0x8;
+    const ping = 0x9;
+};
+
+/// The longest payload of one frame: actions/runner splits a message into 1 KiB frames.
+const max_frame_payload = 1024;
+
 pub const Socket = struct {
     io: std.Io,
     /// Holds the upgraded connection; deinit closes it.
@@ -33,7 +44,7 @@ pub const Socket = struct {
         var local: ?*std.http.Client = null;
         const client = http.shared.load(.acquire) orelse blk: {
             const c = try gpa.create(std.http.Client);
-            c.* = .{ .allocator = gpa, .io = io, .write_buffer_size = 16 * 1024 };
+            c.* = .{ .allocator = gpa, .io = io, .write_buffer_size = http.write_buffer_size };
             local = c;
             break :blk c;
         };
@@ -71,8 +82,9 @@ pub const Socket = struct {
         var i: usize = 0;
         var first = true;
         while (true) {
-            const end = @min(payload.len, i + 1024);
-            try writeFrame(s.io, w, if (first) 0x1 else 0x0, end == payload.len, payload[i..end]);
+            const end = @min(payload.len, i + max_frame_payload);
+            const opcode: u4 = if (first) Opcode.text else Opcode.continuation;
+            try writeFrame(s.io, w, opcode, end == payload.len, payload[i..end]);
             first = false;
             i = end;
             if (i == payload.len) break;
@@ -82,14 +94,14 @@ pub const Socket = struct {
 
     /// A ping, so a feed that has nothing to say for a while is not closed as idle on the way.
     pub fn ping(s: *Socket) !void {
-        try writeFrame(s.io, s.req.connection.?.writer(), 0x9, true, &.{});
+        try writeFrame(s.io, s.req.connection.?.writer(), Opcode.ping, true, &.{});
         try s.req.connection.?.flush();
     }
 
     pub fn close(s: *Socket, gpa: Allocator) void {
         const w = s.req.connection.?.writer();
         // A close frame with status 1000 (normal closure).
-        writeFrame(s.io, w, 0x8, true, &.{ 0x03, 0xE8 }) catch {};
+        writeFrame(s.io, w, Opcode.close, true, &.{ 0x03, 0xE8 }) catch {};
         s.req.connection.?.flush() catch {};
         s.req.connection.?.closing = true;
         s.req.deinit();
@@ -102,7 +114,7 @@ pub const Socket = struct {
 
 /// One frame from a client: FIN, the opcode, the mask bit and length, a random mask, and the masked
 /// payload.
-pub fn writeFrame(io: std.Io, w: *std.Io.Writer, opcode: u4, fin: bool, payload: []const u8) !void {
+fn writeFrame(io: std.Io, w: *std.Io.Writer, opcode: u4, fin: bool, payload: []const u8) !void {
     var mask: [4]u8 = undefined;
     io.random(&mask);
     try writeFrameMasked(w, opcode, fin, payload, mask);
