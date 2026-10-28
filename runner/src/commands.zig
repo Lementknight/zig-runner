@@ -20,6 +20,8 @@ pub const Parsed = union(enum) {
     invalid: []const u8,
 };
 
+/// The `name=value` and `name<<DELIMITER` entries of a `GITHUB_OUTPUT` or `GITHUB_ENV` file, in the
+/// order written; or, for the first malformed line, why.
 pub fn parseKeyValues(arena: Allocator, text: []const u8) Allocator.Error!Parsed {
     var out: std.ArrayList(job_mod.EnvVar) = .empty;
     var lines = std.mem.splitScalar(u8, text, '\n');
@@ -40,26 +42,13 @@ pub fn parseKeyValues(arena: Allocator, text: []const u8) Allocator.Error!Parsed
                     "invalid format '{s}' on line {d}: expected name<<DELIMITER",
                     .{ line, line_no },
                 ) };
-            var value: std.ArrayList(u8) = .empty;
-            var closed = false;
-            var first = true;
-            while (lines.next()) |body_raw| {
-                line_no += 1;
-                const body = std.mem.trimEnd(u8, body_raw, "\r");
-                if (std.mem.eql(u8, body, delim)) {
-                    closed = true;
-                    break;
-                }
-                if (!first) try value.append(arena, '\n');
-                try value.appendSlice(arena, body);
-                first = false;
-            }
-            if (!closed) return .{ .invalid = try std.fmt.allocPrint(
-                arena,
-                "matching delimiter '{s}' not found for '{s}'",
-                .{ delim, name },
-            ) };
-            try out.append(arena, .{ .name = name, .value = value.items });
+            const value = try heredocValue(arena, &lines, &line_no, delim) orelse
+                return .{ .invalid = try std.fmt.allocPrint(
+                    arena,
+                    "matching delimiter '{s}' not found for '{s}'",
+                    .{ delim, name },
+                ) };
+            try out.append(arena, .{ .name = name, .value = value });
             continue;
         }
         const e = eq orelse return .{ .invalid = try std.fmt.allocPrint(
@@ -75,6 +64,27 @@ pub fn parseKeyValues(arena: Allocator, text: []const u8) Allocator.Error!Parsed
         try out.append(arena, .{ .name = line[0..e], .value = line[e + 1 ..] });
     }
     return .{ .ok = out.items };
+}
+
+/// The lines of a multi-line value up to the line that is `delim`, joined with `\n` and taken from
+/// `lines`; null when the file ends first. `line_no` counts the lines taken.
+fn heredocValue(
+    arena: Allocator,
+    lines: *std.mem.SplitIterator(u8, .scalar),
+    line_no: *usize,
+    delim: []const u8,
+) Allocator.Error!?[]const u8 {
+    var value: std.ArrayList(u8) = .empty;
+    var first = true;
+    while (lines.next()) |raw| {
+        line_no.* += 1;
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (std.mem.eql(u8, line, delim)) return value.items;
+        if (!first) try value.append(arena, '\n');
+        try value.appendSlice(arena, line);
+        first = false;
+    }
+    return null;
 }
 
 /// Directories from a GITHUB_PATH file, in the order written.
