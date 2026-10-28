@@ -95,8 +95,8 @@ pub const Scope = struct {
 /// tree: a string as 26 bytes and two per UTF-16 code unit (as .NET stores it), anything else as
 /// an object's 24, a `*` filter's result as 24 and a pointer per element. When a node's result is
 /// a plain primitive (a literal's, a function's, an operator's), it no longer refers to what was
-/// made below it, so the levels below are dropped from the count first. `format` also counts what
-/// it builds as it goes, segment by segment, against the same limit. Past it, the evaluation
+/// made below it, so the levels below are dropped from the count first. `format`, `join` and
+/// `toJSON` also count what they build as they go, piece by piece, against the same limit. Past it, the evaluation
 /// fails, as GitHub's does (`syntax-errors/memory-errors` in GitHub's tests), before
 /// `format('{0}{0}{0}{0}', format('{0}{0}{0}{0}', ...))` can grow until the runner runs out of
 /// memory.
@@ -1094,6 +1094,10 @@ fn callContains(arena: Allocator, args: []const Value, scope: Scope) Error!Value
     }
 }
 
+/// `join()`, as GitHub's runner does it (`Join`): each element and each separator is counted as
+/// it is appended, as a string of its own (`countString`), against `max_memory`, so a result GitHub
+/// would refuse is refused before it is built, however many elements and however long the
+/// separator.
 fn callJoin(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
     if (args.len < 1 or args.len > 2)
         return scope.fail("join() takes 1 or 2 arguments", .{}, arena);
@@ -1106,9 +1110,14 @@ fn callJoin(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
         .object => return .{ .string = "" },
         .array => |a| {
             var out: std.ArrayList(u8) = .empty;
+            var counted: usize = 0;
             for (a, 0..) |e, i| {
+                if (i > 0) {
+                    try countString(&counted, sep, scope, arena);
+                    try out.appendSlice(arena, sep);
+                }
                 const item = try toStr(arena, e);
-                if (i > 0) try out.appendSlice(arena, sep);
+                try countString(&counted, item, scope, arena);
                 try out.appendSlice(arena, item);
             }
             return .{ .string = out.items };
@@ -1119,9 +1128,9 @@ fn callJoin(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
 
 fn callToJson(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
     if (args.len != 1) return scope.fail("toJSON() takes 1 argument", .{}, arena);
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    writeJson(&aw.writer, args[0], 0) catch return error.OutOfMemory; // Allocating writer: only OOM
-    return .{ .string = aw.written() };
+    var j: JsonOut = .{ .aw = .init(arena), .scope = scope, .arena = arena };
+    try writeJson(&j, args[0], 0);
+    return .{ .string = j.aw.written() };
 }
 
 fn callFromJson(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
@@ -1238,43 +1247,119 @@ fn formatString(
 /// one is not).
 fn countPiece(counted: *usize, text: []const u8, scope: Scope, arena: Allocator) Error!void {
     if (text.len == 0) return;
+    return countString(counted, text, scope, arena);
+}
+
+/// A string a function builds its result from, counted as `MemoryCounter.Add(String)` counts it
+/// (an empty one too), against `max_memory`.
+fn countString(counted: *usize, text: []const u8, scope: Scope, arena: Allocator) Error!void {
     counted.* += costOf(.{ .string = text });
     if (counted.* > max_memory) return scope.tooMuchMemory(arena);
 }
 
-fn writeJson(w: *std.Io.Writer, v: Value, depth: usize) !void {
+/// What `toJSON()` writes, counted as GitHub's runner counts it (`ToJson`): in pieces, each a
+/// string of its own (`costOf`) against `max_memory`. A piece is a value, an array's or object's
+/// opening bracket, or a key, each with what goes before it (`,` and a new line and the
+/// indentation, or `: ` before a key's value), or a closing bracket with the new line and
+/// indentation before it. The current piece is checked before each part of it is written, so the
+/// indentation of something nested deep is refused before it is written, and so is what follows
+/// once the pieces add up to more than GitHub allows.
+const JsonOut = struct {
+    aw: std.Io.Writer.Allocating,
+    scope: Scope,
+    arena: Allocator,
+    /// The pieces before the current one.
+    counted: usize = 0,
+    /// UTF-16 code units in the current piece so far.
+    units: usize = 0,
+
+    /// Fails when `units` more in the current piece would make it too much.
+    fn room(j: *JsonOut, units: usize) Error!void {
+        if (j.counted + string_overhead + 2 * (j.units + units) > max_memory)
+            return j.scope.tooMuchMemory(j.arena);
+    }
+
+    fn put(j: *JsonOut, bytes: []const u8) Error!void {
+        const units = utf16Len(bytes);
+        try j.room(units);
+        j.aw.writer.writeAll(bytes) catch return error.OutOfMemory; // Allocating writer: only OOM
+        j.units += units;
+    }
+
+    fn indent(j: *JsonOut, n: usize) Error!void {
+        try j.room(n);
+        j.aw.writer.splatByteAll(' ', n) catch return error.OutOfMemory;
+        j.units += n;
+    }
+
+    /// A string, quoted and escaped: at least its own length and the quotes, checked before it is
+    /// written, and what escaping it took, after.
+    fn str(j: *JsonOut, s: []const u8) Error!void {
+        try j.room(utf16Len(s) + 2);
+        const start = j.aw.written().len;
+        std.json.Stringify.value(s, .{}, &j.aw.writer) catch return error.OutOfMemory;
+        try j.wrote(start);
+    }
+
+    /// Counts what was written since `start` (something short: a number).
+    fn wrote(j: *JsonOut, start: usize) Error!void {
+        const units = utf16Len(j.aw.written()[start..]);
+        try j.room(units);
+        j.units += units;
+    }
+
+    /// Ends the current piece.
+    fn cut(j: *JsonOut) void {
+        j.counted += string_overhead + 2 * j.units;
+        j.units = 0;
+    }
+};
+
+fn writeJson(j: *JsonOut, v: Value, depth: usize) Error!void {
     switch (v) {
-        .null => try w.writeAll("null"),
-        .boolean => |b| try w.writeAll(if (b) "true" else "false"),
+        .null => try j.put("null"),
+        .boolean => |b| try j.put(if (b) "true" else "false"),
         // JSON has no NaN or Infinity; GitHub writes null, as JavaScript's JSON.stringify does.
-        .number => |n| if (!std.math.isFinite(n)) try w.writeAll("null") else if (@floor(n) == n and @abs(n) < 1e15) try w.print(
-            "{d}",
-            .{@as(i64, @intFromFloat(n))},
-        ) else try w.print("{d}", .{n}),
-        .string => |s| try std.json.Stringify.value(s, .{}, w),
+        .number => |n| if (!std.math.isFinite(n)) try j.put("null") else {
+            const start = j.aw.written().len;
+            const w = &j.aw.writer;
+            (if (@floor(n) == n and @abs(n) < 1e15)
+                w.print("{d}", .{@as(i64, @intFromFloat(n))})
+            else
+                w.print("{d}", .{n})) catch return error.OutOfMemory;
+            try j.wrote(start);
+        },
+        .string => |s| try j.str(s),
         .array => |a| {
-            if (a.len == 0) return w.writeAll("[]");
-            try w.writeAll("[\n");
+            if (a.len == 0) return j.put("[]");
+            try j.put("[");
             for (a, 0..) |e, i| {
-                try w.splatByteAll(' ', (depth + 1) * 2);
-                try writeJson(w, e, depth + 1);
-                try w.writeAll(if (i + 1 < a.len) ",\n" else "\n");
+                j.cut();
+                try j.put(if (i == 0) "\n" else ",\n");
+                try j.indent((depth + 1) * 2);
+                try writeJson(j, e, depth + 1);
             }
-            try w.splatByteAll(' ', depth * 2);
-            try w.writeByte(']');
+            j.cut();
+            try j.put("\n");
+            try j.indent(depth * 2);
+            try j.put("]");
         },
         .object => |o| {
-            if (o.len == 0) return w.writeAll("{}");
-            try w.writeAll("{\n");
+            if (o.len == 0) return j.put("{}");
+            try j.put("{");
             for (o, 0..) |e, i| {
-                try w.splatByteAll(' ', (depth + 1) * 2);
-                try std.json.Stringify.value(e.key, .{}, w);
-                try w.writeAll(": ");
-                try writeJson(w, e.value, depth + 1);
-                try w.writeAll(if (i + 1 < o.len) ",\n" else "\n");
+                j.cut();
+                try j.put(if (i == 0) "\n" else ",\n");
+                try j.indent((depth + 1) * 2);
+                try j.str(e.key);
+                j.cut();
+                try j.put(": ");
+                try writeJson(j, e.value, depth + 1);
             }
-            try w.splatByteAll(' ', depth * 2);
-            try w.writeByte('}');
+            j.cut();
+            try j.put("\n");
+            try j.indent(depth * 2);
+            try j.put("}");
         },
     }
 }
@@ -1348,22 +1433,82 @@ pub fn evalString(arena: Allocator, text: []const u8, scope: Scope) Error![]cons
 /// Replaces every `${{ <expression> }}` in `text` with its value as a string. The job message
 /// arrives with this already done (as `format()` expressions), but `action.yml` files are read as
 /// they are written. A `}}` inside a quoted string does not end the expression.
+///
+/// Unless the text is one expression alone, GitHub's runner makes it one `format()` expression
+/// (`TemplateReader`: the text between the expressions, its braces doubled, is the format string,
+/// and the expressions are its arguments), so what it builds is limited as `format()` limits its
+/// result: the pieces of text (cut after each brace, as an escaped brace cuts a format string),
+/// then each expression's value, counted as `formatString` counts them, against
+/// `template_max_memory`. Each expression is evaluated in scratch memory that the next one
+/// reuses, so neither many results nor many expressions that build something large on the way to
+/// a short result add up.
 pub fn interpolate(arena: Allocator, text: []const u8, scope: Scope) Error![]const u8 {
     if (std.mem.indexOf(u8, text, "${{") == null) return text;
-    var out: std.ArrayList(u8) = .empty;
+    // Each expression, and the text before it.
+    const Segment = struct { before: []const u8, body: []const u8 };
+    var segments: std.ArrayList(Segment) = .empty;
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, text, i, "${{")) |open| {
-        try out.appendSlice(arena, text[i..open]);
         const body_start = open + 3;
         const close = expressionEnd(text, body_start) orelse {
             if (scope.diag) |d| d.* = "'${{' is never closed with '}}'";
             return error.ParseError;
         };
-        try out.appendSlice(arena, try evalString(arena, text[body_start..close], scope));
+        try segments.append(arena, .{ .before = text[i..open], .body = text[body_start..close] });
         i = close + 2;
     }
-    try out.appendSlice(arena, text[i..]);
+    const after = text[i..];
+    const alone = segments.items.len == 1 and segments.items[0].before.len == 0 and after.len == 0;
+
+    // The format string is read first, whole, as `formatString` reads it.
+    var counted: usize = 0;
+    if (!alone) {
+        for (segments.items) |seg| try countTemplateText(&counted, seg.before, scope, arena);
+        try countTemplateText(&counted, after, scope, arena);
+    }
+    var scratch: std.heap.ArenaAllocator = .init(arena);
+    defer scratch.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    for (segments.items) |seg| {
+        try out.appendSlice(arena, seg.before);
+        _ = scratch.reset(.retain_capacity);
+        const value = evalString(scratch.allocator(), seg.body, scope) catch |e| {
+            // The reason outlives the scratch memory it may be in.
+            if (scope.diag) |d| d.* = try arena.dupe(u8, d.*);
+            return e;
+        };
+        if (!alone) try countTemplatePiece(&counted, value, scope, arena);
+        try out.appendSlice(arena, value);
+    }
+    try out.appendSlice(arena, after);
     return out.items;
+}
+
+/// The memory GitHub's runner lets it use reading an `action.yml` (`ActionManifestManager`'s
+/// `TemplateMemory`), which is also the limit on each expression it evaluates there
+/// (`TemplateToken.EvaluateStringToken`): 10 MiB. An interpolated text's pieces are counted
+/// against it.
+const template_max_memory = 10 * 1024 * 1024;
+
+/// Text between expressions, in the pieces a format string has once its braces are doubled.
+fn countTemplateText(counted: *usize, text: []const u8, scope: Scope, arena: Allocator) Error!void {
+    var start: usize = 0;
+    for (text, 0..) |c, k| if (c == '{' or c == '}') {
+        try countTemplatePiece(counted, text[start .. k + 1], scope, arena);
+        start = k + 1;
+    };
+    try countTemplatePiece(counted, text[start..], scope, arena);
+}
+
+/// One piece of an interpolated text, counted as `countPiece` counts it.
+fn countTemplatePiece(counted: *usize, text: []const u8, scope: Scope, arena: Allocator) Error!void {
+    if (text.len == 0) return;
+    counted.* += costOf(.{ .string = text });
+    if (counted.* > template_max_memory) return scope.fail(
+        "the text needs more than the {d} bytes of memory GitHub allows",
+        .{template_max_memory},
+        arena,
+    );
 }
 
 /// Index of the `}}` that ends the expression starting at `from`, skipping 'quoted' strings.
@@ -1893,4 +2038,138 @@ test "what random expressions against Gitea's evaluator turned up, settled by Gi
     // A filter's result stays one through a function, and is a new array.
     try std.testing.expectEqualStrings("a,b", try evalStr(ar, "join(case(true, objs.*, l).n)", s));
     try std.testing.expectEqualStrings("false", try evalStr(ar, "l.* == l", s));
+}
+
+test "join() and toJSON() count what they build as GitHub's runner does, to the byte" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // join(): each element and separator is a string of its own, an empty one too, so n empty
+    // strings joined with ',' are 26n + 28(n - 1) bytes: 19418 fit in 1048576, 19419 do not.
+    for ([_]struct { usize, bool }{ .{ 19418, true }, .{ 19419, false } }) |c| {
+        const items = try ar.alloc(Value, c[0]);
+        @memset(items, .{ .string = "" });
+        const env = [_]Value.Entry{.{ .key = "a", .value = .{ .array = items } }};
+        const s = tctx(&.{.{ .key = "env", .value = .{ .object = &env } }});
+        if (c[1])
+            try std.testing.expectEqual(c[0] - 1, (try evalStr(ar, "join(env.a)", s)).len)
+        else
+            try std.testing.expectError(error.EvalError, evaluate(ar, "join(env.a)", s));
+    }
+    // toJSON(): `[`, then each element with what goes before it, then the new line and `]`, so n
+    // nulls are 28 + 40 + 42(n - 1) + 30 bytes: 24964 fit, 24965 do not.
+    for ([_]struct { usize, bool }{ .{ 24964, true }, .{ 24965, false } }) |c| {
+        const items = try ar.alloc(Value, c[0]);
+        @memset(items, .null);
+        const env = [_]Value.Entry{.{ .key = "a", .value = .{ .array = items } }};
+        const s = tctx(&.{.{ .key = "env", .value = .{ .object = &env } }});
+        if (c[1])
+            try std.testing.expectEqual(8 * c[0] + 2, (try evalStr(ar, "toJSON(env.a)", s)).len)
+        else
+            try std.testing.expectError(error.EvalError, evaluate(ar, "toJSON(env.a)", s));
+    }
+}
+
+test "join() and toJSON() refuse what GitHub would before building it" {
+    // A thousand elements and a 20000-character separator: 20 MB of result, refused after a few
+    // dozen pieces.
+    {
+        var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer a.deinit();
+        const ar = a.allocator();
+        const sep = try ar.alloc(u8, 20000);
+        @memset(sep, 's');
+        const items = try ar.alloc(Value, 1000);
+        @memset(items, .{ .string = "x" });
+        const env = [_]Value.Entry{
+            .{ .key = "a", .value = .{ .array = items } },
+            .{ .key = "sep", .value = .{ .string = sep } },
+        };
+        const s = tctx(&.{.{ .key = "env", .value = .{ .object = &env } }});
+        const before = a.queryCapacity();
+        try std.testing.expectError(error.EvalError, evaluate(ar, "join(env.a, env.sep)", s));
+        try std.testing.expect(a.queryCapacity() - before < 4 << 20);
+    }
+    // Arrays nested 2000 deep: their indentation alone is 8 MB, refused about 720 levels in.
+    {
+        var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer a.deinit();
+        const ar = a.allocator();
+        var v: Value = .null;
+        for (0..2000) |_| {
+            const one = try ar.alloc(Value, 1);
+            one[0] = v;
+            v = .{ .array = one };
+        }
+        const env = [_]Value.Entry{.{ .key = "a", .value = v }};
+        const s = tctx(&.{.{ .key = "env", .value = .{ .object = &env } }});
+        const before = a.queryCapacity();
+        try std.testing.expectError(error.EvalError, evaluate(ar, "toJSON(env.a)", s));
+        try std.testing.expect(a.queryCapacity() - before < 4 << 20);
+    }
+}
+
+test "an interpolated text is limited as GitHub limits the format() it makes of it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // Twenty values of n characters are 20 (26 + 2n) bytes: n = 262131 fills 10 MiB exactly.
+    for ([_]struct { usize, bool }{ .{ 262131, true }, .{ 262132, false } }) |c| {
+        const x = try ar.alloc(u8, c[0]);
+        @memset(x, 'x');
+        const env = [_]Value.Entry{.{ .key = "x", .value = .{ .string = x } }};
+        const s = tctx(&.{.{ .key = "env", .value = .{ .object = &env } }});
+        const text = try repeated(ar, &.{.{ "${{ env.x }}", 20 }});
+        if (c[1])
+            try std.testing.expectEqual(20 * c[0], (try interpolate(ar, text, s)).len)
+        else
+            try std.testing.expectError(error.EvalError, interpolate(ar, text, s));
+    }
+    // The text between the expressions counts too, cut after each brace: k braces and a value of
+    // one character are 28 (k + 1) bytes, so 374490 braces fit and 374491 do not.
+    const s: Scope = .{};
+    const text = try repeated(ar, &.{ .{ "{", 374491 }, .{ "${{ 1 }}", 1 } });
+    try std.testing.expectError(error.EvalError, interpolate(ar, text, s));
+    try std.testing.expectEqual(@as(usize, 374490 + 1), (try interpolate(ar, text[1..], s)).len);
+    // One expression alone is no format(), and only its own limit applies.
+    try std.testing.expectEqualStrings("1", try interpolate(ar, "${{ 1 }}", s));
+}
+
+test "interpolation stops at its limit, and what each expression builds on the way does not add up" {
+    // A hundred values of 300000 characters: 30 MB, refused at the 18th.
+    {
+        var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer a.deinit();
+        const ar = a.allocator();
+        const big = try ar.alloc(u8, 300000);
+        @memset(big, 'x');
+        const env = [_]Value.Entry{.{ .key = "big", .value = .{ .string = big } }};
+        const s = tctx(&.{.{ .key = "env", .value = .{ .object = &env } }});
+        const text = try repeated(ar, &.{.{ "${{ env.big }}", 100 }});
+        const before = a.queryCapacity();
+        try std.testing.expectError(error.EvalError, interpolate(ar, text, s));
+        try std.testing.expect(a.queryCapacity() - before < 32 << 20);
+    }
+    // Two hundred expressions, each building 300000 characters to compare with: short results,
+    // and each one's scratch memory is the next one's.
+    {
+        var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer a.deinit();
+        const ar = a.allocator();
+        const big = try ar.alloc(u8, 150000);
+        @memset(big, 'x');
+        const env = [_]Value.Entry{.{ .key = "big", .value = .{ .string = big } }};
+        const s = tctx(&.{.{ .key = "env", .value = .{ .object = &env } }});
+        const text = try repeated(ar, &.{.{ "${{ format('{0}{0}', env.big) == '' }} ", 200 }});
+        const before = a.queryCapacity();
+        try std.testing.expectEqual(@as(usize, 6 * 200), (try interpolate(ar, text, s)).len);
+        try std.testing.expect(a.queryCapacity() - before < 16 << 20);
+        // A failure's reason outlives the scratch memory it was written in.
+        var diag: []const u8 = "";
+        var sd = s;
+        sd.diag = &diag;
+        try std.testing.expectError(error.ParseError, interpolate(ar, "a ${{ 1 }} ${{ join(1, 2, 3) }}", sd));
+        @memset(try ar.alloc(u8, 4096), '!');
+        try std.testing.expect(std.mem.indexOf(u8, diag, "too many arguments to join()") != null);
+    }
 }
