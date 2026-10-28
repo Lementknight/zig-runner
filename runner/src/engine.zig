@@ -839,11 +839,15 @@ pub const Session = struct {
         const md_json = try metadataJson(gpa, &ids[0], &ids[1], &ids[2]);
         defer gpa.free(md_json);
         const enc = std.base64.standard.Encoder;
+        // Until the session holds them, an error frees what is made here; after, `close` does, and
+        // freeing them here as well would free them twice (a panic in ReleaseSafe, and another
+        // runner's descriptor closed by number otherwise).
+        var owned = false;
         const md = try gpa.alloc(u8, enc.calcSize(md_json.len));
-        errdefer gpa.free(md);
+        errdefer if (!owned) gpa.free(md);
         _ = enc.encode(md, md_json);
         const auth = try basicAuth(gpa, &ids[2]);
-        errdefer gpa.free(auth);
+        errdefer if (!owned) gpa.free(auth);
 
         var trace: [16]u8 = undefined;
         var span: [8]u8 = undefined;
@@ -853,10 +857,10 @@ pub const Session = struct {
         _ = std.fmt.bufPrint(&traceparent, "00-{x}-{x}-01", .{ &trace, &span }) catch unreachable;
 
         const attach = try dial(gpa, io, ep);
-        errdefer {
+        errdefer if (!owned) {
             attach.close();
             gpa.destroy(attach);
-        }
+        };
         try writeRequest(attach.writer(), "GET", "/sessionAttachables", &.{
             .{ "X-Dagger-Client-Metadata", md },
             .{ "traceparent", &traceparent },
@@ -880,6 +884,7 @@ pub const Session = struct {
             .log_handler = log_handler,
         };
         s.health = try io.concurrent(serveHealth, .{s});
+        owned = true;
         errdefer s.close();
 
         var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -1022,8 +1027,11 @@ pub const Session = struct {
             }
             s.logs_conn.?.shutdown();
             t.await(s.io);
-            s.logs_conn.?.close();
-            s.gpa.destroy(s.logs_conn.?);
+        }
+        // Dialled, even if its reader never started (`open` failed in between).
+        if (s.logs_conn) |lc| {
+            lc.close();
+            s.gpa.destroy(lc);
         }
         if (s.query_conn) |c| {
             c.close();
@@ -1239,4 +1247,50 @@ test "live: a session runs a query and streams its exec's output" {
     s.close();
     std.debug.print("health checks answered: {d}\nlog stream:\n{s}\n", .{ s.health_answered.load(.monotonic), got.text.items });
     try std.testing.expect(std.mem.indexOf(u8, got.text.items, "out-line") != null);
+}
+
+test "a session whose /init is refused is torn down once, not twice (#97)" {
+    // An engine that attaches the session and then refuses /init, as one restarting does. Freeing
+    // what open made and then what close frees again panicked here.
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const Fake = struct {
+        fn head(s: Io.net.Stream) !void {
+            var buf: [4096]u8 = undefined;
+            var r = s.reader(std.testing.io, &buf);
+            var last: [4]u8 = .{ 0, 0, 0, 0 };
+            while (!std.mem.eql(u8, &last, "\r\n\r\n")) {
+                const b = try r.interface.takeByte();
+                last = .{ last[1], last[2], last[3], b };
+            }
+        }
+        fn send(s: Io.net.Stream, text: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            var w = s.writer(std.testing.io, &buf);
+            try w.interface.writeAll(text);
+            try w.interface.flush();
+        }
+        fn run(l: *Io.net.Server) void {
+            const a = l.accept(std.testing.io) catch return;
+            head(a) catch return;
+            send(a, "HTTP/1.1 101 Switching Protocols\r\n\r\n") catch return;
+            const b = l.accept(std.testing.io) catch return;
+            head(b) catch return;
+            send(b, "HTTP/1.1 500 Nope\r\nContent-Length: 0\r\n\r\n") catch return;
+            head(b) catch {};
+            send(b, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n") catch {};
+            b.close(std.testing.io);
+            a.close(std.testing.io);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Fake.run, .{&listener});
+    defer t.join();
+    var host_buf: [64]u8 = undefined;
+    const host = try std.fmt.bufPrint(&host_buf, "tcp://127.0.0.1:{d}", .{listener.socket.address.getPort()});
+    var s: Session = undefined;
+    try std.testing.expectError(error.SessionInitFailed, s.open(gpa, io, .{ .host = host }, null));
 }
