@@ -442,7 +442,7 @@ pub const Live = struct {
         var buf: [512]u8 = undefined;
         const text = std.fmt.bufPrint(&buf, "job {d}: " ++ fmt, .{l.job.check_run_id} ++ args) catch
             return;
-        l.log.append(0, 0, .stderr, text) catch {};
+        l.log.say(text) catch {};
     }
 };
 

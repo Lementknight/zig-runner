@@ -235,7 +235,7 @@ fn settleRegistrations(
 ) ![]const u64 {
     if (jitconfig.movedRepo(arena, io, cfg)) |now| {
         const was = cfg.scope.repo;
-        try log.append(0, 0, .stderr, try std.fmt.allocPrint(
+        try log.say(try std.fmt.allocPrint(
             arena,
             "GH_SCOPE {s}/{s} moved to {s}/{s}: registering there (set GH_SCOPE to it)",
             .{ was.owner, was.name, now.repo.owner, now.repo.name },
@@ -243,7 +243,7 @@ fn settleRegistrations(
         cfg.scope = now;
     }
     const candidates = jitconfig.staleRegistrations(arena, io, cfg) catch &.{};
-    if (candidates.len > 0) try log.append(0, 0, .stderr, try std.fmt.allocPrint(
+    if (candidates.len > 0) try log.say(try std.fmt.allocPrint(
         arena,
         "{d} offline registration(s) named {s}-* look left behind; removing those still offline " ++
             "in {d} s",
@@ -292,7 +292,7 @@ const StaleSweep = struct {
             "removed {d} stale registration(s) named {s}-*, which a stopped runner left behind",
             .{ removed, s.cfg.name_prefix },
         ) catch return;
-        s.log.append(0, 0, .stderr, line) catch {};
+        s.log.say(line) catch {};
     }
 };
 
@@ -303,7 +303,7 @@ fn dryRun(arena: std.mem.Allocator, log: *sink.LogSink, name: []const u8, labels
         "dry run: would register runner '{s}' with labels '{s}'",
         .{ name, labels },
     );
-    try log.append(0, 0, .stdout, line);
+    try log.say(line);
     return @backingInt(Exit.done);
 }
 

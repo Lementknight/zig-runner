@@ -34,6 +34,16 @@ pub const StdoutSink = struct {
         try s.writer.flush();
     }
 
+    /// A line from the runner itself, bare: a `[job 0 step 0 ...]` prefix would pass it off as
+    /// some step's output.
+    pub fn say(s: *StdoutSink, line: []const u8) Error!void {
+        if (s.io) |io| s.mu.lockUncancelable(io);
+        defer if (s.io) |io| s.mu.unlock(io);
+        try redact.writeWith(s.writer, line, s.secrets, s.index);
+        try s.writer.writeByte('\n');
+        try s.writer.flush();
+    }
+
     pub fn flush(s: *StdoutSink) Error!void {
         if (s.io) |io| s.mu.lockUncancelable(io);
         defer if (s.io) |io| s.mu.unlock(io);
@@ -275,6 +285,16 @@ pub const LogSink = union(enum) {
         }
     }
 
+    /// A line from the runner itself that belongs to no job (registering, waiting for work): the
+    /// console prints it without a job and step, and no job's log, here or in the database, gets
+    /// it. A message about one job goes through `append` with that job's id, to stay in its log.
+    pub fn say(s: *LogSink, line: []const u8) Error!void {
+        switch (s.*) {
+            .stdout => |*o| try o.say(line),
+            inline .collect, .postgres => |*impl| try impl.inner.say(line),
+        }
+    }
+
     /// The current redaction list.
     pub fn currentSecrets(s: *LogSink) []const []const u8 {
         return switch (s.*) {
@@ -337,6 +357,28 @@ test "stdout sink formats and redacts" {
     try sink.append(7, 2, .stderr, "key=s3cret \x1b[31mred\x1b[0m");
     try sink.flush();
     try std.testing.expectEqualStrings("[job 7 step 2 stderr] key=*** \x1b[31mred\x1b[0m\n", w.buffered());
+}
+
+test "the runner's own lines carry no step prefix; a step's output does" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var console: LogSink = .{ .stdout = .{ .writer = &w, .secrets = &.{"s3cret"} } };
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var job: LogSink = .{
+        .collect = .{ .arena = a.allocator(), .io = std.testing.io, .inner = &console },
+    };
+    try console.say("'zig-ci-1' listening for jobs (token s3cret)");
+    try job.say("started 2 runners");
+    try job.append(0, 0, .stderr, "Set up job");
+    try std.testing.expectEqualStrings(
+        "'zig-ci-1' listening for jobs (token ***)\n" ++
+            "started 2 runners\n" ++
+            "[job 0 step 0 stderr] Set up job\n",
+        w.buffered(),
+    );
+    // Nor is it part of the job's log.
+    try std.testing.expectEqual(@as(usize, 1), job.collect.lines.items.len);
 }
 
 test "collect sink forwards, redacts and timestamps" {
