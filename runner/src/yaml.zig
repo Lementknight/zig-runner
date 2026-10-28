@@ -134,6 +134,37 @@ const Line = struct {
     inside: bool = false,
 };
 
+/// A mapping's entries while it is read, in order, with each key's place: a key read again replaces
+/// the value in the earlier key's place (the last duplicate wins, as in most parsers). Found through
+/// a hash map, so a mapping of n keys takes O(n), not O(n²) comparisons.
+const Entries = struct {
+    list: std.ArrayList(Node.Entry) = .empty,
+    index: std.HashMapUnmanaged([]const u8, usize, KeyContext, std.hash_map.default_max_load_percentage) = .empty,
+    /// Key comparisons made, for the tests.
+    compares: usize = 0,
+
+    const KeyContext = struct {
+        compares: *usize,
+        pub fn hash(_: KeyContext, k: []const u8) u64 {
+            return std.hash_map.hashString(k);
+        }
+        pub fn eql(c: KeyContext, a: []const u8, b: []const u8) bool {
+            c.compares.* += 1;
+            return std.mem.eql(u8, a, b);
+        }
+    };
+
+    fn put(e: *Entries, arena: Allocator, key: []const u8, value: Node) Allocator.Error!void {
+        const gop = try e.index.getOrPutContext(arena, key, .{ .compares = &e.compares });
+        if (gop.found_existing) {
+            e.list.items[gop.value_ptr.*].value = value;
+            return;
+        }
+        gop.value_ptr.* = e.list.items.len;
+        try e.list.append(arena, .{ .key = key, .value = value });
+    }
+};
+
 const Parser = struct {
     arena: Allocator,
     lines: []Line,
@@ -281,7 +312,7 @@ const Parser = struct {
     }
 
     fn map(p: *Parser, indent: usize) Error!Node {
-        var entries: std.ArrayList(Node.Entry) = .empty;
+        var entries: Entries = .{};
         while (p.peek()) |i| {
             const l = p.lines[i];
             if (l.indent != indent) break;
@@ -330,16 +361,11 @@ const Parser = struct {
             }
             try p.putEntry(&entries, key, value);
         }
-        return .{ .map = entries.items };
+        return .{ .map = entries.list.items };
     }
 
-    fn putEntry(p: *Parser, entries: *std.ArrayList(Node.Entry), key: []const u8, value: Node) Error!void {
-        // The last duplicate wins, as in most parsers.
-        for (entries.items) |*e| if (std.mem.eql(u8, e.key, key)) {
-            e.value = value;
-            return;
-        };
-        try entries.append(p.arena, .{ .key = key, .value = value });
+    fn putEntry(p: *Parser, entries: *Entries, key: []const u8, value: Node) Error!void {
+        try entries.put(p.arena, key, value);
     }
 
     /// The key after the `?` that starts line `i`: a scalar, read as its text.
@@ -904,7 +930,7 @@ const Flow = struct {
 
     /// The rest of a flow mapping, after its `{`.
     fn map(f: *Flow) Error!Node {
-        var entries: std.ArrayList(Node.Entry) = .empty;
+        var entries: Entries = .{};
         while (true) {
             try f.skip();
             const ch = f.c.char() orelse return f.p.invalid(f.line(), "a flow collection that is never closed");
@@ -928,7 +954,7 @@ const Flow = struct {
             }
             try f.entryEnd('}');
         }
-        return .{ .map = entries.items };
+        return .{ .map = entries.list.items };
     }
 
     /// A plain scalar in flow: it ends at `,`, `[`, `]`, `{`, `}`, `?`, a `:` followed by a blank,
@@ -1528,6 +1554,52 @@ test "a leading document marker, CRLF line endings and duplicate keys" {
     const n = try parse(a.allocator(), "---\r\nname: x\r\nname: y\r\nk:\r\n  - 1\r\n", null);
     try expectStr(n.get("name"), "y");
     try expectStr(n.get("k").?.seq[0], "1");
+}
+
+test "a duplicate key replaces the value in its first place, in block and flow mappings" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    for ([_][]const u8{ "a: 1\nb: 2\na: 3\nc: 4\n", "{a: 1, b: 2, a: 3, c: 4}\n", "? a\n: 1\nb: 2\na: 3\nc: 4\n" }) |src| {
+        const m = (try parse(ar, src, null)).map;
+        try std.testing.expectEqual(3, m.len);
+        try std.testing.expectEqualStrings("a", m[0].key);
+        try expectStr(m[0].value, "3");
+        try std.testing.expectEqualStrings("b", m[1].key);
+        try std.testing.expectEqualStrings("c", m[2].key);
+    }
+}
+
+test "a mapping's keys are found in linear time, not by comparing each with all before it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // 20000 distinct keys, then each again: comparing each key with all before it makes ~6e8
+    // comparisons; the index makes about one per repeated key.
+    const n = 20000;
+    var e: Entries = .{};
+    for (0..2) |round| for (0..n) |i| {
+        const key = try std.fmt.allocPrint(ar, "key{d}", .{i});
+        try e.put(ar, key, .{ .string = if (round == 0) "first" else "second" });
+    };
+    try std.testing.expectEqual(n, e.list.items.len);
+    try std.testing.expectEqualStrings("key0", e.list.items[0].key);
+    try expectStr(e.list.items[n - 1].value, "second");
+    try std.testing.expect(e.compares <= 2 * n);
+
+    // And through the parser: a block and a flow mapping of as many keys.
+    var block: std.ArrayList(u8) = .empty;
+    var flow: std.ArrayList(u8) = .empty;
+    try flow.appendSlice(ar, "{");
+    for (0..n) |i| {
+        try block.print(ar, "k{d}: v\n", .{i});
+        try flow.print(ar, "k{d}: v, ", .{i});
+    }
+    try flow.appendSlice(ar, "k0: last}\n");
+    try std.testing.expectEqual(n, (try parse(ar, block.items, null)).map.len);
+    const fm = (try parse(ar, flow.items, null)).map;
+    try std.testing.expectEqual(n, fm.len);
+    try expectStr(fm[0].value, "last");
 }
 
 test "a lone scalar at the top level" {
