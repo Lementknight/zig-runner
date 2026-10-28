@@ -25,6 +25,18 @@ services:
       # grow to about three quarters of the disk.
       - ./engine.json:/etc/dagger/engine.json:ro
     restart: unless-stopped
+    # No memory limit here: the engine may use all of the machine's memory, and its swap. To cap
+    # it, give it a swap limit equal to its memory limit, so it has no swap of its own (with
+    # `mem_limit` alone Docker lets it swap as much again, which is how razorbill's 4 GB engine
+    # filled the Pi's 2 GB of swap and slowed every service on it for hours, #126):
+    #   mem_limit: 4g
+    #   memswap_limit: 4g
+    # A job that needs more then fails inside the engine, the kernel killing a process in its
+    # cgroup, instead of finishing hours later on a machine that is unusable meanwhile. Check what
+    # gets killed before relying on it: if it is the engine itself, its unclean restart wipes its
+    # cache (below). Not the default because it trades a slow job for a failed one; the runner's
+    # memory gate (RUNNER_MIN_MEM_AVAILABLE_MB, runner.env.example) keeps jobs from piling up.
+    #
     # Docker kills a container 10 s after asking it to stop. The engine needs longer (22 s on a
     # Raspberry Pi), and one killed before it marks its cache clean wipes the whole cache when it
     # next starts: 21 GB on razorbill, so a 56 s job took 249 s after a reboot. Under 90 s, after

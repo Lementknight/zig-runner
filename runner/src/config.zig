@@ -2,6 +2,7 @@
 const std = @import("std");
 const pg = @import("pg.zig");
 const engine = @import("engine.zig");
+const admission = @import("admission.zig");
 
 pub const Scope = union(enum) {
     repo: struct { owner: []const u8, name: []const u8 },
@@ -111,6 +112,9 @@ pub const Config = struct {
     once: bool = false,
     /// Runners in this process, each serving jobs one after another, concurrently with the others.
     runners: u32 = 1,
+    /// Ask for a job only while the machine has the memory for it (`admission.zig`, #126).
+    admission: bool = true,
+    admission_limits: admission.Limits = .{},
     /// Connect to the configured database, report what is there, and exit (no GitHub credentials
     /// needed).
     db_check: bool = false,
@@ -204,6 +208,12 @@ pub const Config = struct {
         if (environ.get("RUNNER_OUTPUT_KEYS_DAYS")) |v| c.output_keys_days = try count(v);
         if (environ.get("RUNNER_ONCE")) |v| c.once = try boolean(v);
         if (environ.get("RUNNER_COUNT")) |v| c.runners = try count(v);
+        if (environ.get("RUNNER_ADMISSION")) |v| c.admission = try boolean(v);
+        const l = &c.admission_limits;
+        if (environ.get("RUNNER_MIN_MEM_AVAILABLE_MB")) |v| l.min_available_mb = try num(u32, v);
+        if (environ.get("RUNNER_MEM_PER_JOB_MB")) |v| l.per_job_mb = try num(u32, v);
+        if (environ.get("RUNNER_MAX_MEM_PRESSURE")) |v| l.max_pressure = try percent(v);
+        if (environ.get("RUNNER_MAX_SWAP_GROWTH_MB")) |v| l.max_swap_growth_mb = try num(u32, v);
         if (environ.get("RUNNER_TRUSTED_REFS")) |v| c.trusted_refs = v;
         if (environ.get("RUNNER_TRUSTED_EVENTS")) |v| c.trusted_events = v;
     }
@@ -225,6 +235,7 @@ pub const Config = struct {
                 return std.mem.eql(u8, a, b);
             }
         }.f;
+        const l = &c.admission_limits;
         if (eq(key, "token")) creds.token = val //
         else if (eq(key, "scope")) creds.scope = val //
         else if (eq(key, "exec-job")) c.exec_job = val //
@@ -251,6 +262,11 @@ pub const Config = struct {
         else if (eq(key, "output-keys")) c.output_keys = try boolean(val) //
         else if (eq(key, "output-keys-days")) c.output_keys_days = try count(val) //
         else if (eq(key, "runners")) c.runners = try count(val) //
+        else if (eq(key, "admission")) c.admission = try boolean(val) //
+        else if (eq(key, "min-mem-available-mb")) l.min_available_mb = try num(u32, val) //
+        else if (eq(key, "mem-per-job-mb")) l.per_job_mb = try num(u32, val) //
+        else if (eq(key, "max-mem-pressure")) l.max_pressure = try percent(val) //
+        else if (eq(key, "max-swap-growth-mb")) l.max_swap_growth_mb = try num(u32, val) //
         else if (eq(key, "trusted-refs")) c.trusted_refs = val //
         else if (eq(key, "trusted-events")) c.trusted_events = val //
         else return error.UnknownFlag;
@@ -320,6 +336,13 @@ pub const Config = struct {
     fn count(s: []const u8) error{InvalidNumber}!u32 {
         const n = try num(u32, s);
         if (n < 1 or n > max_count) return error.InvalidNumber;
+        return n;
+    }
+
+    /// A percentage, 0 to 100; 0 turns the limit off.
+    fn percent(s: []const u8) error{InvalidNumber}!u32 {
+        const n = try num(u32, s);
+        if (n > 100) return error.InvalidNumber;
         return n;
     }
 
@@ -495,4 +518,29 @@ test "RUNNER_TRUSTED_REFS and RUNNER_TRUSTED_EVENTS" {
     try std.testing.expectEqualStrings("push", set.trusted_events);
     const flag = try Config.load(&env, &.{ "runner", "--trusted-refs", "refs/heads/main" });
     try std.testing.expectEqualStrings("refs/heads/main", flag.trusted_refs);
+}
+
+test "the memory gate is on by default, with limits from the environment or flags" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    const d = try Config.load(&env, &.{"runner"});
+    try std.testing.expect(d.admission);
+    try std.testing.expectEqual(admission.Limits{}, d.admission_limits);
+    try env.put("RUNNER_MIN_MEM_AVAILABLE_MB", "2048");
+    try env.put("RUNNER_MEM_PER_JOB_MB", "0");
+    try env.put("RUNNER_MAX_MEM_PRESSURE", "20");
+    try env.put("RUNNER_MAX_SWAP_GROWTH_MB", "128");
+    const set = try Config.load(&env, &.{ "runner", "--max-mem-pressure=5" });
+    try std.testing.expectEqual(admission.Limits{
+        .min_available_mb = 2048,
+        .per_job_mb = 0,
+        .max_pressure = 5,
+        .max_swap_growth_mb = 128,
+    }, set.admission_limits);
+    try std.testing.expectError(error.InvalidNumber, Config.load(&env, &.{ "runner", "--max-mem-pressure=101" }));
+    try env.put("RUNNER_ADMISSION", "false");
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).admission);
+    try std.testing.expect((try Config.load(&env, &.{ "runner", "--admission=true" })).admission);
 }
