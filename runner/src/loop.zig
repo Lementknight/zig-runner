@@ -215,10 +215,17 @@ fn runnerName(arena: Allocator, c: Context) ![]const u8 {
 }
 
 /// The next cycle's JIT registration, made in the background while this cycle's job finishes
-/// (completing it with GitHub, uploading its logs), so the next cycle can open its session at once
-/// instead of first waiting for GitHub to register it: about 0.5 s between jobs. It is started only
-/// once a job's steps are done, so it is never left waiting through a long job, and it outlives
-/// the cycle whose arena `serve` frees, so it has memory of its own.
+/// (completing it with GitHub, uploading its logs), so the next cycle can listen at once instead
+/// of first waiting for GitHub to register it (about 0.7 s) and then for a token and a broker
+/// session (about 0.2 s more). It is started only once a job's steps are done, so it is never left
+/// waiting through a long job, and it outlives the cycle whose arena `serve` frees, so it has
+/// memory of its own.
+///
+/// The session is the new runner's own, so it never meets the session of the runner finishing its
+/// job (each JIT registration is a runner of its own, with its own agent id). A session that could
+/// not be opened here is opened by the cycle, which reports why if it fails again. Whoever ends up
+/// with the session deletes it exactly once: the cycle (through its `Ending`) once it took it over,
+/// or `discard` when no cycle does (the runner stopping).
 pub const Registering = struct {
     arena: std.heap.ArenaAllocator,
     c: Context,
@@ -231,11 +238,18 @@ pub const Registering = struct {
         ok: jitconfig.Jit,
         failed: struct { err: anyerror, status: std.http.Status, message: []const u8 },
     } = .pending,
+    /// The registered runner's broker session, when it could be opened.
+    session: ?Session = null,
 
     const Calls = struct {
         generate: *const @TypeOf(jitconfig.generate) = jitconfig.generate,
         remove: *const fn (Context, u64, []const u8) void = removeRegistration,
+        open: *const fn (Context, jitconfig.Jit) ?Session = openSession,
+        delete: *const fn (Context, []const u8, []const u8, []const u8) void = deleteSession,
     };
+
+    /// What the next cycle takes over: copied into its arena.
+    const Taken = struct { result: @FieldType(Registering, "result"), session: ?Session };
 
     fn start(c: Context) !*Registering {
         return startWith(c, .{});
@@ -263,24 +277,41 @@ pub const Registering = struct {
             .{ .ok = jit }
         else |e|
             .{ .failed = .{ .err = e, .status = status, .message = message } };
+        // A runner that is stopping takes nothing over: no session to open, only to delete.
+        if (r.result == .ok and !stopRequested()) r.session = r.calls.open(r.c, r.result.ok);
     }
 
-    /// The registration, copied into `arena` (the cycle's); this is freed.
-    fn take(r: *Registering, arena: Allocator) !@TypeOf(r.result) {
+    /// The registration and its session, copied into `arena` (the cycle's); this is freed. When
+    /// they cannot be copied, they are removed rather than left behind.
+    fn take(r: *Registering, arena: Allocator) !Taken {
         r.future.await(r.c.io);
         defer r.free();
-        return switch (r.result) {
-            .pending => unreachable,
-            .ok => |jit| .{ .ok = try copyJit(arena, jit) },
-            .failed => |f| .{ .failed = .{ .err = f.err, .status = f.status, .message = try arena.dupe(u8, f.message) } },
+        errdefer r.end();
+        return .{
+            .result = switch (r.result) {
+                .pending => unreachable,
+                .ok => |jit| .{ .ok = try copyJit(arena, jit) },
+                .failed => |f| .{ .failed = .{
+                    .err = f.err,
+                    .status = f.status,
+                    .message = try arena.dupe(u8, f.message),
+                } },
+            },
+            .session = if (r.session) |s| try s.copy(arena) else null,
         };
     }
 
-    /// Never used: waited for, and the registration removed.
+    /// Never used: waited for, and its session and registration removed.
     fn discard(r: *Registering, c: Context) void {
         r.future.await(c.io);
-        if (r.result == .ok) r.calls.remove(r.c, r.result.ok.runner_id, r.result.ok.runner_name);
+        r.end();
         r.free();
+    }
+
+    /// Deletes the session, then the registration, as a cycle's `Ending` does.
+    fn end(r: *Registering) void {
+        if (r.session) |s| r.calls.delete(r.c, s.base, s.sid, s.token);
+        if (r.result == .ok) r.calls.remove(r.c, r.result.ok.runner_id, r.result.ok.runner_name);
     }
 
     fn free(r: *Registering) void {
@@ -289,6 +320,42 @@ pub const Registering = struct {
         gpa.destroy(r);
     }
 };
+
+/// A runner's broker session, open, with the token it was opened with.
+const Session = struct {
+    /// The broker's URL, with a trailing slash.
+    base: []const u8,
+    sid: []const u8,
+    token: []const u8,
+    /// When `token` was minted, in seconds (see `token_refresh_secs`).
+    token_at: i64,
+
+    fn copy(s: Session, arena: Allocator) !Session {
+        return .{
+            .base = try arena.dupe(u8, s.base),
+            .sid = try arena.dupe(u8, s.sid),
+            .token = try arena.dupe(u8, s.token),
+            .token_at = s.token_at,
+        };
+    }
+};
+
+/// Opens a session for a registered runner, as `cycle` does, for `Registering`; null when any step
+/// fails (the cycle then tries again and reports what went wrong).
+fn openSession(c: Context, jit: jitconfig.Jit) ?Session {
+    const creds = auth.parseCredentials(c.arena, jit.files) catch return null;
+    const settings = broker.parseSettings(c.arena, jit.files) catch return null;
+    var status: std.http.Status = .ok;
+    const token = mintToken(c, creds, &status) catch return null;
+    const token_at = std.Io.Clock.real.now(c.io).toSeconds();
+    const base = withSlash(c.arena, settings.broker_url) catch return null;
+    const url = std.fmt.allocPrint(c.arena, "{s}session", .{base}) catch return null;
+    const body = broker.sessionBody(c.arena, settings, "zig-runner") catch return null;
+    const created = broker.call(c.arena, c.io, .POST, url, token, body) catch return null;
+    if (created.status.class() != .success) return null;
+    const sid = jsonString(c.arena, created.body, "sessionId") orelse return null;
+    return .{ .base = base, .sid = sid, .token = token, .token_at = token_at };
+}
 
 fn copyJit(arena: Allocator, jit: jitconfig.Jit) !jitconfig.Jit {
     const files = try arena.alloc(jitconfig.File, jit.files.len);
@@ -448,15 +515,23 @@ pub fn cycle(c: Context) !Cycle {
     // Made while the previous job finished, when there was one (`Registering`).
     const early: ?*Registering = if (c.next) |slot| slot.* else null;
     if (c.next) |slot| slot.* = null;
-    const jit = if (early) |r| switch (try r.take(c.arena)) {
-        .pending => unreachable,
-        .ok => |j| j,
-        .failed => |f| return registrationFailed(c, f.err, f.status, f.message),
+    // Its session too, when it could open one.
+    var opened: ?Session = null;
+    const jit = if (early) |r| taken: {
+        const t = try r.take(c.arena);
+        opened = t.session;
+        break :taken switch (t.result) {
+            .pending => unreachable,
+            .ok => |j| j,
+            .failed => |f| return registrationFailed(c, f.err, f.status, f.message),
+        };
     } else jitconfig.generate(c.arena, c.io, c.cfg, c.name, &status, &message) catch |e|
         return registrationFailed(c, e, status, message);
-    // Read when the cycle ends: the session once there is one, and the latest token.
-    var token: []const u8 = "";
-    var session: @FieldType(Ending, "session") = null;
+    // Read when the cycle ends: the session once there is one, and the latest token. A session
+    // taken over is the cycle's from here on, whatever happens next.
+    var token: []const u8 = if (opened) |o| o.token else "";
+    var session: @FieldType(Ending, "session") =
+        if (opened) |o| .{ .base = o.base, .sid = o.sid } else null;
     defer endCycle(c, .{
         .id = jit.runner_id,
         .name = jit.runner_name,
@@ -467,20 +542,30 @@ pub fn cycle(c: Context) !Cycle {
 
     const creds = auth.parseCredentials(c.arena, jit.files) catch |e|
         return fail(c, "credentials", e);
-    const settings = broker.parseSettings(c.arena, jit.files) catch |e|
-        return fail(c, "runner settings", e);
-    token = mintToken(c, creds, &status) catch |e| return failHttp(c, "oauth token", e, status);
-    var token_at = std.Io.Clock.real.now(c.io).toSeconds();
+    var token_at: i64 = undefined;
+    var base: []const u8 = undefined;
+    var sid: []const u8 = undefined;
+    if (opened) |o| {
+        token_at = o.token_at;
+        base = o.base;
+        sid = o.sid;
+    } else {
+        const settings = broker.parseSettings(c.arena, jit.files) catch |e|
+            return fail(c, "runner settings", e);
+        token = mintToken(c, creds, &status) catch |e|
+            return failHttp(c, "oauth token", e, status);
+        token_at = std.Io.Clock.real.now(c.io).toSeconds();
 
-    const base = try withSlash(c.arena, settings.broker_url);
-    const session_url = try std.fmt.allocPrint(c.arena, "{s}session", .{base});
-    const session_body = try broker.sessionBody(c.arena, settings, "zig-runner");
-    const created = broker.call(c.arena, c.io, .POST, session_url, token, session_body) catch |e|
-        return fail(c, "create session", e);
-    if (created.status.class() != .success) return failBody(c, "create session", created);
-    const sid = jsonString(c.arena, created.body, "sessionId") orelse
-        return fail(c, "create session", error.BadResponse);
-    session = .{ .base = base, .sid = sid };
+        base = try withSlash(c.arena, settings.broker_url);
+        const session_url = try std.fmt.allocPrint(c.arena, "{s}session", .{base});
+        const session_body = try broker.sessionBody(c.arena, settings, "zig-runner");
+        const created = broker.call(c.arena, c.io, .POST, session_url, token, session_body) catch |e|
+            return fail(c, "create session", e);
+        if (created.status.class() != .success) return failBody(c, "create session", created);
+        sid = jsonString(c.arena, created.body, "sessionId") orelse
+            return fail(c, "create session", error.BadResponse);
+        session = .{ .base = base, .sid = sid };
+    }
     try say(c, "'{s}' listening for jobs (labels: {s})", .{ c.name, c.cfg.labels });
 
     while (true) {
@@ -775,9 +860,11 @@ fn handleJob(c: Context, session: Listening, body: []const u8) !Cycle {
     // Keep the hold on the job while it runs, as GitHub's runner does (see `Renewer`).
     var renewer = Renewer.init(c, job, jr, &cancel);
     var renewing: ?std.Io.Future(void) = c.io.concurrent(Renewer.run, .{&renewer}) catch null;
+    // Cancelled rather than waited for: it sleeps in 50 ms steps, and the job's end (and the
+    // runner's next session) waited out the rest of one, 25 ms a job on average.
     defer if (renewing) |*f| {
         renewer.stop.store(true, .release);
-        f.await(c.io);
+        f.cancel(c.io);
     };
     var watcher = CancelWatch.init(c, session, job, &cancel);
     var watching: ?std.Io.Future(void) = c.io.concurrent(CancelWatch.run, .{&watcher}) catch null;
@@ -801,13 +888,21 @@ fn handleJob(c: Context, session: Listening, body: []const u8) !Cycle {
         collect.collect.listener = null;
         live.finish(&.{});
     };
+    // Each step's log goes up as the step finishes; lines and step events go on to the live view.
+    var step_logs = try StepLogs.init(c.gpa, c.io, &job, live.ids, live.listener(), live.observer());
+    collect.collect.listener = step_logs.listener();
+    defer {
+        collect.collect.listener = null;
+        step_logs.deinit();
+    }
     // For the runner's own console and database only: the job's log starts as GitHub's does.
     try sayJob(c.log, c.arena, job, "job acquired: {d} steps", .{job.steps.len});
 
     const job_started_ms = std.Io.Clock.real.now(c.io).toMilliseconds();
     var reporter = try startReporter(c, job, job_started_ms);
-    const result = try runJobSteps(c, job, log, &cancel, &live, if (reporter) |*r| r else null);
-    // The steps are done: register the next runner while this job is wrapped up.
+    const result = try runJobSteps(c, job, log, &cancel, &live, &step_logs, if (reporter) |*r| r else null);
+    // The steps are done: register the next runner, and open its session, while this job is
+    // wrapped up.
     if (c.next) |slot| if (slot.* == null and !stopRequested()) {
         slot.* = Registering.start(c) catch null;
     };
@@ -819,11 +914,21 @@ fn handleJob(c: Context, session: Listening, body: []const u8) !Cycle {
     try reportCacheAndKeys(c, job, log, result);
     const shown = try shownSteps(c.arena, live.ids, job, result, job_started_ms, completion);
     const lines = log.collect.collected(c.arena);
-    try uploadLogs(c, job, shown, lines, result.summaries, log.currentSecrets());
-    // The live view ends with the steps as completejob reports them.
-    live_done = true;
-    collect.collect.listener = null;
-    live.finish(try liveFinals(c.arena, shown));
+    {
+        // The live view ends with the steps as completejob reports them, while the logs go up:
+        // its last requests (the lines left, the final step list) and the uploads are
+        // independent, as GitHub's runner sends its timeline and its logs from queues of their
+        // own, and both are done before completejob. One after the other, the job's end waited
+        // for both.
+        const finals = try liveFinals(c.arena, shown);
+        live_done = true;
+        collect.collect.listener = null;
+        var finishing: ?std.Io.Future(void) = c.io.concurrent(Live.finish, .{ &live, finals }) catch
+            null;
+        defer if (finishing) |*f| f.await(c.io);
+        if (finishing == null) live.finish(finals);
+        try uploadLogs(c, job, shown, lines, result.summaries, log.currentSecrets(), &step_logs, .{});
+    }
 
     const conclusion = jobConclusion(result);
     if (try completeJobWithRetry(c, jr, job, conclusion, shown, result, log.currentSecrets())) |failed| return failed;
@@ -983,6 +1088,8 @@ fn runJobSteps(
     log: *sink.LogSink,
     cancel: *dagger.Cancel,
     live: *Live,
+    /// Told of the steps first; passes them on to `live`.
+    step_logs: *StepLogs,
     reporter: ?*Reporter,
 ) !dagger.Result {
     const cfg = c.cfg;
@@ -1011,7 +1118,7 @@ fn runJobSteps(
         .cancel = cancel,
         .observer = observer: {
             live.next = if (reporter) |r| r.observer() else null;
-            break :observer live.observer();
+            break :observer step_logs.observer();
         },
         .sink_job_id = job.check_run_id,
         .runner_name = c.name,
@@ -1296,6 +1403,8 @@ const Renewer = struct {
                 r.plan_id,
                 r.job_id,
             ) catch |e| {
+                // Cut short at the job's end (see handleJob): nothing failed.
+                if (e == error.Canceled or r.stop.load(.acquire)) return;
                 r.say(arena, "renewjob failed: {s}", .{@errorName(e)});
                 continue;
             };
@@ -1628,8 +1737,10 @@ fn extraShown(ids: []const []const u8, e: dagger.ExtraStep) Shown {
     };
 }
 
-/// Uploads each shown step's log, then the whole job's, so GitHub's UI can show them. Failures are
-/// reported but never stop the job from completing.
+/// Uploads each shown step's log that did not already go up as the step finished (`StepLogs`), the
+/// step summaries and the whole job's log, so GitHub's UI can show them, and waits for the steps'
+/// own uploads too: when this returns, every log is up or has failed. Failures are reported but
+/// never stop the job from completing.
 fn uploadLogs(
     c: Context,
     job: job_mod.Job,
@@ -1637,11 +1748,21 @@ fn uploadLogs(
     lines: []const sink.CollectedLine,
     summaries: []const []const u8,
     secrets: []const []const u8,
+    /// The steps' logs uploaded as each step finished, when they were.
+    early: ?*StepLogs,
+    up: Uploader,
 ) !void {
     var uploads: std.ArrayList(Upload) = .empty;
+    // Steps whose log went up as they finished: only reported, or uploaded again if that failed.
+    const Covered = struct { early: *StepLogs.Early, name: []const u8, blob: results.Blob };
+    var covered: std.ArrayList(Covered) = .empty;
     for (shown) |s| {
         const blob = try results.formatBlob(c.arena, lines, s.log_step);
         if (blob.line_count == 0) continue;
+        if (early) |e| if (e.done(s.log_step, s.id, blob.line_count, textBytes(lines, s.log_step))) |d| {
+            try covered.append(c.arena, .{ .early = d, .name = s.name, .blob = blob });
+            continue;
+        };
         try uploads.append(
             c.arena,
             .{ .what = .{ .log = .{ .step = s.id } }, .name = s.name, .blob = blob },
@@ -1666,19 +1787,44 @@ fn uploadLogs(
     // Each upload is three requests one after another (a signed URL, the blob, its metadata), and
     // they were made one upload after another too: 30 round trips, 1.5 s, before the job could end.
     // Now they run at once, each with its own memory; what one failed to start runs here instead.
+    // Room for the steps' logs uploaded again below: a task holds a pointer into `uploads`.
+    try uploads.ensureUnusedCapacity(c.arena, covered.items.len);
+    // Nothing between here and `group.await` can fail: every upload in `uploads` is running.
     var group: std.Io.Group = .init;
     for (uploads.items) |*u| {
-        group.concurrent(c.io, Upload.run, .{ u, c.gpa, c.io, job }) catch
-            Upload.run(u, c.gpa, c.io, job);
+        group.concurrent(c.io, Upload.run, .{ u, c.gpa, c.io, job, up }) catch
+            Upload.run(u, c.gpa, c.io, job, up);
+    }
+    // The steps' own uploads, long done but for the last ones; one that failed (or never started)
+    // goes up again now, with the rest.
+    if (early) |e| e.wait();
+    for (covered.items) |cv| {
+        if (cv.early.result.ok) continue;
+        uploads.appendAssumeCapacity(.{
+            .what = .{ .log = .{ .step = cv.early.id } },
+            .name = cv.name,
+            .blob = cv.blob,
+            .again = cv.early.result.detail,
+        });
+        const u = &uploads.items[uploads.items.len - 1];
+        group.concurrent(c.io, Upload.run, .{ u, c.gpa, c.io, job, up }) catch
+            Upload.run(u, c.gpa, c.io, job, up);
     }
     group.await(c.io) catch {};
     defer for (uploads.items) |*u| u.arena.deinit();
+    for (covered.items) |cv| if (cv.early.result.ok) try c.err.print(
+        "job {d}: log upload '{s}': ok, {s} (as the step finished)\n",
+        .{ job.check_run_id, cv.name, cv.early.result.detail },
+    );
     for (uploads.items) |*u| {
         const r = u.result;
         const outcome = if (r.ok) "ok, " else "FAILED: ";
         switch (u.what) {
             .log => |w| switch (w) {
-                .step => try c.err.print(
+                .step => if (u.again) |why| try c.err.print(
+                    "job {d}: log upload '{s}': {s}{s} (again; as the step finished: {s})\n",
+                    .{ job.check_run_id, u.name, outcome, r.detail, why },
+                ) else try c.err.print(
                     "job {d}: log upload '{s}': {s}{s}\n",
                     .{ job.check_run_id, u.name, outcome, r.detail },
                 ),
@@ -1704,14 +1850,262 @@ const Upload = struct {
     markdown: []const u8 = "",
     arena: std.heap.ArenaAllocator = undefined,
     result: results.Result = .{ .ok = false, .detail = "not run" },
+    /// A step's log uploaded again because its upload as the step finished failed: why that did.
+    again: ?[]const u8 = null,
 
-    fn run(u: *Upload, gpa: Allocator, io: std.Io, job: job_mod.Job) void {
+    fn run(u: *Upload, gpa: Allocator, io: std.Io, job: job_mod.Job, up: Uploader) void {
         u.arena = .init(gpa);
         const arena = u.arena.allocator();
         u.result = switch (u.what) {
-            .log => |w| results.upload(arena, io, job, w, u.blob),
-            .summary => |id| results.uploadSummary(arena, io, job, id, u.markdown),
+            .log => |w| up.log(arena, io, job, w, u.blob),
+            .summary => |id| up.summary(arena, io, job, id, u.markdown),
         };
+    }
+};
+
+/// The results service's uploads, replaced in tests.
+const Uploader = struct {
+    log: *const @TypeOf(results.upload) = results.upload,
+    summary: *const @TypeOf(results.uploadSummary) = results.uploadSummary,
+};
+
+/// The bytes of a step's lines, without their timestamps: with the line count, what tells whether
+/// a log uploaded as its step finished is the step's whole log (`StepLogs.done`).
+fn textBytes(lines: []const sink.CollectedLine, log_step: u32) usize {
+    var n: usize = 0;
+    for (lines) |l| if (l.step == log_step) {
+        n += l.text.len;
+    };
+    return n;
+}
+
+/// Each step's log, uploaded in the background as soon as the step finishes, as actions/runner
+/// does (its `JobServerQueue` sends a step's log while the next step runs), rather than every log
+/// at the job's end: the end is left with "Set up job", "Complete job", the job's whole log and
+/// whatever the steps' own uploads could not cover, and fewer uploads at once there (each a new
+/// connection and three round trips) finish sooner. All of them are done before completejob, as
+/// GitHub's runner has them.
+///
+/// Lines come from the job's log sink (its listener, so as redacted as everything else uploaded)
+/// and are passed on to the live view; steps' ends from the Dagger observer, passed on too. A
+/// step's lines are kept here, already formatted, only until its upload: one that logs more than
+/// `max_bytes` gives up its early upload and is uploaded at the end from the spool, so the job's
+/// memory never holds more than that per step on top of what it did before.
+///
+/// At the end, `uploadLogs` skips a step only when what was uploaded is exactly what the job logged
+/// for it (the same id, line count and bytes) and the upload succeeded; a line that arrived after
+/// the step's end, or a failed upload, means it is uploaded at the end as before.
+const StepLogs = struct {
+    gpa: Allocator,
+    io: std.Io,
+    job: *const job_mod.Job,
+    /// GitHub's id for each log step (`Live.ids`).
+    ids: []const []const u8,
+    /// Where lines and step events go on to (the live view).
+    inner: sink.CollectSink.Listener,
+    next: dagger.Observer,
+    up: Uploader = .{},
+
+    mu: std.Io.Mutex = .init,
+    /// Per log step (guarded by `mu`).
+    steps: []Step,
+    /// Uploads started (guarded by `mu`), each in `group`.
+    sent: std.ArrayList(*Early) = .empty,
+    group: std.Io.Group = .init,
+    awaited: bool = false,
+
+    /// A step's lines kept for its upload, at most this many bytes formatted.
+    const max_bytes = 1 << 20;
+
+    const Step = struct {
+        text: std.ArrayList(u8) = .empty,
+        lines: usize = 0,
+        text_bytes: usize = 0,
+        state: enum { collecting, too_big, sent } = .collecting,
+    };
+
+    /// One step's upload, made in a task of its own; its memory is its own (`gpa`).
+    const Early = struct {
+        log_step: u32,
+        id: []const u8,
+        blob: results.Blob,
+        text_bytes: usize,
+        arena: std.heap.ArenaAllocator,
+        result: results.Result = .{ .ok = false, .detail = "not started" },
+
+        /// The text is freed once it is up: a job of many steps does not keep their logs in
+        /// memory until it ends (the spool has them).
+        fn run(e: *Early, gpa: Allocator, io: std.Io, job: *const job_mod.Job, up: Uploader) void {
+            e.result = up.log(e.arena.allocator(), io, job.*, .{ .step = e.id }, e.blob);
+            gpa.free(e.blob.text);
+            e.blob.text = &.{};
+        }
+    };
+
+    fn init(
+        gpa: Allocator,
+        io: std.Io,
+        job: *const job_mod.Job,
+        ids: []const []const u8,
+        inner: sink.CollectSink.Listener,
+        next: dagger.Observer,
+    ) !StepLogs {
+        const steps = try gpa.alloc(Step, ids.len);
+        @memset(steps, .{});
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .job = job,
+            .ids = ids,
+            .inner = inner,
+            .next = next,
+            .steps = steps,
+        };
+    }
+
+    /// Waits for the uploads still running and frees everything. The `StepLogs` must no longer be
+    /// the sink's listener or the job's observer.
+    fn deinit(s: *StepLogs) void {
+        s.wait();
+        for (s.sent.items) |e| {
+            s.gpa.free(e.blob.text);
+            e.arena.deinit();
+            s.gpa.destroy(e);
+        }
+        s.sent.deinit(s.gpa);
+        for (s.steps) |*st| st.text.deinit(s.gpa);
+        s.gpa.free(s.steps);
+    }
+
+    /// Waits for every upload started. No step may finish after this.
+    fn wait(s: *StepLogs) void {
+        {
+            s.mu.lockUncancelable(s.io);
+            defer s.mu.unlock(s.io);
+            if (s.awaited) return;
+            s.awaited = true;
+        }
+        s.group.await(s.io) catch {};
+    }
+
+    fn listener(s: *StepLogs) sink.CollectSink.Listener {
+        return .{ .ptr = s, .onLine = onLine };
+    }
+
+    fn observer(s: *StepLogs) dagger.Observer {
+        return .{
+            .ptr = s,
+            .startedFn = stepStarted,
+            .finishedFn = stepFinished,
+            .extraStartedFn = if (s.next.extraStartedFn != null) extraStarted else null,
+            .extraFinishedFn = extraFinished,
+            .postsFn = if (s.next.postsFn != null) posts else null,
+        };
+    }
+
+    fn onLine(ptr: *anyopaque, step: u32, seq: u64, text: []const u8) void {
+        const s: *StepLogs = @ptrCast(@alignCast(ptr));
+        s.inner.onLine(s.inner.ptr, step, seq, text);
+        // "Set up job" is uploaded at the end: the runner logs to it before and after the steps.
+        if (step == 0 or step >= s.steps.len) return;
+        s.mu.lockUncancelable(s.io);
+        defer s.mu.unlock(s.io);
+        const st = &s.steps[step];
+        if (st.state != .collecting) return;
+        // As `results.formatBlob` writes a line.
+        var ts_buf: [64]u8 = undefined;
+        const ts = timefmt.isoTime7Buf(&ts_buf, std.Io.Clock.real.now(s.io).toMilliseconds());
+        if (ts.len == 0) return s.giveUp(st);
+        if (st.text.items.len + ts.len + text.len + 2 > max_bytes) return s.giveUp(st);
+        st.text.ensureUnusedCapacity(s.gpa, ts.len + text.len + 2) catch return s.giveUp(st);
+        st.text.appendSliceAssumeCapacity(ts);
+        st.text.appendAssumeCapacity(' ');
+        st.text.appendSliceAssumeCapacity(text);
+        st.text.appendAssumeCapacity('\n');
+        st.lines += 1;
+        st.text_bytes += text.len;
+    }
+
+    /// A step whose lines are not all here: uploaded at the end instead.
+    fn giveUp(s: *StepLogs, st: *Step) void {
+        st.state = .too_big;
+        st.text.clearAndFree(s.gpa);
+    }
+
+    /// Starts the upload of a step that finished, unless it logged nothing or gave up.
+    fn send(s: *StepLogs, log_step: u32) void {
+        if (log_step == 0 or log_step >= s.steps.len) return;
+        s.mu.lockUncancelable(s.io);
+        defer s.mu.unlock(s.io);
+        if (s.awaited) return;
+        const st = &s.steps[log_step];
+        if (st.state != .collecting or st.lines == 0) return;
+        st.state = .sent;
+        s.sent.ensureUnusedCapacity(s.gpa, 1) catch return;
+        const e = s.gpa.create(Early) catch return;
+        const text = st.text.toOwnedSlice(s.gpa) catch {
+            s.gpa.destroy(e);
+            return;
+        };
+        e.* = .{
+            .log_step = log_step,
+            .id = s.ids[log_step],
+            .blob = .{ .text = text, .line_count = st.lines },
+            .text_bytes = st.text_bytes,
+            .arena = .init(s.gpa),
+        };
+        s.sent.appendAssumeCapacity(e);
+        // Not run here when no task can be had: the step would wait for it. It is uploaded at the
+        // end instead (its result says it was not started).
+        s.group.concurrent(s.io, Early.run, .{ e, s.gpa, s.io, s.job, s.up }) catch {};
+    }
+
+    /// The upload made as `log_step` finished, when it holds exactly the step's log (`id`,
+    /// `line_count` lines, `text_bytes` bytes without timestamps); null when there is none, or the
+    /// step logged more since. Its result is final only after `wait`.
+    fn done(s: *StepLogs, log_step: u32, id: []const u8, line_count: usize, text_bytes: usize) ?*Early {
+        s.mu.lockUncancelable(s.io);
+        defer s.mu.unlock(s.io);
+        for (s.sent.items) |e| {
+            if (e.log_step != log_step) continue;
+            if (!std.mem.eql(u8, e.id, id)) return null;
+            if (e.blob.line_count != line_count or e.text_bytes != text_bytes) return null;
+            return e;
+        }
+        return null;
+    }
+
+    fn stepStarted(ptr: *anyopaque, number: u32, name: []const u8, started_ms: i64) void {
+        const s: *StepLogs = @ptrCast(@alignCast(ptr));
+        s.next.startedFn(s.next.ptr, number, name, started_ms);
+    }
+
+    fn stepFinished(ptr: *anyopaque, number: u32, res: dagger.StepResult) void {
+        const s: *StepLogs = @ptrCast(@alignCast(ptr));
+        s.next.finishedFn(s.next.ptr, number, res);
+        s.send(number);
+    }
+
+    fn extraStarted(
+        ptr: *anyopaque,
+        kind: dagger.ExtraKind,
+        log_step: u32,
+        name: []const u8,
+        started_ms: i64,
+    ) void {
+        const s: *StepLogs = @ptrCast(@alignCast(ptr));
+        s.next.extraStartedFn.?(s.next.ptr, kind, log_step, name, started_ms);
+    }
+
+    fn extraFinished(ptr: *anyopaque, e: dagger.ExtraStep) void {
+        const s: *StepLogs = @ptrCast(@alignCast(ptr));
+        if (s.next.extraFinishedFn) |f| f(s.next.ptr, e);
+        s.send(e.log_step);
+    }
+
+    fn posts(ptr: *anyopaque, count: u32, stop: bool) void {
+        const s: *StepLogs = @ptrCast(@alignCast(ptr));
+        s.next.postsFn.?(s.next.ptr, count, stop);
     }
 };
 
@@ -1994,7 +2388,42 @@ const FakeGitHub = struct {
 
     fn remove(_: Context, id: u64, _: []const u8) void {
         removed = id;
+        removes += 1;
     }
+
+    // Sessions: opened in the background (`open`), or not (`noSession`); each deletion counted.
+    var opens: u32 = 0;
+    var removes: u32 = 0;
+    var deletes: u32 = 0;
+    var deleted_sid: [16]u8 = undefined;
+    var deleted_len: usize = 0;
+
+    fn reset() void {
+        removed = null;
+        opens = 0;
+        removes = 0;
+        deletes = 0;
+        deleted_len = 0;
+    }
+
+    fn open(c: Context, jit: jitconfig.Jit) ?Session {
+        opens += 1;
+        const sid = std.fmt.allocPrint(c.arena, "s-{d}", .{jit.runner_id}) catch return null;
+        return .{ .base = "https://broker.test/", .sid = sid, .token = "tok", .token_at = 42 };
+    }
+
+    fn noSession(_: Context, _: jitconfig.Jit) ?Session {
+        opens += 1;
+        return null;
+    }
+
+    fn delete(_: Context, _: []const u8, sid: []const u8, _: []const u8) void {
+        deletes += 1;
+        deleted_len = @min(sid.len, deleted_sid.len);
+        @memcpy(deleted_sid[0..deleted_len], sid[0..deleted_len]);
+    }
+
+    const calls: Registering.Calls = .{ .generate = generate, .remove = remove, .open = open, .delete = delete };
 };
 
 test "the next registration, made while a job finishes, is taken over, or removed when unused" {
@@ -2007,27 +2436,296 @@ test "the next registration, made while a job finishes, is taken over, or remove
     const c = testContext(a.allocator(), &log, &w, &cfg);
 
     // Taken over: copied into the cycle's arena, and the background task's memory freed (the
-    // testing allocator would report it otherwise).
-    const r = try Registering.startWith(c, .{ .generate = FakeGitHub.generate, .remove = FakeGitHub.remove });
+    // testing allocator would report it otherwise). Its session too, which is the cycle's to
+    // delete from then on: nothing is deleted or removed here.
+    FakeGitHub.reset();
+    const r = try Registering.startWith(c, FakeGitHub.calls);
     const name = try a.allocator().dupe(u8, r.name);
-    const got = (try r.take(a.allocator())).ok;
+    const taken = try r.take(a.allocator());
+    const got = taken.result.ok;
     try std.testing.expectEqual(@as(u64, 7), got.runner_id);
     try std.testing.expectEqualStrings(name, got.runner_name);
     try std.testing.expect(std.mem.startsWith(u8, got.runner_name, "r-"));
     try std.testing.expectEqualStrings("{\"agentId\": 7}", got.files[0].content);
+    const s = taken.session.?;
+    try std.testing.expectEqualStrings("s-7", s.sid);
+    try std.testing.expectEqualStrings("https://broker.test/", s.base);
+    try std.testing.expectEqualStrings("tok", s.token);
+    try std.testing.expectEqual(@as(i64, 42), s.token_at);
+    try std.testing.expectEqual(@as(u32, 0), FakeGitHub.deletes);
+    try std.testing.expectEqual(@as(u32, 0), FakeGitHub.removes);
 
-    // Never used: removed from GitHub, as an idle registration must be.
-    FakeGitHub.removed = null;
-    const unused = try Registering.startWith(c, .{ .generate = FakeGitHub.generate, .remove = FakeGitHub.remove });
+    // Never used (the runner stopped): its session deleted, then its registration removed, once
+    // each, as an idle registration must be.
+    FakeGitHub.reset();
+    const unused = try Registering.startWith(c, FakeGitHub.calls);
     unused.discard(c);
+    try std.testing.expectEqual(@as(u32, 1), FakeGitHub.deletes);
+    try std.testing.expectEqualStrings("s-7", FakeGitHub.deleted_sid[0..FakeGitHub.deleted_len]);
+    try std.testing.expectEqual(@as(u32, 1), FakeGitHub.removes);
     try std.testing.expectEqual(@as(?u64, 7), FakeGitHub.removed);
 
-    // Refused: the cycle gets GitHub's answer, as if it had registered itself.
-    const refused = try Registering.startWith(c, .{ .generate = FakeGitHub.refuse, .remove = FakeGitHub.remove });
-    const f = (try refused.take(a.allocator())).failed;
+    // Refused: the cycle gets GitHub's answer, as if it had registered itself; no session is
+    // opened for a runner that does not exist.
+    FakeGitHub.reset();
+    var refusing = FakeGitHub.calls;
+    refusing.generate = FakeGitHub.refuse;
+    const refused = try Registering.startWith(c, refusing);
+    const f = (try refused.take(a.allocator())).result.failed;
     try std.testing.expectEqual(error.GithubRejected, f.err);
     try std.testing.expectEqual(std.http.Status.forbidden, f.status);
     try std.testing.expectEqualStrings("no", f.message);
+    try std.testing.expectEqual(@as(u32, 0), FakeGitHub.opens);
+    try std.testing.expectEqual(@as(u32, 0), FakeGitHub.deletes + FakeGitHub.removes);
+}
+
+test "a session the next registration could not open is left to the cycle, and never deleted" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    var cfg: Config = .{ .gh_token = "", .scope = undefined, .name_prefix = "r" };
+    const c = testContext(a.allocator(), &log, &w, &cfg);
+    var calls = FakeGitHub.calls;
+    calls.open = FakeGitHub.noSession;
+
+    // Taken over without one: the cycle opens it itself, as it did before.
+    FakeGitHub.reset();
+    const r = try Registering.startWith(c, calls);
+    const taken = try r.take(a.allocator());
+    try std.testing.expect(taken.result == .ok);
+    try std.testing.expect(taken.session == null);
+    try std.testing.expectEqual(@as(u32, 1), FakeGitHub.opens);
+
+    // Unused: only the registration is removed; there is no session to delete.
+    FakeGitHub.reset();
+    const unused = try Registering.startWith(c, calls);
+    unused.discard(c);
+    try std.testing.expectEqual(@as(u32, 0), FakeGitHub.deletes);
+    try std.testing.expectEqual(@as(u32, 1), FakeGitHub.removes);
+}
+
+test "a registration made as the runner stops opens no session, and is removed once" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    var cfg: Config = .{ .gh_token = "", .scope = undefined, .name_prefix = "r" };
+    const c = testContext(a.allocator(), &log, &w, &cfg);
+
+    FakeGitHub.reset();
+    stop_signals.store(1, .release);
+    defer stop_signals.store(0, .release);
+    const r = try Registering.startWith(c, FakeGitHub.calls);
+    // As `serve` ends on a stop: what no cycle took is discarded.
+    r.discard(c);
+    try std.testing.expectEqual(@as(u32, 0), FakeGitHub.opens);
+    try std.testing.expectEqual(@as(u32, 0), FakeGitHub.deletes);
+    try std.testing.expectEqual(@as(u32, 1), FakeGitHub.removes);
+}
+
+/// The results service for `StepLogs` tests: records each log upload (which log, how many lines,
+/// its text), and fails the first upload of the step "post".
+const FakeResults = struct {
+    const Call = struct { id: [16]u8 = undefined, id_len: usize = 0, lines: usize = 0, text: [128]u8 = undefined, text_len: usize = 0 };
+    var mu: std.Io.Mutex = .init;
+    var calls: [32]Call = undefined;
+    var n: usize = 0;
+
+    fn upload(arena: Allocator, io: std.Io, _: job_mod.Job, which: results.Which, blob: results.Blob) results.Result {
+        mu.lockUncancelable(io);
+        defer mu.unlock(io);
+        const id = switch (which) {
+            .step => |s| s,
+            .job => "job",
+        };
+        const first_post = std.mem.eql(u8, id, "post") and count("post") == 0;
+        var call: Call = .{ .lines = blob.line_count };
+        call.id_len = @min(id.len, call.id.len);
+        @memcpy(call.id[0..call.id_len], id[0..call.id_len]);
+        call.text_len = @min(blob.text.len, call.text.len);
+        @memcpy(call.text[0..call.text_len], blob.text[0..call.text_len]);
+        calls[n] = call;
+        n += 1;
+        if (first_post) return .{ .ok = false, .detail = "HTTP 500" };
+        return .{ .ok = true, .detail = std.fmt.allocPrint(arena, "{d} lines", .{blob.line_count}) catch "" };
+    }
+
+    fn summary(_: Allocator, _: std.Io, _: job_mod.Job, _: []const u8, _: []const u8) results.Result {
+        return .{ .ok = true, .detail = "" };
+    }
+
+    fn count(id: []const u8) usize {
+        var k: usize = 0;
+        for (calls[0..n]) |cl| if (std.mem.eql(u8, cl.id[0..cl.id_len], id)) {
+            k += 1;
+        };
+        return k;
+    }
+
+    /// The lines of each upload of `id`, in the order they were made.
+    fn lines(id: []const u8, out: []usize) []usize {
+        var k: usize = 0;
+        for (calls[0..n]) |cl| if (std.mem.eql(u8, cl.id[0..cl.id_len], id)) {
+            out[k] = cl.lines;
+            k += 1;
+        };
+        return out[0..k];
+    }
+
+    const uploader: Uploader = .{ .log = upload, .summary = summary };
+};
+
+/// Counts what `StepLogs` passes on to the live view.
+const FakeLive = struct {
+    lines: std.atomic.Value(u32) = .init(0),
+    finished: std.atomic.Value(u32) = .init(0),
+
+    fn onLine(ptr: *anyopaque, _: u32, _: u64, _: []const u8) void {
+        const l: *FakeLive = @ptrCast(@alignCast(ptr));
+        _ = l.lines.fetchAdd(1, .monotonic);
+    }
+    fn started(_: *anyopaque, _: u32, _: []const u8, _: i64) void {}
+    fn finishedFn(ptr: *anyopaque, _: u32, _: dagger.StepResult) void {
+        const l: *FakeLive = @ptrCast(@alignCast(ptr));
+        _ = l.finished.fetchAdd(1, .monotonic);
+    }
+    fn extraFinished(ptr: *anyopaque, _: dagger.ExtraStep) void {
+        const l: *FakeLive = @ptrCast(@alignCast(ptr));
+        _ = l.finished.fetchAdd(1, .monotonic);
+    }
+};
+
+test "each step's log goes up as the step finishes, and the job's end uploads only the rest" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var out_buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var err_buf: [4096]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+    var cfg: Config = .{ .gh_token = "", .scope = undefined };
+    const c = testContext(arena, &log, &err, &cfg);
+    FakeResults.n = 0;
+
+    const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 9, .secrets = &.{}, .steps = &.{} };
+    const ids = [_][]const u8{ "setup", "a", "b", "c", "post", "complete" };
+    var fake: FakeLive = .{};
+    var logs = try StepLogs.init(
+        std.testing.allocator,
+        io,
+        &job,
+        &ids,
+        .{ .ptr = &fake, .onLine = FakeLive.onLine },
+        .{ .ptr = &fake, .startedFn = FakeLive.started, .finishedFn = FakeLive.finishedFn, .extraFinishedFn = FakeLive.extraFinished },
+    );
+    defer logs.deinit();
+    logs.up = FakeResults.uploader;
+    const l = logs.listener();
+    const o = logs.observer();
+
+    // What the job logs, as the sink tells its listener and keeps it (`collected`).
+    var kept: std.ArrayList(sink.CollectedLine) = .empty;
+    const big = try arena.alloc(u8, StepLogs.max_bytes);
+    @memset(big, 'x');
+    const Line = struct { step: u32, text: []const u8 };
+    const log_line = struct {
+        fn f(lst: sink.CollectSink.Listener, k: *std.ArrayList(sink.CollectedLine), al: Allocator, ln: Line) !void {
+            lst.onLine(lst.ptr, ln.step, k.items.len + 1, ln.text);
+            try k.append(al, .{ .step = ln.step, .seq = k.items.len + 1, .ts_ms = 0, .text = ln.text });
+        }
+    }.f;
+    try log_line(l, &kept, arena, .{ .step = 0, .text = "job acquired" });
+    try log_line(l, &kept, arena, .{ .step = 1, .text = "one" });
+    try log_line(l, &kept, arena, .{ .step = 1, .text = "two" });
+    o.finishedFn(o.ptr, 1, .{ .outcome = .success });
+    try log_line(l, &kept, arena, .{ .step = 2, .text = "b" });
+    o.finishedFn(o.ptr, 2, .{ .outcome = .success });
+    // After step 2's end: its upload no longer holds its whole log.
+    try log_line(l, &kept, arena, .{ .step = 2, .text = "late" });
+    // Too much to keep in memory: uploaded at the end, from what the sink kept.
+    try log_line(l, &kept, arena, .{ .step = 3, .text = big });
+    o.finishedFn(o.ptr, 3, .{ .outcome = .success });
+    try log_line(l, &kept, arena, .{ .step = 4, .text = "p" });
+    o.extraFinishedFn.?(o.ptr, .{ .kind = .post, .name = "Post a", .log_step = 4, .outcome = .success, .started_ms = 0, .completed_ms = 0 });
+    try log_line(l, &kept, arena, .{ .step = 5, .text = "Cleaning up orphan processes" });
+
+    // Passed on to the live view, every line and every step.
+    try std.testing.expectEqual(@as(u32, 8), fake.lines.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 4), fake.finished.load(.monotonic));
+    // Started as each step finished, before the job's end: a, b and the post step.
+    try std.testing.expectEqual(@as(usize, 3), logs.sent.items.len);
+
+    const shown = [_]Shown{
+        .{ .id = "setup", .number = 0, .name = "Set up job", .log_step = 0, .conclusion = "succeeded" },
+        .{ .id = "a", .number = 1, .name = "a", .log_step = 1, .conclusion = "succeeded" },
+        .{ .id = "b", .number = 2, .name = "b", .log_step = 2, .conclusion = "succeeded" },
+        .{ .id = "c", .number = 3, .name = "c", .log_step = 3, .conclusion = "succeeded" },
+        .{ .id = "post", .number = 4, .name = "Post a", .log_step = 4, .conclusion = "succeeded" },
+        .{ .id = "complete", .number = 5, .name = "Complete job", .log_step = 5, .conclusion = "succeeded" },
+    };
+    try uploadLogs(c, job, &shown, kept.items, &.{}, &.{}, &logs, FakeResults.uploader);
+
+    // Every upload is done once uploadLogs returns, so before completejob.
+    var got: [4]usize = undefined;
+    // a: once, as it finished, with both lines; as the blob formats them.
+    try std.testing.expectEqualSlices(usize, &.{2}, FakeResults.lines("a", &got));
+    for (FakeResults.calls[0..FakeResults.n]) |cl| if (std.mem.eql(u8, cl.id[0..cl.id_len], "a")) {
+        const text = cl.text[0..cl.text_len];
+        try std.testing.expectEqual(@as(usize, 2 * (28 + 1) + "one\ntwo\n".len), text.len);
+        try std.testing.expect(std.mem.endsWith(u8, text[0..33], "Z one\n"));
+        try std.testing.expect(std.mem.endsWith(u8, text, "Z two\n"));
+    };
+    // b: as it finished with one line, then at the end with the line that came after.
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, FakeResults.lines("b", &got));
+    // c: only at the end.
+    try std.testing.expectEqualSlices(usize, &.{1}, FakeResults.lines("c", &got));
+    // The post step: its upload failed, so it went up again at the end.
+    try std.testing.expectEqualSlices(usize, &.{ 1, 1 }, FakeResults.lines("post", &got));
+    // The rest only at the end, as before.
+    try std.testing.expectEqualSlices(usize, &.{1}, FakeResults.lines("setup", &got));
+    try std.testing.expectEqualSlices(usize, &.{1}, FakeResults.lines("complete", &got));
+    try std.testing.expectEqualSlices(usize, &.{8}, FakeResults.lines("job", &got));
+    try std.testing.expectEqual(@as(usize, 9), FakeResults.n);
+
+    const said = err.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, said, "log upload 'a': ok, 2 lines (as the step finished)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "log upload 'Post a': ok, 1 lines (again; as the step finished: HTTP 500)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "FAILED") == null);
+}
+
+test "a step that finishes after the job's uploads began is uploaded at the end, not early" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const io = std.testing.io;
+    FakeResults.n = 0;
+    const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 9, .secrets = &.{}, .steps = &.{} };
+    const ids = [_][]const u8{ "setup", "a" };
+    var fake: FakeLive = .{};
+    var logs = try StepLogs.init(
+        std.testing.allocator,
+        io,
+        &job,
+        &ids,
+        .{ .ptr = &fake, .onLine = FakeLive.onLine },
+        .{ .ptr = &fake, .startedFn = FakeLive.started, .finishedFn = FakeLive.finishedFn },
+    );
+    defer logs.deinit();
+    logs.up = FakeResults.uploader;
+    const l = logs.listener();
+    l.onLine(l.ptr, 1, 1, "x");
+    logs.wait();
+    const o = logs.observer();
+    o.finishedFn(o.ptr, 1, .{});
+    try std.testing.expectEqual(@as(usize, 0), logs.sent.items.len);
+    // Line forwarded, and the extra-step events this live view does not take are not offered.
+    try std.testing.expectEqual(@as(u32, 1), fake.lines.load(.monotonic));
+    try std.testing.expect(o.extraStartedFn == null and o.postsFn == null);
+    try std.testing.expect(logs.done(1, "a", 1, 1) == null);
 }
 
 test "a poll that is never answered is given up after its timeout" {
