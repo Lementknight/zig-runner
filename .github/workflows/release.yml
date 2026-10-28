@@ -112,8 +112,7 @@ jobs:
           gh release edit "$TAG" --draft=false
 
   # The pull request's check of the same build: everything into dist/, nothing published. The
-  # binaries go to the image check; and the x86_64 one must be byte for byte what `zig build` makes,
-  # so the module graph build-binaries.sh gives the compiler cannot drift from build.zig's.
+  # binaries go to the image check; binaries-zig-build checks them against `zig build`.
   binaries-check:
     name: Binaries (check)
     if: github.event_name == 'pull_request'
@@ -132,13 +131,6 @@ jobs:
       - name: Build
         run: .github/scripts/build-binaries.sh "$TAG" dist
 
-      - name: The same as zig build
-        working-directory: runner
-        run: |
-          zig build -Doptimize=ReleaseSafe -Dstrip -Dtarget=x86_64-linux-musl -Dversion="$TAG" \
-            --prefix "$RUNNER_TEMP/zig-build"
-          cmp "$RUNNER_TEMP/zig-build/bin/runner" ../dist/zig-runner-linux-x86_64
-
       - name: SBOM
         run: |
           .github/scripts/sbom.sh "$TAG" dist/SHA256SUMS > "$RUNNER_TEMP/zig-runner.spdx.json"
@@ -149,6 +141,34 @@ jobs:
           name: binaries
           path: dist/
           retention-days: 1
+
+  # The x86_64 binary build-binaries.sh makes must be byte for byte what `zig build` makes, so the
+  # module graph it gives the compiler cannot drift from build.zig's. A job of its own, beside
+  # binaries-check rather than after its build: `zig build` first compiles Zig's build system (about
+  # 100 s on an empty cache), and the image check need not wait for that. Both builds here at once.
+  binaries-zig-build:
+    name: Binaries (same as zig build)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      - name: The same as zig build
+        run: |
+          .github/scripts/build-binaries.sh "$TAG" dist &
+          direct=$!
+          (cd runner && zig build -Doptimize=ReleaseSafe -Dstrip -Dtarget=x86_64-linux-musl \
+            -Dversion="$TAG" --prefix "$RUNNER_TEMP/zig-build")
+          wait "$direct"
+          cmp "$RUNNER_TEMP/zig-build/bin/runner" dist/zig-runner-linux-x86_64
 
   # From the release's own binaries: a tag's, once the binaries job published them (checked against
   # SHA256SUMS and their provenance); a pull request's from its check; by hand, the tag's release.
