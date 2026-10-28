@@ -42,6 +42,12 @@ pub const Result = struct {
     detail: []const u8,
 };
 
+/// What every call answers for a job that names no results service.
+const no_endpoint: Result = .{ .ok = false, .detail = "job has no results endpoint" };
+
+/// The most of an error body a failure's detail quotes.
+const max_detail_body = 300;
+
 pub const Which = union(enum) { step: []const u8, job };
 const Meta = struct { uploaded_at: []const u8, line_count: usize };
 
@@ -84,10 +90,7 @@ pub fn upload(arena: Allocator, io: std.Io, job: job_mod.Job, which: Which, blob
 }
 
 fn uploadInner(arena: Allocator, io: std.Io, job: job_mod.Job, which: Which, blob: Blob) !Result {
-    if (job.results_endpoint.len == 0) return .{
-        .ok = false,
-        .detail = "job has no results endpoint",
-    };
+    if (job.results_endpoint.len == 0) return no_endpoint;
     const get_method = switch (which) {
         .step => "GetStepLogsSignedBlobURL",
         .job => "GetJobLogsSignedBlobURL",
@@ -111,11 +114,7 @@ fn uploadInner(arena: Allocator, io: std.Io, job: job_mod.Job, which: Which, blo
         .detail = try std.fmt.allocPrint(arena, "{s}: no logs_url in response", .{get_method}),
     };
 
-    // Signed URL: no bearer token, but Azure needs the blob type.
-    const put = try broker.request(arena, io, .PUT, logs_url, blob.text, .{
-        .content_type = "text/plain",
-        .extra_headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }},
-    });
+    const put = try putBlob(arena, io, logs_url, blob.text);
     if (put.status.class() != .success) return failed(arena, "blob upload", put);
 
     const uploaded_at = try timefmt.isoTime(arena, std.Io.Clock.real.now(io).toMilliseconds());
@@ -160,10 +159,7 @@ fn uploadSummaryInner(
     step_id: []const u8,
     markdown: []const u8,
 ) !Result {
-    if (job.results_endpoint.len == 0) return .{
-        .ok = false,
-        .detail = "job has no results endpoint",
-    };
+    if (job.results_endpoint.len == 0) return no_endpoint;
     const which: Which = .{ .step = step_id };
     const signed = try broker.call(
         arena,
@@ -182,10 +178,7 @@ fn uploadSummaryInner(
         .ok = false,
         .detail = "GetStepSummarySignedBlobURL: no summary_url in response",
     };
-    const put = try broker.request(arena, io, .PUT, url, markdown, .{
-        .content_type = "text/plain",
-        .extra_headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }},
-    });
+    const put = try putBlob(arena, io, url, markdown);
     if (put.status.class() != .success) return failed(arena, "summary upload", put);
     const uploaded_at = try timefmt.isoTime(arena, std.Io.Clock.real.now(io).toMilliseconds());
     // The ids, then the size and time (the object's closing brace is replaced).
@@ -234,10 +227,7 @@ fn updateStepsInner(
     steps: []const u8,
     change_order: u64,
 ) !Result {
-    if (job.results_endpoint.len == 0) return .{
-        .ok = false,
-        .detail = "job has no results endpoint",
-    };
+    if (job.results_endpoint.len == 0) return no_endpoint;
     const base = std.mem.trimEnd(u8, job.results_endpoint, "/");
     const url = try std.fmt.allocPrint(
         arena,
@@ -259,13 +249,22 @@ fn updateStepsInner(
     return .{ .ok = true, .detail = "" };
 }
 
+/// PUTs `text` to a signed blob URL: no bearer token (the URL is the authorization), but Azure needs
+/// the blob type.
+fn putBlob(arena: Allocator, io: std.Io, url: []const u8, text: []const u8) !broker.Response {
+    return broker.request(arena, io, .PUT, url, text, .{
+        .content_type = "text/plain",
+        .extra_headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }},
+    });
+}
+
 fn failed(arena: Allocator, what: []const u8, r: broker.Response) !Result {
     return .{
         .ok = false,
         .detail = try std.fmt.allocPrint(arena, "{s}: HTTP {d}: {s}", .{
             what,
             @backingInt(r.status),
-            r.body[0..@min(r.body.len, 300)],
+            r.body[0..@min(r.body.len, max_detail_body)],
         }),
     };
 }
