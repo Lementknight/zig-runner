@@ -55,6 +55,10 @@ pub const RequestOptions = struct {
     token: ?[]const u8 = null,
     content_type: []const u8 = "application/json",
     extra_headers: []const std.http.Header = &.{},
+    /// How long one attempt may take (`http.within`); null for none, for a caller that bounds the
+    /// request itself or a request that lasts as long as something else does (a Dagger query runs
+    /// as long as its step).
+    deadline: ?std.Io.Duration = http.request_deadline,
 };
 
 pub fn request(
@@ -68,28 +72,66 @@ pub fn request(
     // A kept-alive connection the server had closed while it sat idle (seen on completejob after a
     // 16-minute step): no byte came back (HttpConnectionClosing), or the request could not even be
     // written (WriteFailed, seen on log uploads to blob storage), so it was never processed, and
-    // the connection is dropped (see `requestOnce`). The pool can hold many such connections to
-    // the same host (one per runner that registered at once, a minute later), so try again until a
+    // the connection is dropped (see `exchange`). The pool can hold many such connections to the
+    // same host (one per runner that registered at once, a minute later), so try again until a
     // live or new connection answers (`http.staleRetries`).
     // A certificate judged by the shared client's stale clock: once, with a new client (`renew`).
+    // A connection that died under the request without a word (no answer by the deadline, a read
+    // or write that failed): once more, on a new connection of a client of its own, so not on
+    // another connection the pool kept from the same time. A log upload read such a connection
+    // for 17 minutes and then failed with ReadFailed (#100).
     var attempt: u32 = 0;
     var renewed = false;
+    var fresh = false;
     while (true) : (attempt += 1) {
         const used = http.shared.load(.acquire);
-        return requestOnce(arena, io, method, url, payload, opts) catch |err| switch (err) {
-            error.HttpConnectionClosing, error.WriteFailed => if (attempt < http.staleRetries(used))
-                continue
-            else
-                err,
-            else => if (!renewed and http.staleClock(err) and used != null) {
+        return requestWithin(arena, io, method, url, payload, opts, fresh) catch |err| {
+            if (err == error.Canceled) return err;
+            if (!renewed and http.staleClock(err) and used != null) {
                 http.renew(used.?);
                 renewed = true;
                 continue;
-            } else err,
+            }
+            if (fresh) return err;
+            const closed = err == error.HttpConnectionClosing or err == error.WriteFailed;
+            if (closed and attempt < http.staleRetries(used)) continue;
+            if (!closed and !deadConnection(err)) return err;
+            fresh = true;
+            continue;
         };
     }
 }
 
+/// Errors of a connection that stopped answering, or went away, while it carried the request.
+fn deadConnection(err: anyerror) bool {
+    return switch (err) {
+        error.Timeout,
+        error.ReadFailed,
+        error.ConnectionResetByPeer,
+        error.EndOfStream,
+        error.BrokenPipe,
+        => true,
+        else => false,
+    };
+}
+
+/// One attempt, given up at `opts.deadline` (`error.Timeout`).
+fn requestWithin(
+    arena: Allocator,
+    io: std.Io,
+    method: std.http.Method,
+    url: []const u8,
+    payload: ?[]const u8,
+    opts: RequestOptions,
+    fresh: bool,
+) anyerror!Response {
+    const args = .{ arena, io, method, url, payload, opts, fresh };
+    const limit = opts.deadline orelse return @call(.auto, requestOnce, args);
+    const r = try http.within(io, limit, requestOnce, args);
+    return r orelse error.Timeout;
+}
+
+/// `fresh`: on a client of its own, whose pool is empty, rather than the shared one.
 fn requestOnce(
     arena: Allocator,
     io: std.Io,
@@ -97,7 +139,8 @@ fn requestOnce(
     url: []const u8,
     payload: ?[]const u8,
     opts: RequestOptions,
-) !Response {
+    fresh: bool,
+) anyerror!Response {
     // What the request needs only while it runs (headers, the decompression window) is freed with
     // it; only the response body goes to `arena`, which a waiting runner keeps until its next job.
     const shared = http.shared.load(.acquire);
@@ -110,13 +153,14 @@ fn requestOnce(
         .{t},
     ) else null;
     const headers = try acceptJsonHeaders(scratch, opts.extra_headers);
+    // A fresh client's CA bundle is freed with it, not kept in `arena` (one is rarely needed).
     var local: std.http.Client = .{
-        .allocator = arena,
+        .allocator = if (fresh and shared != null) shared.?.allocator else arena,
         .io = io,
         .write_buffer_size = http.write_buffer_size,
     };
     defer local.deinit();
-    const client = http.client(&local);
+    const client = if (fresh) &local else http.client(&local);
 
     // Redirects are followed here, not by the client: it would send the token to wherever a
     // redirect points (it drops only `privileged_headers` across domains, which it never sends at
@@ -181,16 +225,17 @@ fn exchange(x: Exchange) !union(enum) { done: Response, redirect: Redirect } {
     if (req.connection) |conn| http.keepAlive(conn.stream_reader.stream.socket.handle);
     // A connection a request failed on is not given back to the pool: one that failed while writing
     // (the server had closed it) would otherwise fail every later request to that host, which is
-    // how every log upload of a runner failed from one moment on.
+    // how every log upload of a runner failed from one moment on. One given up at its deadline
+    // (cancelled, `http.within`) fails here too, and the next request would wait on it in turn.
     errdefer if (req.connection) |conn| {
         conn.closing = true;
     };
 
     if (trace) std.debug.print("trace: connected\n", .{});
-    try send(&req, x.payload);
+    send(&req, x.payload) catch |e| return canceledOr(&req, e);
     if (trace) std.debug.print("trace: request sent\n", .{});
 
-    var response = try req.receiveHead(&.{});
+    var response = req.receiveHead(&.{}) catch |e| return canceledOr(&req, e);
     if (trace) std.debug.print("trace: head status={d} content_length={?d} chunked={}\n", .{
         @backingInt(response.head.status),
         response.head.content_length,
@@ -221,9 +266,20 @@ fn exchange(x: Exchange) !union(enum) { done: Response, redirect: Redirect } {
         return .{ .done = .{ .status = response.head.status, .body = "" } };
     }
 
-    const body = try readBody(x.scratch, &response);
+    const body = readBody(x.scratch, &response) catch |e| return canceledOr(&req, e);
     if (trace) std.debug.print("trace: body {d} bytes\n", .{body.len});
     return .{ .done = .{ .status = response.head.status, .body = try x.arena.dupe(u8, body) } };
+}
+
+/// `error.Canceled` when that is what failed the connection's read or write under `err`: the client
+/// reports it as ReadFailed or WriteFailed, and `request` would take that for a dead connection and
+/// try again, on and on past a cancel that is signalled only once (the poll that `loop.poll` gave
+/// up on, a job's end cancelling its uploads).
+fn canceledOr(req: *std.http.Client.Request, err: anyerror) anyerror {
+    const conn = req.connection orelse return err;
+    if (conn.stream_reader.err) |e| if (e == error.Canceled) return e;
+    if (conn.stream_writer.err) |e| if (e == error.Canceled) return e;
+    return err;
 }
 
 /// Whether a redirect stays where the token may go: the same scheme, host and port.
@@ -358,6 +414,68 @@ test "over real connections: the token stays on its host, and only bodiless requ
         error.TooManyHttpRedirects,
         request(a, io, .GET, server.url(&buf, "127.0.0.1", "/loop"), null, t),
     );
+}
+
+test "a request never answered is given up at its deadline, and tried once on a new connection" {
+    const TestServer = @import("testserver.zig").Server;
+    var server: TestServer = undefined;
+    try server.start();
+    defer server.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = std.testing.io;
+    var buf: [64]u8 = undefined;
+    const quick: RequestOptions = .{ .deadline = .fromMilliseconds(200) };
+
+    // A blob upload, as `results.putBlob` makes it, to a server that never answers.
+    const started = std.Io.Clock.awake.now(io);
+    try std.testing.expectError(
+        error.Timeout,
+        request(a, io, .PUT, server.url(&buf, "127.0.0.1", "/silent"), "log text", quick),
+    );
+    const took = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+    // Two attempts of 200 ms each, not the minutes a dead connection used to be read for.
+    try std.testing.expect(took >= 400 and took < 2_000);
+    try std.testing.expectEqual(@as(u32, 2), server.accepts.load(.acquire));
+
+    // Never answered the first time, answered the second: the retry succeeds.
+    const once = server.url(&buf, "127.0.0.1", "/silent-once/x");
+    const r = try request(a, io, .POST, once, "{}", quick);
+    try std.testing.expectEqual(std.http.Status.ok, r.status);
+    try std.testing.expectEqualStrings("ok", r.body);
+    try std.testing.expectEqual(@as(u32, 4), server.accepts.load(.acquire));
+}
+
+test "a kept-alive connection that went silent is dropped, and the request tried on a new one" {
+    const TestServer = @import("testserver.zig").Server;
+    var server: TestServer = undefined;
+    try server.start();
+    defer server.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = std.testing.io;
+    var buf: [64]u8 = undefined;
+    // Connections are pooled only by the shared client.
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = io };
+    defer client.deinit();
+    http.shared.store(&client, .release);
+    defer http.shared.store(null, .release);
+    const quick: RequestOptions = .{ .deadline = .fromMilliseconds(200) };
+
+    for ([_][]const u8{ "/keep", "/keep-close" }, 0..) |path, i| {
+        const kept = try request(a, io, .GET, server.url(&buf, "127.0.0.1", path), null, quick);
+        try std.testing.expectEqualStrings("kept", kept.body);
+        try std.testing.expectEqual(@as(usize, 1), client.connection_pool.free_len);
+        // /keep: the next request on the pooled connection is never answered; /keep-close: it
+        // finds the connection closed. Either way it is answered on a new connection.
+        const r = try request(a, io, .GET, server.url(&buf, "127.0.0.1", "/echo"), null, quick);
+        try std.testing.expectEqualStrings("GET -", r.body);
+        try std.testing.expectEqual(@as(u32, @intCast(2 * (i + 1))), server.accepts.load(.acquire));
+        // The connection given up is not back in the pool for the next request to wait on.
+        try std.testing.expectEqual(@as(usize, 0), client.connection_pool.free_len);
+    }
 }
 
 test "parseSettings" {

@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A request to GitHub on a connection that died without a word no longer holds up a job''s end: every request has a deadline (30 s; blob uploads longer with their size, up to 5 minutes; long polls 90 s) and is tried once more on a new connection, connections give up unacknowledged data after 90 s, and the job''s end waits for its log uploads at most about 7 minutes before completejob, instead of the 17 minutes a step''s upload once read a dead connection for (#100).'
+time: 2026-10-28T16:00:00.000000-04:00

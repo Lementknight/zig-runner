@@ -29,7 +29,7 @@ pub const Error = error{
     /// Non-2xx from GitHub. Maps to exit code 2.
     GithubRejected,
     BadResponse,
-} || Allocator.Error || std.http.Client.FetchError;
+} || Allocator.Error || http.FetchError;
 
 fn runnersUrl(arena: Allocator, cfg: *const Config) Allocator.Error![]const u8 {
     return switch (cfg.scope) {

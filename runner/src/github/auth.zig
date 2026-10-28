@@ -24,7 +24,7 @@ pub const Error = error{
     TokenRejected,
     BadTokenResponse,
 } ||
-    Allocator.Error || std.http.Client.FetchError || rsa_sign.Error;
+    Allocator.Error || http.FetchError || rsa_sign.Error;
 
 pub fn findFile(files: []const jitconfig.File, name: []const u8) ?[]const u8 {
     for (files) |f| if (std.mem.eql(u8, f.name, name)) return f.content;

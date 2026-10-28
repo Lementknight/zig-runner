@@ -1143,6 +1143,8 @@ const HttpTransport = struct {
         try body.writer.writeByte('}');
         const r = try broker.request(arena, self.io, .POST, self.url, body.written(), .{
             .extra_headers = &.{.{ .name = "Authorization", .value = self.auth }},
+            // A query runs as long as what it runs (a step's exec); the job's cancel ends it.
+            .deadline = null,
         });
         // GraphQL errors can arrive with a non-2xx status; the body says what was wrong.
         if (r.status.class() != .success and r.body.len == 0) return error.DaggerSessionHttpError;
