@@ -24,6 +24,13 @@
 //!
 //! The machine is not the only limit: the engine's container has its own memory cap (`Engine`).
 //! Where the gate can find the engine's cgroup, it holds on that too, by the same reservations.
+//!
+//! A reservation is not the same for every job (#144). On razorbill a `zig build test` job raises
+//! the engine's working set by about 1.6 GB within 45 s of starting, a uv job by 0.3 GB, and a flat
+//! reservation held the next runner back for either as if it were the heavier. A runner cannot know
+//! which job it will be handed, so a runner polling, or asking, reserves the worst case; once its
+//! job is known (`Gate.assigned`), the job reserves what jobs of its name were seen to take
+//! (`Learned`), measured from the engine's working set while they ran (`Admission.sample`).
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -32,7 +39,9 @@ const builtin = @import("builtin");
 pub const Limits = struct {
     /// `MemAvailable` that must be left once every job that may start has its `per_job_mb`.
     min_available_mb: u32 = 1536,
-    /// Memory to reserve for a job that does not show in `MemAvailable` yet.
+    /// Memory to reserve for a job that does not show in `MemAvailable` yet, and the least
+    /// reserved for one whose name is not known yet (`Admission.unknown`). A job whose name has
+    /// been seen reserves what it took instead (`Learned`).
     per_job_mb: u32 = 1024,
     /// PSI `some avg10`, in percent, at or above which no runner takes a job.
     max_pressure: u32 = 10,
@@ -71,27 +80,84 @@ pub const Admission = struct {
     recheck: std.Io.Duration = .fromSeconds(5),
     /// Runners let through to poll for a job: each may be handed one at any moment.
     polling: u32 = 0,
-    /// When each runner's job started (awake clock, ms), one entry per runner (`Gate.slot`): a
-    /// runner runs one job at a time. Cleared when the job ends, so a job that is over reserves
-    /// nothing, however soon it ended.
-    started: []i64,
+    /// Each runner's job, one entry per runner (`Gate.slot`): a runner runs one job at a time.
+    slots: []Slot,
+    /// What jobs took, by name. In memory only: a restart forgets it, and jobs reserve the worst
+    /// case again until each has run once.
+    learned: Learned = .{},
     swap: SwapGrowth = .{},
     engine: Engine = .{},
 
-    /// `started` must have one entry for each runner in the pool, and each runner's `Gate.slot`
-    /// a different index into it.
-    pub fn init(io: std.Io, limits: Limits, started: []i64) Admission {
-        @memset(started, std.math.minInt(i64));
-        return .{ .io = io, .limits = limits, .started = started };
+    /// One runner's job. Cleared when the job ends, so a job that is over reserves nothing,
+    /// however soon it ended.
+    pub const Slot = struct {
+        /// When the job started (awake clock, ms).
+        started_ms: i64 = std.math.minInt(i64),
+        /// What the job reserves while it ramps up, in MB; null while its name is not known, for
+        /// the worst case (`unknown`), whatever that has become since.
+        est_mb: ?u32 = null,
+        /// The job's identity (`jobKey`), once known.
+        key: ?u64 = null,
+        /// The engine's working set when the job's name became known, and the most it has been
+        /// since, in MB: null without an engine signal, and nothing is learned from the job.
+        base_mb: ?u64 = null,
+        peak_mb: u64 = 0,
+        /// A step was replayed from the step cache: not learned from (`Learned`).
+        replayed: bool = false,
+    };
+
+    /// `slots` must have one entry for each runner in the pool, and each runner's `Gate.slot` a
+    /// different index into it.
+    pub fn init(io: std.Io, limits: Limits, slots: []Slot) Admission {
+        @memset(slots, .{});
+        return .{ .io = io, .limits = limits, .slots = slots };
     }
 
-    /// Jobs started less than `ramp_ms` ago.
-    fn ramping(a: *const Admission, now_ms: i64) u32 {
-        var n: u32 = 0;
-        for (a.started) |t| {
-            if (t > now_ms - ramp_ms) n += 1;
+    /// What a job whose name is not known yet reserves: the configured `per_job_mb`, or the most
+    /// any known job took if that is more, so that a job heavier than configured raises it. 0
+    /// (`per_job_mb` off) reserves nothing, learned or not.
+    fn unknown(a: *const Admission) u32 {
+        if (a.limits.per_job_mb == 0) return 0;
+        return @max(a.limits.per_job_mb, a.learned.largest());
+    }
+
+    /// What may start without showing in the machine's or the engine's memory yet: a worst case
+    /// for each runner polling and for the one asking (`asking`), and each job started less than
+    /// `ramp_ms` ago with its own estimate.
+    fn reserved(a: *const Admission, now_ms: i64, asking: bool) Reservation {
+        const unknown_mb = a.unknown();
+        var r: Reservation = .{ .jobs = a.polling + @intFromBool(asking) };
+        r.mb = @as(u64, r.jobs) * unknown_mb;
+        for (a.slots) |s| if (s.started_ms > now_ms - ramp_ms) {
+            r.jobs += 1;
+            r.mb += s.est_mb orelse unknown_mb;
+        };
+        return r;
+    }
+
+    /// Raises the peak of every job running, once a second, from the engine's working set, until
+    /// cancelled with the pool. It reads nothing while no job is being measured.
+    pub fn sample(a: *Admission) void {
+        while (true) {
+            a.io.sleep(.fromSeconds(1), .awake) catch return;
+            a.samplePeaks();
         }
-        return n;
+    }
+
+    /// A job's peak is the engine's, not its own: the engine is one cgroup for every job, so a
+    /// job that overlaps another is charged for both. That errs toward reserving too much, which
+    /// only holds a runner back a little longer.
+    fn samplePeaks(a: *Admission) void {
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        const dir = a.engine.dir orelse return;
+        for (a.slots) |s| {
+            if (s.base_mb != null) break;
+        } else return;
+        const e = readEngine(a.io, dir) orelse return;
+        for (a.slots) |*s| if (s.base_mb != null) {
+            s.peak_mb = @max(s.peak_mb, e.used_mb);
+        };
     }
 
     /// What the gate has learned about the engine's cgroup since this was last asked (found, or
@@ -123,7 +189,7 @@ pub const Admission = struct {
 /// lets it through until it leaves: when it takes a job, or its cycle ends.
 pub const Gate = struct {
     pool: *Admission,
-    /// This runner's entry in `pool.started`.
+    /// This runner's entry in `pool.slots`.
     slot: usize = 0,
     /// Counted in `pool.polling`.
     claimed: bool = false,
@@ -141,9 +207,12 @@ pub const Gate = struct {
         const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
         if (a.engine.dir == null) a.engine.find(a.io, a.paths, now_ms);
         const sample = read(a.io, a.paths, a.engine.dir);
-        // Its files are gone: the engine's container was recreated, under a new cgroup.
-        if (a.engine.dir != null and sample.engine == null) a.engine.lost();
-        const jobs = a.polling + a.ramping(now_ms) + @intFromBool(!g.claimed);
+        // Its files are gone: the engine's container was recreated, under a new cgroup. The jobs
+        // running are not measured further: the new engine's working set is not theirs.
+        if (a.engine.dir != null and sample.engine == null) {
+            a.engine.lost();
+            for (a.slots) |*s| s.base_mb = null;
+        }
         const swap_rate = if (sample.swap_used_mb) |u| a.swap.update(u, now_ms) else null;
         const engine_swap_rate = if (sample.engine_swap_mb) |u|
             a.engine.swap.update(u, now_ms)
@@ -155,7 +224,7 @@ pub const Gate = struct {
             .swap_growth_mb = swap_rate,
             .engine = sample.engine,
             .engine_swap_growth_mb = engine_swap_rate,
-        }, jobs, g.holding);
+        }, a.reserved(now_ms, !g.claimed), g.holding);
         g.holding = hold != null;
         if (hold == null and !g.claimed) a.polling += 1;
         if (hold != null and g.claimed) a.polling -= 1;
@@ -164,7 +233,8 @@ pub const Gate = struct {
     }
 
     /// The runner stops polling; `took_job` when because it was handed a job, whose memory is then
-    /// reserved for `ramp_ms`, or until the job ends (`ended`) if that is sooner.
+    /// reserved for `ramp_ms`, or until the job ends (`ended`) if that is sooner: the worst case
+    /// until its name is known (`assigned`).
     pub fn leave(g: *Gate, took_job: bool) void {
         const a = g.pool;
         a.mu.lockUncancelable(a.io);
@@ -172,41 +242,174 @@ pub const Gate = struct {
         if (g.claimed) a.polling -= 1;
         g.claimed = false;
         if (!took_job) return;
-        a.started[g.slot] = std.Io.Clock.awake.now(a.io).toMilliseconds();
+        a.slots[g.slot] = .{ .started_ms = std.Io.Clock.awake.now(a.io).toMilliseconds() };
+    }
+
+    /// The runner's job is known as `key` (`jobKey`): it reserves what jobs of that name took, or
+    /// the worst case for a name not seen yet, and is measured from here (`Admission.sample`).
+    pub fn assigned(g: *Gate, key: u64) void {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        const s = &a.slots[g.slot];
+        std.debug.assert(s.started_ms != std.math.minInt(i64));
+        s.key = key;
+        if (a.limits.per_job_mb > 0) s.est_mb = a.learned.estimate(key);
+        // Without the engine's cgroup (another OS, `RUNNER_ENGINE_CGROUP=none`) nothing is
+        // measured, nothing learned, and every job reserves `per_job_mb`.
+        const dir = a.engine.dir orelse return;
+        const e = readEngine(a.io, dir) orelse return;
+        s.base_mb = e.used_mb;
+        s.peak_mb = e.used_mb;
+    }
+
+    /// The runner's job replayed a step from the step cache: what it took is not learned.
+    pub fn replayed(g: *Gate) void {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        a.slots[g.slot].replayed = true;
     }
 
     /// The runner's job is over: its memory is no longer reserved. Without this a job reserved its
     /// memory for the whole `ramp_ms` however short it was, so a burst of short jobs went through
     /// at most (available - floor) / per-job every two minutes: 1.5 jobs a minute on razorbill.
-    pub fn ended(g: *Gate) void {
+    /// What the job was seen to take is learned for its name, and returned when that changed what
+    /// its name reserves, for the log. Null for a job not measured, or already ended.
+    pub fn ended(g: *Gate) ?Learned.Change {
         const a = g.pool;
         a.mu.lockUncancelable(a.io);
         defer a.mu.unlock(a.io);
-        a.started[g.slot] = std.math.minInt(i64);
+        const s = a.slots[g.slot];
+        a.slots[g.slot] = .{};
+        if (s.replayed) return null;
+        const key = s.key orelse return null;
+        const base = s.base_mb orelse return null;
+        // At most 1 TB, so that it fits the table's u32 and sums of them cannot overflow.
+        const seen_mb: u32 = @intCast(@min(@max(s.peak_mb -| base, Learned.min_mb), 1 << 20));
+        const before = a.learned.estimate(key);
+        const after = a.learned.record(key, seen_mb);
+        if (before == after) return null;
+        return .{ .seen_mb = seen_mb, .estimate_mb = after };
     }
 };
 
+/// What jobs took, by name (`jobKey`): the engine's working set at its highest while each ran, less
+/// what it was when the job's name became known. Fixed in size: the name least recently used makes
+/// room for a new one. A job that replayed any step from the step cache is not learned from: it
+/// ran little of its work and took far less than its next real run will, and re-runs of one commit
+/// after a restart would otherwise teach an estimate that under-reserves the run that matters.
+pub const Learned = struct {
+    entries: [capacity]Entry = undefined,
+    len: usize = 0,
+    /// Counts uses, so that the entry least recently used has the smallest `used`.
+    tick: u64 = 0,
+
+    pub const capacity = 64;
+    /// A job reserves the most it took in its last `kept` runs: a job that varies with what it is
+    /// given (a cache missed, a larger change) is reserved for its heavier runs.
+    pub const kept = 5;
+    /// The least a job is seen to take: one that ran while another job freed memory can measure 0.
+    pub const min_mb = 64;
+
+    const Entry = struct {
+        key: u64,
+        seen_mb: [kept]u32 = undefined,
+        /// Runs in `seen_mb`, up to `kept`, and where the next one goes.
+        n: u8 = 0,
+        next: u8 = 0,
+        used: u64 = 0,
+
+        fn estimate(e: *const Entry) u32 {
+            return std.mem.max(u32, e.seen_mb[0..e.n]);
+        }
+    };
+
+    /// A job's end that changed what its name reserves: what it took, and what is now reserved.
+    pub const Change = struct { seen_mb: u32, estimate_mb: u32 };
+
+    /// What a job of this name reserves, or null for a name not seen.
+    fn estimate(l: *Learned, key: u64) ?u32 {
+        const e = l.find(key) orelse return null;
+        l.tick += 1;
+        e.used = l.tick;
+        return e.estimate();
+    }
+
+    /// A run of `key` that took `seen_mb`; returns what its name now reserves.
+    fn record(l: *Learned, key: u64, seen_mb: u32) u32 {
+        const e = l.find(key) orelse e: {
+            if (l.len < capacity) {
+                l.len += 1;
+            } else {
+                var lru: usize = 0;
+                for (l.entries, 0..) |x, i| if (x.used < l.entries[lru].used) {
+                    lru = i;
+                };
+                // The last slot is the one reused: swapped in, so `entries[0..len]` stays whole.
+                std.mem.swap(Entry, &l.entries[lru], &l.entries[capacity - 1]);
+            }
+            l.entries[l.len - 1] = .{ .key = key };
+            break :e &l.entries[l.len - 1];
+        };
+        e.seen_mb[e.next] = seen_mb;
+        e.next = (e.next + 1) % kept;
+        e.n = @min(e.n + 1, kept);
+        l.tick += 1;
+        e.used = l.tick;
+        return e.estimate();
+    }
+
+    /// The most any known name reserves; 0 with none known.
+    fn largest(l: *const Learned) u32 {
+        var most: u32 = 0;
+        for (l.entries[0..l.len]) |*e| most = @max(most, e.estimate());
+        return most;
+    }
+
+    fn find(l: *Learned, key: u64) ?*Entry {
+        for (l.entries[0..l.len]) |*e| if (e.key == key) return e;
+        return null;
+    }
+};
+
+/// A job's identity across runs: its repository, its workflow file without the ref (a branch's
+/// runs and main's are one job), and its name as GitHub shows it, a matrix leg's included.
+pub fn jobKey(repository: []const u8, workflow_ref: []const u8, name: []const u8) u64 {
+    const at = std.mem.lastIndexOfScalar(u8, workflow_ref, '@') orelse workflow_ref.len;
+    var h: std.hash.Wyhash = .init(0);
+    // Each ended by a 0 byte, so that no two different triples hash the same bytes.
+    for ([_][]const u8{ repository, workflow_ref[0..at], name }) |part| {
+        h.update(part);
+        h.update(&.{0});
+    }
+    return h.final();
+}
+
+/// What may start without showing in memory yet: how many jobs, and what they reserve together.
+pub const Reservation = struct { jobs: u32, mb: u64 = 0 };
+
 /// Why a runner may not take a job, for the log.
 pub const Hold = union(enum) {
-    memory: struct { available_mb: u64, jobs: u32, per_job_mb: u32, floor_mb: u32 },
+    memory: struct { available_mb: u64, reserved: Reservation, floor_mb: u32 },
     /// Hundredths of a percent.
     pressure: struct { now: u32, limit: u32 },
     /// MB a minute.
     swap: struct { now: u64, limit: u32 },
-    engine: struct { used_mb: u64, cap_mb: u64, jobs: u32, per_job_mb: u32, floor_mb: u32 },
+    engine: struct { used_mb: u64, cap_mb: u64, reserved: Reservation, floor_mb: u32 },
     /// MB a minute.
     engine_swap: struct { now: u64, limit: u32 },
 
     pub fn format(h: Hold, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (h) {
             .memory => |m| try w.print(
-                "{d} MB of memory available; {d} job(s) at {d} MB would leave under {d} MB",
-                .{ m.available_mb, m.jobs, m.per_job_mb, m.floor_mb },
+                "{d} MB of memory available; {d} job(s) needing {f} would leave under {d} MB",
+                .{ m.available_mb, m.reserved.jobs, gb(m.reserved.mb), m.floor_mb },
             ),
             .engine => |e| try w.print(
-                "engine {f} of {f} in use; {d} job(s) at {d} MB would leave under {d} MB of " ++
+                "engine {f} of {f} in use; {d} job(s) needing {f} would leave under {d} MB of " ++
                     "its cap",
-                .{ gb(e.used_mb), gb(e.cap_mb), e.jobs, e.per_job_mb, e.floor_mb },
+                .{ gb(e.used_mb), gb(e.cap_mb), e.reserved.jobs, gb(e.reserved.mb), e.floor_mb },
             ),
             .engine_swap => |s| try w.print(
                 "engine swapping {d} MB/min (its cgroup's memory.swap.current), limit {d} MB/min",
@@ -225,7 +428,7 @@ pub const Hold = union(enum) {
 };
 
 /// MB as GB with one decimal, for the log: "3.6 GB".
-fn gb(mb: u64) Gb {
+pub fn gb(mb: u64) Gb {
     return .{ .tenths = mb * 10 / 1024 };
 }
 
@@ -247,29 +450,27 @@ pub const Signals = struct {
     engine_swap_growth_mb: ?u64 = null,
 };
 
-/// Whether one more job may be taken when `jobs` jobs (this one included) may start without
-/// showing in `available_mb` yet: null if so. `holding` applies the resume thresholds instead
-/// (`resume_margin_mb`, half the pressure and swap limits).
-pub fn decide(limits: Limits, s: Signals, jobs: u32, holding: bool) ?Hold {
+/// Whether one more job may be taken when the jobs `reserved` (this one included) may start
+/// without showing in `available_mb` yet: null if so. `holding` applies the resume thresholds
+/// instead (`resume_margin_mb`, half the pressure and swap limits).
+pub fn decide(limits: Limits, s: Signals, reserved: Reservation, holding: bool) ?Hold {
     if (s.available_mb) |avail| {
         const margin: u64 = if (holding) resume_margin_mb else 0;
-        const needed = @as(u64, limits.min_available_mb) + @as(u64, jobs) * limits.per_job_mb;
+        const needed = limits.min_available_mb + reserved.mb;
         if (needed > 0 and avail < needed + margin) return .{ .memory = .{
             .available_mb = avail,
-            .jobs = jobs,
-            .per_job_mb = limits.per_job_mb,
+            .reserved = reserved,
             .floor_mb = limits.min_available_mb,
         } };
     }
     // The same reservations against the engine's cap: every job taken runs in the engine.
     if (s.engine) |e| {
         const margin: u64 = if (holding) resume_margin_mb else 0;
-        const needed = @as(u64, limits.min_engine_headroom_mb) + @as(u64, jobs) * limits.per_job_mb;
+        const needed = limits.min_engine_headroom_mb + reserved.mb;
         if (needed > 0 and e.cap_mb -| e.used_mb < needed + margin) return .{ .engine = .{
             .used_mb = e.used_mb,
             .cap_mb = e.cap_mb,
-            .jobs = jobs,
-            .per_job_mb = limits.per_job_mb,
+            .reserved = reserved,
             .floor_mb = limits.min_engine_headroom_mb,
         } };
     }
@@ -630,43 +831,50 @@ test "missing files give no signal" {
         "/nonexistent/engine",
     );
     try std.testing.expectEqual(Sample{}, s);
-    try std.testing.expect(decide(.{}, .{}, 4, false) == null);
+    try std.testing.expect(decide(.{}, .{}, flat(4), false) == null);
 }
 
 test "the defaults on razorbill: three jobs at once from idle, not four" {
     // Idle: about 5.5 GB available with the engine at 600 MB, no pressure.
     const idle: Signals = .{ .available_mb = 5500, .pressure = 0, .swap_growth_mb = 0 };
-    try std.testing.expect(decide(.{}, idle, 3, false) == null);
-    try std.testing.expect(decide(.{}, idle, 4, false).? == .memory);
+    try std.testing.expect(decide(.{}, idle, flat(3), false) == null);
+    try std.testing.expect(decide(.{}, idle, flat(4), false).? == .memory);
     // Three heavy jobs in: about 1.1 GB each, the engine near its 4 GB cap.
     const busy: Signals = .{ .available_mb = 2200, .pressure = 0, .swap_growth_mb = 0 };
-    try std.testing.expect(decide(.{}, busy, 1, false).? == .memory);
+    try std.testing.expect(decide(.{}, busy, flat(1), false).? == .memory);
     // Three light jobs (200 MB each) past their ramp: a fourth is let through.
     const light: Signals = .{ .available_mb = 4900, .pressure = 0, .swap_growth_mb = 0 };
-    try std.testing.expect(decide(.{}, light, 1, false) == null);
+    try std.testing.expect(decide(.{}, light, flat(1), false) == null);
     // The incident: engine swapping at its cgroup cap while the host still has memory.
     const thrash: Signals = .{ .available_mb = 2100, .pressure = 4500, .swap_growth_mb = 400 };
-    try std.testing.expect(decide(.{ .per_job_mb = 0 }, thrash, 1, false).? == .pressure);
+    const none: Reservation = .{ .jobs = 1 };
+    try std.testing.expect(decide(.{ .per_job_mb = 0 }, thrash, none, false).? == .pressure);
     const thrash_no_psi: Signals = .{ .available_mb = 2100, .swap_growth_mb = 400 };
-    try std.testing.expect(decide(.{ .per_job_mb = 0 }, thrash_no_psi, 1, false).? == .swap);
+    try std.testing.expect(decide(.{ .per_job_mb = 0 }, thrash_no_psi, none, false).? == .swap);
+}
+
+/// `jobs` jobs at the default `per_job_mb`, as every job reserved before #144.
+fn flat(jobs: u32) Reservation {
+    return .{ .jobs = jobs, .mb = @as(u64, jobs) * (Limits{}).per_job_mb };
 }
 
 test "a held runner resumes only past the margins, so it does not flap at a threshold" {
     const limits: Limits = .{ .min_available_mb = 1000, .per_job_mb = 500 };
+    const at500: Reservation = .{ .jobs = 1, .mb = 500 };
     // Needs 1500 MB to start, 1756 to resume.
-    try std.testing.expect(decide(limits, .{ .available_mb = 1600 }, 1, false) == null);
-    try std.testing.expect(decide(limits, .{ .available_mb = 1499 }, 1, false) != null);
-    try std.testing.expect(decide(limits, .{ .available_mb = 1600 }, 1, true) != null);
-    try std.testing.expect(decide(limits, .{ .available_mb = 1756 }, 1, true) == null);
+    try std.testing.expect(decide(limits, .{ .available_mb = 1600 }, at500, false) == null);
+    try std.testing.expect(decide(limits, .{ .available_mb = 1499 }, at500, false) != null);
+    try std.testing.expect(decide(limits, .{ .available_mb = 1600 }, at500, true) != null);
+    try std.testing.expect(decide(limits, .{ .available_mb = 1756 }, at500, true) == null);
     // Pressure: holds at 10%, resumes under 5%.
-    try std.testing.expect(decide(limits, .{ .pressure = 999 }, 1, false) == null);
-    try std.testing.expect(decide(limits, .{ .pressure = 1000 }, 1, false).? == .pressure);
-    try std.testing.expect(decide(limits, .{ .pressure = 700 }, 1, true) != null);
-    try std.testing.expect(decide(limits, .{ .pressure = 499 }, 1, true) == null);
+    try std.testing.expect(decide(limits, .{ .pressure = 999 }, at500, false) == null);
+    try std.testing.expect(decide(limits, .{ .pressure = 1000 }, at500, false).? == .pressure);
+    try std.testing.expect(decide(limits, .{ .pressure = 700 }, at500, true) != null);
+    try std.testing.expect(decide(limits, .{ .pressure = 499 }, at500, true) == null);
     // Swap growth: holds at 64 MB/min, resumes under 32.
-    try std.testing.expect(decide(limits, .{ .swap_growth_mb = 64 }, 1, false).? == .swap);
-    try std.testing.expect(decide(limits, .{ .swap_growth_mb = 40 }, 1, true) != null);
-    try std.testing.expect(decide(limits, .{ .swap_growth_mb = 31 }, 1, true) == null);
+    try std.testing.expect(decide(limits, .{ .swap_growth_mb = 64 }, at500, false).? == .swap);
+    try std.testing.expect(decide(limits, .{ .swap_growth_mb = 40 }, at500, true) != null);
+    try std.testing.expect(decide(limits, .{ .swap_growth_mb = 31 }, at500, true) == null);
     // Every check off.
     const off: Limits = .{
         .min_available_mb = 0,
@@ -675,7 +883,7 @@ test "a held runner resumes only past the margins, so it does not flap at a thre
         .max_swap_growth_mb = 0,
     };
     const worst: Signals = .{ .available_mb = 0, .pressure = 10000, .swap_growth_mb = 9999 };
-    try std.testing.expect(decide(off, worst, 4, true) == null);
+    try std.testing.expect(decide(off, worst, .{ .jobs = 4 }, true) == null);
 }
 
 test "swap growth is a rate over at least ten seconds" {
@@ -698,8 +906,8 @@ test "the pool reserves memory for runners polling and jobs just started" {
     var path_buf: [256]u8 = undefined;
     const meminfo = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/meminfo", .{tmp.sub_path});
 
-    var started: [4]i64 = undefined;
-    var pool: Admission = .init(io, .{}, &started);
+    var slots: [4]Admission.Slot = undefined;
+    var pool: Admission = .init(io, .{}, &slots);
     pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
     var gates: [4]Gate = undefined;
     for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
@@ -729,8 +937,8 @@ test "a job that is over reserves nothing, however soon it ended" {
     var path_buf: [256]u8 = undefined;
     const meminfo = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/meminfo", .{tmp.sub_path});
 
-    var started: [4]i64 = undefined;
-    var pool: Admission = .init(io, .{}, &started);
+    var slots: [4]Admission.Slot = undefined;
+    var pool: Admission = .init(io, .{}, &slots);
     pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
     var gates: [4]Gate = undefined;
     for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
@@ -741,12 +949,12 @@ test "a job that is over reserves nothing, however soon it ended" {
     }
     try std.testing.expect(gates[3].check() != null);
     // The jobs end at once (short jobs): their reservations go with them, well within ramp_ms.
-    for (gates[0..3]) |*g| g.ended();
+    for (gates[0..3]) |*g| _ = g.ended();
     try std.testing.expect(gates[3].check() == null);
     // A runner's next job takes its own entry again, not another runner's.
     gates[3].leave(true);
-    gates[3].ended();
-    try std.testing.expectEqual(std.math.minInt(i64), started[3]);
+    _ = gates[3].ended();
+    try std.testing.expectEqual(std.math.minInt(i64), slots[3].started_ms);
 }
 
 /// A cgroup directory under `tmp` with memory.max, memory.current, memory.stat and, if given,
@@ -829,32 +1037,33 @@ test "the engine's cap holds a runner the machine's memory would let through" {
         .swap_growth_mb = 0,
         .engine = .{ .cap_mb = 4096, .used_mb = 3600 },
     };
-    try std.testing.expect(decide(.{}, .{ .available_mb = 4800 }, 1, false) == null);
-    const hold = decide(.{}, incident, 1, false).?;
+    try std.testing.expect(decide(.{}, .{ .available_mb = 4800 }, flat(1), false) == null);
+    const hold = decide(.{}, incident, flat(1), false).?;
     try std.testing.expect(hold == .engine);
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings(
-        "engine 3.5 GB of 4.0 GB in use; 1 job(s) at 1024 MB would leave under 256 MB of its cap",
+        "engine 3.5 GB of 4.0 GB in use; 1 job(s) needing 1.0 GB would leave under 256 MB " ++
+            "of its cap",
         try std.fmt.bufPrint(&buf, "{f}", .{hold}),
     );
     // The engine at idle (600 MB): three jobs fit under its cap, as under the machine's; four not.
     const idle: Signals = .{ .engine = .{ .cap_mb = 4096, .used_mb = 600 } };
-    try std.testing.expect(decide(.{}, idle, 3, false) == null);
-    try std.testing.expect(decide(.{}, idle, 4, false).? == .engine);
+    try std.testing.expect(decide(.{}, idle, flat(3), false) == null);
+    try std.testing.expect(decide(.{}, idle, flat(4), false).? == .engine);
     // Held, it resumes only with `resume_margin_mb` more: 1280 MB needed, 1536 to resume.
     const tight: Signals = .{ .engine = .{ .cap_mb = 4096, .used_mb = 4096 - 1400 } };
-    try std.testing.expect(decide(.{}, tight, 1, false) == null);
-    try std.testing.expect(decide(.{}, tight, 1, true).? == .engine);
+    try std.testing.expect(decide(.{}, tight, flat(1), false) == null);
+    try std.testing.expect(decide(.{}, tight, flat(1), true).? == .engine);
     const freed: Signals = .{ .engine = .{ .cap_mb = 4096, .used_mb = 4096 - 1536 } };
-    try std.testing.expect(decide(.{}, freed, 1, true) == null);
+    try std.testing.expect(decide(.{}, freed, flat(1), true) == null);
     // Over its cap (memory.current can pass memory.max for a moment): held, not an overflow.
     const over: Signals = .{ .engine = .{ .cap_mb = 4096, .used_mb = 4200 } };
-    try std.testing.expect(decide(.{}, over, 1, false).? == .engine);
+    try std.testing.expect(decide(.{}, over, flat(1), false).? == .engine);
     // The engine swapping: held at 64 MB/min, resumed under 32, as for the machine's swap.
     const swapping: Signals = .{ .engine_swap_growth_mb = 64 };
-    try std.testing.expect(decide(.{}, swapping, 1, false).? == .engine_swap);
-    try std.testing.expect(decide(.{}, .{ .engine_swap_growth_mb = 40 }, 1, true) != null);
-    try std.testing.expect(decide(.{}, .{ .engine_swap_growth_mb = 31 }, 1, true) == null);
+    try std.testing.expect(decide(.{}, swapping, flat(1), false).? == .engine_swap);
+    try std.testing.expect(decide(.{}, .{ .engine_swap_growth_mb = 40 }, flat(1), true) != null);
+    try std.testing.expect(decide(.{}, .{ .engine_swap_growth_mb = 31 }, flat(1), true) == null);
 }
 
 test "the engine's cgroup is the nearest capped one at or above its process's" {
@@ -903,8 +1112,8 @@ test "the engine's cgroup is found through its socket's listener, or not, saying
     var host_buf: [160]u8 = undefined;
     const host = try std.fmt.bufPrint(&host_buf, "unix://{s}", .{sock});
 
-    var started: [1]i64 = undefined;
-    var pool: Admission = .init(io, .{}, &started);
+    var slots: [1]Admission.Slot = undefined;
+    var pool: Admission = .init(io, .{}, &slots);
     const paths: Paths = .{
         .meminfo = "/nonexistent",
         .pressure = "/nonexistent",
@@ -921,7 +1130,7 @@ test "the engine's cgroup is found through its socket's listener, or not, saying
     try std.testing.expectEqual(@as(?[]const u8, null), pool.engineNews(&buf));
 
     // No engine there: said once with why, and not looked for again for a minute.
-    var none: Admission = .init(io, .{}, &started);
+    var none: Admission = .init(io, .{}, &slots);
     none.paths = paths;
     none.engine.source = .{ .host = "unix:///nonexistent/engine.sock" };
     var g2: Gate = .{ .pool = &none };
@@ -931,7 +1140,7 @@ test "the engine's cgroup is found through its socket's listener, or not, saying
     _ = g2.check();
     try std.testing.expectEqual(@as(?[]const u8, null), none.engineNews(&buf));
     // An engine reached over TCP, or through Docker, has no socket to follow.
-    var tcp: Admission = .init(io, .{}, &started);
+    var tcp: Admission = .init(io, .{}, &slots);
     tcp.paths = paths;
     tcp.engine.source = .{ .host = "tcp://127.0.0.1:1234" };
     var g3: Gate = .{ .pool = &tcp };
@@ -939,7 +1148,7 @@ test "the engine's cgroup is found through its socket's listener, or not, saying
     const why = tcp.engineNews(&buf).?;
     try std.testing.expect(std.mem.indexOf(u8, why, "EngineHostNotUnixSocket") != null);
     // Off: nothing looked for, nothing said.
-    var off: Admission = .init(io, .{}, &started);
+    var off: Admission = .init(io, .{}, &slots);
     off.paths = paths;
     var g4: Gate = .{ .pool = &off };
     _ = g4.check();
@@ -955,8 +1164,8 @@ test "an engine container recreated is looked for again" {
     const root = try std.fmt.bufPrint(&root_buf, ".zig-cache/tmp/{s}/cg", .{tmp.sub_path});
     var dir_buf: [160]u8 = undefined;
     const dir = try std.fmt.bufPrint(&dir_buf, "{s}/docker-a.scope", .{root});
-    var started: [1]i64 = undefined;
-    var pool: Admission = .init(io, .{}, &started);
+    var slots: [1]Admission.Slot = undefined;
+    var pool: Admission = .init(io, .{}, &slots);
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent", .cgroup_root = root };
     pool.engine.source = .{ .cgroup = dir };
     var gate: Gate = .{ .pool = &pool };
@@ -978,4 +1187,216 @@ test "an engine container recreated is looked for again" {
     pool.engine.failed_ms = null;
     try std.testing.expect(gate.check() == null);
     try std.testing.expect(pool.engine.dir != null);
+}
+
+test "reservations add up what each job reserves, not a flat amount for each" {
+    // razorbill idle (5.5 GB available): four jobs at the flat 1 GB do not fit, but three at the
+    // worst case (polling, asking) and one light job ramping (300 MB) do.
+    const idle: Signals = .{ .available_mb = 5500 };
+    try std.testing.expect(decide(.{}, idle, flat(4), false).? == .memory);
+    try std.testing.expect(decide(.{}, idle, .{ .jobs = 4, .mb = 3 * 1024 + 300 }, false) == null);
+    const engine: Signals = .{ .engine = .{ .cap_mb = 4096, .used_mb = 3072 } };
+    const hold = decide(.{}, engine, .{ .jobs = 2, .mb = 1024 + 2200 }, false).?;
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "engine 3.0 GB of 4.0 GB in use; 2 job(s) needing 3.1 GB would leave under 256 MB " ++
+            "of its cap",
+        try std.fmt.bufPrint(&buf, "{f}", .{hold}),
+    );
+}
+
+/// The engine's cgroup fixture, "engine" under `tmp`: `used` MB in use of a 4 GB cap.
+fn setEngine(tmp: std.Io.Dir, used: u64) !void {
+    try writeCgroup(tmp, "engine", "4294967296", used * mib, 0, null);
+}
+
+test "a job known to be light lets the next runner through where the worst case would hold" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [256]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/engine", .{tmp.sub_path});
+    try setEngine(tmp.dir, 600);
+    var slots: [2]Admission.Slot = undefined;
+    var pool: Admission = .init(io, .{}, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    pool.engine.dir = dir;
+    var gates: [2]Gate = .{ .{ .pool = &pool, .slot = 0 }, .{ .pool = &pool, .slot = 1 } };
+    const uv = jobKey("o/r", "o/r/.github/workflows/ci.yml@refs/heads/main", "uv");
+
+    // A uv job's first run: the worst case while it runs, and 300 MB learned when it ends.
+    try std.testing.expect(gates[0].check() == null);
+    gates[0].leave(true);
+    gates[0].assigned(uv);
+    try std.testing.expectEqual(@as(?u32, null), slots[0].est_mb);
+    try setEngine(tmp.dir, 900);
+    pool.samplePeaks();
+    try setEngine(tmp.dir, 700);
+    pool.samplePeaks();
+    const learned = gates[0].ended().?;
+    try std.testing.expectEqual(Learned.Change{ .seen_mb = 300, .estimate_mb = 300 }, learned);
+
+    // The engine at 1.8 GB, 2.3 GB under its cap. A job just handed out, its name not known
+    // yet, and the runner asking: 2 x 1024 + 256 MB do not fit.
+    try setEngine(tmp.dir, 1800);
+    try std.testing.expect(gates[0].check() == null);
+    gates[0].leave(true);
+    try std.testing.expect(gates[1].check().? == .engine);
+    // It is the uv job again: 300 + 1024 + 256 MB do, with the resume margin.
+    gates[0].assigned(uv);
+    try std.testing.expectEqual(@as(?u32, 300), slots[0].est_mb);
+    try std.testing.expect(gates[1].check() == null);
+    // It took less this time (the 64 MB floor): still 300 MB reserved, so nothing to say.
+    try std.testing.expectEqual(@as(?Learned.Change, null), gates[0].ended());
+}
+
+test "a job heavier than configured raises what an unknown job reserves" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [256]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/engine", .{tmp.sub_path});
+    try setEngine(tmp.dir, 600);
+    var slots: [2]Admission.Slot = undefined;
+    var pool: Admission = .init(io, .{}, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    pool.engine.dir = dir;
+    var gates: [2]Gate = .{ .{ .pool = &pool, .slot = 0 }, .{ .pool = &pool, .slot = 1 } };
+    const workflow = "o/r/.github/workflows/ci.yml@refs/pull/7/merge";
+    try std.testing.expectEqual(@as(u32, 1024), pool.unknown());
+
+    // `zig build test`: 1.6 GB over the engine's use at its start.
+    gates[0].leave(true);
+    gates[0].assigned(jobKey("o/r", workflow, "test (zig)"));
+    try setEngine(tmp.dir, 2200);
+    pool.samplePeaks();
+    try std.testing.expectEqual(@as(u32, 1600), gates[0].ended().?.estimate_mb);
+    try std.testing.expectEqual(@as(u32, 1600), pool.unknown());
+
+    // A name not seen yet, and a runner asking: both at the new worst case.
+    gates[1].leave(true);
+    gates[1].assigned(jobKey("o/r", workflow, "lint"));
+    try std.testing.expectEqual(@as(?u32, null), slots[1].est_mb);
+    const now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+    try std.testing.expectEqual(Reservation{ .jobs = 2, .mb = 3200 }, pool.reserved(now_ms, true));
+    // `per_job_mb` off reserves nothing, whatever was learned.
+    pool.limits.per_job_mb = 0;
+    try std.testing.expectEqual(@as(u64, 0), pool.reserved(now_ms, true).mb);
+}
+
+test "a name reserves the most it took in its last five runs; a full table forgets the oldest" {
+    var l: Learned = .{};
+    try std.testing.expectEqual(@as(?u32, null), l.estimate(1));
+    try std.testing.expectEqual(@as(u32, 1000), l.record(1, 1000));
+    for (0..4) |_| try std.testing.expectEqual(@as(u32, 1000), l.record(1, 300));
+    // A sixth run: the heavy one is no longer among the last five.
+    try std.testing.expectEqual(@as(u32, 300), l.record(1, 300));
+    try std.testing.expectEqual(@as(u32, 300), l.largest());
+
+    // Full: a new name takes the place of the one least recently used, name 3, since names 1
+    // and 2 were just looked up.
+    for (2..Learned.capacity + 1) |k| _ = l.record(k, 100);
+    try std.testing.expectEqual(@as(usize, Learned.capacity), l.len);
+    _ = l.estimate(1);
+    _ = l.estimate(2);
+    _ = l.record(Learned.capacity + 1, 2000);
+    try std.testing.expectEqual(@as(usize, Learned.capacity), l.len);
+    try std.testing.expectEqual(@as(?u32, null), l.estimate(3));
+    try std.testing.expectEqual(@as(?u32, 300), l.estimate(1));
+    try std.testing.expectEqual(@as(?u32, 100), l.estimate(2));
+    try std.testing.expectEqual(@as(?u32, 2000), l.estimate(Learned.capacity + 1));
+    try std.testing.expectEqual(@as(u32, 2000), l.largest());
+}
+
+test "sampling raises the peaks of jobs running only; a job seen to take nothing takes 64 MB" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [256]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/engine", .{tmp.sub_path});
+    try setEngine(tmp.dir, 1000);
+    var slots: [3]Admission.Slot = undefined;
+    var pool: Admission = .init(io, .{}, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    pool.engine.dir = dir;
+    var running: Gate = .{ .pool = &pool, .slot = 0 };
+    // Handed a job whose name is not known yet: not measured.
+    var handed: Gate = .{ .pool = &pool, .slot = 1 };
+    running.leave(true);
+    running.assigned(jobKey("o/r", "o/r/.github/workflows/ci.yml", "build"));
+    handed.leave(true);
+    try setEngine(tmp.dir, 1500);
+    pool.samplePeaks();
+    try setEngine(tmp.dir, 1200);
+    pool.samplePeaks();
+    try std.testing.expectEqual(@as(u64, 1500), slots[0].peak_mb);
+    try std.testing.expectEqual(@as(?u64, null), slots[1].base_mb);
+    try std.testing.expectEqual(@as(u64, 0), slots[1].peak_mb);
+    try std.testing.expectEqual(Admission.Slot{}, slots[2]);
+    try std.testing.expectEqual(@as(?Learned.Change, null), handed.ended());
+    try std.testing.expectEqual(@as(u32, 500), running.ended().?.seen_mb);
+
+    // The engine's use fell while the job ran (another job ended): the floor is learned.
+    running.leave(true);
+    running.assigned(jobKey("o/r", "o/r/.github/workflows/ci.yml", "fmt"));
+    try setEngine(tmp.dir, 400);
+    pool.samplePeaks();
+    try std.testing.expectEqual(@as(u32, Learned.min_mb), running.ended().?.estimate_mb);
+}
+
+test "without the engine's cgroup nothing is learned, and every job reserves per_job_mb" {
+    var slots: [2]Admission.Slot = undefined;
+    var pool: Admission = .init(std.testing.io, .{}, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    var gate: Gate = .{ .pool = &pool };
+    try std.testing.expect(gate.check() == null);
+    gate.leave(true);
+    gate.assigned(jobKey("o/r", "o/r/.github/workflows/ci.yml", "build"));
+    pool.samplePeaks();
+    const now_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+    try std.testing.expectEqual(Reservation{ .jobs = 2, .mb = 2048 }, pool.reserved(now_ms, true));
+    try std.testing.expectEqual(@as(?Learned.Change, null), gate.ended());
+    try std.testing.expectEqual(@as(usize, 0), pool.learned.len);
+}
+
+test "a job that replayed steps from the cache is not learned from, and still frees its slot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [256]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/engine", .{tmp.sub_path});
+    try setEngine(tmp.dir, 600);
+    var slots: [1]Admission.Slot = undefined;
+    var pool: Admission = .init(io, .{}, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    pool.engine.dir = dir;
+    var gate: Gate = .{ .pool = &pool };
+    const zig = jobKey("o/r", "o/r/.github/workflows/ci.yml@refs/heads/main", "test (zig)");
+    // A re-run of one commit: its steps replayed, 100 MB where a real run takes 1.6 GB.
+    gate.leave(true);
+    gate.assigned(zig);
+    try setEngine(tmp.dir, 700);
+    pool.samplePeaks();
+    gate.replayed();
+    try std.testing.expectEqual(@as(?Learned.Change, null), gate.ended());
+    try std.testing.expectEqual(Admission.Slot{}, slots[0]);
+    try std.testing.expectEqual(@as(?u32, null), pool.learned.estimate(zig));
+    // The next run is real: learned, and not flagged by the replay before it.
+    gate.leave(true);
+    gate.assigned(zig);
+    try setEngine(tmp.dir, 2300);
+    pool.samplePeaks();
+    try std.testing.expectEqual(@as(u32, 1600), gate.ended().?.estimate_mb);
+}
+
+test "a job is the same job on any ref, and another under another name or workflow" {
+    const main = jobKey("o/r", "o/r/.github/workflows/ci.yml@refs/heads/main", "test (zig)");
+    const pr = jobKey("o/r", "o/r/.github/workflows/ci.yml@refs/pull/7/merge", "test (zig)");
+    try std.testing.expectEqual(main, pr);
+    const leg = jobKey("o/r", "o/r/.github/workflows/ci.yml@refs/heads/main", "test (uv)");
+    try std.testing.expect(main != leg);
+    const other = jobKey("o/r", "o/r/.github/workflows/cd.yml@refs/heads/main", "test (zig)");
+    try std.testing.expect(main != other);
+    // Where one part ends matters: "ab" and "c" are not "a" and "bc".
+    try std.testing.expect(jobKey("ab", "c", "") != jobKey("a", "bc", ""));
 }

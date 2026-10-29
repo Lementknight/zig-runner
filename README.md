@@ -252,10 +252,12 @@ the machine thrashed for hours (#126). Two things keep that from happening again
   struggling. A held runner removes its registration, so GitHub gives the job to another runner;
   running jobs are never touched. Where it can find the engine container's cgroup (a runner on
   the host, reaching the engine over a unix socket), it holds on the engine's own memory cap and
-  swap too, since the engine can fill its cap while the machine still has memory (#142). The
-  limits and why they are what they are are in `deploy/runner.env.example`
-  (`RUNNER_MIN_MEM_AVAILABLE_MB` and the rest; `RUNNER_ADMISSION=false` turns it off). The gate
-  sees only its own process's runners: run one pool per machine.
+  swap too, since the engine can fill its cap while the machine still has memory (#142), and
+  learns from it what each job (by repository, workflow and name) takes, so that a light job
+  reserves less than a heavy one once it has run (#144). The limits and why they are what they
+  are are in `deploy/runner.env.example` (`RUNNER_MIN_MEM_AVAILABLE_MB` and the rest;
+  `RUNNER_ADMISSION=false` turns it off). The gate sees only its own process's runners: run one
+  pool per machine.
 - **No swap for the engine**, optional. With `--memory 4g` alone, Docker lets a container swap as
   much again; `--memory-swap` equal to `--memory` (`memswap_limit` in compose) gives it none. A
   job that outgrows the engine then fails inside it, killed by the kernel, instead of the whole
