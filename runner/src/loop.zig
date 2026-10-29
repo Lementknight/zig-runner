@@ -129,7 +129,7 @@ pub fn pool(c: Context, n: u32) !Exit {
     // One per process too, so each runner counts the others' jobs before it takes one.
     const memory: ?*admission.Admission = if (c.cfg.admission) m: {
         const m = try c.arena.create(admission.Admission);
-        m.* = .init(c.io, c.cfg.admission_limits, try c.arena.alloc(i64, n));
+        m.* = .init(c.io, c.cfg.admission_limits, try c.arena.alloc(admission.Admission.Slot, n));
         const cgroup = c.cfg.engine_cgroup;
         m.engine.source = if (std.mem.eql(u8, cgroup, "none"))
             .off
@@ -139,6 +139,12 @@ pub fn pool(c: Context, n: u32) !Exit {
             .{ .host = c.cfg.engine_host };
         break :m m;
     } else null;
+    // Measures the jobs running, for what jobs of their names reserve next; ends with the pool.
+    var sampling: ?std.Io.Future(void) = if (memory) |m|
+        c.io.concurrent(admission.Admission.sample, .{m}) catch null
+    else
+        null;
+    defer if (sampling) |*f| f.cancel(c.io);
     var group: std.Io.Group = .init;
     for (slots, 0..) |*s, i| {
         s.* = .{ .c = c };
@@ -233,7 +239,7 @@ pub fn serve(c: Context) !Exit {
         // not, afresh, and a job that ended reserves nothing any more.
         if (c.gate) |g| {
             g.leave(false);
-            g.ended();
+            _ = g.ended();
         }
         if (r == .held and !stopRequested()) continue;
         if (c.cfg.once) return switch (r) {
@@ -983,6 +989,16 @@ fn handleJob(c: Context, session: Listening, body: []const u8) !Cycle {
 
     // The definition holds secrets; it is parsed but never printed.
     const job = job_mod.parse(c.arena, acq.body) catch |e| return fail(c, "parse job", e);
+    // Known by name now: it reserves what jobs of its name took (`admission.Learned`), and what it
+    // takes is learned when it ends.
+    const job_name = if (job.display_name.len > 0) job.display_name else job.github.job;
+    const g = job.github;
+    if (c.gate) |gate| gate.assigned(admission.jobKey(g.repository, g.workflow_ref, job_name));
+    defer if (c.gate) |gate| if (gate.ended()) |learned| sayUnallocated(
+        c,
+        "job '{s}' raised the engine's memory by {f} at most; reserving {f} for it while it starts",
+        .{ job_name, admission.gb(learned.seen_mb), admission.gb(learned.estimate_mb) },
+    );
 
     // GitHub cancels a job (in its UI, or at the job's timeout-minutes) through the runner's
     // session.
@@ -3150,8 +3166,8 @@ test "a runner short of memory stops asking for jobs, and asks again once memory
     const calm = "some avg10=0.00 avg60=0.00 avg300=0.00 total=900\n";
     try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 8388608 kB\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "pressure", .data = thrashing });
-    var started: [1]i64 = undefined;
-    var memory: admission.Admission = .init(io, .{}, &started);
+    var slots: [1]admission.Admission.Slot = undefined;
+    var memory: admission.Admission = .init(io, .{}, &slots);
     memory.paths = .{
         .meminfo = try std.fs.path.join(arena, &.{ dir, "meminfo" }),
         .pressure = try std.fs.path.join(arena, &.{ dir, "pressure" }),
@@ -3201,7 +3217,7 @@ test "a runner short of memory stops asking for jobs, and asks again once memory
     try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "acquirejob") != null);
     // No longer polling, and its job reserved while it ramps up.
     try std.testing.expectEqual(@as(u32, 0), memory.polling);
-    try std.testing.expect(started[0] > std.math.minInt(i64));
+    try std.testing.expect(slots[0].started_ms > std.math.minInt(i64));
 
     // The hold and its end were each said once, though the gate was looked at many times.
     const said = out.buffered();
@@ -3239,8 +3255,8 @@ test "a runner holds while the engine is near its own cap, though the machine ha
     try scope.writeFile(io, .{ .sub_path = "memory.max", .data = "4294967296\n" });
     try scope.writeFile(io, .{ .sub_path = "memory.current", .data = "3774873600\n" });
     try scope.writeFile(io, .{ .sub_path = "memory.stat", .data = "inactive_file 0\n" });
-    var started: [1]i64 = undefined;
-    var memory: admission.Admission = .init(io, .{}, &started);
+    var slots: [1]admission.Admission.Slot = undefined;
+    var memory: admission.Admission = .init(io, .{}, &slots);
     memory.paths = .{
         .meminfo = try std.fs.path.join(arena, &.{ dir, "meminfo" }),
         .pressure = "/nonexistent",
