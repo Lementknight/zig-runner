@@ -10,6 +10,10 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.17.0 - 2026-10-29
+### Added
+* The memory gate learns what each job takes (#144): once a runner knows which job it was handed (by repository, workflow file and job name), the job reserves, while it starts, the most its last 5 runs raised the engine's working set by, instead of `RUNNER_MEM_PER_JOB_MB` for every job. On razorbill a uv job takes about 300 MB and `zig build test` 1.6 GB, so light jobs no longer hold the next runner back as if they were heavy. Runners polling, and jobs not seen yet, reserve the worst case: `RUNNER_MEM_PER_JOB_MB`, or the most any job took if that is more. Learned only where the engine's cgroup is found, and in memory only; a job whose run changed its reservation is logged once.
+
 ## v0.16.0 - 2026-10-28
 ### Added
 * The memory gate also holds on the Dagger engine container's own memory cap and swap (#142): razorbill's engine filled its 4 GB cap and swapped while the host still showed 2 GB available. The runner finds the engine's cgroup through the process listening on its unix socket, with no Docker access, and logs which one, or why it could not, in which case it holds on the host's memory only. New settings: `RUNNER_MIN_ENGINE_HEADROOM_MB` (256) and `RUNNER_ENGINE_CGROUP`.

@@ -1,3 +1,0 @@
-kind: Added
-body: 'The memory gate learns what each job takes (#144): once a runner knows which job it was handed (by repository, workflow file and job name), the job reserves, while it starts, the most its last 5 runs raised the engine''s working set by, instead of `RUNNER_MEM_PER_JOB_MB` for every job. On razorbill a uv job takes about 300 MB and `zig build test` 1.6 GB, so light jobs no longer hold the next runner back as if they were heavy. Runners polling, and jobs not seen yet, reserve the worst case: `RUNNER_MEM_PER_JOB_MB`, or the most any job took if that is more. Learned only where the engine''s cgroup is found, and in memory only; a job whose run changed its reservation is logged once.'
-time: 2026-10-29T12:00:00.000000-04:00
