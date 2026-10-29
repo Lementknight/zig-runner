@@ -1345,7 +1345,8 @@ fn logCompleteJob(
 }
 
 /// On the runner's own console: how many steps the engine served from cache, as the step logs say
-/// (`dagger.reused_note`) — what step caching saved this job, next to what output keys cost it.
+/// (`dagger.reused_note`) — what step caching saved this job, next to what output keys cost it. A
+/// job with a step replayed is not learned from by the memory gate (`admission.Gate.replayed`).
 fn reportCacheAndKeys(
     c: Context,
     job: job_mod.Job,
@@ -1361,6 +1362,7 @@ fn reportCacheAndKeys(
             if (l.step >= 1 and l.step <= job.steps.len and
                 (it.textIs(dagger.reused_note) catch false)) replayed += 1;
         }
+        if (replayed > 0) if (c.gate) |gate| gate.replayed();
         try c.err.print(
             "job {d}: {d} of {d} steps replayed from the cache\n",
             .{ job.check_run_id, replayed, job.steps.len },

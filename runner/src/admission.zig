@@ -102,6 +102,8 @@ pub const Admission = struct {
         /// since, in MB: null without an engine signal, and nothing is learned from the job.
         base_mb: ?u64 = null,
         peak_mb: u64 = 0,
+        /// A step was replayed from the step cache: not learned from (`Learned`).
+        replayed: bool = false,
     };
 
     /// `slots` must have one entry for each runner in the pool, and each runner's `Gate.slot` a
@@ -261,6 +263,14 @@ pub const Gate = struct {
         s.peak_mb = e.used_mb;
     }
 
+    /// The runner's job replayed a step from the step cache: what it took is not learned.
+    pub fn replayed(g: *Gate) void {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        a.slots[g.slot].replayed = true;
+    }
+
     /// The runner's job is over: its memory is no longer reserved. Without this a job reserved its
     /// memory for the whole `ramp_ms` however short it was, so a burst of short jobs went through
     /// at most (available - floor) / per-job every two minutes: 1.5 jobs a minute on razorbill.
@@ -272,6 +282,7 @@ pub const Gate = struct {
         defer a.mu.unlock(a.io);
         const s = a.slots[g.slot];
         a.slots[g.slot] = .{};
+        if (s.replayed) return null;
         const key = s.key orelse return null;
         const base = s.base_mb orelse return null;
         // At most 1 TB, so that it fits the table's u32 and sums of them cannot overflow.
@@ -285,7 +296,9 @@ pub const Gate = struct {
 
 /// What jobs took, by name (`jobKey`): the engine's working set at its highest while each ran, less
 /// what it was when the job's name became known. Fixed in size: the name least recently used makes
-/// room for a new one.
+/// room for a new one. A job that replayed any step from the step cache is not learned from: it
+/// ran little of its work and took far less than its next real run will, and re-runs of one commit
+/// after a restart would otherwise teach an estimate that under-reserves the run that matters.
 pub const Learned = struct {
     entries: [capacity]Entry = undefined,
     len: usize = 0,
@@ -1344,6 +1357,36 @@ test "without the engine's cgroup nothing is learned, and every job reserves per
     try std.testing.expectEqual(Reservation{ .jobs = 2, .mb = 2048 }, pool.reserved(now_ms, true));
     try std.testing.expectEqual(@as(?Learned.Change, null), gate.ended());
     try std.testing.expectEqual(@as(usize, 0), pool.learned.len);
+}
+
+test "a job that replayed steps from the cache is not learned from, and still frees its slot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [256]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/engine", .{tmp.sub_path});
+    try setEngine(tmp.dir, 600);
+    var slots: [1]Admission.Slot = undefined;
+    var pool: Admission = .init(io, .{}, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    pool.engine.dir = dir;
+    var gate: Gate = .{ .pool = &pool };
+    const zig = jobKey("o/r", "o/r/.github/workflows/ci.yml@refs/heads/main", "test (zig)");
+    // A re-run of one commit: its steps replayed, 100 MB where a real run takes 1.6 GB.
+    gate.leave(true);
+    gate.assigned(zig);
+    try setEngine(tmp.dir, 700);
+    pool.samplePeaks();
+    gate.replayed();
+    try std.testing.expectEqual(@as(?Learned.Change, null), gate.ended());
+    try std.testing.expectEqual(Admission.Slot{}, slots[0]);
+    try std.testing.expectEqual(@as(?u32, null), pool.learned.estimate(zig));
+    // The next run is real: learned, and not flagged by the replay before it.
+    gate.leave(true);
+    gate.assigned(zig);
+    try setEngine(tmp.dir, 2300);
+    pool.samplePeaks();
+    try std.testing.expectEqual(@as(u32, 1600), gate.ended().?.estimate_mb);
 }
 
 test "a job is the same job on any ref, and another under another name or workflow" {
