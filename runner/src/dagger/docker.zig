@@ -560,12 +560,13 @@ pub fn workspaceDirId(x: *Exec) ![]const u8 {
 /// Dagger secrets.
 pub const ContainerEnv = struct { plain: []const job_mod.EnvVar, secret: []const SecretRef };
 
-/// The job's env (workflow, job, GITHUB_ENV), then the step's and the action's, then the
-/// runtime's and the OIDC token when the job has one — as on GitHub.
+/// The job's env (workflow, job, GITHUB_ENV) without the defaults GitHub sets again over it
+/// (`Evaluator.withoutReapplied`; `writeActionEnv` sets them), then the step's and the action's,
+/// then the runtime's and the OIDC token when the job has one — as on GitHub.
 pub fn containerEnv(x: *Exec, dr: DockerRun, state: []const job_mod.EnvVar) !ContainerEnv {
     const arena = x.arena;
     var env: std.ArrayList(job_mod.EnvVar) = .empty;
-    try env.appendSlice(arena, x.ev.job_env.items);
+    try env.appendSlice(arena, try x.ev.withoutReapplied(x.ev.job_env.items));
     try env.appendSlice(arena, dr.env);
     try env.append(arena, .{ .name = "HOME", .value = docker_home });
     if (dr.repository.len > 0) {

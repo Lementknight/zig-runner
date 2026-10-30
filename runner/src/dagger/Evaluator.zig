@@ -350,6 +350,27 @@ pub fn defaultEnv(ev: *const Evaluator) ![]const job_mod.EnvVar {
     return out.items;
 }
 
+/// `env`, an `env` context (workflow, job, GITHUB_ENV), without the variables GitHub sets again
+/// over it in every step's processes: its `GITHUB_*` from the `github` context's allowlist and
+/// `RUNNER_*` from the `runner` context (`GetRuntimeEnvironmentVariables` in actions/runner's
+/// GitHubContext.cs and RunnerContext.cs, applied after the env context in ScriptHandler.cs and
+/// ContainerActionHandler.cs), and GITHUB_ACTIONS (ProcessInvoker.cs). Those are `defaultEnv`'s
+/// names but `CI`, which GitHub sets only when nothing else has. The `env` context keeps them:
+/// `${{ env.GITHUB_SHA }}` reads what a step wrote, as on GitHub.
+pub fn withoutReapplied(
+    ev: *const Evaluator,
+    env: []const job_mod.EnvVar,
+) ![]const job_mod.EnvVar {
+    const defaults = try ev.defaultEnv();
+    var out: std.ArrayList(job_mod.EnvVar) = .empty;
+    for (env) |e| {
+        const reapplied = !std.mem.eql(u8, e.name, "CI") and
+            for (defaults) |d| (if (std.mem.eql(u8, d.name, e.name)) break true) else false;
+        if (!reapplied) try out.append(ev.arena, e);
+    }
+    return out.items;
+}
+
 test "the variables GitHub's runner sets: empty ones too, numbers and booleans as text" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -381,6 +402,31 @@ test "the variables GitHub's runner sets: empty ones too, numbers and booleans a
     for (env) |e| try std.testing.expect(!std.mem.eql(u8, e.name, "GITHUB_ACTOR_ID"));
     // The workflow's commit and ref follow the commit and branch: not part of step cache keys.
     try std.testing.expect(isVolatile("GITHUB_WORKFLOW_SHA") and isVolatile("GITHUB_WORKFLOW_REF"));
+}
+
+test "the env context reaches processes but for the defaults GitHub sets again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var job = testJob(&.{});
+    job.context_data = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"sha","v":"abc"}]}}
+    , .{});
+    const ev = try Evaluator.init(arena, &job);
+    const env = [_]job_mod.EnvVar{
+        .{ .name = "GITHUB_SHA", .value = "evil" },
+        .{ .name = "RUNNER_TEMP", .value = "/elsewhere" },
+        .{ .name = "GITHUB_ACTIONS", .value = "false" },
+        .{ .name = "CI", .value = "false" },
+        .{ .name = "GITHUB_TOKEN", .value = "pat" },
+        .{ .name = "RUNNER_MINE", .value = "1" },
+        // Not in this job's github context, so GitHub does not set it again either.
+        .{ .name = "GITHUB_ACTOR_ID", .value = "7" },
+    };
+    const kept = try ev.withoutReapplied(&env);
+    try std.testing.expectEqual(@as(usize, 4), kept.len);
+    for (kept, [_][]const u8{ "CI", "GITHUB_TOKEN", "RUNNER_MINE", "GITHUB_ACTOR_ID" }) |e, n|
+        try std.testing.expectEqualStrings(n, e.name);
 }
 
 test "github.workspace is the job's workspace, as actions' input defaults expect" {

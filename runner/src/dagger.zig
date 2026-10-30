@@ -2084,6 +2084,44 @@ test "step caching: a step run again after a replayed failure keeps the exports 
     try std.testing.expect(std.mem.indexOf(u8, seen[3], mode) != null);
 }
 
+test "step caching: GITHUB_ENV cannot set the run marker or the runner's other variables" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{ testStep("setup"), testStep("./test.sh") };
+    // Set in the container, `ZIG_RUNNER_RAN` would be what every later step writes as its ran
+    // marker: a step replayed from an earlier job would pass for one that ran in this one, and a
+    // failure kept from an earlier run would be shown as this run's. The markers' secret, the
+    // event and the secret aliases are the runner's too.
+    const answers = [_][]const u8{
+        base_answer,
+        "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"id\":\"C1\",\"exitCode\":0,\"stdout\":\"\",\"stderr\":\"\"," ++
+            "\"fc_ran\":{\"contents\":\"j1\"},\"fc_env\":{\"contents\":\"MODE=ci\\nZIG_RUNNER_RAN=forged\\n" ++
+            "ZIG_RUNNER_MARK=m\\nZIG_RUNNER_EVENT={}\\nZIG_SECRET_0=s\\n\"}}}}}",
+        try execRan(arena, "C2", 0, "passed", "j1"),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .test_ran_marker = "j1", .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    // Refused with an error annotation each; the step that wrote them goes on.
+    try std.testing.expect(res.succeeded);
+    const seen = fake.seen.items;
+    try std.testing.expectEqual(@as(usize, 3), seen.len);
+    try std.testing.expect(std.mem.indexOf(u8, seen[2], "withEnvVariable(name:\"MODE\",value:\"ci\")") != null);
+    for ([_][]const u8{ "ZIG_RUNNER_RAN", "ZIG_RUNNER_MARK", "ZIG_RUNNER_EVENT", "ZIG_SECRET_0" }) |name| {
+        const set = try std.fmt.allocPrint(arena, "withEnvVariable(name:\"{s}\"", .{name});
+        try std.testing.expect(std.mem.indexOf(u8, seen[2], set) == null);
+        const refused = try std.fmt.allocPrint(arena, "##[error]Can't store {s} using '$GITHUB_ENV' command: it is the runner's own.", .{name});
+        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), refused) != null);
+    }
+    // The next step still writes the job's own marker, from the base container's variable.
+    try std.testing.expect(std.mem.indexOf(u8, seen[0], "withVolatileVariable(name:\"ZIG_RUNNER_RAN\",value:\"j1\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[2], "::zig-file-command::ran' \\\"${ZIG_RUNNER_RAN-}\\\"") != null);
+}
+
 test "step caching: a failure the cache kept from an earlier run is not replayed, the step runs again" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -2365,7 +2403,7 @@ test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH
         \\  {"type":"action","reference":{"type":"script"},"id":"s1","contextName":"build","name":"build","condition":"success()",
         \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo producing"}}]}},
         \\  {"type":"action","reference":{"type":"script"},"id":"s2","contextName":"use","name":"use","condition":"success()",
-        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"format('echo version={0} multi={1} env=$FROM_ENV', steps.build.outputs.version, steps.build.outputs.notes)"}}]}},
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"format('echo version={0} multi={1} env=$FROM_ENV sha={2}', steps.build.outputs.version, steps.build.outputs.notes, env.GITHUB_SHA)"}}]}},
         \\  {"type":"action","reference":{"type":"script"},"id":"s3","contextName":"bad","name":"bad","condition":"success()",
         \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo writes garbage"}}]}},
         \\  {"type":"action","reference":{"type":"script"},"id":"s4","contextName":"after","name":"after","condition":"always()",
@@ -2375,7 +2413,8 @@ test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH
     const job = try job_mod.parse(arena, json);
     const answers = [_][]const u8{
         base_answer,
-        try execFc(arena, "C1", "producing\\n", "version=1.2.3\\nnotes<<EOF\\nline a\\nline b\\nEOF\\n", "FROM_ENV=hello\\nGITHUB_SHA=evil\\n", "/opt/tool/bin\\n"),
+        try execFc(arena, "C1", "producing\\n", "version=1.2.3\\nnotes<<EOF\\nline a\\nline b\\nEOF\\n", "FROM_ENV=hello\\nGITHUB_SHA=evil\\nCI=false\\nGITHUB_TOKEN=pat\\n" ++
+            "NODE_OPTIONS=--require=/x.js\\n", "/opt/tool/bin\\n"),
         try execFc(arena, "C2", "x\\n", "", "", ""),
         try execFc(arena, "C3", "y\\n", "this is not valid\\n", "", ""),
         try execFc(arena, "C4", "z\\n", "", "", ""),
@@ -2395,12 +2434,19 @@ test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "fc_all: file(path:\"/github/file_commands/all_1\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "fc_output: file(") == null);
     // Outputs (including a multi-line one) were evaluated into step 2's script.
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "echo version=1.2.3 multi=line a\\nline b env=$FROM_ENV") != null);
-    // GITHUB_ENV and GITHUB_PATH apply to the next step's container; reserved names are refused.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "echo version=1.2.3 multi=line a\\nline b env=$FROM_ENV sha=evil") != null);
+    // GITHUB_ENV and GITHUB_PATH apply to the next step's container, GITHUB_* and CI included.
+    // A default GitHub sets again over the env context keeps its value in the container, but
+    // the env context has what the step wrote (above); NODE_OPTIONS alone is refused, as an
+    // error annotation that does not fail the step.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withEnvVariable(name:\"FROM_ENV\",value:\"hello\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withEnvVariable(name:\"PATH\",value:\"/opt/tool/bin:$PATH\",expand:true)") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "name:\"GITHUB_SHA\",value:\"evil\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "ignored GITHUB_ENV entry 'GITHUB_SHA'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withEnvVariable(name:\"CI\",value:\"false\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withEnvVariable(name:\"GITHUB_TOKEN\",value:\"pat\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "NODE_OPTIONS") == null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]Can't store NODE_OPTIONS output parameter using '$GITHUB_ENV' command.") != null);
+    try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
     // ...and only once: step 3 no longer re-applies them.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[3], "withEnvVariable") == null);
     // A malformed GITHUB_OUTPUT fails the step that wrote it; always() still runs.
