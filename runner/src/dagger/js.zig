@@ -302,6 +302,7 @@ pub fn jsEnv(
         arena,
         x.transport,
         x.job.*,
+        x.sh,
         &x.secrets,
         env.items,
         &plain,

@@ -241,7 +241,7 @@ and the theorems still hold of the model. Where the runner does not do what the 
 | `Script`, `Numbered`, `Ahead` | Composite inner steps and JavaScript pre/main/post share a step number; what keeps their scripts apart is the file-command directory in the text, plus the container's depth | The bookkeeping hypotheses are false in letter, true in substance: no two executions in a job share a stamped script | — |
 | `Subset` | Models BuildKit's cache pruning; the output store (`output_keys_days`) is a separate digest-to-bytes map the model has no object for | Store pruning is safe for another reason: the apply copies from the store and fails (so falls back) if the content is gone | — |
 | `Key` | The real key holds more: cache volume identities, action code, user and directory, the nesting flag, secret variables, the file-command paths | Only extra misses, so safe | — |
-| `mark` | The runner also marks every Docker action, every JavaScript action when a job token exists, and every step when the job has `id-token: write` | Only extra runs, so safe | — |
+| `mark` | The runner also marks every Docker action, every JavaScript action when a job token exists, and every step when the job has `id-token: write`. A variable holding a secret or an `::add-mask::` value (the workflow's, the job's, the container's, or one exported through `$GITHUB_ENV`) reaches the container as a Dagger secret, so its value is not in the key, and every step that has it is marked | Only extra runs, so safe: a step whose key lacks such a value is stamped with the job's nonce | #101 |
 
 `Enforce` is composed with `Build` since #89: `Enforce.replay_eq_run_enforced` is P1 for `exec`
 instantiated with the withheld input.

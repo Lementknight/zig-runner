@@ -334,12 +334,13 @@ pub fn redacted(sh: *JobLog, arena: Allocator, text: []const u8) Allocator.Error
     return redact.alloc(arena, text, sh.log.currentSecrets());
 }
 
-/// Whether `text` holds one of the job's secrets or masks.
-pub fn holdsSecret(sh: *JobLog, text: []const u8) bool {
+/// Whether `text` holds one of the job's secrets or masks, of `min_len` bytes or more.
+pub fn holdsSecret(sh: *JobLog, text: []const u8, min_len: usize) bool {
+    std.debug.assert(min_len > 0);
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     for (sh.log.currentSecrets()) |s| {
-        if (s.len > 0 and std.mem.indexOf(u8, text, s) != null) return true;
+        if (s.len >= min_len and std.mem.indexOf(u8, text, s) != null) return true;
     }
     return false;
 }
@@ -1119,6 +1120,6 @@ test "masks cost memory in proportion to their number, and a repeated one costs 
         "[job 0 step 1 stdout] *** *** *** *** secret-value-\n",
         out.written(),
     );
-    try std.testing.expect(sh.holdsSecret("x secret-value-12 y"));
+    try std.testing.expect(sh.holdsSecret("x secret-value-12 y", 1));
     try std.testing.expectEqualStrings("a *** b", try sh.redacted(a.allocator(), "a job-secret b"));
 }

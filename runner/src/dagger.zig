@@ -576,8 +576,21 @@ pub fn gqlAtMost(
 /// match unrelated text.
 pub fn containsSecret(job: job_mod.Job, value: []const u8) bool {
     for (job.secrets) |sec|
-        if (sec.len >= 3 and std.mem.indexOf(u8, value, sec) != null) return true;
+        if (sec.len >= min_secret_len and std.mem.indexOf(u8, value, sec) != null) return true;
     return false;
+}
+
+/// The shortest secret or mask that a value is checked for: a shorter one would match unrelated
+/// text.
+pub const min_secret_len = 3;
+
+/// Whether a value contains a secret (`containsSecret`) or a value the job's steps masked so far
+/// (`::add-mask::`, through `sh`; none before the first step). A step can pass a masked value on
+/// through GITHUB_ENV, and it is then as secret as the job's own (#101).
+pub fn holdsSecret(job: job_mod.Job, sh: ?*JobLog, value: []const u8) bool {
+    if (containsSecret(job, value)) return true;
+    const log = sh orelse return false;
+    return log.holdsSecret(value, min_secret_len);
 }
 
 pub const SecretRef = struct { name: []const u8, id: []const u8 };
@@ -629,7 +642,7 @@ pub const Secrets = struct {
     }
 
     /// Registers the values not registered yet, in one query (none when there are none).
-    fn register(
+    pub fn register(
         s: *Secrets,
         arena: Allocator,
         t: Transport,
@@ -660,12 +673,13 @@ pub fn newSecret(
     return secrets.ids.get(plaintext).?;
 }
 
-/// Splits env into plain variables and secret-bearing ones (registered as Dagger secrets, those
-/// not registered yet in one query).
+/// Splits env into plain variables and secret-bearing ones (`holdsSecret`, registered as Dagger
+/// secrets, those not registered yet in one query).
 pub fn splitEnv(
     arena: Allocator,
     t: Transport,
     job: job_mod.Job,
+    sh: ?*JobLog,
     secrets: *Secrets,
     env: []const job_mod.EnvVar,
     plain: *std.ArrayList(job_mod.EnvVar),
@@ -673,10 +687,10 @@ pub fn splitEnv(
     err_msg: *[]const u8,
 ) !void {
     var values: std.ArrayList([]const u8) = .empty;
-    for (env) |e| if (containsSecret(job, e.value)) try values.append(arena, e.value);
+    for (env) |e| if (holdsSecret(job, sh, e.value)) try values.append(arena, e.value);
     try secrets.register(arena, t, values.items, err_msg);
     for (env) |e| {
-        if (containsSecret(job, e.value)) {
+        if (holdsSecret(job, sh, e.value)) {
             try secret.append(arena, .{ .name = e.name, .id = secrets.ids.get(e.value).? });
         } else {
             try plain.append(arena, e);
@@ -1636,7 +1650,7 @@ fn jobOutputs(arena: Allocator, ev: *Evaluator, sh: *JobLog, job: job_mod.Job, r
         };
         // Against every secret and mask, in every form (`::add-mask::` values too: an OIDC-minted
         // token is one), as GitHub's runner checks job outputs.
-        if (containsSecret(job, value) or sh.holdsSecret(value)) {
+        if (containsSecret(job, value) or sh.holdsSecret(value, 1)) {
             try lines.append(
                 arena,
                 try std.fmt.allocPrint(arena, "##[warning]Skip output '{s}' since it may " ++
@@ -3450,4 +3464,115 @@ test "a container job's env gives way to the job's env of the same name" {
     try std.testing.expectEqual(@as(usize, 0), auto.count(secret));
     try std.testing.expectEqual(@as(usize, 1), auto.count("withEnvVariable(name:\"NPM_TOKEN\"," ++
         "value:\"from-the-job\")"));
+}
+
+test "a secret passed on through GITHUB_ENV reaches later steps as a Dagger secret, and they always run" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const secret = "deploy_s3cr3t-value";
+    const steps = [_]job_mod.Step{
+        testStep("./fetch-token >> \"$GITHUB_ENV\""),
+        testStep("./deploy.sh"),
+    };
+    var job = testJob(&steps);
+    job.secrets = &.{secret};
+    const files = [_][2][]const u8{.{
+        "/github/file_commands/all_1",
+        "::zig-file-command::env\nTOKEN=" ++ secret ++ "\nREGION=eu\n",
+    }};
+    for ([_]Options{
+        .{ .step_cache = true, .test_ran_marker = "j1" },
+        .{ .step_cache = true, .output_keys = true, .test_ran_marker = "j1" },
+    }) |opts| {
+        var auto: AutoSession = .{ .arena = arena, .files = &files };
+        _ = try roundTrips(arena, &auto, opts, job);
+        try expectSecretOnlyInSetSecret(&auto, secret);
+        const deploy = try execOf(&auto, "./deploy.sh");
+        try std.testing.expect(std.mem.indexOf(u8, deploy, "withoutEnvVariable(name:\"TOKEN\") " ++
+            "{ withSecretVariable(name:\"TOKEN\",secret:\"ID") != null);
+        try std.testing.expect(std.mem.indexOf(u8, deploy, "withEnvVariable(name:\"REGION\"," ++
+            "value:\"eu\")") != null);
+        // The script names no secret, but its environment has one: it runs in every job.
+        try std.testing.expect(std.mem.indexOf(u8, deploy, "runs this step every time: it uses " ++
+            "secrets (run ") != null);
+        const fetch = try execOf(&auto, "./fetch-token");
+        try std.testing.expect(std.mem.indexOf(u8, fetch, "runs this step every time") == null);
+    }
+}
+
+test "a value masked before it is passed on through GITHUB_ENV is a secret to the steps after" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    // Not one of the job's secrets: a token a step minted (an OIDC exchange) and masked.
+    const minted = "minted-token-4242";
+    const steps = [_]job_mod.Step{ testStep("./mint-token"), testStep("./deploy.sh") };
+    const files = [_][2][]const u8{.{
+        "/github/file_commands/all_1",
+        "::zig-file-command::env\nTOKEN=" ++ minted ++ "\n",
+    }};
+    var auto: AutoSession = .{
+        .arena = arena,
+        .files = &files,
+        .stdout = &.{.{ "./mint-token", "::add-mask::" ++ minted ++ "\n" }},
+    };
+    _ = try roundTrips(arena, &auto, .{ .step_cache = true, .test_ran_marker = "j1" }, testJob(&steps));
+    try expectSecretOnlyInSetSecret(&auto, minted);
+    const deploy = try execOf(&auto, "./deploy.sh");
+    try std.testing.expect(std.mem.indexOf(u8, deploy, "withSecretVariable(name:\"TOKEN\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, deploy, "runs this step every time: it uses " ++
+        "secrets (run ") != null);
+}
+
+test "a value in GITHUB_ENV masked by a later step makes the steps after that one always run" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const late = "masked-later-4242";
+    const steps = [_]job_mod.Step{
+        testStep("./export-value"),
+        testStep("./mask-it"),
+        testStep("./deploy.sh"),
+    };
+    const files = [_][2][]const u8{.{
+        "/github/file_commands/all_1",
+        "::zig-file-command::env\nVALUE=" ++ late ++ "\n",
+    }};
+    var auto: AutoSession = .{
+        .arena = arena,
+        .files = &files,
+        .stdout = &.{.{ "./mask-it", "::add-mask::" ++ late ++ "\n" }},
+    };
+    _ = try roundTrips(arena, &auto, .{ .step_cache = true, .test_ran_marker = "j1" }, testJob(&steps));
+    // The step that masks it got it as a plain variable (nothing said it was secret yet), and
+    // nothing can take that back; the steps after it run every time, and get it from the
+    // container, not in their own documents.
+    const mask_it = try execOf(&auto, "./mask-it");
+    try std.testing.expect(std.mem.indexOf(u8, mask_it, "runs this step every time") == null);
+    const deploy = try execOf(&auto, "./deploy.sh");
+    try std.testing.expect(std.mem.indexOf(u8, deploy, late) == null);
+    try std.testing.expect(std.mem.indexOf(u8, deploy, "runs this step every time: it uses " ++
+        "secrets (run ") != null);
+}
+
+test "a secret variable set again through GITHUB_ENV as a plain value loses its secret first" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const secret = "job_s3cr3t-value";
+    const steps = [_]job_mod.Step{ testStep("./reset-token"), testStep("./use-token") };
+    var job = testJob(&steps);
+    job.secrets = &.{secret};
+    job.env = &.{.{ .name = "TOKEN", .value = .{ .lit = secret } }};
+    const files = [_][2][]const u8{.{
+        "/github/file_commands/all_1",
+        "::zig-file-command::env\nTOKEN=anonymous\n",
+    }};
+    var auto: AutoSession = .{ .arena = arena, .files = &files };
+    _ = try roundTrips(arena, &auto, .{}, job);
+    try expectSecretOnlyInSetSecret(&auto, secret);
+    const use = try execOf(&auto, "./use-token");
+    try std.testing.expect(std.mem.indexOf(u8, use, "withoutSecretVariable(name:\"TOKEN\") " ++
+        "{ withEnvVariable(name:\"TOKEN\",value:\"anonymous\")") != null);
 }
