@@ -29,7 +29,6 @@ const redact = @import("redact.zig");
 const broker = @import("github/broker.zig");
 const build_version = @import("version.zig");
 const expr = @import("expr.zig");
-const glob = @import("glob.zig");
 const context = @import("context.zig");
 const commands = @import("commands.zig");
 const config = @import("config.zig");

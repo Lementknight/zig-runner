@@ -1,0 +1,3 @@
+kind: Changed
+body: 'The doc comment about the static busybox moved from `Exec.startExtra` to `Exec.busyboxFile`, which it describes, `startExtra` got one of its own, and dagger.zig no longer imports glob.zig, which it did not use (#148).'
+time: 2026-10-30T17:00:00.000000-04:00
