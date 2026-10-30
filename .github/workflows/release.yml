@@ -44,7 +44,7 @@ env:
   # Trivy's own;
   TRIVY_IMAGE: aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
   # BuildKit, which builds the image (setup-buildx-action would take buildx-stable-1, a moving tag);
-  BUILDKIT_IMAGE: moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+  BUILDKIT_IMAGE: moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
   # and the scanner that writes the image's SBOM (BuildKit would take stable-1, a moving tag).
   SBOM_SCANNER_IMAGE: docker/buildkit-syft-scanner:1.12.0@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
   # Where Trivy's vulnerability database comes from, in order: Google's mirror, then GitHub's.
