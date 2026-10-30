@@ -163,6 +163,20 @@ trust, and the runner itself enforces it:
   project in the worst case, with no caches to hide a slow or broken first build. Nothing there is
   trusted or holds a secret.
 
+Package caches (Go's modules, Zig's packages, cargo's sources, the tool cache and the rest) are
+Dagger cache volumes, keyed by repository and by trust, and several are not checked again when
+used. A job shares the repository's `repo` volumes only when the runner vouches for it: it passes
+the trust gate on `RUNNER_TRUSTED_REFS` and `RUNNER_TRUSTED_EVENTS` lists that name what they trust
+(`trust.vouches`), and it is not a fork's pull request. Every other job, including a
+same-repository pull request, a `workflow_run` or `issue_comment` a fork set off, and a fork's pull
+request whose repository was deleted, gets the `untrusted` volumes. A `*` in either list lets every
+job through without vouching for any, so all of a pre-prod runner's jobs share the `untrusted`
+volumes with each other, and none can write what prod reads. Still, run **one engine per trust
+level**: untrusted jobs on one engine share its `untrusted` volumes, the engine's other state (its
+layer cache, and with `RUNNER_DAGGER_NESTING` the engine itself) is not scoped at all, and
+nesting is control of the host. A second instance on prod's machine (`zig-runner@sandbox.service`)
+gets its own engine, or none.
+
 Pushes to `main` run CI on prod, so every merge exercises the runner; the repository variable
 `PROD_RUNNER` holds prod's `runs-on` labels as JSON (unset, GitHub's runner stands in):
 

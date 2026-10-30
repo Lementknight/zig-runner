@@ -34,7 +34,7 @@ pub fn outputKeysKey(
     step_cache: bool,
 ) !?[]const u8 {
     if (!(step_cache and opts.output_keys and job.github.repository.len > 0)) return null;
-    const scope = try packageCacheScope(arena, ev, job.github.repository);
+    const scope = try packageCacheScope(arena, ev, job.github.repository, opts.trusted);
     return try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/step-outputs", .{
         job.github.repository,
         scope,
@@ -432,7 +432,7 @@ test "output keys: after a Docker action, the next steps start from the workspac
     var buf: [8192]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-    const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .output_keys = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .output_keys = true, .trusted = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
     const seen = fake.seen.items;
     try std.testing.expect(res.succeeded);
     try std.testing.expectEqual(@as(usize, 10), seen.len);
@@ -479,7 +479,7 @@ test "output keys: the step after one that always runs starts from that step's o
     var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-    const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .output_keys = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .output_keys = true, .trusted = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
     try std.testing.expect(res.succeeded);
     for (fake.seen.items) |d| try std.testing.expect(braceBalanced(d));
     try std.testing.expectEqual(@as(usize, 8), fake.seen.items.len);
@@ -540,7 +540,7 @@ test "output keys: when they cannot apply, the next step starts from the step's 
     var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-    const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .output_keys = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .output_keys = true, .trusted = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
     try std.testing.expect(res.succeeded);
     try std.testing.expectEqual(@as(usize, 5), fake.seen.items.len);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[4], "loadContainerFromID(id:\"C1\")") != null);
