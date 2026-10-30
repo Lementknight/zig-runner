@@ -36,7 +36,6 @@ const mark_env = @import("../dagger.zig").mark_env;
 const ran_env = @import("../dagger.zig").ran_env;
 const ActionOut = @import("Exec.zig").ActionOut;
 const DockerRun = @import("Exec.zig").DockerRun;
-const ExecOut = @import("Exec.zig").ExecOut;
 const ImageInfo = @import("Exec.zig").ImageInfo;
 const Loaded = @import("Exec.zig").Loaded;
 const Phase = @import("Exec.zig").Phase;
@@ -439,7 +438,7 @@ pub fn runContainer(
     phase: Phase,
     dr: DockerRun,
     state: []const job_mod.EnvVar,
-) !?ExecOut {
+) !?Exec.Out {
     const arena = x.arena;
     if (phase == .main) try x.logContainerStart(num, phase, dr);
     const busybox = (try x.busyboxFile(num)) orelse return null;
@@ -615,7 +614,7 @@ pub fn writeActionSecrets(arena: Allocator, q: *Query, secret: []const SecretRef
 /// After the action ran: /github/home kept for its next step, and the workspace as the action
 /// left it replacing the job's — through output keys when they apply, else copied back whole,
 /// deletions included.
-pub fn takeWorkspaceBack(x: *Exec, num: u32, data: std.json.Value, out: ExecOut) !void {
+pub fn takeWorkspaceBack(x: *Exec, num: u32, data: std.json.Value, out: Exec.Out) !void {
     const arena = x.arena;
     if (jsonFind(data, "home")) |h| if (jsonFindString(h, "id")) |id| {
         x.docker_home = id;
