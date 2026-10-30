@@ -1,0 +1,3 @@
+kind: Changed
+body: 'The built-in checkout (the fetch query, submodules left empty, the log and refs it leaves) and its tests moved from dagger.zig to dagger/checkout.zig, the third step in splitting dagger.zig into smaller files (#148).'
+time: 2026-10-29T23:20:00.000000-04:00
