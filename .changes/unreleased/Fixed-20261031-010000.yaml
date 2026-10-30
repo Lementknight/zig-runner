@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A step whose Dagger engine has gone silent no longer waits for it for hours (#100): once nothing at all has come from the engine for `RUNNER_ENGINE_SILENCE_TIMEOUT` seconds (600 by default; no health check, no answer, no log line), the step''s query is aborted and the step fails, saying why. Only while a step runs; the runner logs the timeout at startup, and `0` turns it off.'
+time: 2026-10-31T01:00:00.000000-04:00

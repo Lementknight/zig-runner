@@ -36,7 +36,20 @@ pub const Endpoint = struct {
     docker_socket: []const u8 = default_docker_socket,
     /// The engine container `buildctl dial-stdio` runs in.
     container: []const u8 = default_container,
+    /// How long a query may go on with nothing at all heard from the engine before its session
+    /// is aborted (`Session.watch`); null never. `Config.engine_silence_timeout_secs`.
+    silence_timeout: ?Io.Duration = default_silence_timeout,
 };
+
+/// Ten minutes: 120 missed health checks (the engine sends one every 5 s), with no byte
+/// on the query or the log stream either. A Pi whose engine swaps under heavy jobs answers late,
+/// but not that late, and keeps logging meanwhile (#100).
+pub const default_silence_timeout: Io.Duration = .fromSeconds(10 * 60);
+
+/// Monotonic milliseconds, for `Session.heard_ms`.
+fn nowMs(io: Io) i64 {
+    return Io.Clock.awake.now(io).toMilliseconds();
+}
 
 // --- reading a byte stream ---
 
@@ -709,15 +722,20 @@ pub const Conn = struct {
     w: Io.net.Stream.Writer = undefined,
     rbuf: [16 * 1024]u8 = undefined,
     r: Io.net.Stream.Reader = undefined,
+    /// Set to the time whenever something arrives (`Session.heard_ms`).
+    heard: ?*std.atomic.Value(i64) = null,
 
     /// Whatever one read of the socket returns (not a full buffer), or 0 at its end.
     fn readFn(ptr: *anyopaque, dst: []u8) anyerror!usize {
         const c: *Conn = @ptrCast(@alignCast(ptr));
         const r = &c.r.interface;
-        if (r.bufferedLen() == 0) r.fillMore() catch |e| switch (e) {
-            error.EndOfStream => return 0,
-            error.ReadFailed => return c.r.err orelse error.ReadFailed,
-        };
+        if (r.bufferedLen() == 0) {
+            r.fillMore() catch |e| switch (e) {
+                error.EndOfStream => return 0,
+                error.ReadFailed => return c.r.err orelse error.ReadFailed,
+            };
+            if (c.heard) |h| h.store(nowMs(c.io), .monotonic);
+        }
         const avail = r.buffered();
         const n = @min(avail.len, dst.len);
         @memcpy(dst[0..n], avail[0..n]);
@@ -920,6 +938,12 @@ pub const Session = struct {
     /// (`abort`). An engine that never answered it held the job's end, after its steps, for good
     /// (#100). Telemetry still being flushed past this is lost, nothing else.
     shutdown_timeout: Io.Duration = .fromSeconds(10),
+    /// When anything last arrived from the engine, on any of the session's connections, or a
+    /// query began: what `watch` measures silence from.
+    heard_ms: std.atomic.Value(i64) = .init(0),
+    /// Under `query_mu`: the request in flight was aborted by `watch`, not by the job's cancel.
+    silenced: bool = false,
+    watchdog: ?Io.Future(void) = null,
 
     /// Opens a session: the callback connection (serving health checks), `/init`, and, with a
     /// handler, the log subscription. The Session must not move afterwards.
@@ -973,9 +997,11 @@ pub const Session = struct {
             .attach = attach,
             .log_handler = log_handler,
         };
+        attach.heard = &s.heard_ms;
         s.health = try io.concurrent(serveHealth, .{s});
         owned = true;
         errdefer s.close();
+        if (ep.silence_timeout) |limit| s.watchdog = io.concurrent(watch, .{ s, limit }) catch null;
 
         var arena_state: std.heap.ArenaAllocator = .init(gpa);
         defer arena_state.deinit();
@@ -984,6 +1010,7 @@ pub const Session = struct {
 
         if (log_handler != null) {
             const lc = try dial(gpa, io, ep);
+            lc.heard = &s.heard_ms;
             s.logs_conn = lc;
             try writeRequest(lc.writer(), "GET", "/v1/logs", &.{
                 .{ "X-Dagger-Client-Metadata", md },
@@ -1030,7 +1057,7 @@ pub const Session = struct {
     pub const Response = struct { status: u16, body: []u8 };
 
     /// One request on the session's query connection (opened on first use, kept alive).
-    /// `error.QueryAborted` when `abort` ended it.
+    /// `error.QueryAborted` when `abort` ended it, `error.EngineSilent` when `watch` did.
     pub fn request(
         s: *Session,
         arena: Allocator,
@@ -1041,11 +1068,19 @@ pub const Session = struct {
     ) !Response {
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
-            if (s.query_conn == null) s.query_conn = try dial(s.gpa, s.io, s.ep);
+            if (s.query_conn == null) {
+                const dialled = try dial(s.gpa, s.io, s.ep);
+                dialled.heard = &s.heard_ms;
+                s.query_conn = dialled;
+            }
             const c = s.query_conn.?;
             s.query_mu.lockUncancelable(s.io);
             s.in_flight = true;
             s.aborted = false;
+            s.silenced = false;
+            // Silence counts from the query's start at the earliest: an idle session hears only
+            // health checks, and an engine that sends none (a test's) has said nothing for long.
+            s.heard_ms.store(nowMs(s.io), .monotonic);
             s.query_mu.unlock(s.io);
             const result: anyerror!Response = blk: {
                 writeRequest(c.writer(), method, path, &.{
@@ -1061,6 +1096,7 @@ pub const Session = struct {
             s.query_mu.lockUncancelable(s.io);
             s.in_flight = false;
             const aborted = s.aborted;
+            const silenced = s.silenced;
             s.query_mu.unlock(s.io);
             return result catch |e| {
                 s.query_mu.lockUncancelable(s.io);
@@ -1068,6 +1104,7 @@ pub const Session = struct {
                 s.query_mu.unlock(s.io);
                 c.close();
                 s.gpa.destroy(c);
+                if (silenced) return error.EngineSilent;
                 if (aborted) return error.QueryAborted;
                 // A connection the engine closed between requests: dial again, once.
                 if (attempt == 0 and (e == error.EndOfStream or e == error.BrokenPipe or
@@ -1083,11 +1120,36 @@ pub const Session = struct {
     pub fn abort(s: *Session) bool {
         s.query_mu.lockUncancelable(s.io);
         defer s.query_mu.unlock(s.io);
+        return s.abortLocked();
+    }
+
+    /// `abort`, with `query_mu` held.
+    fn abortLocked(s: *Session) bool {
         if (!s.in_flight) return false;
         const c = s.query_conn orelse return false;
         s.aborted = true;
         c.shutdown();
         return true;
+    }
+
+    /// Aborts the query in flight once nothing at all has come from the engine for `limit`: no
+    /// health check (it sends one every 5 s), no byte of an answer, no log line. Keepalive notices
+    /// an engine host that went away; this, an engine that is there and has stopped (frozen,
+    /// deadlocked), which held a job for hours (#100). Only while a query runs: a session between
+    /// steps is never ended, and the next query finds out. The step then fails with
+    /// `error.EngineSilent`, which says so.
+    fn watch(s: *Session, limit: Io.Duration) void {
+        const limit_ms = limit.toMilliseconds();
+        // A second at most between looks, a quarter of a short (test) limit.
+        const step: Io.Duration = .fromMilliseconds(@max(10, @min(1000, @divTrunc(limit_ms, 4))));
+        while (true) {
+            s.io.sleep(step, .awake) catch return;
+            s.query_mu.lockUncancelable(s.io);
+            defer s.query_mu.unlock(s.io);
+            if (!s.in_flight or s.aborted) continue;
+            if (nowMs(s.io) - s.heard_ms.load(.monotonic) < limit_ms) continue;
+            if (s.abortLocked()) s.silenced = true;
+        }
     }
 
     /// Ends the request in flight once `limit` has passed (`close`'s `/shutdown`). Tried again
@@ -1113,6 +1175,8 @@ pub const Session = struct {
     pub fn close(s: *Session) void {
         if (s.closed) return;
         s.closed = true;
+        // `/shutdown` has a deadline of its own.
+        if (s.watchdog) |*w| w.cancel(s.io);
         var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena_state.deinit();
         var timer: ?Io.Future(void) = s.io.concurrent(abortAfter, .{ s, s.shutdown_timeout }) catch
@@ -1530,4 +1594,142 @@ test "a session whose engine never answers /shutdown is closed at its deadline" 
     s.close();
     const took = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
     try std.testing.expect(took >= 200 and took < 2_000);
+}
+
+/// An engine that attaches the session, answers `/init`, takes a query and never answers it, then
+/// answers `/shutdown` on a new connection. With `talk` it keeps the attach connection busy
+/// meanwhile (HTTP/2 pings every 50 ms), as a live engine that is slow to answer does.
+const SilentEngine = struct {
+    listener: Io.net.Server,
+    talk: bool,
+    stop: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+
+    fn start(e: *SilentEngine, talk: bool) !void {
+        const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+        const listener = try addr.listen(std.testing.io, .{ .reuse_address = true });
+        e.* = .{ .listener = listener, .talk = talk };
+        e.thread = try std.Thread.spawn(.{}, run, .{e});
+    }
+
+    fn finish(e: *SilentEngine) void {
+        e.thread.join();
+        e.listener.deinit(std.testing.io);
+    }
+
+    fn host(e: *SilentEngine, buf: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "tcp://127.0.0.1:{d}", .{e.listener.socket.address.getPort()});
+    }
+
+    fn head(s: Io.net.Stream) !void {
+        var buf: [4096]u8 = undefined;
+        var r = s.reader(std.testing.io, &buf);
+        var last: [4]u8 = .{ 0, 0, 0, 0 };
+        while (!std.mem.eql(u8, &last, "\r\n\r\n")) {
+            const b = try r.interface.takeByte();
+            last = .{ last[1], last[2], last[3], b };
+        }
+    }
+
+    fn send(s: Io.net.Stream, text: []const u8) !void {
+        var buf: [256]u8 = undefined;
+        var w = s.writer(std.testing.io, &buf);
+        try w.interface.writeAll(text);
+        try w.interface.flush();
+    }
+
+    fn run(e: *SilentEngine) void {
+        const io = std.testing.io;
+        const ok = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        const a = e.listener.accept(io) catch return;
+        defer a.close(io);
+        head(a) catch return;
+        send(a, "HTTP/1.1 101 Switching Protocols\r\n\r\n") catch return;
+        const pinger: ?std.Thread = if (e.talk)
+            std.Thread.spawn(.{}, ping, .{ e, a }) catch null
+        else
+            null;
+        defer {
+            e.stop.store(true, .release);
+            if (pinger) |t| t.join();
+        }
+        const b = e.listener.accept(io) catch return;
+        defer b.close(io);
+        head(b) catch return; // /init
+        send(b, ok) catch return;
+        head(b) catch return; // /query, never answered
+        head(b) catch {}; // until the client goes
+        const c = e.listener.accept(io) catch return;
+        defer c.close(io);
+        head(c) catch return; // /shutdown
+        send(c, ok) catch {};
+    }
+
+    fn ping(e: *SilentEngine, a: Io.net.Stream) void {
+        send(a, h2.preface) catch return;
+        // A PING frame: length 8, type 6, no flags, stream 0, 8 bytes of payload.
+        const frame = [_]u8{ 0, 0, 8, 6, 0, 0, 0, 0, 0 } ++ @as([8]u8, @splat(0));
+        while (!e.stop.load(.acquire)) {
+            send(a, &frame) catch return;
+            std.testing.io.sleep(.fromMilliseconds(50), .awake) catch return;
+        }
+    }
+};
+
+/// The job's cancel, `after` from now (`Session.abort`).
+fn abortLater(s: *Session, after: Io.Duration) void {
+    std.testing.io.sleep(after, .awake) catch return;
+    while (!s.abort()) std.testing.io.sleep(.fromMilliseconds(10), .awake) catch return;
+}
+
+test "a query to an engine that has gone silent is aborted at the silence timeout" {
+    const io = std.testing.io;
+    var engine: SilentEngine = undefined;
+    try engine.start(false);
+    defer engine.finish();
+    var buf: [64]u8 = undefined;
+    var s: Session = undefined;
+    try s.open(std.testing.allocator, io, .{
+        .host = try engine.host(&buf),
+        .silence_timeout = .fromMilliseconds(300),
+    }, null);
+    defer s.close();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const started = Io.Clock.awake.now(io);
+    const silent = s.query(arena_state.allocator(), "{a}", no_limit);
+    try std.testing.expectError(error.EngineSilent, silent);
+    const took = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    // Where it used to wait for good.
+    try std.testing.expect(took >= 300 and took < 2_000);
+}
+
+test "an engine slow to answer but still talking is not aborted, nor one with the timeout off" {
+    const io = std.testing.io;
+    for ([_]bool{ true, false }) |talk| {
+        var engine: SilentEngine = undefined;
+        try engine.start(talk);
+        defer engine.finish();
+        var buf: [64]u8 = undefined;
+        var s: Session = undefined;
+        // Talking: health traffic the whole time, with a timeout of 300 ms. Silent: no timeout.
+        try s.open(std.testing.allocator, io, .{
+            .host = try engine.host(&buf),
+            .silence_timeout = if (talk) .fromMilliseconds(300) else null,
+        }, null);
+        defer s.close();
+        var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena_state.deinit();
+
+        // Many times the timeout goes by; then the job's cancel ends the query, not the watchdog.
+        const cancel_after: Io.Duration = .fromMilliseconds(1_500);
+        var cancelling = try io.concurrent(abortLater, .{ &s, cancel_after });
+        defer cancelling.cancel(io);
+        const started = Io.Clock.awake.now(io);
+        const cancelled = s.query(arena_state.allocator(), "{a}", no_limit);
+        try std.testing.expectError(error.QueryAborted, cancelled);
+        const took = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+        try std.testing.expect(took >= 1_500);
+    }
 }
