@@ -80,6 +80,11 @@ extra: std.ArrayList(ExtraStep) = .empty,
 /// Per job step (index = step - 1): the action loaded for it, the state its `pre` saved.
 loaded: []?LoadResult,
 pre_state: [][]const job_mod.EnvVar,
+/// The `steps` ids from the job step down to the composite step running now ("" outside
+/// composite actions, `build/__2` two levels in): which nested action a `pre` state is for.
+nested_path: []const u8 = "",
+/// The state the `pre` of an action inside a composite action saved, by `nestedKey`.
+nested_pre_state: std.StringHashMapUnmanaged([]const job_mod.EnvVar) = .empty,
 /// What each log step wrote to $GITHUB_STEP_SUMMARY (index = log step - 1), uploaded with the
 /// logs so GitHub shows it on the run's summary page.
 summaries: [][]const u8,
@@ -901,6 +906,19 @@ pub const LoadResult = union(enum) { ok: Loaded, failed: []const u8, unresolved:
 /// The name GitHub gives a `pre` or `post` step: the prefix and the step's name for the step's
 /// own action ("Post Run actions/cache@v4"), or "<prefix> Run <action>" for an action nested in
 /// a composite one (`depth` > 0 while a composite action's steps run).
+/// The state the running action's `pre` saved: the job step's own, or a nested action's
+/// (`nested_pre_state`).
+pub fn preState(x: *Exec, num: u32) ![]const job_mod.EnvVar {
+    if (x.nested_path.len == 0) return x.pre_state[num - 1];
+    return x.nested_pre_state.get(try x.nestedKey(num)) orelse &.{};
+}
+
+/// `<step>/<nested_path>`: one action inside the composite action of job step `num`.
+pub fn nestedKey(x: *Exec, num: u32) ![]const u8 {
+    std.debug.assert(x.nested_path.len > 0);
+    return std.fmt.allocPrint(x.arena, "{d}/{s}", .{ num, x.nested_path });
+}
+
 pub fn extraName(x: *Exec, prefix: []const u8, num: u32, act: Loaded) ![]const u8 {
     if (x.depth == 0)
         return std.fmt.allocPrint(x.arena, "{s} {s}", .{ prefix, x.job.steps[num - 1].name });

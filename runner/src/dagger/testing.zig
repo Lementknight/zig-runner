@@ -38,6 +38,20 @@ pub fn testJob(steps: []const job_mod.Step) job_mod.Job {
     };
 }
 
+/// Every document in `seen` carries `secret` only as a `setSecret` value: not in an exec's args,
+/// its key or anything else the engine keeps (#101).
+pub fn expectSecretOnlyInSetSecret(seen: []const []const u8, secret: []const u8) !void {
+    for (seen) |d| {
+        var rest = d;
+        while (std.mem.indexOf(u8, rest, secret)) |at| : (rest = rest[at + secret.len ..]) {
+            const before = rest[0..at];
+            const call = std.mem.lastIndexOf(u8, before, "setSecret(name:") orelse
+                return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOfScalar(u8, before[call..], ')') == null);
+        }
+    }
+}
+
 pub fn braceBalanced(doc: []const u8) bool {
     var depth: i32 = 0;
     var in_str = false;
