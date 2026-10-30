@@ -2409,6 +2409,38 @@ test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH
     try std.testing.expectEqual(Outcome.success, res.steps[3].outcome);
 }
 
+test "GITHUB_PATH: newest directory first, each once, also before a step env or GITHUB_ENV PATH" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var custom = testStep("custom");
+    custom.env = &.{.{ .name = "PATH", .value = .{ .lit = "/custom" } }};
+    var last = testStep("last");
+    last.env = &.{.{ .name = "PATH", .value = .{ .lit = "/x" } }};
+    const steps = [_]job_mod.Step{ testStep("first"), custom, last };
+    const answers = [_][]const u8{
+        base_answer,
+        try execFc(arena, "C1", "", "", "", "/a\\n/b\\n/a\\n/c\\n"),
+        try execFc(arena, "C2", "", "", "PATH=/env\\n", "/b\\n"),
+        try exec(arena, "C3", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    // GitHub keeps [/b, /a, /c] and prepends it reversed.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withEnvVariable(name:\"PATH\",value:\"/c:/a:/b:$PATH\",expand:true)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "PATH=/c:/a:/b:/custom") != null);
+    // /b again moves to the front, here and before the next step's own PATH; a PATH set
+    // through GITHUB_ENV keeps every directory in front of it.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[3], "withEnvVariable(name:\"PATH\",value:\"/b:/c:/a:/env\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[3], "$PATH") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[3], "PATH=/b:/c:/a:/x") != null);
+}
+
 test "an output set twice keeps its last value, case-insensitively; GITHUB_OUTPUT beats set-output" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();

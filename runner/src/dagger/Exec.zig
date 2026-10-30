@@ -369,6 +369,18 @@ fn resolveRunStep(
     var resolved = resolved_in;
     if (resolved != .run) return .{ .resolved = resolved, .secret_env = &.{} };
     var secret_env: []const SecretRef = secret_env_in;
+    // A PATH in the step's env gets the $GITHUB_PATH directories in front, as the container's
+    // does (`Handler.AddPrependPathToEnvironment`, `Handler.cs` ~205-232).
+    if (x.ev.path_prepend.items.len > 0) {
+        const env = try arena.dupe(job_mod.EnvVar, resolved.run.env);
+        for (env) |*e| if (std.mem.eql(u8, e.name, "PATH")) {
+            e.value = try std.fmt.allocPrint(arena, "{s}:{s}", .{
+                try Evaluator.prependPath(arena, x.ev.path_prepend.items),
+                e.value,
+            });
+        };
+        resolved.run.env = env;
+    }
     // A script with a secret written in (`${{ secrets.X }}`) reaches its file as a Dagger
     // secret: in the command, the plaintext would be in the engine's cache metadata (#101).
     const script_secret: ?[]const u8 = if (holdsSecret(x.job.*, x.sh, resolved.run.script))
@@ -438,6 +450,9 @@ fn writePendingEnv(x: *Exec, q: *Query) !void {
         if (holdsSecret(x.job.*, x.sh, e.value)) try values.append(arena, e.value);
     x.secrets.register(arena, x.transport, values.items, &x.err_msg) catch
         return error.EngineFailed;
+    // GitHub puts the $GITHUB_PATH directories before whatever PATH a step gets, a PATH set
+    // through $GITHUB_ENV included (`Handler.cs` ~205-232); then the container already has them.
+    var path_set = false;
     // A variable is plain or secret, never both: with both, which one a step sees would be the
     // engine's choice.
     for (ev.pending_env.items) |e| {
@@ -451,12 +466,21 @@ fn writePendingEnv(x: *Exec, q: *Query) !void {
         } else {
             if (x.secret_vars.remove(e.name))
                 try q.call("withoutSecretVariable", .{ .name = e.name });
-            try q.call("withEnvVariable", .{ .name = e.name, .value = e.value });
+            const path = std.mem.eql(u8, e.name, "PATH") and ev.path_prepend.items.len > 0;
+            const value = if (path) try std.fmt.allocPrint(arena, "{s}:{s}", .{
+                try Evaluator.prependPath(arena, ev.path_prepend.items),
+                e.value,
+            }) else e.value;
+            path_set = path_set or path;
+            try q.call("withEnvVariable", .{ .name = e.name, .value = value });
         }
     }
-    if (ev.pending_path.items.len > 0) {
-        const joined = try std.mem.join(arena, ":", ev.pending_path.items);
-        const value = try std.fmt.allocPrint(arena, "{s}:$PATH", .{joined});
+    // Only the directories added since: the container's PATH has the earlier ones. One added
+    // again then appears twice, its first place being the one GitHub gives it.
+    if (ev.pending_path.items.len > 0 and !path_set) {
+        const value = try std.fmt.allocPrint(arena, "{s}:$PATH", .{
+            try Evaluator.prependPath(arena, ev.pending_path.items),
+        });
         try q.call("withEnvVariable", .{ .name = "PATH", .value = value, .expand = true });
     }
     ev.pending_env.clearRetainingCapacity();
@@ -712,7 +736,7 @@ pub fn collect(x: *Exec, num: u32, data: std.json.Value, recorded: Recorded) !Ou
             "the GITHUB_ENV file command: {s}", .{why}),
     };
     if (fileCommand(data, "fc_path")) |text| {
-        for (try commands.parsePaths(arena, text)) |dir| try ev.pending_path.append(arena, dir);
+        for (try commands.parsePaths(arena, text)) |dir| try ev.addPath(dir);
     }
     if (fileCommand(data, "fc_step_summary")) |text| try x.appendSummary(num, text);
     if (cmd_error) |msg| {
