@@ -153,6 +153,10 @@ services: std.ArrayList(RunningService) = .empty,
 /// Shell lines at the start of every step that forward `localhost:<port>` to the services, as
 /// a job on GitHub's runner reaches them through ports published on its host.
 forward_prelude: []const u8 = "",
+/// `defaults.run`, evaluated once in "Set up job" (`setUpJob`); null where unset or empty. Only
+/// the job's own `run:` steps use them, not a composite action's.
+default_shell: ?[]const u8 = null,
+default_working_directory: ?[]const u8 = null,
 
 pub const RunningService = struct {
     name: []const u8,

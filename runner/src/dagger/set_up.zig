@@ -760,10 +760,12 @@ pub fn execFor(
 
 /// "Set up job": what GitHub's runner logs before the first step, including fetching every action.
 /// As on GitHub, an action that cannot be resolved (even one whose step would be skipped) fails
-/// "Set up job" with one error naming them all, and no step runs: that is the Result returned.
+/// "Set up job" with one error naming them all, and no step runs: that is the Result returned. So
+/// does `defaults.run` that cannot be read or evaluated.
 pub fn setUpJob(x: *Exec, opts: Options, results: []StepResult) !?Result {
     const arena = x.arena;
     try x.logSetUp(opts);
+    if (try evalRunDefaults(x)) |why| return try failSetUp(x, results, why);
     var downloaded: std.StringHashMapUnmanaged(void) = .empty;
     var unresolved: std.StringArrayHashMapUnmanaged(void) = .empty;
     for (x.job.steps, 1..) |step, n| if (step.action == .uses and !step.action.uses.local) {
@@ -782,16 +784,46 @@ pub fn setUpJob(x: *Exec, opts: Options, results: []StepResult) !?Result {
         else
             try std.fmt.allocPrint(arena, "Download action repository '{s}'", .{label}));
     };
-    if (unresolved.count() > 0) {
-        x.sh.errorLine(0, try std.mem.join(arena, ". ", unresolved.keys()));
-        var failed = try finish(arena, x.sh, results, "");
-        failed.succeeded = false;
-        failed.engine_error = null;
-        failed.set_up_failed = true;
-        return failed;
-    }
+    if (unresolved.count() > 0)
+        return try failSetUp(x, results, try std.mem.join(arena, ". ", unresolved.keys()));
     const job = x.job;
     x.setUpLine(try std.fmt.allocPrint(arena, "Complete job name: {s}", .{jobLabel(job.*)}));
+    return null;
+}
+
+/// "Set up job" failed with `why`: logged as its error, and no step runs.
+fn failSetUp(x: *Exec, results: []StepResult, why: []const u8) !Result {
+    x.sh.errorLine(0, why);
+    var failed = try finish(x.arena, x.sh, results, "");
+    failed.succeeded = false;
+    failed.engine_error = null;
+    failed.set_up_failed = true;
+    return failed;
+}
+
+/// Evaluates `defaults.run` into `Exec.default_shell` and `default_working_directory`, once for
+/// the job as GitHub's runner does in "Set up job"; an empty value counts as unset (actions/runner
+/// src/Runner.Worker/JobExtension.cs 277-293). Returns why, when it cannot.
+fn evalRunDefaults(x: *Exec) !?[]const u8 {
+    if (x.job.defaults_error) |why| return why;
+    const d = x.job.defaults_run;
+    const sc = try x.ev.scope(&.{});
+    if (d.shell) |t| {
+        const v = x.ev.render(t, sc) catch return try std.fmt.allocPrint(
+            x.arena,
+            "defaults.run.shell: {s}",
+            .{x.ev.diag},
+        );
+        if (v.len > 0) x.default_shell = v;
+    }
+    if (d.working_directory) |t| {
+        const v = x.ev.render(t, sc) catch return try std.fmt.allocPrint(
+            x.arena,
+            "defaults.run.working-directory: {s}",
+            .{x.ev.diag},
+        );
+        if (v.len > 0) x.default_working_directory = v;
+    }
     return null;
 }
 

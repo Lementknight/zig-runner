@@ -129,6 +129,12 @@ pub const Job = struct {
     github: Github = .{},
     /// Workflow- and job-level `env`, in order (later entries override earlier ones).
     env: []const Input = &.{},
+    /// `defaults.run`, workflow- or job-level, unevaluated: what a `run:` step without its own
+    /// `shell:` or `working-directory:` uses.
+    defaults_run: RunDefaults = .{},
+    /// Set when `defaults:` could not be read; "Set up job" fails with it, as an evaluation error
+    /// fails it on GitHub.
+    defaults_error: ?[]const u8 = null,
     /// The job's `contextData` (github, inputs, job, matrix, needs, strategy, vars) as parsed JSON.
     context_data: Value = .null,
     /// Base URL of the results service (`system.github.results_endpoint`), where logs are uploaded.
@@ -136,6 +142,12 @@ pub const Job = struct {
     /// Service URLs JavaScript actions reach through the `ACTIONS_*` variables (cache, artifacts).
     runtime: Runtime = .{},
     steps: []const Step,
+};
+
+/// `defaults.run`: its two settings, each a literal or an expression.
+pub const RunDefaults = struct {
+    shell: ?Template = null,
+    working_directory: ?Template = null,
 };
 
 /// A `services:` entry: a container that runs next to the job's steps for the whole job.
@@ -199,6 +211,7 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
 
     const services = try jobServices(arena, root);
     const container = try jobContainer(arena, root);
+    const defaults = try jobDefaults(arena, root);
 
     return .{
         .plan_id = path(root, &.{ "plan", "planId" }) orelse return error.MalformedJob,
@@ -220,6 +233,8 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
             break :github g;
         },
         .env = try jobEnv(arena, root),
+        .defaults_run = defaults.run,
+        .defaults_error = defaults.err,
         .context_data = root.object.get("contextData") orelse .null,
         .display_name = path(root, &.{"jobDisplayName"}) orelse "",
         .container = container.container,
@@ -263,6 +278,46 @@ fn jobContainer(arena: Allocator, root: Value) Allocator.Error!JobContainer {
         },
     };
     return .{ .container = container };
+}
+
+const JobDefaults = struct { run: RunDefaults = .{}, err: ?[]const u8 = null };
+
+/// `defaults`: a list of mapping tokens, the workflow's then the job's. As GitHub's runner reads
+/// it, each `run` key (any case) replaces the whole of the one before, so a job's `defaults.run`
+/// does not inherit the workflow's `working-directory` (actions/runner
+/// src/Runner.Worker/JobExtension.cs 277-293).
+fn jobDefaults(arena: Allocator, root: Value) Allocator.Error!JobDefaults {
+    const unreadable: JobDefaults = .{
+        .err = "defaults: could not be read (written as an expression, or in a form the " ++
+            "runner does not know)",
+    };
+    const list = root.object.get("defaults") orelse return .{};
+    if (list == .null) return .{};
+    if (list != .array) return unreadable;
+    var out: JobDefaults = .{};
+    for (list.array.items) |token| {
+        if (tokenType(token) != Token.mapping) return unreadable;
+        const map = token.object.get("map") orelse continue;
+        if (map != .array) return unreadable;
+        for (map.array.items) |pair| {
+            if (pair != .object) return unreadable;
+            const key = literal(pair.object.get("Key") orelse return unreadable) orelse
+                return unreadable;
+            if (!std.ascii.eqlIgnoreCase(key, "run")) continue;
+            const value = pair.object.get("Value") orelse return unreadable;
+            const settings = mappingInputs(arena, value) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Unsupported => return unreadable,
+            };
+            out.run = .{};
+            for (settings) |in| {
+                if (std.ascii.eqlIgnoreCase(in.name, "shell")) out.run.shell = in.value;
+                if (std.ascii.eqlIgnoreCase(in.name, "working-directory"))
+                    out.run.working_directory = in.value;
+            }
+        }
+    }
+    return out;
 }
 
 /// `jobOutputs`; an unreadable mapping counts as none.
@@ -1187,6 +1242,28 @@ test "github.job comes from system.github.job when the context leaves it out" {
     );
     // As seen live for a matrix job: the key is the variable, not the leg in jobName.
     try std.testing.expectEqualStrings("which-job", job.github.job);
+}
+
+test "defaults: the last run mapping wins whole, keys in any case; an unreadable one is an error" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const head =
+        \\{"plan":{"planId":"p"},"jobId":"j","steps":[],
+        \\ "resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"t"}}}]},
+    ;
+    const job = try parse(a.allocator(), head ++
+        \\ "defaults":[{"type":2,"map":[{"Key":{"lit":"run"},"Value":{"type":2,"map":[{"Key":{"lit":"working-directory"},"Value":{"lit":"wf"}}]}}]},
+        \\  {"type":2,"map":[{"Key":{"lit":"Run"},"Value":{"type":2,"map":[{"Key":{"lit":"Shell"},"Value":{"type":3,"expr":"vars.SHELL"}}]}}]}]}
+    );
+    try std.testing.expectEqualStrings("vars.SHELL", job.defaults_run.shell.?.expr);
+    try std.testing.expect(job.defaults_run.working_directory == null);
+    try std.testing.expect(job.defaults_error == null);
+    const none = try parse(a.allocator(), head ++ "\"defaults\":null}");
+    try std.testing.expect(none.defaults_run.shell == null and none.defaults_error == null);
+    const bad = try parse(a.allocator(), head ++
+        \\ "defaults":[{"type":2,"map":[{"Key":{"lit":"run"},"Value":{"type":3,"expr":"fromJSON(vars.D)"}}]}]}
+    );
+    try std.testing.expect(bad.defaults_error != null);
 }
 
 test "malformed job" {
