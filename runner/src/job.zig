@@ -593,38 +593,62 @@ fn parseLocalUses(arena: Allocator, local: []const u8, inputs: ?Value) Error!Act
     } };
 }
 
-/// `bash`, `sh`, `python`, or a custom command for any of them with `{0}` standing for the script
-/// file (`bash -l {0}`, `/bin/bash --login -eo pipefail {0}`, `python3 {0}`), as GitHub accepts
-/// them.
+/// A `shell:` as GitHub's runner reads it: the program up to the first space, and the arguments
+/// after it, which default to the program's own when there are none (`bash` is
+/// `bash --noprofile --norc -e -o pipefail {0}`) (actions/runner
+/// src/Runner.Worker/Handlers/ScriptHandlerHelpers.cs, `ParseShellOptionString` and
+/// `GetScriptArgumentsFormat`; ScriptHandler.cs 221-239).
+pub const Shell = struct {
+    program: []const u8,
+    args: []const u8,
+
+    pub fn parse(sh: []const u8) Shell {
+        const space = std.mem.indexOfScalar(u8, sh, ' ') orelse sh.len;
+        const program = sh[0..space];
+        const args = std.mem.trimStart(u8, sh[space..], " ");
+        return .{ .program = program, .args = if (args.len > 0) args else defaultArgs(program) };
+    }
+
+    /// The arguments GitHub gives a program named alone; "" for one it has none for.
+    fn defaultArgs(program: []const u8) []const u8 {
+        const known = [_][2][]const u8{
+            .{ "bash", "--noprofile --norc -e -o pipefail {0}" },
+            .{ "sh", "-e {0}" },
+            .{ "python", "{0}" },
+        };
+        for (known) |k| if (std.ascii.eqlIgnoreCase(program, k[0])) return k[1];
+        return "";
+    }
+};
+
+/// Any program whose arguments name the script file as `{0}` (`node {0}`, `bash -l {0}`,
+/// `/bin/bash --login -eo pipefail {0}`), or `bash`, `sh` or `python` alone, as GitHub accepts
+/// them. PowerShell and cmd are refused on purpose (`unsupportedShell`).
 pub fn validShell(sh: []const u8) bool {
-    if (std.mem.eql(u8, sh, "bash") or std.mem.eql(u8, sh, "sh") or std.mem.eql(u8, sh, "python"))
-        return true;
-    if (std.mem.indexOf(u8, sh, "{0}") == null) return false;
-    var it = std.mem.tokenizeAny(u8, sh, " \t");
-    return isRunnableShell(std.fs.path.basenamePosix(it.next() orelse return false));
+    const s = Shell.parse(sh);
+    if (s.program.len == 0 or isWindowsShell(s.program)) return false;
+    return std.mem.indexOf(u8, s.args, "{0}") != null;
 }
 
-/// The interpreters a step's script may be handed to. `python3` as well as `python`, because the
-/// name GitHub's images provide is not the name every image provides.
-fn isRunnableShell(prog: []const u8) bool {
-    for ([_][]const u8{ "bash", "sh", "python", "python3" }) |ok|
-        if (std.mem.eql(u8, prog, ok)) return true;
+fn isWindowsShell(program: []const u8) bool {
+    const prog = std.fs.path.basenamePosix(program);
+    for ([_][]const u8{ "pwsh", "powershell", "cmd" }) |w|
+        if (std.ascii.eqlIgnoreCase(prog, w)) return true;
     return false;
 }
 
-/// Why a shell is refused, for the step's log. The shells of GitHub's Ubuntu runners run here: bash
-/// (by far the most used), sh and python. PowerShell is left out on purpose (it needs .NET).
+/// Why a shell is refused, for the step's log. PowerShell is left out on purpose (it needs .NET),
+/// and cmd is Windows-only; anything else lacks `{0}`, as GitHub's runner says.
 pub fn unsupportedShell(arena: Allocator, sh: []const u8) Allocator.Error![]const u8 {
-    var it = std.mem.tokenizeAny(u8, sh, " \t");
-    const prog = std.fs.path.basenamePosix(it.next() orelse "");
-    const why = if (std.mem.eql(u8, prog, "pwsh") or std.mem.eql(u8, prog, "powershell"))
+    const prog = std.fs.path.basenamePosix(Shell.parse(sh).program);
+    const why = if (std.ascii.eqlIgnoreCase(prog, "pwsh") or
+        std.ascii.eqlIgnoreCase(prog, "powershell"))
         "PowerShell is not supported (it needs .NET); use `shell: bash`"
-    else if (std.mem.eql(u8, prog, "cmd"))
+    else if (std.ascii.eqlIgnoreCase(prog, "cmd"))
         "cmd is Windows-only; use `shell: bash`"
     else
-        "this runner runs bash, sh and python, the shells of GitHub's Ubuntu runners: use " ++
-            "`shell: bash`, `sh`, `python`, or one of their commands with {0} for the script " ++
-            "file, such as `bash -l {0}`";
+        "a shell must be bash, sh or python, or a command with {0} for the script file, " ++
+            "such as `bash -l {0}` or `node {0}`";
     return std.fmt.allocPrint(arena, "unsupported shell '{s}': {s}", .{ sh, why });
 }
 
@@ -1303,16 +1327,33 @@ test "unsupportedShell says why" {
     try std.testing.expectEqualStrings("unsupported shell 'pwsh': PowerShell is not supported (it needs .NET); use `shell: bash`", try unsupportedShell(a.allocator(), "pwsh"));
     try std.testing.expect(std.mem.indexOf(u8, try unsupportedShell(a.allocator(), "powershell -command {0}"), "needs .NET") != null);
     try std.testing.expect(std.mem.indexOf(u8, try unsupportedShell(a.allocator(), "cmd"), "Windows-only") != null);
-    // A shell nobody recognises is told what does run, which now includes python.
-    try std.testing.expect(std.mem.indexOf(u8, try unsupportedShell(a.allocator(), "fish"), "bash, sh and python") != null);
+    // A program named without {0} is told what a shell must be.
+    try std.testing.expect(std.mem.indexOf(u8, try unsupportedShell(a.allocator(), "fish"), "a command with {0}") != null);
 }
 
-test "validShell: bash, sh, python, and custom commands for them with {0}" {
-    for ([_][]const u8{ "bash", "sh", "python", "bash -l {0}", "/bin/bash --login -eo pipefail {0}", "sh -x {0}", "python {0}", "python3 {0}", "/usr/bin/python3 {0}" }) |ok|
-        try std.testing.expect(validShell(ok));
-    // `pwsh` is a non-goal (it needs .NET) and a bare command without {0} is not a template.
-    for ([_][]const u8{ "pwsh", "powershell", "cmd", "bash -l", "node {0}", "ruby {0}", "" }) |bad|
-        try std.testing.expect(!validShell(bad));
+test "validShell: bash, sh, python, or any program given {0}, as on GitHub" {
+    const ok = [_][]const u8{
+        "bash",        "sh",        "python",      "BASH",        "/usr/bin/python3 {0}",
+        "bash -l {0}", "sh -x {0}", "python {0}",  "python3 {0}", "perl  -w {0}",
+        "node {0}",    "ruby {0}",  "/bin/sh {0}",
+    } ++ .{"/bin/bash --login -eo pipefail {0}"};
+    for (ok) |sh| try std.testing.expect(validShell(sh));
+    // `pwsh` is a non-goal (it needs .NET), and a program without {0} has no place for the
+    // script, which GitHub refuses too.
+    const bad = [_][]const u8{
+        "pwsh", "powershell", "cmd", "pwsh -File {0}", "bash -l", "node", "fish", "", " {0}",
+    };
+    for (bad) |sh| try std.testing.expect(!validShell(sh));
+}
+
+test "Shell.parse splits at the first space and gives a lone program its default arguments" {
+    const bash = Shell.parse("bash");
+    try std.testing.expectEqualStrings("bash", bash.program);
+    try std.testing.expectEqualStrings("--noprofile --norc -e -o pipefail {0}", bash.args);
+    const node = Shell.parse("node  --no-warnings {0}");
+    try std.testing.expectEqualStrings("node", node.program);
+    try std.testing.expectEqualStrings("--no-warnings {0}", node.args);
+    try std.testing.expectEqualStrings("", Shell.parse("ruby").args);
 }
 
 test "uses: references keep their directory and inputs; local actions; docker:// images" {
