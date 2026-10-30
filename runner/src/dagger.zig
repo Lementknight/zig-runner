@@ -274,7 +274,7 @@ pub const ExtraKind = enum { pre, post, initialize, stop };
 
 pub const ExtraStep = struct {
     /// `initialize` and `stop` are "Initialize containers" and "Stop containers", which GitHub
-    /// lists with the pre and post steps but numbers apart from them (see `loop.shownSteps`).
+    /// lists with the pre and post steps but numbers apart from them (see `upload.shownSteps`).
     kind: ExtraKind,
     name: []const u8,
     log_step: u32,
@@ -419,7 +419,7 @@ pub const Observer = struct {
     ) void = null,
     extraFinishedFn: ?*const fn (ptr: *anyopaque, e: ExtraStep) void = null,
     /// Before the post steps: how many will run, and whether "Stop containers" follows (GitHub
-    /// numbers them apart from the steps before, see `loop.shownSteps`).
+    /// numbers them apart from the steps before, see `upload.shownSteps`).
     postsFn: ?*const fn (ptr: *anyopaque, posts: u32, stop: bool) void = null,
 
     fn started(o: Observer, number: u32, name: []const u8, started_ms: i64) void {

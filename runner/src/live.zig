@@ -129,7 +129,7 @@ pub const Live = struct {
         };
     }
 
-    /// GitHub's numbering after the main steps (see `loop.shownSteps`): one number per step that
+    /// GitHub's numbering after the main steps (see `upload.shownSteps`): one number per step that
     /// could have a post and one more are set aside, the post steps take the last of them.
     fn posts(ptr: *anyopaque, count: u32, _: bool) void {
         const l: *Live = @ptrCast(@alignCast(ptr));

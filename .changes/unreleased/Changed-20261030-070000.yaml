@@ -1,0 +1,3 @@
+kind: Changed
+body: 'What GitHub shows for a job once it ends (the steps in its runner''s order and numbering, the log uploads, each step''s as it finishes, and the step results and annotations completejob sends) moved with its tests from loop.zig to loop/upload.zig, the first step in splitting loop.zig into smaller files (#148).'
+time: 2026-10-30T07:00:00.000000-04:00

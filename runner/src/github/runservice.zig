@@ -99,7 +99,7 @@ pub fn complete(
     step_results: []const u8,
     /// The job's outputs, read by later jobs as `needs.<job>.outputs.<name>`.
     outputs: []const EnvVar,
-    /// JSON array of annotations (see `loop.annotationsJson`).
+    /// JSON array of annotations (see `upload.annotationsJson`).
     annotations: []const u8,
 ) !broker.Response {
     // Outputs as the runner sends them: name -> {value, isSecret} (actions/runner's VariableValue).
