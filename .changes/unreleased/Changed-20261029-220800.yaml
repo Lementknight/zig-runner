@@ -1,0 +1,3 @@
+kind: Changed
+body: 'The fakes shared by the Dagger tests (`FakeSession`, the answers it gives, and the test steps and jobs) moved from dagger.zig to dagger/testing.zig, the first step in splitting dagger.zig into smaller files (#148).'
+time: 2026-10-29T22:08:00.000000-04:00
