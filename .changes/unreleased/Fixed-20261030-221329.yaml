@@ -1,0 +1,3 @@
+kind: Fixed
+body: '`version` tags `main` only once `main`''s own checks have passed on the commit it releases (#106): "Format, build and test", "Database tests", "Workflows" and "Proofs" from the push to `main`, waiting up to 30 minutes. The merge queue checked each merge, not `main` as it stands after them. A run by hand can skip the wait (`skip_main_checks`) for a release that fixes what fails them; it still needs `prod`''s approval. The wait is now one script (`wait-for-checks.sh`) shared with the release''s deploy gate, whose behaviour is unchanged. The `prod` environment deploys only from `main` (its `v*` tag rule is removed).'
+time: 2026-10-30T22:13:29.000000-04:00
