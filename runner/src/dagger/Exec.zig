@@ -972,7 +972,8 @@ pub const writeActionEnv = @import("docker.zig").writeActionEnv;
 pub const writeActionSecrets = @import("docker.zig").writeActionSecrets;
 pub const takeWorkspaceBack = @import("docker.zig").takeWorkspaceBack;
 
-/// The static busybox that starts Docker actions' commands (taken from its image once per job).
+/// Tells the observer that a step the runner adds (a pre or post script, "Initialize containers",
+/// "Stop containers") started, logged under `log_step`.
 pub fn startExtra(
     x: *Exec,
     kind: ExtraKind,
@@ -1000,6 +1001,7 @@ pub const bindServicesToJob = @import("services.zig").bindServicesToJob;
 pub const writeServiceBindings = @import("services.zig").writeServiceBindings;
 pub const stopServices = @import("services.zig").stopServices;
 
+/// The static busybox that starts Docker actions' commands (taken from its image once per job).
 pub fn busyboxFile(x: *Exec, num: u32) !?[]const u8 {
     return x.busyboxFileFor(num, false);
 }
