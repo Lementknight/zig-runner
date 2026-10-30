@@ -61,6 +61,11 @@ jobs:
       - name: shellcheck
         run: .github/scripts/shellcheck.sh
 
+      # The changie the release installs, against its pinned checksum: a new version (Renovate's)
+      # fails here until the checksum is updated, not at the release, after it was approved.
+      - name: changie's checksum
+        run: .github/scripts/install-changie.sh
+
       - name: zizmor
         env:
           # Read-only; zizmor asks GitHub whether the pinned actions' commits are what they say.

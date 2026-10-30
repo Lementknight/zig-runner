@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A new changie with a stale checksum now fails its pull request, not the release (#106). changie''s version and checksum moved from `version.yml` into `.github/scripts/install-changie.sh`, which the release runs and CI''s Workflows job runs on every pull request, so a Renovate update to changie fails until its checksum is updated, as for Zig and tls.zig. Before, it passed, merged on its own, and broke the next release after it was approved.'
+time: 2026-10-30T23:34:11.000000-04:00

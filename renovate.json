@@ -94,13 +94,13 @@
       "datasourceTemplate": "github-tags"
     },
     {
-      "description": "changie, pinned by version in version.yml. A new version also needs CHANGIE_SHA256 from its release's checksums.txt.",
+      "description": "changie, pinned by version in install-changie.sh. A new version also needs its checksum from the release's checksums.txt, updated by hand, which CI enforces by failing until it is (the Workflows job runs install-changie.sh).",
       "customType": "regex",
       "managerFilePatterns": [
-        "/^\\.github/workflows/version\\.yml$/"
+        "/^\\.github/scripts/install-changie\\.sh$/"
       ],
       "matchStrings": [
-        "CHANGIE_VERSION: \"(?<currentValue>[^\"]+)\""
+        "\\nversion=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
       ],
       "depNameTemplate": "miniscruff/changie",
       "datasourceTemplate": "github-releases",

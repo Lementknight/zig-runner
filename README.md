@@ -96,9 +96,9 @@ repository:
   `deploy/compose.yaml`, pinned by tag and held there on purpose: the runner speaks one engine
   version's protocol, and a new engine starts with an empty cache. tls.zig and GitHub's expression
   test cases are pinned by commit. Zig and changie are checked against pinned checksums before they
-  run, tls.zig against its `.hash` as well; a Renovate pull request for a new Zig or tls.zig fails
-  until its checksums are updated. changie's is checked only when the release installs it, so a
-  pull request for a new one passes regardless: update its checksum before it merges.
+  run, tls.zig against its `.hash` as well; a Renovate pull request for a new Zig, tls.zig or
+  changie fails until its checksums are updated (changie's by the Workflows job, which downloads
+  it on every pull request, though only the release runs it).
 - **Verifiable releases.** Every binary and image has a signed provenance attestation saying which
   workflow built it from which commit. Check a binary as razorbill does, built by `release.yml` from
   its tag on GitHub's own runners:
