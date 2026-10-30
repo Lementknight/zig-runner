@@ -51,13 +51,15 @@ decide the version, write the changelog and tag the release alongside this, disa
 ## Pipeline
 
 `ci` checks every pull request: the branch name, the workflows (actionlint, and
-[zizmor](https://docs.zizmor.sh) for security), the format, build and tests, and the database tests
-against TimescaleDB; `proofs` checks the Lean proofs and `release` the packaging (below). Every one
-of these is a required check, and reports on every pull request and in the merge queue: on a change
-that cannot affect what a job checks, it reports without running its steps
-(`.github/scripts/ci-scope.sh tests|proofs|packaging`, each with the list of files that can; the
-build and tests run for any file it does not know, the proofs and the packaging only for the files
-they read). A path filter would instead leave the check unreported, and the merge queue waiting for
+[zizmor](https://docs.zizmor.sh) for security), the format, build and tests, the database tests
+against TimescaleDB, and the release's own builds, for both targets in ReleaseSafe ("Release
+builds"), so code that does not compile for aarch64 fails here rather than after the tag;
+`proofs` checks the Lean proofs and `release` the packaging (below). Every one of these is a
+required check, and reports on every pull request and in the merge queue: on a change that cannot
+affect what a job checks, it reports without running its steps
+(`.github/scripts/ci-scope.sh tests|binaries|proofs|packaging`, each with the list of files that
+can; the build and tests run for any file it does not know, the others only for the files they
+read). A path filter would instead leave the check unreported, and the merge queue waiting for
 it. The GitHub client's tests run over real connections to a local server
 (`src/github/testserver.zig`), so how it handles redirects and tokens is tested, not described. A merge into
 `main` goes through the merge queue, which runs these checks again on top of `main`; `automerge` turns on
