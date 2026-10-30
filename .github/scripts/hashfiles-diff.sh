@@ -8,7 +8,7 @@
 #     (runner/tools/hashfilescorpus.zig).
 #
 # Both read the same directories, so the files must be the same, in the same order, with the same
-# hash. In a job, glob.zig reads the container through Dagger's API instead (DaggerFs, in
+# hash. In a job, glob.zig reads the container through Dagger's API instead (Fs, in
 # dagger/hash_files.zig).
 # Needs Go and Docker. CI runs it weekly (compare.yml), not on pull requests.
 #
