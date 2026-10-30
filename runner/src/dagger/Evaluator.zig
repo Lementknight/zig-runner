@@ -36,7 +36,11 @@ steps: std.ArrayList(StepCtx) = .empty,
 /// Changes a step made through $GITHUB_ENV / $GITHUB_PATH, applied to the container before the
 /// next step.
 pending_env: std.ArrayList(job_mod.EnvVar) = .empty,
+/// Directories added since the container's PATH was last written, oldest first, each once.
 pending_path: std.ArrayList([]const u8) = .empty,
+/// Every directory added through $GITHUB_PATH in the job, oldest first, each once: GitHub's
+/// `Global.PrependPath`. PATH starts with them newest first.
+path_prepend: std.ArrayList([]const u8) = .empty,
 job_failed: bool = false,
 /// Set once GitHub cancelled the job: `cancelled()` is true and `success()` false from then on.
 cancelled: bool = false,
@@ -125,6 +129,33 @@ pub fn putEnv(
         return;
     };
     try list.append(arena, .{ .name = name, .value = value });
+}
+
+/// A directory a step added through $GITHUB_PATH. As GitHub's `AddPathFileCommand`
+/// (`FileCommandManager.cs` ~140-155), an earlier copy is removed and the directory goes last, so
+/// it comes first in PATH.
+pub fn addPath(ev: *Evaluator, dir: []const u8) !void {
+    for ([_]*std.ArrayList([]const u8){ &ev.pending_path, &ev.path_prepend }) |list| {
+        for (list.items, 0..) |d, i| if (std.mem.eql(u8, d, dir)) {
+            _ = list.orderedRemove(i);
+            break;
+        };
+        try list.append(ev.arena, dir);
+    }
+}
+
+/// `dirs` newest first, joined with `:`, as GitHub's `Handler.AddPrependPathToEnvironment`
+/// (`Handler.cs` ~205-232) puts them before PATH.
+pub fn prependPath(arena: Allocator, dirs: []const []const u8) ![]const u8 {
+    std.debug.assert(dirs.len > 0);
+    var out: std.ArrayList(u8) = .empty;
+    var i = dirs.len;
+    while (i > 0) {
+        i -= 1;
+        try out.appendSlice(arena, dirs[i]);
+        if (i > 0) try out.append(arena, ':');
+    }
+    return out.items;
 }
 
 /// The scope for evaluating one step: `step_env` is applied on top of the job's env.

@@ -233,6 +233,7 @@ pub fn runJsScript(
     const before = x.container_id;
     const pending_env = try arena.dupe(job_mod.EnvVar, x.ev.pending_env.items);
     const pending_path = try arena.dupe([]const u8, x.ev.pending_path.items);
+    const path_prepend = try arena.dupe([]const u8, x.ev.path_prepend.items);
     const name = if (act.repository.len > 0) act.repository else act.ref_label;
     const resolved = scriptRun(script, env.plain);
     const out = try x.execScript(num, fc, resolved, name, env.secret, mounts.items);
@@ -251,6 +252,8 @@ pub fn runJsScript(
     try x.ev.pending_env.appendSlice(arena, pending_env);
     x.ev.pending_path.clearRetainingCapacity();
     try x.ev.pending_path.appendSlice(arena, pending_path);
+    x.ev.path_prepend.clearRetainingCapacity();
+    try x.ev.path_prepend.appendSlice(arena, path_prepend);
     const again = scriptRun(try command(arena, fallback_path, act, script_rel), env.plain);
     const fc_again = x.next_fc;
     x.next_fc += 1;
