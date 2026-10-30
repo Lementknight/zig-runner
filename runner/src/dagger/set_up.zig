@@ -178,7 +178,7 @@ pub fn baseContainerId(
     plan: BasePlan,
     secrets: *Secrets,
     err_msg: *[]const u8,
-) ![]const u8 {
+) !Base {
     var q: Query = .init(arena);
     try q.open("container");
     try writeImage(&q, arena, transport, ev, job, plan, secrets, err_msg);
@@ -189,11 +189,15 @@ pub fn baseContainerId(
     try q.leaf("id");
     const data = gql(arena, transport, try q.finish(), err_msg) catch
         return error.BaseContainerFailed;
-    return jsonFindString(data, "id") orelse {
+    const id = jsonFindString(data, "id") orelse {
         err_msg.* = "Dagger returned no container";
         return error.BaseContainerFailed;
     };
+    return .{ .id = id, .runtime_path = jsonFindString(data, "zig_runtime_path") };
 }
+
+/// The base container, and a `container:` job's own PATH (`Exec.container_path`).
+pub const Base = struct { id: []const u8, runtime_path: ?[]const u8 };
 
 /// `from` the job image, behind a private registry's credentials when there are any, with a
 /// container job's cache variables and its own `env:` set on it.
@@ -252,6 +256,10 @@ fn writeImage(
     ) catch
         return error.BaseContainerFailed;
     try writeEnvNodes(q, plain.items, secret.items);
+    // The container's own PATH, which GitHub's runner reads from the container and puts after the
+    // $GITHUB_PATH directories (`ContainerInfo.ContainerRuntimePath`, see `Exec.container_path`).
+    if (job.container != null)
+        try q.leafArgs("zig_runtime_path", "envVariable", .{ .name = "PATH" });
 }
 
 /// A `container:` job's own `env:`, evaluated, without the names the job's env sets: those win
