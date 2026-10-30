@@ -107,9 +107,9 @@ once, to check that `zig build` makes the same binary.
 
 *2026-10-27 to 2026-10-30, zig-runner v0.14.0 to v0.18.0.* A stress harness, kept in a private bench
 repository, drove a third pool of 6 runners on razorbill, beside the production pools on the same
-engine, with a mix of `zig build test` and `uv sync` jobs. The Pi's memory, pressure and the engine's cgroup were sampled every second.
-The harness stops a run, cancels its jobs and stops its pool when the Pi falls under 1.5 GB of
-available memory or adds 1 GB of swap.
+engine, with a mix of `zig build test` and `uv sync` jobs. The Pi's memory, pressure and the
+engine's cgroup were sampled every second. The harness stops a run, cancels its jobs and stops its
+pool when the Pi falls under 1.5 GB of available memory or adds 1 GB of swap.
 
 **Without a limit, four jobs thrash the Pi.** On v0.14.0, four `zig build test` jobs at once pushed
 the engine to its 4 GB cap and into swap on the SD card, and razorbill thrashed for six hours,
@@ -144,6 +144,38 @@ one, so every runner that asks must have room for the heaviest. Light jobs wait 
 (`uv sync` waited a median of 94 s to run for 10). Production asks far less: razorbill ran 40 jobs
 in the 30 days before, all `zig build test`. The runner itself stayed between 24 and 38 MB over the
 hour-long soak, and flat after the first 20 minutes.
+
+## Against GitHub's hosted runner
+
+*2026-10-30, zig-runner at main (between v0.18.0 and the next release).* The same job, this
+repository's CI test steps (checkout, Install Zig, format check, the tests), run alternately on
+GitHub's `ubuntu-latest` (4 vCPUs) and on zig-runner on a laptop (Ryzen 5 PRO 4650U, 6 cores and 12
+threads, 30 GB, on the balanced power profile), five times each per scenario. Times come from
+GitHub's API; the job and its driver are in the private bench repository.
+
+| Scenario (medians) | Hosted job | Hosted tests | zig-runner job | zig-runner tests |
+| --- | --- | --- | --- | --- |
+| Cold: `zig build test`, Zig's cache empty on both | 136 s | 123 s | 137 s | 132 s |
+| A new commit, each as its CI runs it | 40 s | 28 s | 30 s | 26 s |
+| The same commit again | 45 s | 31 s | 2 s | 0 s |
+
+- **Cold, it is a tie.** Both spend most of the job compiling Zig's build runner on one core, where
+  GitHub's server is about 9 s faster; zig-runner makes that up around the steps (Install Zig took
+  1-2 s against 8 s, as Zig stays in its tool cache).
+- **On a new commit, zig-runner is 25% faster.** The hosted job calls the compiler directly, as CI
+  does there (`zig-test.sh`), and the tests take about as long on each; the rest of the job is what
+  zig-runner keeps between jobs.
+- **On the same commit again, it is 20 times faster:** every step replays from the step cache, and
+  the job takes 2 s. GitHub's runner does all of it again.
+- **Waiting for a runner** took 1 s against 2 s.
+
+A step whose script names a run-specific variable (`GITHUB_RUN_ID`, `GITHUB_SHA` and the rest of
+`volatile_env` in `runner/src/dagger.zig`) is never replayed, and the check reads the script's text,
+comments included: the first attempts at the third scenario replayed nothing because a comment named
+the run's ID.
+
+On razorbill the same new-commit job takes about 76 s, against 41 s on GitHub's runner: the Pi, not
+the runner, is the difference (the runner's own work is 0.11 s of CPU a job, see above).
 
 ## Earlier measurements
 

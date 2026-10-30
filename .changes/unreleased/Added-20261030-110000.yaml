@@ -1,0 +1,3 @@
+kind: Added
+body: 'BENCHMARKS.md: zig-runner against GitHub''s hosted runner on the same job: a tie cold, 25% faster on a new commit, and 2 s against 45 s on the same commit again.'
+time: 2026-10-30T11:00:00.000000-04:00
