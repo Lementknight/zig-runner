@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A step whose `env:` fails to evaluate now fails the job even with `continue-on-error: true`, as on GitHub, which never runs the step and so never applies `continue-on-error` to it (#103).'
+time: 2026-10-30T18:04:12.000000-04:00

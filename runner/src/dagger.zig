@@ -1254,11 +1254,9 @@ fn runStep(
     const sc0 = try ev.scope(&.{});
     const step_env = ev.renderEnv(step.env, sc0) catch {
         const msg = try std.fmt.allocPrint(arena, "could not evaluate env: {s}", .{ev.diag});
-        // Still the step's failure, so its continue-on-error holds, read without its env: the
-        // job went on to fail, and skipped the steps after one that hit the expression memory
-        // limit on purpose.
-        const coe = std.mem.eql(u8, ev.render(step.continue_on_error, sc0) catch "false", "true");
-        try failStep(ev, x.sh, x.observer, step, res, num, msg, coe);
+        // Not continued: GitHub completes the step as failed here (`StepsRunner.cs` ~131-138)
+        // and never reaches `ApplyContinueOnError`, which only `RunStepAsync` calls (~353).
+        try failStep(ev, x.sh, x.observer, step, res, num, msg, false);
         return null;
     };
     const sc1 = try ev.scope(step_env);
@@ -3716,7 +3714,7 @@ test "a step that ran and printed nothing does not ask for its output" {
     for (fake.seen.items) |d| try std.testing.expect(std.mem.indexOf(u8, d, "stdout") == null);
 }
 
-test "a step whose env fails to evaluate keeps its continue-on-error" {
+test "a step whose env fails to evaluate fails the job, continue-on-error or not" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -3741,11 +3739,13 @@ test "a step whose env fails to evaluate keeps its continue-on-error" {
     }, testJob(&steps), &log);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "could not evaluate env: the " ++
         "expression needs more than the 1048576 bytes") != null);
-    // The step failed and the job went on: the next step ran, and the job succeeded.
-    try std.testing.expect(res.succeeded);
-    try std.testing.expectEqual(@as(usize, 2), fake.seen.items.len);
+    // As on GitHub, continue-on-error is not applied to a step that never ran: it failed, the
+    // job failed, and the next step (success()) was skipped.
+    try std.testing.expect(!res.succeeded);
+    try std.testing.expectEqual(@as(usize, 1), fake.seen.items.len);
     try std.testing.expectEqual(Outcome.failure, res.steps[0].outcome);
-    try std.testing.expect(res.steps[0].continued);
+    try std.testing.expect(!res.steps[0].continued);
+    try std.testing.expectEqual(Outcome.skipped, res.steps[1].outcome);
 }
 
 test "a step's if: and name see its own env, and an env error fails it whatever its if: says" {
