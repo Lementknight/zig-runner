@@ -16,15 +16,7 @@ const redact = @import("../redact.zig");
 const timefmt = @import("../timefmt.zig");
 const Live = @import("../live.zig").Live;
 const admission = @import("../admission.zig");
-const CompleteStep = @import("upload.zig").CompleteStep;
-const Shown = @import("upload.zig").Shown;
-const shownSteps = @import("upload.zig").shownSteps;
-const liveConclusion = @import("upload.zig").liveConclusion;
-const uploadLogs = @import("upload.zig").uploadLogs;
-const keptBuffer = @import("upload.zig").keptBuffer;
-const StepLogs = @import("upload.zig").StepLogs;
-const annotationsJson = @import("upload.zig").annotationsJson;
-const stepResultsJson = @import("upload.zig").stepResultsJson;
+const upload = @import("upload.zig");
 const Runner = @import("../loop.zig").Runner;
 const Cycle = @import("../loop.zig").Cycle;
 const Registering = @import("../loop.zig").Registering;
@@ -306,7 +298,7 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
         live.finish(&.{});
     };
     // Each step's log goes up as the step finishes; lines and step events go on to the live view.
-    var step_logs = try StepLogs.init(c.gpa, c.io, &job, live.ids, live.listener(), live.observer());
+    var step_logs = try upload.StepLogs.init(c.gpa, c.io, &job, live.ids, live.listener(), live.observer());
     collect.collect.listener = step_logs.listener();
     defer {
         collect.collect.listener = null;
@@ -329,7 +321,7 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
         try finishReporter(c, r, job, result, job_started_ms);
     }
     try reportCacheAndKeys(c, job, log, result);
-    const shown = try shownSteps(c.arena, live.ids, job, result, job_started_ms, completion);
+    const shown = try upload.shownSteps(c.arena, live.ids, job, result, job_started_ms, completion);
     const kept = log.collect.kept();
     {
         // The live view ends with the steps as completejob reports them, while the logs go up:
@@ -344,7 +336,7 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
             null;
         defer if (finishing) |*f| f.await(c.io);
         if (finishing == null) live.finish(finals);
-        try uploadLogs(c, job, shown, &kept, result.summaries, log.currentSecrets(), &step_logs, .{});
+        try upload.logs(c, job, shown, &kept, result.summaries, log.currentSecrets(), &step_logs, .{});
     }
 
     const conclusion = jobConclusion(result);
@@ -506,7 +498,7 @@ fn runJobSteps(
     cancel: *dagger.Cancel,
     live: *Live,
     /// Told of the steps first; passes them on to `live`.
-    step_logs: *StepLogs,
+    step_logs: *upload.StepLogs,
     reporter: ?*Reporter,
 ) !dagger.Result {
     const cfg = c.cfg;
@@ -574,7 +566,7 @@ test "a job failed before its steps fails in Set up job" {
 }
 
 /// "Complete job", as GitHub's runner ends a job (the job's containers went with its session).
-/// Returns where that step sits, for `shownSteps`.
+/// Returns where that step sits, for `upload.shownSteps`.
 fn logCompleteJob(
     c: Runner,
     job: job_mod.Job,
@@ -582,7 +574,7 @@ fn logCompleteJob(
     live: *Live,
     result: dagger.Result,
     job_started_ms: i64,
-) !CompleteStep {
+) !upload.CompleteStep {
     const complete_started = std.Io.Clock.real.now(c.io).toMilliseconds();
     const after_last: u32 = @intCast(job.steps.len + 1);
     const complete_step: u32 = if (result.next_log_step > 0) result.next_log_step else after_last;
@@ -617,7 +609,7 @@ fn reportCacheAndKeys(
         var replayed: usize = 0;
         // Read a line at a time, not held: the log can be the 64 MiB it keeps.
         const kept = log.collect.kept();
-        var it = kept.iterate(c.io, try keptBuffer(c));
+        var it = kept.iterate(c.io, try upload.keptBuffer(c));
         while (it.next() catch null) |l| {
             if (l.step >= 1 and l.step <= job.steps.len and
                 (it.textIs(dagger.reused_note) catch false)) replayed += 1;
@@ -659,13 +651,13 @@ fn reportCacheAndKeys(
 }
 
 /// The steps as completejob reports them, for the live view's last update.
-fn liveFinals(arena: std.mem.Allocator, shown: []const Shown) ![]const Live.Final {
+fn liveFinals(arena: std.mem.Allocator, shown: []const upload.Shown) ![]const Live.Final {
     const finals = try arena.alloc(Live.Final, shown.len);
     for (shown, finals) |sh, *f| f.* = .{
         .id = sh.id,
         .number = sh.number,
         .name = sh.name,
-        .conclusion = liveConclusion(sh.conclusion),
+        .conclusion = upload.liveConclusion(sh.conclusion),
         .started_ms = sh.started_ms,
         .completed_ms = sh.completed_ms,
     };
@@ -680,13 +672,13 @@ fn completeJobWithRetry(
     jr: runservice.JobRequest,
     job: job_mod.Job,
     conclusion: runservice.Conclusion,
-    shown: []const Shown,
+    shown: []const upload.Shown,
     result: dagger.Result,
     /// The job's secrets and masks, which annotations are redacted with.
     secrets: []const []const u8,
 ) !?Cycle {
-    const step_json = try stepResultsJson(c.arena, shown);
-    const annotations_json = try annotationsJson(c.arena, shown, result.annotations, secrets);
+    const step_json = try upload.stepResultsJson(c.arena, shown);
+    const annotations_json = try upload.annotationsJson(c.arena, shown, result.annotations, secrets);
     var done = completeJob(
         c,
         jr,

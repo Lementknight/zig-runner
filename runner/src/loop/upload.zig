@@ -157,7 +157,7 @@ fn extraShown(ids: []const []const u8, e: dagger.ExtraStep) Shown {
 /// own uploads too: when this returns, every log is up or has failed. Failures are reported but
 /// never stop the job from completing, and however many uploads hang, this returns within
 /// `Uploader.limit` (a request's deadline bounds each one already; this bounds them all).
-pub fn uploadLogs(
+pub fn logs(
     c: Runner,
     job: job_mod.Job,
     shown: []const Shown,
@@ -279,7 +279,7 @@ pub fn uploadLogs(
     }
 }
 
-/// One upload of `uploadLogs`, made in a task of its own. The blob and the markdown are only read;
+/// One upload of `logs`, made in a task of its own. The blob and the markdown are only read;
 /// what the requests allocate, the result's detail included, lives in `arena` until it is reported.
 const Upload = struct {
     what: union(enum) { log: results.Which, summary: []const u8 },
@@ -375,7 +375,7 @@ pub fn keptBuffer(c: Runner) ![]u8 {
 /// `max_bytes` gives up its early upload and is uploaded at the end from the spool, so the job's
 /// memory never holds more than that per step on top of what it did before.
 ///
-/// At the end, `uploadLogs` skips a step only when what was uploaded is exactly what the job logged
+/// At the end, `logs` skips a step only when what was uploaded is exactly what the job logged
 /// for it (the same id, line count and bytes) and the upload succeeded; a line that arrived after
 /// the step's end, or a failed upload, means it is uploaded at the end as before.
 pub const StepLogs = struct {
@@ -466,7 +466,7 @@ pub const StepLogs = struct {
     }
 
     /// Waits for every upload started, cancelling those still running once `limit` passes (their
-    /// result is then a failure, so `uploadLogs` uploads them again). False when any was. No step
+    /// result is then a failure, so `logs` uploads them again). False when any was. No step
     /// may finish after this.
     fn waitAtMost(s: *StepLogs, limit: std.Io.Duration) bool {
         if (!s.stopSending()) return true;
@@ -825,7 +825,7 @@ test "each step's log goes up as the step finishes, and the job's end uploads on
     const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 9, .secrets = &.{}, .steps = &.{} };
     const ids = [_][]const u8{ "setup", "a", "b", "c", "post", "complete" };
     var fake: FakeLive = .{};
-    var logs = try StepLogs.init(
+    var step_logs = try StepLogs.init(
         std.testing.allocator,
         io,
         &job,
@@ -833,10 +833,10 @@ test "each step's log goes up as the step finishes, and the job's end uploads on
         .{ .ptr = &fake, .onLine = FakeLive.onLine },
         .{ .ptr = &fake, .startedFn = FakeLive.started, .finishedFn = FakeLive.finishedFn, .extraFinishedFn = FakeLive.extraFinished },
     );
-    defer logs.deinit();
-    logs.up = FakeResults.uploader;
-    const l = logs.listener();
-    const o = logs.observer();
+    defer step_logs.deinit();
+    step_logs.up = FakeResults.uploader;
+    const l = step_logs.listener();
+    const o = step_logs.observer();
 
     // What the job logs, as the sink tells its listener and keeps it (`collected`).
     var kept: std.ArrayList(sink.CollectedLine) = .empty;
@@ -868,7 +868,7 @@ test "each step's log goes up as the step finishes, and the job's end uploads on
     try std.testing.expectEqual(@as(u32, 8), fake.lines.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 4), fake.finished.load(.monotonic));
     // Started as each step finished, before the job's end: a, b and the post step.
-    try std.testing.expectEqual(@as(usize, 3), logs.sent.items.len);
+    try std.testing.expectEqual(@as(usize, 3), step_logs.sent.items.len);
 
     const shown = [_]Shown{
         .{ .id = "setup", .number = 0, .name = "Set up job", .log_step = 0, .conclusion = "succeeded" },
@@ -879,9 +879,9 @@ test "each step's log goes up as the step finishes, and the job's end uploads on
         .{ .id = "complete", .number = 5, .name = "Complete job", .log_step = 5, .conclusion = "succeeded" },
     };
     const up = FakeResults.uploader;
-    try uploadLogs(c, job, &shown, &.{ .memory = kept.items }, &.{}, &.{}, &logs, up);
+    try logs(c, job, &shown, &.{ .memory = kept.items }, &.{}, &.{}, &step_logs, up);
 
-    // Every upload is done once uploadLogs returns, so before completejob.
+    // Every upload is done once logs returns, so before completejob.
     var got: [4]usize = undefined;
     // a: once, as it finished, with both lines; as the blob formats them.
     try std.testing.expectEqualSlices(usize, &.{2}, FakeResults.lines("a", &got));
@@ -917,7 +917,7 @@ test "a step that finishes after the job's uploads began is uploaded at the end,
     const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 9, .secrets = &.{}, .steps = &.{} };
     const ids = [_][]const u8{ "setup", "a" };
     var fake: FakeLive = .{};
-    var logs = try StepLogs.init(
+    var step_logs = try StepLogs.init(
         std.testing.allocator,
         io,
         &job,
@@ -925,18 +925,18 @@ test "a step that finishes after the job's uploads began is uploaded at the end,
         .{ .ptr = &fake, .onLine = FakeLive.onLine },
         .{ .ptr = &fake, .startedFn = FakeLive.started, .finishedFn = FakeLive.finishedFn },
     );
-    defer logs.deinit();
-    logs.up = FakeResults.uploader;
-    const l = logs.listener();
+    defer step_logs.deinit();
+    step_logs.up = FakeResults.uploader;
+    const l = step_logs.listener();
     l.onLine(l.ptr, 1, 1, "x");
-    logs.wait();
-    const o = logs.observer();
+    step_logs.wait();
+    const o = step_logs.observer();
     o.finishedFn(o.ptr, 1, .{});
-    try std.testing.expectEqual(@as(usize, 0), logs.sent.items.len);
+    try std.testing.expectEqual(@as(usize, 0), step_logs.sent.items.len);
     // Line forwarded, and the extra-step events this live view does not take are not offered.
     try std.testing.expectEqual(@as(u32, 1), fake.lines.load(.monotonic));
     try std.testing.expect(o.extraStartedFn == null and o.postsFn == null);
-    try std.testing.expect(logs.done(1, "a", 1, 1) == null);
+    try std.testing.expect(step_logs.done(1, "a", 1, 1) == null);
 }
 
 /// The results service over a dead connection: the first upload of step "a" and every upload of
@@ -988,7 +988,7 @@ test "hung uploads hold up the job's end no longer than its limit, and a hung st
     const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 9, .secrets = &.{}, .steps = &.{} };
     const ids = [_][]const u8{ "setup", "a" };
     var fake: FakeLive = .{};
-    var logs = try StepLogs.init(
+    var step_logs = try StepLogs.init(
         std.testing.allocator,
         io,
         &job,
@@ -996,31 +996,31 @@ test "hung uploads hold up the job's end no longer than its limit, and a hung st
         .{ .ptr = &fake, .onLine = FakeLive.onLine },
         .{ .ptr = &fake, .startedFn = FakeLive.started, .finishedFn = FakeLive.finishedFn },
     );
-    defer logs.deinit();
+    defer step_logs.deinit();
     const up: Uploader = .{
         .log = HungResults.upload,
         .summary = HungResults.summary,
         .early_wait = .fromMilliseconds(200),
         .limit = .fromMilliseconds(600),
     };
-    logs.up = up;
+    step_logs.up = up;
     const kept = [_]sink.CollectedLine{
         .{ .step = 0, .seq = 1, .ts_ms = 0, .text = "job acquired" },
         .{ .step = 1, .seq = 2, .ts_ms = 0, .text = "one" },
     };
-    const l = logs.listener();
+    const l = step_logs.listener();
     for (kept) |k| l.onLine(l.ptr, k.step, k.seq, k.text);
     // Step a's upload starts as it finishes, and hangs.
-    const o = logs.observer();
+    const o = step_logs.observer();
     o.finishedFn(o.ptr, 1, .{ .outcome = .success });
-    try std.testing.expectEqual(@as(usize, 1), logs.sent.items.len);
+    try std.testing.expectEqual(@as(usize, 1), step_logs.sent.items.len);
 
     const shown = [_]Shown{
         .{ .id = "setup", .number = 0, .name = "Set up job", .log_step = 0, .conclusion = "succeeded" },
         .{ .id = "a", .number = 1, .name = "a", .log_step = 1, .conclusion = "succeeded" },
     };
     const started = std.Io.Clock.awake.now(io);
-    try uploadLogs(c, job, &shown, &.{ .memory = &kept }, &.{}, &.{}, &logs, up);
+    try logs(c, job, &shown, &.{ .memory = &kept }, &.{}, &.{}, &step_logs, up);
     const took = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
     // Back by the limit (and not the 600 s the hung uploads would take), so completejob, next,
     // goes ahead.
@@ -1061,11 +1061,11 @@ test "the steps GitHub shows: Set up job, pre, the job's steps, post, Complete j
     const ids = [_][]const u8{ "setup", "a", "b", "c", "d", "pre-a", "post-a", "complete" };
     const shown = try shownSteps(arena, &ids, job, result, 500, .{ .log_step = 7, .started_ms = 3200, .completed_ms = 3300 });
     const names = [_][]const u8{ "Set up job", "Pre a", "a", "b", "c", "d", "Post a", "Complete job" };
-    const logs = [_]u32{ 0, 5, 1, 2, 3, 4, 6, 7 };
+    const log_steps = [_]u32{ 0, 5, 1, 2, 3, 4, 6, 7 };
     // After the main steps GitHub sets aside 4 job steps + 1 pre + 1 numbers; the post takes the last.
     const numbers = [_]u32{ 1, 2, 3, 4, 5, 6, 12, 13 };
     try std.testing.expectEqual(names.len, shown.len);
-    for (shown, names, logs, numbers) |sh, name, ls, n| {
+    for (shown, names, log_steps, numbers) |sh, name, ls, n| {
         try std.testing.expectEqualStrings(name, sh.name);
         try std.testing.expectEqual(ls, sh.log_step);
         try std.testing.expectEqual(n, sh.number);
