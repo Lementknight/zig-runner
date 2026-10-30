@@ -1,3 +1,0 @@
-kind: Changed
-body: 'The `Evaluator`, which holds what expressions can see while a job runs, moved with its tests from dagger.zig to its own file, dagger/Evaluator.zig, the fourth step in splitting dagger.zig into smaller files (#148).'
-time: 2026-10-29T23:55:00.000000-04:00

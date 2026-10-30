@@ -1,3 +1,0 @@
-kind: Changed
-body: 'The code that writes each step''s shell script (file commands, env and shell commands, markers) and its tests moved from dagger.zig to dagger/scripts.zig, the second step in splitting dagger.zig into smaller files (#148).'
-time: 2026-10-29T22:45:00.000000-04:00

@@ -1,3 +1,0 @@
-kind: Changed
-body: 'The loop''s per-runner state (its config, name, gate and output) is now named for what it is, one runner of the pool: `loop.Context` became `loop.Runner` and `testContext` became `testRunner` (#148).'
-time: 2026-10-30T10:00:00.000000-04:00

@@ -1,3 +1,0 @@
-kind: Changed
-body: 'loop/upload.zig''s `uploadLogs` is now `upload.logs`, and loop/job.zig imports the `upload` namespace instead of nine names from it (#148).'
-time: 2026-10-30T16:00:00.000000-04:00

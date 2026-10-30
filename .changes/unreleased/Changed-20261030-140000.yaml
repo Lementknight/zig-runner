@@ -1,3 +1,0 @@
-kind: Changed
-body: 'dagger/js.zig''s private names no longer repeat "js" where the file already says it: `jsCommand`, `jsRuntimeQuery`, `JsRuntimeSource` and the `js_*` paths and runtime tables lost the prefix (#148).'
-time: 2026-10-30T14:00:00.000000-04:00

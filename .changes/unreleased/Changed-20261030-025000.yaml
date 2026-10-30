@@ -1,3 +1,0 @@
-kind: Changed
-body: 'Services and the job container ("Initialize containers" pulling the job''s container and starting each service with its ports forwarded to localhost, and "Stop containers") moved with their tests from dagger.zig to dagger/services.zig, the ninth step in splitting dagger.zig into smaller files (#148).'
-time: 2026-10-30T02:50:00.000000-04:00

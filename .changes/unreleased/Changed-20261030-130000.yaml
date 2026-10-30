@@ -1,3 +1,0 @@
-kind: Changed
-body: 'dagger/services.zig''s names no longer repeat "service" where the file already says it: `ServicePort`, `parseServicePort`, `ServiceSpec` and `ignoredServiceOptions` became `Port`, `parsePort`, `Spec` and `ignoredOptions` (#148).'
-time: 2026-10-30T13:00:00.000000-04:00

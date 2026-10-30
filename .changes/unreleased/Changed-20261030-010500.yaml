@@ -1,3 +1,0 @@
-kind: Changed
-body: '`hashFiles()` in a job (the search of the job''s container through Dagger and the hashing) moved with its tests from dagger.zig to dagger/hash_files.zig, the sixth step in splitting dagger.zig into smaller files (#148).'
-time: 2026-10-30T01:05:00.000000-04:00

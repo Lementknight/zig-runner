@@ -1,3 +1,0 @@
-kind: Security
-body: 'A secret in a `container:` job''s `env:` now reaches steps as a Dagger secret instead of in plain text in the engine''s cache metadata, and every step of such a job runs each time instead of being replayed from an earlier run.'
-time: 2026-10-30T11:37:00.000000-04:00

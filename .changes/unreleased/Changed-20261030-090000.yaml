@@ -1,3 +1,0 @@
-kind: Changed
-body: 'The job''s log state, shared by the main and reader tasks, is now named for what it holds: the type `Shared` and dagger/Shared.zig became `JobLog` and dagger/JobLog.zig, and `sharedFor` became `jobLogFor` (#148).'
-time: 2026-10-30T09:00:00.000000-04:00

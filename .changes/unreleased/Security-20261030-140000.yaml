@@ -1,3 +1,0 @@
-kind: Security
-body: 'A secret in a service container''s `env:` (a database password) now reaches the service as a Dagger secret instead of in plain text in the engine''s metadata.'
-time: 2026-10-30T14:00:00.000000-04:00
