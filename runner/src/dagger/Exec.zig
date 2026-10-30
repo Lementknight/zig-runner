@@ -85,6 +85,10 @@ pre_state: [][]const job_mod.EnvVar,
 nested_path: []const u8 = "",
 /// The state the `pre` of an action inside a composite action saved, by `nestedKey`.
 nested_pre_state: std.StringHashMapUnmanaged([]const job_mod.EnvVar) = .empty,
+/// A `container:` job's PATH as its image and `env:` set it. With $GITHUB_PATH directories,
+/// GitHub's runner starts every step there with `PATH=<directories>:<this>`, whatever PATH the
+/// job's, the step's or $GITHUB_ENV's env says (`ContainerStepHost`, `StepHost.cs` ~250-255).
+container_path: ?[]const u8 = null,
 /// What each log step wrote to $GITHUB_STEP_SUMMARY (index = log step - 1), uploaded with the
 /// logs so GitHub shows it on the run's summary page.
 summaries: [][]const u8,
@@ -387,7 +391,7 @@ fn resolveRunStep(
         for (env) |*e| if (std.mem.eql(u8, e.name, "PATH")) {
             e.value = try std.fmt.allocPrint(arena, "{s}:{s}", .{
                 try Evaluator.prependPath(arena, x.ev.path_prepend.items),
-                e.value,
+                x.container_path orelse e.value,
             });
         };
         resolved.run.env = env;
@@ -480,7 +484,7 @@ fn writePendingEnv(x: *Exec, q: *Query) !void {
             const path = std.mem.eql(u8, e.name, "PATH") and ev.path_prepend.items.len > 0;
             const value = if (path) try std.fmt.allocPrint(arena, "{s}:{s}", .{
                 try Evaluator.prependPath(arena, ev.path_prepend.items),
-                e.value,
+                x.container_path orelse e.value,
             }) else e.value;
             path_set = path_set or path;
             try q.call("withEnvVariable", .{ .name = e.name, .value = value });
@@ -488,12 +492,19 @@ fn writePendingEnv(x: *Exec, q: *Query) !void {
     }
     // Only the directories added since: the container's PATH has the earlier ones. One added
     // again then appears twice, its first place being the one GitHub gives it.
-    if (ev.pending_path.items.len > 0 and !path_set) {
+    if (ev.pending_path.items.len > 0 and !path_set) if (x.container_path) |own| {
+        // A job container: every directory, then the container's own PATH, over any other.
+        const value = try std.fmt.allocPrint(arena, "{s}:{s}", .{
+            try Evaluator.prependPath(arena, ev.path_prepend.items),
+            own,
+        });
+        try q.call("withEnvVariable", .{ .name = "PATH", .value = value });
+    } else {
         const value = try std.fmt.allocPrint(arena, "{s}:$PATH", .{
             try Evaluator.prependPath(arena, ev.pending_path.items),
         });
         try q.call("withEnvVariable", .{ .name = "PATH", .value = value, .expand = true });
-    }
+    };
     ev.pending_env.clearRetainingCapacity();
     ev.pending_path.clearRetainingCapacity();
 }

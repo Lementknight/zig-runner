@@ -1609,7 +1609,8 @@ fn runSteps(
             error.BaseContainerFailed => return fail(sh, results, err_msg),
             else => return e,
         };
-    var x = try execFor(arena, io, transport, sh, &ev, &job, opts, plan, base, secrets, step_cache);
+    var x = try execFor(arena, io, transport, sh, &ev, &job, opts, plan, base.id, secrets, step_cache);
+    x.container_path = base.runtime_path;
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
 
     var watch: Watch = .{ .io = io, .transport = transport, .cancel = opts.cancel };
@@ -2681,6 +2682,44 @@ test "GITHUB_PATH: newest directory first, each once, also before a step env or 
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[3], "withEnvVariable(name:\"PATH\",value:\"/b:/c:/a:/env\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[3], "$PATH") == null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[3], "PATH=/b:/c:/a:/x") != null);
+}
+
+test "GITHUB_PATH in a container job: the directories, then the container's own PATH, over any PATH" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var custom = testStep("custom");
+    custom.env = &.{.{ .name = "PATH", .value = .{ .lit = "/custom" } }};
+    const steps = [_]job_mod.Step{ testStep("first"), custom, testStep("last") };
+    var job = testJob(&steps);
+    job.container = .{ .name = "", .image = .{ .lit = "node:20" } };
+    const own = "/usr/local/bin:/usr/bin";
+    const answers = [_][]const u8{
+        "{\"data\":{\"container\":{\"from\":{\"zig_runtime_path\":\"" ++ own ++ "\"," ++
+            "\"withWorkdir\":{\"id\":\"C0\"}}}}}",
+        // starting the job container: its image's digest, and whether it is musl
+        "{\"data\":{\"container\":{\"from\":{\"imageRef\":\"node:20\"}}}}",
+        "{\"data\":{\"container\":{\"from\":{\"directory\":{\"entries\":[]}}}}}",
+        try execFc(arena, "C1", "", "", "", "/a\\n/b\\n"),
+        try execFc(arena, "C2", "", "", "PATH=/from-github-env\\n", ""),
+        try exec(arena, "C3", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    try std.testing.expect(res.succeeded);
+    const seen = fake.seen.items;
+    try std.testing.expect(std.mem.indexOf(u8, seen[0], "zig_runtime_path: envVariable(name:\"PATH\")") != null);
+    // GitHub's `docker exec -e PATH="<directories>:<container PATH>"` comes after the step's env.
+    try std.testing.expect(std.mem.indexOf(u8, seen[4], "withEnvVariable(name:\"PATH\",value:\"/b:/a:" ++ own ++ "\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[4], "PATH=/b:/a:" ++ own) != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[4], "/custom") == null);
+    // ...and after a PATH written to GITHUB_ENV.
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], "withEnvVariable(name:\"PATH\",value:\"/b:/a:" ++ own ++ "\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], "/from-github-env") == null);
 }
 
 test "an output set twice keeps its last value, case-insensitively; GITHUB_OUTPUT beats set-output" {

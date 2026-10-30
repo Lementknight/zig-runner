@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'In a `container:` job, once a step has added directories through `$GITHUB_PATH`, every later step gets those directories followed by the container''s own `PATH`, as on GitHub, which then ignores a `PATH` set in the workflow''s, the job''s, the step''s or `$GITHUB_ENV`''s env (#103).'
+time: 2026-10-30T19:53:18.000000-04:00
