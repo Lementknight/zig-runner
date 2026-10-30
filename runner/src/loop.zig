@@ -12,6 +12,7 @@ const sink = @import("sink.zig");
 const redact = @import("redact.zig");
 const admission = @import("admission.zig");
 const handleJob = @import("loop/job.zig").handleJob;
+const trust = @import("trust.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -115,6 +116,14 @@ pub const Cycle = union(enum) {
 /// They share the configuration, the log sinks and the database connection (all safe to share).
 /// Returns once every runner has stopped: the most severe exit code among them.
 pub fn pool(c: Runner, n: u32) !Exit {
+    // What this runner trusts, once: a runner that trusts no ref fails every job, and one that
+    // trusts every ref runs pull requests, so neither may go unnoticed (#105).
+    const refs = c.cfg.trusted_refs;
+    try c.log.say(try trust.mode(c.arena, refs, c.cfg.trusted_events));
+    if (trust.everything(refs) and trust.prodLabel(c.cfg.labels)) try c.log.say(
+        "WARNING: this runner carries the prod label and trusts every ref " ++
+            "(RUNNER_TRUSTED_REFS=*): a pull request that names prod in runs-on runs here",
+    );
     const slots = try c.arena.alloc(Slot, n);
     // One per process, so what one runner learns about a repository the others use too.
     const slow = try c.arena.create(SlowOutputs);
@@ -1195,4 +1204,39 @@ test "a repository whose output keys run over the limit is remembered once" {
     try std.testing.expectEqual(@as(?i64, 25_600), so.spent("o/r"));
     // Another repository is unaffected: the cost follows the checkout's size, not the runner's.
     try std.testing.expect(so.spent("o/small") == null);
+}
+
+test "the pool logs what it trusts once at startup, and warns when prod trusts every ref" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    var cfg: Config = .{
+        .gh_token = "",
+        .scope = undefined,
+        .admission = false,
+        .trusted_refs = "refs/heads/main,refs/tags/v*",
+    };
+    const c = testRunner(a.allocator(), &log, &w, &cfg);
+    try std.testing.expectEqual(Exit.done, try pool(c, 0));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(
+        u8,
+        w.buffered(),
+        "trusting refs refs/heads/main,refs/tags/v* and events push,workflow_dispatch",
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "WARNING") == null);
+
+    w.end = 0;
+    cfg.trusted_refs = "";
+    _ = try pool(c, 0);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "trusting no ref") != null);
+
+    w.end = 0;
+    cfg.trusted_refs = "*";
+    cfg.labels = "self-hosted,linux,zig,prod";
+    _ = try pool(c, 0);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "trusting every ref") != null);
+    const warning = "WARNING: this runner carries the prod label and trusts every ref";
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), warning) != null);
 }

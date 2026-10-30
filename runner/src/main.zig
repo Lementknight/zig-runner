@@ -65,7 +65,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (try printVersionIfAsked(io, args)) return @backingInt(Exit.done);
 
     var cfg = Config.load(init.environ_map, args) catch |e| {
-        try err.print("config error: {s}\n", .{@errorName(e)});
+        try err.print("config error: {s}\n", .{Config.explain(e) orelse @errorName(e)});
         return @backingInt(Exit.config);
     };
     // Where logs and run state go: DATABASE_URL / PG* when set, else stdout only.
