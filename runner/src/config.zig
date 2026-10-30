@@ -3,6 +3,7 @@ const std = @import("std");
 const pg = @import("pg.zig");
 const engine = @import("engine.zig");
 const admission = @import("admission.zig");
+const trust = @import("trust.zig");
 
 pub const Scope = union(enum) {
     repo: struct { owner: []const u8, name: []const u8 },
@@ -101,10 +102,10 @@ pub const Config = struct {
     /// With output keys: days a stored output may go unused before it is removed.
     output_keys_days: u32 = 7,
     /// Refs a job must come from to run here, comma-separated, a trailing `*` matching any rest
-    /// (`refs/heads/main,refs/tags/v*`): the run's ref and its workflow file's. Empty runs every
-    /// job. Set on a runner whose machine untrusted workflows must not reach (see `trust.zig`).
+    /// (`refs/heads/main,refs/tags/v*`): the run's ref and its workflow file's. Empty runs no job;
+    /// `*` trusts every ref, only on a machine untrusted workflows may reach (see `trust.zig`).
     trusted_refs: []const u8 = "",
-    /// With `trusted_refs`: the events a job may come from.
+    /// The events a job may come from, as `trusted_refs`: `*` trusts every event, empty none.
     trusted_events: []const u8 = "push,workflow_dispatch",
     dry_run: bool = false,
     /// Stop after one job (or one failed attempt), as an ephemeral runner process. Off by default:
@@ -144,7 +145,19 @@ pub const Config = struct {
         InvalidBool,
         UnknownFlag,
         MissingFlagValue,
+        ProdTrustsNoRef,
     };
+
+    /// What to tell the operator for an error whose name does not say how to fix it.
+    pub fn explain(e: Error) ?[]const u8 {
+        return switch (e) {
+            error.ProdTrustsNoRef => "RUNNER_LABELS includes prod, but RUNNER_TRUSTED_REFS is " ++
+                "not set, so this runner would fail every job. Set it to the refs prod may run " ++
+                "(RUNNER_TRUSTED_REFS=refs/heads/main,refs/tags/v*), or to * to trust every ref " ++
+                "(README, \"Environments\").",
+            else => null,
+        };
+    }
 
     /// Values are borrowed from `environ` / `args`, which must outlive the Config.
     pub fn load(environ: *const std.process.Environ.Map, args: []const [:0]const u8) Error!Config {
@@ -179,6 +192,9 @@ pub const Config = struct {
             c.scope = .{ .org = "offline" };
             return c;
         }
+        // A runner that says it is prod and trusts nothing is a configuration slip (a lost
+        // `EnvironmentFile` line, a typo), not a choice: say so now, not in every job's log (#105).
+        if (trust.prodLabel(c.labels) and trust.none(c.trusted_refs)) return error.ProdTrustsNoRef;
         c.gh_token = creds.token orelse return error.MissingGhToken;
         c.scope = try Scope.parse(creds.scope orelse return error.MissingGhScope);
         return c;
@@ -555,6 +571,41 @@ test "RUNNER_TRUSTED_REFS and RUNNER_TRUSTED_EVENTS" {
     try std.testing.expectEqualStrings("push", set.trusted_events);
     const flag = try Config.load(&env, &.{ "runner", "--trusted-refs", "refs/heads/main" });
     try std.testing.expectEqualStrings("refs/heads/main", flag.trusted_refs);
+    // Empty is kept as empty, which trusts no ref (`trust.refusal`); `*` is every ref.
+    try env.put("RUNNER_TRUSTED_REFS", "");
+    try env.put("RUNNER_TRUSTED_EVENTS", "");
+    const empty = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqualStrings("", empty.trusted_refs);
+    try std.testing.expectEqualStrings("", empty.trusted_events);
+    try env.put("RUNNER_TRUSTED_REFS", "*");
+    try env.put("RUNNER_TRUSTED_EVENTS", "*");
+    const all = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqualStrings("*", all.trusted_refs);
+    try std.testing.expectEqualStrings("*", all.trusted_events);
+}
+
+test "a prod runner with no trusted refs refuses to start; with * or a list it starts" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try env.put("RUNNER_LABELS", "self-hosted,linux,zig,prod");
+    const refused = error.ProdTrustsNoRef;
+    try std.testing.expectError(refused, Config.load(&env, &.{"runner"}));
+    try std.testing.expect(Config.explain(refused) != null);
+    try env.put("RUNNER_TRUSTED_REFS", " , ");
+    try std.testing.expectError(refused, Config.load(&env, &.{"runner"}));
+    // A flag can leave it empty too.
+    const flag = [_][:0]const u8{ "runner", "--trusted-refs=" };
+    try env.put("RUNNER_TRUSTED_REFS", "refs/heads/main");
+    try std.testing.expectError(refused, Config.load(&env, &flag));
+    _ = try Config.load(&env, &.{"runner"});
+    try env.put("RUNNER_TRUSTED_REFS", "*");
+    _ = try Config.load(&env, &.{"runner"});
+    // Not prod: no refs is allowed (every job fails, and the log says why).
+    try env.put("RUNNER_TRUSTED_REFS", "");
+    try env.put("RUNNER_LABELS", "self-hosted,linux,zig,pre-prod");
+    _ = try Config.load(&env, &.{"runner"});
 }
 
 test "the memory gate is on by default, with limits from the environment or flags" {

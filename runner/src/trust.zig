@@ -3,21 +3,26 @@
 //! A pull request can name any runner's labels in `runs-on`, and a personal account's repository
 //! has no runner groups to stop it, so the runner itself refuses: before any step runs, from the
 //! github context that GitHub, not the workflow, wrote into the job.
+//!
+//! It fails closed (#105): no trusted refs trusts no job, and trusting every ref takes an explicit
+//! `*`. An unset value used to trust every job, so a lost `EnvironmentFile` line or a typo turned
+//! prod, still carrying the `prod` label, into a runner that took pull requests.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Github = @import("job.zig").Github;
 
-/// Why the job may not run here, or null when it may. `refs` is comma-separated, a trailing `*`
-/// matching any rest (`refs/tags/v*`); empty trusts every job. Both the run's ref and the ref its
-/// workflow file was read from must be trusted: an event can run a workflow from another ref.
+/// Why the job may not run here, or null when it may. `refs` and `events` are comma-separated, a
+/// trailing `*` matching any rest (`refs/tags/v*`) and `*` alone matching anything. No refs trusts
+/// no job. Both the run's ref and the ref its workflow file was read from must be trusted: an event
+/// can run a workflow from another ref.
 pub fn refusal(
     arena: Allocator,
     refs: []const u8,
     events: []const u8,
     g: Github,
 ) Allocator.Error!?[]const u8 {
-    if (refs.len == 0) return null;
+    if (none(refs)) return no_refs;
     if (!listed(events, g.event_name)) return try std.fmt.allocPrint(
         arena,
         "This runner does not run jobs from '{s}' events (RUNNER_TRUSTED_EVENTS: {s}).",
@@ -37,19 +42,68 @@ pub fn refusal(
     return null;
 }
 
+/// A job's refusal on a runner with no trusted refs: what to set, since nothing is wrong with the
+/// job.
+const no_refs = "This runner trusts no ref, so it runs no job: RUNNER_TRUSTED_REFS is not set. " ++
+    "Set it to the refs whose jobs may run here (refs/heads/main,refs/tags/v*), or to * to run " ++
+    "every job, on a machine untrusted code may reach (README, \"Environments\").";
+
+/// What the runner trusts, for its log at startup: which refs and events, every ref, or none.
+pub fn mode(arena: Allocator, refs: []const u8, events: []const u8) Allocator.Error![]const u8 {
+    if (none(refs)) return "trusting no ref: every job will fail before its first step; " ++
+        "set RUNNER_TRUSTED_REFS (README, \"Environments\")";
+    const refs_text = if (everything(refs))
+        "every ref (RUNNER_TRUSTED_REFS=*)"
+    else
+        try std.fmt.allocPrint(arena, "refs {s}", .{std.mem.trim(u8, refs, " ")});
+    const events_text = if (none(events))
+        "no event: every job will fail before its first step; set RUNNER_TRUSTED_EVENTS"
+    else if (everything(events))
+        "every event (RUNNER_TRUSTED_EVENTS=*)"
+    else
+        try std.fmt.allocPrint(arena, "events {s}", .{std.mem.trim(u8, events, " ")});
+    return std.fmt.allocPrint(arena, "trusting {s} and {s}", .{ refs_text, events_text });
+}
+
+/// Whether `labels` (comma-separated, as `RUNNER_LABELS`) include `prod`, the label of the runner
+/// untrusted code must not reach (README, "Environments"). GitHub matches labels ignoring case.
+pub fn prodLabel(labels: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, labels, ',');
+    while (it.next()) |raw| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw, " "), "prod")) return true;
+    }
+    return false;
+}
+
+/// Whether the comma-separated `list` has no entry: unset, empty, or only commas and spaces.
+pub fn none(list: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, list, ", ");
+    return it.next() == null;
+}
+
+/// Whether the comma-separated `list` has the entry `*`, which matches anything.
+pub fn everything(list: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, list, ',');
+    while (it.next()) |raw| {
+        if (std.mem.eql(u8, std.mem.trim(u8, raw, " "), "*")) return true;
+    }
+    return false;
+}
+
 /// `owner/repo/.github/workflows/ci.yml@refs/heads/main` -> `refs/heads/main`; empty without one.
 fn workflowRef(workflow_ref: []const u8) []const u8 {
     const at = std.mem.lastIndexOfScalar(u8, workflow_ref, '@') orelse return "";
     return workflow_ref[at + 1 ..];
 }
 
-/// Whether `item` is in the comma-separated `list`, where an entry ending in `*` matches any rest.
+/// Whether `item` is in the comma-separated `list`, where an entry ending in `*` matches any rest
+/// of a non-empty item, and `*` alone matches anything, even an empty item.
 fn listed(list: []const u8, item: []const u8) bool {
-    if (item.len == 0) return false;
     var entries = std.mem.tokenizeScalar(u8, list, ',');
     while (entries.next()) |raw| {
         const entry = std.mem.trim(u8, raw, " ");
-        if (entry.len == 0) continue;
+        if (std.mem.eql(u8, entry, "*")) return true;
+        if (entry.len == 0 or item.len == 0) continue;
         if (entry[entry.len - 1] == '*') {
             if (std.mem.startsWith(u8, item, entry[0 .. entry.len - 1])) return true;
         } else if (std.mem.eql(u8, entry, item)) return true;
@@ -65,10 +119,68 @@ fn ctx(event: []const u8, ref: []const u8, workflow_ref: []const u8) Github {
     return .{ .event_name = event, .ref = ref, .workflow_ref = workflow_ref };
 }
 
-test "no trusted refs: every job runs" {
+test "no trusted refs: no job runs, not even a push to main, and the refusal says what to set" {
     const wf = "o/r/.github/workflows/ci.yml@";
-    const g = ctx("pull_request", "refs/pull/7/merge", wf ++ "refs/pull/7/merge");
-    try testing.expectEqual(null, try refusal(testing.allocator, "", prod_events, g));
+    const jobs = [_]Github{
+        ctx("push", "refs/heads/main", wf ++ "refs/heads/main"),
+        ctx("pull_request", "refs/pull/7/merge", wf ++ "refs/pull/7/merge"),
+    };
+    for (jobs) |g| for ([_][]const u8{ "", " ", ",", " , " }) |refs| {
+        const why = (try refusal(testing.allocator, refs, "*", g)).?;
+        try testing.expect(std.mem.indexOf(u8, why, "trusts no ref") != null);
+        try testing.expect(std.mem.indexOf(u8, why, "Set it to") != null);
+    };
+}
+
+test "* trusts every ref, even a missing one, and events are still checked" {
+    const wf = "o/r/.github/workflows/ci.yml@";
+    const pr = ctx("pull_request", "refs/pull/7/merge", wf ++ "refs/pull/7/merge");
+    try testing.expectEqual(null, try refusal(testing.allocator, "*", "*", pr));
+    const blank = ctx("", "", "");
+    try testing.expectEqual(null, try refusal(testing.allocator, " * ", "push, *", blank));
+    const push = ctx("push", "refs/heads/anything", wf ++ "refs/heads/anything");
+    try testing.expectEqual(null, try refusal(testing.allocator, "*", prod_events, push));
+    // The default events: every ref, but a pull request is still not trusted.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const why = (try refusal(arena.allocator(), "*", prod_events, pr)).?;
+    try testing.expect(std.mem.indexOf(u8, why, "'pull_request' events") != null);
+    // No events: no job.
+    try testing.expect(try refusal(arena.allocator(), "*", "", push) != null);
+}
+
+test "the trust mode, as logged at startup" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "trusting refs refs/heads/main, refs/tags/v* and events push,workflow_dispatch",
+        try mode(a, prod_refs, prod_events),
+    );
+    try testing.expectEqualStrings(
+        "trusting every ref (RUNNER_TRUSTED_REFS=*) and every event (RUNNER_TRUSTED_EVENTS=*)",
+        try mode(a, "*", "*"),
+    );
+    try testing.expectEqualStrings(
+        "trusting every ref (RUNNER_TRUSTED_REFS=*) and events push,workflow_dispatch",
+        try mode(a, "*", prod_events),
+    );
+    for ([_][]const u8{ "", " , " }) |refs| try testing.expect(
+        std.mem.startsWith(u8, try mode(a, refs, "*"), "trusting no ref: every job will fail"),
+    );
+    try testing.expect(std.mem.endsWith(
+        u8,
+        try mode(a, prod_refs, ""),
+        "and no event: every job will fail before its first step; set RUNNER_TRUSTED_EVENTS",
+    ));
+}
+
+test "the prod label, among others and in any case, but not pre-prod" {
+    try testing.expect(prodLabel("self-hosted,linux,zig,prod"));
+    try testing.expect(prodLabel("self-hosted, Prod"));
+    try testing.expect(!prodLabel("self-hosted,linux,zig,pre-prod"));
+    try testing.expect(!prodLabel("production,prod-like"));
+    try testing.expect(!prodLabel(""));
 }
 
 test "a push to main, a dispatch and a version tag run" {

@@ -150,9 +150,14 @@ trust, and the runner itself enforces it:
 - **prod**, the runner on the maintainer's machine (`runs-on: [self-hosted, prod]`), runs only jobs
   from pushes to `main`, version tags and `workflow_dispatch` there, whose workflow file comes from
   one of those refs too (`RUNNER_TRUSTED_REFS`, `RUNNER_TRUSTED_EVENTS`; `src/trust.zig`). Any
-  other job fails before a step runs, with the reason in its log. The `prod` GitHub environment
-  holds the release's deploy key, deploys only from `main` and `v*` tags, and waits for the
-  maintainer's approval.
+  other job fails before a step runs, with the reason in its log. The protection fails closed: an
+  unset or empty `RUNNER_TRUSTED_REFS` trusts no ref, so every job fails, and a runner whose
+  `RUNNER_LABELS` include `prod` refuses to start without it. Trusting every ref takes
+  `RUNNER_TRUSTED_REFS=*` (prod starts with it, but logs a warning). `RUNNER_TRUSTED_EVENTS`
+  defaults to `push,workflow_dispatch`, and `*` trusts every event. The runner logs what it
+  trusts when it starts ("trusting refs refs/heads/main,refs/tags/v* and events
+  push,workflow_dispatch"). The `prod` GitHub environment holds the release's deploy key, deploys
+  only from `main` and `v*` tags, and waits for the maintainer's approval.
 - **pre-prod**, where pull requests and the merge queue run, is GitHub's `ubuntu-latest`, on
   purpose: a hosted runner starts cold every time, so every pull request builds and tests the
   project in the worst case, with no caches to hide a slow or broken first build. Nothing there is
@@ -170,9 +175,10 @@ Most do not run `zig build` either: on GitHub's runners CI calls the compiler di
 (`.github/scripts/zig-test.sh`), and only a pull request that touches the packaging runs "Binaries
 (same as zig build)" in `release.yml`, which builds the x86_64 binary with `zig build` and checks it
 is byte for byte the release's. A self-hosted pre-prod remains possible (`PREPROD_RUNNER`, and
-`deploy/runner.preprod.env.example` for a runner with no trusted refs, no secrets and no access to
-its Dagger engine from steps; the engine is built for `linux/amd64` and `linux/arm64` only), but the
-project leaves it unset. The release still builds on GitHub's runners.
+`deploy/runner.preprod.env.example` for a runner that trusts every ref and event
+(`RUNNER_TRUSTED_REFS=*`, `RUNNER_TRUSTED_EVENTS=*`), with no secrets and no access to its Dagger
+engine from steps; the engine is built for `linux/amd64` and `linux/arm64` only), but the project
+leaves it unset. The release still builds on GitHub's runners.
 
 Workflows name `prod` (or `pre-prod`, should one exist), never just `zig`, which any of this project's
 runners carries. Workflows from
