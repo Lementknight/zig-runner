@@ -93,6 +93,9 @@ pub const StepCommands = struct {
     /// A command failed, which fails the step whatever its exit code, as GitHub's
     /// `CommandResult = Failed` does (ActionCommandManager.cs, `TryProcessCommand`).
     failed: bool = false,
+    /// Commands' own lines are logged too (`::echo::on`; on from the start with step debug, as
+    /// GitHub's `EchoOnActionCommand` is).
+    echo: bool = false,
 };
 
 /// What the unsecure commands of a step's exec left (`takeUnsecure`).
@@ -126,14 +129,30 @@ fn stepOutput(sh: *JobLog, step: u32, text: []const u8) void {
     // What a command keeps (an annotation, an output, a stop token) can be a slice of its line,
     // and a direct session's line lives only as long as its log record: the line is copied,
     // and what outlives it is copied again into the job's arena below.
-    const line = if (std.mem.indexOf(u8, text, "::") != null) scratch.dupe(u8, text) catch
-        return else text;
+    const maybe_command = std.mem.indexOf(u8, text, "::") != null or
+        std.mem.indexOf(u8, text, "##[") != null;
+    const line = if (maybe_command) scratch.dupe(u8, text) catch return else text;
     const cmd = commands_mod.parseWorkflow(scratch, line, st.stop_token) catch
         return sh.appendLocked(step, line);
+    // With `::echo::on` (or step debug), a command's own line is logged before it is carried
+    // out, but for those GitHub never echoes (`OmitEcho`: add-mask, debug and the annotations)
+    // and stop-commands, which logs its line either way (`TryProcessCommand`).
+    const echoed = switch (cmd) {
+        .none, .add_mask, .debug, .annotation, .stop, .resume_commands => false,
+        else => true,
+    };
+    if (st.echo and echoed) sh.appendLocked(step, text);
     switch (cmd) {
         // Not a command: the problem matchers' issue, or else the line as it is.
         .none => if (!sh.matchLocked(step, text)) sh.appendLocked(step, text),
-        .add_mask => |value| sh.addMask(value),
+        // `AddMaskCommandExtension`: an empty value is a warning; echo shows the mask, not it.
+        .add_mask => |value| if (std.mem.trim(u8, value, " \t\r\n").len == 0) {
+            sh.warningLineLocked(step, "Can't add secret mask for empty string in " ++
+                "##[add-mask] command.");
+        } else {
+            if (st.echo) sh.appendLocked(step, "::add-mask::***");
+            sh.addMask(value);
+        },
         .group => |title| sh.appendScratch(step, "##[group]{s}", .{title}),
         .endgroup => sh.appendLocked(step, "##[endgroup]"),
         .annotation => |an| {
@@ -202,15 +221,30 @@ fn stepOutput(sh: *JobLog, step: u32, text: []const u8) void {
         },
         .add_path => |dir| {
             if (!st.unsecure_commands) return sh.unsecureDisabledLocked(step, line, "add-path");
+            // `ArgUtil.NotNullOrEmpty`'s ArgumentNullException, as .NET words it.
             if (dir.len == 0) return sh.commandFailedLocked(
                 step,
                 line,
-                "Parameter 'path' cannot be null or empty.",
+                "Value cannot be null. (Parameter 'path')",
             );
             const kept = sh.arena.dupe(u8, dir) catch return;
             st.paths.append(sh.arena, kept) catch {};
         },
-        .echo => {},
+        // `EchoCommandExtension`: `on` or `off`, in any case, around whitespace.
+        .echo => |value| {
+            const v = std.mem.trim(u8, value, " \t\r\n");
+            if (std.ascii.eqlIgnoreCase(v, "on")) {
+                st.echo = true;
+            } else if (std.ascii.eqlIgnoreCase(v, "off")) {
+                st.echo = false;
+            } else if (value.len == 0) {
+                sh.commandFailedLocked(step, line, "Value cannot be null. (Parameter 'value')");
+            } else {
+                const why = std.fmt.allocPrint(scratch, "Invalid echo command value. Possible " ++
+                    "values can be: 'on', 'off'. Current value is: '{s}'.", .{value}) catch return;
+                sh.commandFailedLocked(step, line, why);
+            }
+        },
     }
 }
 
@@ -226,6 +260,12 @@ pub fn errorLine(sh: *JobLog, step: u32, msg: []const u8) void {
 fn errorLineLocked(sh: *JobLog, step: u32, msg: []const u8) void {
     sh.appendScratch(step, "##[error]{s}", .{msg});
     sh.annotateLocked(step, .{ .level = "error", .message = msg });
+}
+
+/// `errorLineLocked` for a warning (GitHub's `context.Warning`).
+fn warningLineLocked(sh: *JobLog, step: u32, msg: []const u8) void {
+    sh.appendScratch(step, "##[warning]{s}", .{msg});
+    sh.annotateLocked(step, .{ .level = "warning", .message = msg });
 }
 
 /// A workflow command that could not be carried out, as GitHub's runner reports one: the line,
@@ -269,6 +309,7 @@ fn envValue(env: []const job_mod.EnvVar, name: []const u8) ?[]const u8 {
 /// The workflow-command state of the exec about to run as `step`, whose env context is `env`.
 /// Commands start unstopped: each of GitHub's step handlers has its own ActionCommandManager
 /// (`Handler.Initialize` creates one), so a `::stop-commands::` lasts to the end of its exec.
+/// Echo starts as step debug sets it (`EchoOnActionCommand`, in ExecutionContext.cs).
 /// The env opts into `::set-env` and `::add-path` with ACTIONS_ALLOW_UNSECURE_COMMANDS, read
 /// with .NET's `bool.TryParse` (`true` in any case, around whitespace; `SetEnvCommandExtension`),
 /// and into refused stop tokens with ACTIONS_ALLOW_UNSECURE_STOPCOMMAND_TOKENS, read with
@@ -282,6 +323,7 @@ pub fn beginCommands(sh: *JobLog, step: u32, env: []const job_mod.EnvVar) void {
     if (step == 0 or step > sh.commands.len) return;
     const st = &sh.commands[step - 1];
     st.stop_token = null;
+    st.echo = sh.step_debug;
     st.unsecure_commands = eql(std.mem.trim(u8, commands, " \t\r\n"), "true");
     st.unsecure_stop_tokens = eql(tokens, "true") or eql(tokens, "1") or eql(tokens, "$true");
 }
@@ -1367,4 +1409,67 @@ test "a matched line is logged as the issue; a file outside the workspace is dro
     try std.testing.expectEqualStrings("12", got[1].an.line.?);
     try std.testing.expectEqualStrings("src/b.c", got[2].an.file.?);
     try std.testing.expectEqualStrings("src/c.c", got[3].an.file.?);
+}
+
+test "::echo::on logs commands' own lines; add-mask with nothing to mask warns" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out.writer } };
+    var live: [1]std.atomic.Value(u32) = .{.init(0)};
+    var ended: [1]std.atomic.Value(bool) = .{.init(false)};
+    var replayed: [1]bool = .{false};
+    var cmds: [1]StepCommands = .{.{}};
+    var line_counts: [2]u32 = .{ 0, 0 };
+    var sh: JobLog = .{
+        .io = std.testing.io,
+        .arena = arena,
+        .log = &log,
+        .sink_job_id = 0,
+        .live_lines = &live,
+        .ended = &ended,
+        .replayed_steps = &replayed,
+        .commands = &cmds,
+        .line_counts = &line_counts,
+    };
+    sh.beginCommands(1, &.{});
+    for ([_][]const u8{
+        "::group::quiet",
+        "::echo::ON",
+        "::group::loud",
+        "::set-output name=k::v",
+        "::warning::not echoed",
+        "::add-mask::s3cr3t-value",
+        "::add-mask:: ",
+        "##[endgroup]",
+        "::echo::off",
+        "::endgroup::",
+        "::echo::sometimes",
+    }) |l| sh.stepOutput(1, l);
+    try std.testing.expectEqualStrings(
+        "[job 0 step 1 stdout] ##[group]quiet\n" ++
+            "[job 0 step 1 stdout] ::group::loud\n" ++
+            "[job 0 step 1 stdout] ##[group]loud\n" ++
+            "[job 0 step 1 stdout] ::set-output name=k::v\n" ++
+            "[job 0 step 1 stdout] ##[warning]not echoed\n" ++
+            "[job 0 step 1 stdout] ::add-mask::***\n" ++
+            "[job 0 step 1 stdout] ##[warning]Can't add secret mask for empty string in " ++
+            "##[add-mask] command.\n" ++
+            "[job 0 step 1 stdout] ##[endgroup]\n" ++
+            "[job 0 step 1 stdout] ##[endgroup]\n" ++
+            "[job 0 step 1 stdout] ::echo::off\n" ++
+            "[job 0 step 1 stdout] ##[endgroup]\n" ++
+            "[job 0 step 1 stdout] ##[error]Unable to process command '::echo::sometimes' " ++
+            "successfully.\n" ++
+            "[job 0 step 1 stdout] ##[error]Invalid echo command value. Possible values can be: " ++
+            "'on', 'off'. Current value is: 'sometimes'.\n",
+        out.written(),
+    );
+    // A bad value fails the step; the empty mask only warns.
+    try std.testing.expect(cmds[0].failed);
+    // Step debug starts every exec with echo on.
+    sh.step_debug = true;
+    sh.beginCommands(1, &.{});
+    try std.testing.expect(cmds[0].echo);
 }
