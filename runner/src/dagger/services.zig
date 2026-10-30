@@ -12,6 +12,7 @@ const jsonFind = @import("../dagger.zig").jsonFind;
 const jsonFindString = @import("../dagger.zig").jsonFindString;
 const jsonStrings = @import("../dagger.zig").jsonStrings;
 const newSecret = @import("../dagger.zig").newSecret;
+const SecretRef = @import("../dagger.zig").SecretRef;
 const shellQuote = @import("../dagger.zig").shellQuote;
 const busybox_path = @import("../dagger.zig").busybox_path;
 const marker = @import("../dagger.zig").marker;
@@ -425,7 +426,21 @@ pub fn startServiceContainer(
         .{ .name = "CI", .value = "true" },
     };
     for (&defaults) |e| try q.call("withEnvVariable", .{ .name = e.name, .value = e.value });
-    for (spec.env) |e| try q.call("withEnvVariable", .{ .name = e.name, .value = e.value });
+    // What carries a secret (a database password) goes in as a Dagger secret, as a step's env
+    // does: as a plain variable it would be in the engine's metadata (#101).
+    var plain: std.ArrayList(job_mod.EnvVar) = .empty;
+    var secret: std.ArrayList(SecretRef) = .empty;
+    x.splitStepEnv(spec.env, &plain, &secret) catch {
+        x.sh.errorLine(
+            ls,
+            try std.fmt.allocPrint(arena, "Could not register the env of service '{s}': " ++
+                "{s}", .{ svc.name, x.err_msg }),
+        );
+        return null;
+    };
+    for (plain.items) |e| try q.call("withEnvVariable", .{ .name = e.name, .value = e.value });
+    for (secret.items) |sr|
+        try q.call("withSecretVariable", .{ .name = sr.name, .secret = sr.id });
     for (spec.ports) |p| try q.call("withExposedPort", .{ .port = p.container });
     // The image's entrypoint and command, started by a shell that first prints the marker
     // that names this service's output. `start` waits until the exposed ports accept
