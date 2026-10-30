@@ -1,0 +1,3 @@
+kind: Changed
+body: 'dagger/hash_files.zig''s view of the job''s container for glob.zig is now `Fs`, not `DaggerFs`, since the file already says it is Dagger''s (#148).'
+time: 2026-10-30T11:00:00.000000-04:00

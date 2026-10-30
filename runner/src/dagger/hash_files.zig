@@ -1,5 +1,5 @@
 //! `hashFiles()` in a job: glob.zig's search over the job's container through Dagger's API
-//! (`DaggerFs`), and the found files hashed by `sha256sum` there.
+//! (`Fs`), and the found files hashed by `sha256sum` there.
 
 const std = @import("std");
 const job_mod = @import("../job.zig");
@@ -31,7 +31,7 @@ const hash_list_path = "/tmp/zig-runner-hashfiles";
 /// `hashFiles(patterns)`, as GitHub computes it: the SHA-256 of the SHA-256 digests of the
 /// files its patterns find under the workspace, "" when none. The search is glob.zig
 /// (@actions/glob, as GitHub's runner uses it), asking Dagger what is in the job's container
-/// (`DaggerFs`); the files are hashed by `sha256sum` there, in the order the search found them,
+/// (`Fs`); the files are hashed by `sha256sum` there, in the order the search found them,
 /// which is GitHub's, so the result is the hash GitHub computes for the same files.
 pub fn hashFiles(
     ptr: *anyopaque,
@@ -44,7 +44,7 @@ pub fn hashFiles(
         .invalid => |why| return .{ .failed = why },
         .ok => |p| p,
     };
-    var dfs: DaggerFs = .{ .x = x };
+    var dfs: Fs = .{ .x = x };
     const found = switch (try glob.walk(arena, dfs.fs(), parsed.patterns, parsed.follow, ws, &dfs.why)) {
         .failed => |msg| return .{ .failed = msg },
         .files => |f| f,
@@ -63,18 +63,18 @@ pub fn hashFiles(
 /// a directory, many paths to a query. Canonical paths, which `--follow-symbolic-links` needs
 /// to break cycles as GitHub does, are not in Dagger's API: `realpath` in the job's container
 /// gives them (only for the directories reached while following links).
-const DaggerFs = struct {
+const Fs = struct {
     x: *Exec,
     why: []const u8 = "",
 
     /// Paths to a query, so that a big tree does not make one enormous document.
     const batch = 1000;
 
-    fn fs(d: *DaggerFs) glob.Fs {
+    fn fs(d: *Fs) glob.Fs {
         return .{ .ptr = d, .vtable = &.{ .stat = stat, .list = list, .realpath = realpath } };
     }
 
-    fn run(d: *DaggerFs, arena: Allocator, query: []const u8) glob.Fs.Error!std.json.Value {
+    fn run(d: *Fs, arena: Allocator, query: []const u8) glob.Fs.Error!std.json.Value {
         var msg: []const u8 = "";
         return gql(arena, d.x.transport, query, &msg) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -86,7 +86,7 @@ const DaggerFs = struct {
     }
 
     fn stat(ptr: *anyopaque, arena: Allocator, paths: []const []const u8, follow: bool) glob.Fs.Error![]const glob.Kind {
-        const d: *DaggerFs = @ptrCast(@alignCast(ptr));
+        const d: *Fs = @ptrCast(@alignCast(ptr));
         const out = try arena.alloc(glob.Kind, paths.len);
         var start: usize = 0;
         while (start < paths.len) : (start += batch) {
@@ -131,7 +131,7 @@ const DaggerFs = struct {
     /// none, `-z` and `--` included, and every path here is absolute, so none reads as one;
     /// one per line, and a path with a newline in it fails the count instead of misleading.
     fn realpath(ptr: *anyopaque, arena: Allocator, paths: []const []const u8) glob.Fs.Error![]const []const u8 {
-        const d: *DaggerFs = @ptrCast(@alignCast(ptr));
+        const d: *Fs = @ptrCast(@alignCast(ptr));
         const out = try arena.alloc([]const u8, paths.len);
         var start: usize = 0;
         while (start < paths.len) : (start += batch) {
@@ -161,7 +161,7 @@ const DaggerFs = struct {
     }
 
     fn list(ptr: *anyopaque, arena: Allocator, dirs: []const []const u8) glob.Fs.Error![]const []const []const u8 {
-        const d: *DaggerFs = @ptrCast(@alignCast(ptr));
+        const d: *Fs = @ptrCast(@alignCast(ptr));
         const out = try arena.alloc([]const []const u8, dirs.len);
         var start: usize = 0;
         while (start < dirs.len) : (start += batch) {
@@ -263,7 +263,7 @@ fn foldDigests(
     return .{ .ok = try arena.dupe(u8, &hex) };
 }
 
-/// Dagger's answer to DaggerFs.stat: one letter per path, `d`irectory, `f`ile, `l`ink, `m`issing.
+/// Dagger's answer to Fs.stat: one letter per path, `d`irectory, `f`ile, `l`ink, `m`issing.
 fn existsAnswer(arena: Allocator, kinds: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena, "{\"data\":{\"loadContainerFromID\":{\"rootfs\":{");
