@@ -273,8 +273,8 @@ theorem without_keys_runs_both :
     (build vol execD (always .off) 2 ⟨start, [], 0, warm, 0, []⟩ [deploy, check]).ran = 2 := rfl
 
 /-- And output keys buy nothing when the always-run step's output is never the same twice: the
-digest is the key, so a new digest is a new container. `outputs_ignored` in dagger.zig exists for
-exactly this reason. -/
+digest is the key, so a new digest is a new container. `outputs_ignored` in dagger/output_keys.zig
+exists for exactly this reason. -/
 def noisy : Cache :=
   (build vol execD (always .on) 1 ⟨start, [], 0, [], 0, []⟩ [noisyDeploy, check]).cache
 
