@@ -669,7 +669,28 @@ pub fn runPre(x: *Exec, num: u32, step: job_mod.Step) !void {
     const sc0 = try ev.scope(&.{});
     const step_env = ev.renderEnv(step.env, sc0) catch return;
     const sc1 = try ev.scope(step_env);
-    if (!(expr.evalCondition(x.arena, pre_if orelse "always()", sc1) catch false)) return;
+    const cond = pre_if orelse "always()";
+    const go = expr.evalCondition(x.arena, cond, sc1) catch {
+        // GitHub fails a step whose condition cannot be evaluated, the pre step too, and so the
+        // job (`StepsRunner.cs` ~237-242).
+        const ls = x.next_log_step;
+        x.next_log_step += 1;
+        const started = std.Io.Clock.real.now(x.io).toMilliseconds();
+        const pre_name = x.extraName("Pre", num, act) catch "Pre";
+        x.startExtra(.pre, ls, pre_name, started);
+        x.sh.errorLine(ls, try preIfError(x, act, cond));
+        ev.job_failed = true;
+        x.hook_failed = true;
+        return x.addExtra(.{
+            .kind = .pre,
+            .name = pre_name,
+            .log_step = ls,
+            .outcome = .failure,
+            .started_ms = started,
+            .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds(),
+        });
+    };
+    if (!go) return;
     const inputs = switch (try x.resolveInputs(num, act, u, sc1, false)) {
         .failed => return,
         .ok => |in| in,
@@ -759,6 +780,15 @@ fn runCompositePre(x: *Exec, num: u32, step: job_mod.Step, u: job_mod.Uses, act:
         .outcome = if (ok) .success else .failure,
         .started_ms = started,
         .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds(),
+    });
+}
+
+/// Why an action's `pre-if` could not be evaluated, for its pre step's log.
+fn preIfError(x: *Exec, act: Loaded, cond: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(x.arena, "{s}: could not evaluate the pre-if '{s}': {s}", .{
+        act.ref_label,
+        cond,
+        x.ev.diag,
     });
 }
 
@@ -874,7 +904,15 @@ fn runNestedPres(
             .docker => |dk| dk.pre_if,
             .composite => null,
         };
-        if (!(expr.evalCondition(arena, pre_if orelse "always()", sc) catch false)) continue;
+        const cond = pre_if orelse "always()";
+        // GitHub fails a nested step whose condition cannot be evaluated, and with it the
+        // composite action's pre (`CompositeActionHandler.cs` ~424-430).
+        const go = expr.evalCondition(arena, cond, sc) catch {
+            x.sh.errorLine(ls, try preIfError(x, act, cond));
+            ok = false;
+            continue;
+        };
+        if (!go) continue;
         const nested_inputs = switch (try x.resolveInputs(ls, act, u, sc, false)) {
             .failed => continue,
             .ok => |in| in,
@@ -1703,4 +1741,47 @@ test "nested pres: pre-if, no pre for local actions, composites in composites, a
     try std.testing.expectEqual(Outcome.failure, res.extra[0].outcome);
     try std.testing.expectEqual(Outcome.skipped, res.steps[0].outcome);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]Process completed with exit code 1.") != null);
+}
+
+test "a pre-if that cannot be evaluated fails the pre and the job, at the top or nested" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const js_yml =
+        \\runs:
+        \\  using: node24
+        \\  pre: dist/pre.js
+        \\  pre-if: fromJSON('{')
+        \\  main: dist/main.js
+    ;
+    const comp_yml = "runs:\n  using: composite\n  steps:\n    - uses: o/js@v1\n";
+    for ([_]bool{ false, true }) |nested| {
+        const steps = [_]job_mod.Step{if (nested)
+            usesStep("comp", "o", "comp", "v1", &.{})
+        else
+            usesStep("js", "o", "js", "v1", &.{})};
+        var answers: std.ArrayList([]const u8) = .empty;
+        try answers.append(arena, base_answer);
+        if (nested) try answers.appendSlice(arena, &.{
+            try treeAnswer(arena, "D1", &.{"action.yml"}),
+            try fileAnswer(arena, comp_yml),
+        });
+        try answers.appendSlice(arena, &.{
+            try treeAnswer(arena, "D2", &.{ "action.yml", "dist" }),
+            try fileAnswer(arena, js_yml),
+        });
+        var fake: FakeSession = .{ .answers = answers.items, .arena = arena };
+        var buf: [8192]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+        try std.testing.expectEqual(answers.items.len, fake.seen.items.len);
+        try std.testing.expect(!res.succeeded);
+        try std.testing.expectEqual(@as(usize, 1), res.extra.len);
+        try std.testing.expectEqual(Outcome.failure, res.extra[0].outcome);
+        try std.testing.expectEqual(Outcome.skipped, res.steps[0].outcome);
+        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]o/js@v1: could not " ++
+            "evaluate the pre-if 'fromJSON('{')'") != null);
+    }
 }

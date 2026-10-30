@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'An action''s `pre-if` that cannot be evaluated now fails its pre step and the job with an error naming the action, as on GitHub, instead of silently skipping the pre script (#103).'
+time: 2026-10-30T20:12:44.000000-04:00
