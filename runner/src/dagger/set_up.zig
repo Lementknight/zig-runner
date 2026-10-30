@@ -8,7 +8,7 @@ const sink = @import("../sink.zig");
 const expr = @import("../expr.zig");
 const config = @import("../config.zig");
 const Query = @import("query.zig").Query;
-const Shared = @import("Shared.zig");
+const JobLog = @import("JobLog.zig");
 const Evaluator = @import("Evaluator.zig");
 const Exec = @import("Exec.zig");
 const Transport = @import("../dagger.zig").Transport;
@@ -160,7 +160,7 @@ const BasePlan = struct {
     /// The output-key store (`Exec.outputs_volume`), when the job setup's query asked for it.
     outputs_volume: ?[]const u8 = null,
     ran_marker: []const u8,
-    /// The job's `mark_env` value (`Shared.mark`).
+    /// The job's `mark_env` value (`JobLog.mark`).
     mark: []const u8,
 };
 
@@ -664,7 +664,7 @@ pub fn execFor(
     arena: Allocator,
     io: std.Io,
     transport: Transport,
-    sh: *Shared,
+    sh: *JobLog,
     ev: *Evaluator,
     job: *const job_mod.Job,
     opts: Options,

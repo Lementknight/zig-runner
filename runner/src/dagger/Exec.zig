@@ -12,10 +12,10 @@ const config = @import("../config.zig");
 const engine = @import("../engine.zig");
 const Query = @import("query.zig").Query;
 const Raw = @import("query.zig").Raw;
-const Shared = @import("Shared.zig");
-const awaitLive = @import("Shared.zig").awaitLive;
-const servedFromCache = @import("Shared.zig").servedFromCache;
-const replayNotLive = @import("Shared.zig").replayNotLive;
+const JobLog = @import("JobLog.zig");
+const awaitLive = @import("JobLog.zig").awaitLive;
+const servedFromCache = @import("JobLog.zig").servedFromCache;
+const replayNotLive = @import("JobLog.zig").replayNotLive;
 const Evaluator = @import("Evaluator.zig");
 const stepScriptFc = @import("scripts.zig").stepScriptFc;
 const fcPath = @import("scripts.zig").fcPath;
@@ -55,7 +55,7 @@ const Allocator = std.mem.Allocator;
 arena: Allocator,
 io: std.Io,
 transport: Transport,
-sh: *Shared,
+sh: *JobLog,
 ev: *Evaluator,
 job: *const job_mod.Job,
 /// The container after the last exec; each exec starts from it.

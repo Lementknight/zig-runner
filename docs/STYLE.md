@@ -12,7 +12,7 @@ Nothing here overrides it.
 
 - Functions `camelCase`, types `TitleCase`, variables, constants, fields and files that are
   namespaces `snake_case`. A file with top-level fields is a struct and is named for it:
-  `dagger/Exec.zig`, `dagger/Shared.zig`.
+  `dagger/Exec.zig`, `dagger/JobLog.zig`.
 - Choose a name for how it reads fully qualified. `checkout.fetch`, not `checkout.fetchCheckout`;
   `services.Port`, not `services.ServicePort`. Methods are read through their type: `Exec.runDocker`
   is fine.
