@@ -376,7 +376,7 @@ test "script quotes, applies env, shell and working directory, and propagates th
     try std.testing.expect(std.mem.startsWith(u8, w, "exec 2>&1\necho '" ++ marker ++ "begin 2' \"${ZIG_RUNNER_MARK-}\"\n"));
     try std.testing.expect(std.mem.indexOf(u8, w, "echo '" ++ marker ++ "end 2' \"${ZIG_RUNNER_MARK-}\"\nexit $rc\n") != null);
     // A Docker action's script too.
-    const c = try containerScript(a.allocator(), 3, 3, &.{"/entry"}, &.{}, &.{}, null, false, false, "x");
+    const c = try containerScript(a.allocator(), 3, 3, &.{.{ .text = "/entry" }}, &.{}, &.{}, null, false, false, "x");
     try std.testing.expect(std.mem.startsWith(u8, c, "exec 2>&1\necho '" ++ marker ++ "begin 3' \"${ZIG_RUNNER_MARK-}\"\n"));
     try std.testing.expect(std.mem.indexOf(u8, c, "-u ZIG_RUNNER_MARK ") != null);
     try std.testing.expect(std.mem.endsWith(u8, c, "echo '" ++ marker ++ "end 3' \"${ZIG_RUNNER_MARK-}\"\nexit $rc\n"));

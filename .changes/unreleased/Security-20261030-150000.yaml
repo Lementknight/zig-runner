@@ -1,0 +1,3 @@
+kind: Security
+body: 'A Docker action''s `args:` holding a secret now reach the action as a Dagger secret, still as the same arguments, instead of in plain text in the command the engine keeps in its cache metadata.'
+time: 2026-10-30T15:00:00.000000-04:00
