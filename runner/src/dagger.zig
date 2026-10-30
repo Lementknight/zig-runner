@@ -1109,7 +1109,10 @@ fn prepareScript(
         try failStep(ev, x.sh, x.observer, step, res, num, msg, coe);
         return null;
     };
-    const shell: ?[]const u8 = if (sc.shell) |t| (ev.render(t, sc1) catch null) else null;
+    // `defaults.run` fills in a shell the step leaves out or empty, and a working directory it
+    // leaves out (actions/runner src/Runner.Worker/Handlers/ScriptHandler.cs 155-180).
+    const own_shell: ?[]const u8 = if (sc.shell) |t| (ev.render(t, sc1) catch null) else null;
+    const shell = if (own_shell != null and own_shell.?.len > 0) own_shell else x.default_shell;
     if (shell) |sh_name| if (!job_mod.validShell(sh_name)) {
         try failStep(
             ev,
@@ -1123,7 +1126,10 @@ fn prepareScript(
         );
         return null;
     };
-    const wd: ?[]const u8 = if (sc.working_directory) |t| (ev.render(t, sc1) catch null) else null;
+    const wd: ?[]const u8 = if (sc.working_directory) |t|
+        (ev.render(t, sc1) catch null)
+    else
+        x.default_working_directory;
     try logRunHeader(
         arena,
         x.sh,
@@ -2277,6 +2283,71 @@ test "run evaluates expressions in conditions, names, env, scripts and the steps
         try std.testing.expectEqual(is_set_secret, std.mem.indexOf(u8, d, "s3cr3t-value") != null);
         _ = i;
     }
+}
+
+test "defaults.run gives run: steps their shell and working directory unless they set their own" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    // The workflow's defaults.run, then the job's, which replaces it whole: the workflow's
+    // working-directory is gone, and the job's comes from an expression.
+    const json =
+        \\{"plan":{"planId":"p"},"jobId":"j","resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"t"}}}]},
+        \\ "defaults":[{"type":2,"map":[{"Key":{"lit":"run"},"Value":{"type":2,"map":[{"Key":{"lit":"working-directory"},"Value":{"lit":"wf"}}]}}]},
+        \\  {"type":2,"map":[{"Key":{"lit":"run"},"Value":{"type":2,"map":[{"Key":{"lit":"shell"},"Value":{"lit":"bash"}},{"Key":{"lit":"working-directory"},"Value":{"type":3,"expr":"format('app-{0}', github.ref_name)"}}]}}]}],
+        \\ "contextData":{"github":{"t":2,"d":[{"k":"ref_name","v":"main"}]}},
+        \\ "steps":[
+        \\  {"type":"action","reference":{"type":"script"},"id":"s1","contextName":"__run","name":"__run","condition":"success()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"false | true"}}]}},
+        \\  {"type":"action","reference":{"type":"script"},"id":"s2","contextName":"__run_2","name":"__run_2","condition":"success()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo own"}},{"Key":{"lit":"shell"},"Value":{"lit":"sh"}},{"Key":{"lit":"workingDirectory"},"Value":{"lit":"own"}}]}}
+        \\ ]}
+    ;
+    const job = try job_mod.parse(arena, json);
+    const answers = [_][]const u8{
+        base_answer,
+        try exec(arena, "C1", 0, ""),
+        try exec(arena, "C2", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    try std.testing.expect(res.succeeded);
+    try std.testing.expectEqual(@as(usize, 3), fake.seen.items.len);
+    // The step without its own: the defaults' `bash` (pipefail, so `false | true` fails as on
+    // GitHub) in the job's directory, and the log header says so.
+    const s1 = fake.seen.items[1];
+    try std.testing.expect(std.mem.indexOf(u8, s1, "cd 'app-main' && ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s1, "'bash' '--noprofile' '--norc' '-e' '-o' 'pipefail' '/tmp/zig-runner-step-1.sh'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}") != null);
+    // The step's own settings win.
+    const s2 = fake.seen.items[2];
+    try std.testing.expect(std.mem.indexOf(u8, s2, "cd 'own' && ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s2, "'sh' '-e' '/tmp/zig-runner-step-2.sh'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s2, "app-main") == null);
+}
+
+test "defaults.run that cannot be evaluated fails Set up job, and no step runs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("echo never")};
+    var job = testJob(&steps);
+    job.defaults_run = .{ .shell = .{ .expr = "no_such_function()" } };
+    const answers = [_][]const u8{base_answer};
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    try std.testing.expect(!res.succeeded);
+    try std.testing.expect(res.set_up_failed);
+    try std.testing.expectEqual(@as(usize, 1), fake.seen.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "defaults.run.shell: ") != null);
 }
 
 test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH reach later steps" {
