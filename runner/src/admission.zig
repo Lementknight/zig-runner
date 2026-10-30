@@ -104,6 +104,9 @@ pub const Admission = struct {
         peak_mb: u64 = 0,
         /// A step was replayed from the step cache: not learned from (`Learned`).
         replayed: bool = false,
+        /// Another runner's job ran at some point during this one: its peak is the engine's for
+        /// both, an upper bound on its own (`Learned`).
+        overlapped: bool = false,
     };
 
     /// `slots` must have one entry for each runner in the pool, and each runner's `Gate.slot` a
@@ -145,8 +148,7 @@ pub const Admission = struct {
     }
 
     /// A job's peak is the engine's, not its own: the engine is one cgroup for every job, so a
-    /// job that overlaps another is charged for both. That errs toward reserving too much, which
-    /// only holds a runner back a little longer.
+    /// job that overlaps another is charged for both (`Slot.overlapped`).
     fn samplePeaks(a: *Admission) void {
         a.mu.lockUncancelable(a.io);
         defer a.mu.unlock(a.io);
@@ -242,7 +244,17 @@ pub const Gate = struct {
         if (g.claimed) a.polling -= 1;
         g.claimed = false;
         if (!took_job) return;
-        a.slots[g.slot] = .{ .started_ms = std.Io.Clock.awake.now(a.io).toMilliseconds() };
+        // Two jobs overlap exactly when one starts while the other runs, so marking both here
+        // catches every overlap, however briefly the jobs shared the engine.
+        var overlapped = false;
+        for (a.slots, 0..) |*s, i| if (i != g.slot and s.started_ms != std.math.minInt(i64)) {
+            s.overlapped = true;
+            overlapped = true;
+        };
+        a.slots[g.slot] = .{
+            .started_ms = std.Io.Clock.awake.now(a.io).toMilliseconds(),
+            .overlapped = overlapped,
+        };
     }
 
     /// The runner's job is known as `key` (`jobKey`): it reserves what jobs of that name took, or
@@ -288,9 +300,9 @@ pub const Gate = struct {
         // At most 1 TB, so that it fits the table's u32 and sums of them cannot overflow.
         const seen_mb: u32 = @intCast(@min(@max(s.peak_mb -| base, Learned.min_mb), 1 << 20));
         const before = a.learned.estimate(key);
-        const after = a.learned.record(key, seen_mb);
+        const after = a.learned.record(key, seen_mb, !s.overlapped);
         if (before == after) return null;
-        return .{ .seen_mb = seen_mb, .estimate_mb = after };
+        return .{ .seen_mb = seen_mb, .estimate_mb = after, .alone = !s.overlapped };
     }
 };
 
@@ -299,6 +311,13 @@ pub const Gate = struct {
 /// room for a new one. A job that replayed any step from the step cache is not learned from: it
 /// ran little of its work and took far less than its next real run will, and re-runs of one commit
 /// after a restart would otherwise teach an estimate that under-reserves the run that matters.
+///
+/// A run that shared the engine with another job (`Slot.overlapped`) measured both: an upper
+/// bound on its own peak, not the peak. On razorbill the first `zig build test` runs overlapped
+/// another and were learned at 2.9 and 3.1 GB, against 1.6 GB alone; kept as peaks, they doubled
+/// zig's estimate and the worst case with it, and held runners for memory no job needed. So runs
+/// alone and runs beside others are kept apart: a name reserves the most of its recent runs alone,
+/// and only while it has none, the least of its recent runs beside others, still an upper bound.
 pub const Learned = struct {
     entries: [capacity]Entry = undefined,
     len: usize = 0,
@@ -306,27 +325,39 @@ pub const Learned = struct {
     tick: u64 = 0,
 
     pub const capacity = 64;
-    /// A job reserves the most it took in its last `kept` runs: a job that varies with what it is
-    /// given (a cache missed, a larger change) is reserved for its heavier runs.
+    /// A job reserves the most it took in its last `kept` runs alone: a job that varies with what
+    /// it is given (a cache missed, a larger change) is reserved for its heavier runs.
     pub const kept = 5;
     /// The least a job is seen to take: one that ran while another job freed memory can measure 0.
     pub const min_mb = 64;
 
     const Entry = struct {
         key: u64,
-        seen_mb: [kept]u32 = undefined,
-        /// Runs in `seen_mb`, up to `kept`, and where the next one goes.
-        n: u8 = 0,
-        next: u8 = 0,
+        alone: Runs = .{},
+        beside: Runs = .{},
         used: u64 = 0,
 
         fn estimate(e: *const Entry) u32 {
-            return std.mem.max(u32, e.seen_mb[0..e.n]);
+            if (e.alone.n > 0) return std.mem.max(u32, e.alone.slice());
+            return std.mem.min(u32, e.beside.slice());
         }
     };
 
-    /// A job's end that changed what its name reserves: what it took, and what is now reserved.
-    pub const Change = struct { seen_mb: u32, estimate_mb: u32 };
+    /// The last `kept` runs' MB, oldest overwritten first.
+    const Runs = struct {
+        mb: [kept]u32 = undefined,
+        /// Runs in `mb`, up to `kept`, and where the next one goes.
+        n: u8 = 0,
+        next: u8 = 0,
+
+        fn slice(r: *const Runs) []const u32 {
+            return r.mb[0..r.n];
+        }
+    };
+
+    /// A job's end that changed what its name reserves: what it took, whether it ran alone, and
+    /// what is now reserved.
+    pub const Change = struct { seen_mb: u32, estimate_mb: u32, alone: bool };
 
     /// What a job of this name reserves, or null for a name not seen.
     fn estimate(l: *Learned, key: u64) ?u32 {
@@ -336,8 +367,9 @@ pub const Learned = struct {
         return e.estimate();
     }
 
-    /// A run of `key` that took `seen_mb`; returns what its name now reserves.
-    fn record(l: *Learned, key: u64, seen_mb: u32) u32 {
+    /// A run of `key` that took `seen_mb`, `alone` or beside other jobs; returns what its name now
+    /// reserves.
+    fn record(l: *Learned, key: u64, seen_mb: u32, alone: bool) u32 {
         const e = l.find(key) orelse e: {
             if (l.len < capacity) {
                 l.len += 1;
@@ -352,9 +384,10 @@ pub const Learned = struct {
             l.entries[l.len - 1] = .{ .key = key };
             break :e &l.entries[l.len - 1];
         };
-        e.seen_mb[e.next] = seen_mb;
-        e.next = (e.next + 1) % kept;
-        e.n = @min(e.n + 1, kept);
+        const runs = if (alone) &e.alone else &e.beside;
+        runs.mb[runs.next] = seen_mb;
+        runs.next = (runs.next + 1) % kept;
+        runs.n = @min(runs.n + 1, kept);
         l.tick += 1;
         e.used = l.tick;
         return e.estimate();
@@ -1234,7 +1267,8 @@ test "a job known to be light lets the next runner through where the worst case 
     try setEngine(tmp.dir, 700);
     pool.samplePeaks();
     const learned = gates[0].ended().?;
-    try std.testing.expectEqual(Learned.Change{ .seen_mb = 300, .estimate_mb = 300 }, learned);
+    const change: Learned.Change = .{ .seen_mb = 300, .estimate_mb = 300, .alone = true };
+    try std.testing.expectEqual(change, learned);
 
     // The engine at 1.8 GB, 2.3 GB under its cap. A job just handed out, its name not known
     // yet, and the runner asking: 2 x 1024 + 256 MB do not fit.
@@ -1287,19 +1321,19 @@ test "a job heavier than configured raises what an unknown job reserves" {
 test "a name reserves the most it took in its last five runs; a full table forgets the oldest" {
     var l: Learned = .{};
     try std.testing.expectEqual(@as(?u32, null), l.estimate(1));
-    try std.testing.expectEqual(@as(u32, 1000), l.record(1, 1000));
-    for (0..4) |_| try std.testing.expectEqual(@as(u32, 1000), l.record(1, 300));
+    try std.testing.expectEqual(@as(u32, 1000), l.record(1, 1000, true));
+    for (0..4) |_| try std.testing.expectEqual(@as(u32, 1000), l.record(1, 300, true));
     // A sixth run: the heavy one is no longer among the last five.
-    try std.testing.expectEqual(@as(u32, 300), l.record(1, 300));
+    try std.testing.expectEqual(@as(u32, 300), l.record(1, 300, true));
     try std.testing.expectEqual(@as(u32, 300), l.largest());
 
     // Full: a new name takes the place of the one least recently used, name 3, since names 1
     // and 2 were just looked up.
-    for (2..Learned.capacity + 1) |k| _ = l.record(k, 100);
+    for (2..Learned.capacity + 1) |k| _ = l.record(k, 100, true);
     try std.testing.expectEqual(@as(usize, Learned.capacity), l.len);
     _ = l.estimate(1);
     _ = l.estimate(2);
-    _ = l.record(Learned.capacity + 1, 2000);
+    _ = l.record(Learned.capacity + 1, 2000, true);
     try std.testing.expectEqual(@as(usize, Learned.capacity), l.len);
     try std.testing.expectEqual(@as(?u32, null), l.estimate(3));
     try std.testing.expectEqual(@as(?u32, 300), l.estimate(1));
@@ -1387,6 +1421,40 @@ test "a job that replayed steps from the cache is not learned from, and still fr
     try setEngine(tmp.dir, 2300);
     pool.samplePeaks();
     try std.testing.expectEqual(@as(u32, 1600), gate.ended().?.estimate_mb);
+}
+
+test "runs beside other jobs are upper bounds: the most alone, else the least beside others" {
+    var l: Learned = .{};
+    // razorbill's burst: zig's first runs overlapped another zig job.
+    try std.testing.expectEqual(@as(u32, 2970), l.record(1, 2970, false));
+    // Only runs beside others: the least of them, which still bounds the job's own peak.
+    try std.testing.expectEqual(@as(u32, 2970), l.record(1, 3170, false));
+    try std.testing.expectEqual(@as(u32, 2600), l.record(1, 2600, false));
+    // A run alone replaces them, lower or not.
+    try std.testing.expectEqual(@as(u32, 1600), l.record(1, 1600, true));
+    try std.testing.expectEqual(@as(u32, 1600), l.largest());
+    // Later runs beside others do not raise it.
+    try std.testing.expectEqual(@as(u32, 1600), l.record(1, 3100, false));
+    try std.testing.expectEqual(@as(u32, 1700), l.record(1, 1700, true));
+}
+
+test "jobs that share the engine at any moment are each marked as overlapped" {
+    var slots: [3]Admission.Slot = undefined;
+    var pool: Admission = .init(std.testing.io, .{}, &slots);
+    var gates: [3]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    // Alone, until another starts beside it: both marked, and the mark stays after it ends.
+    gates[0].leave(true);
+    try std.testing.expect(!slots[0].overlapped);
+    gates[1].leave(true);
+    try std.testing.expect(slots[0].overlapped and slots[1].overlapped);
+    _ = gates[1].ended();
+    try std.testing.expect(slots[0].overlapped);
+    _ = gates[0].ended();
+    // The next job on an idle engine runs alone; a runner ending a cycle with no job is no job.
+    gates[1].leave(false);
+    gates[2].leave(true);
+    try std.testing.expect(!slots[2].overlapped);
 }
 
 test "a job is the same job on any ref, and another under another name or workflow" {

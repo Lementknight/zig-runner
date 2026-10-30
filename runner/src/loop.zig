@@ -996,8 +996,14 @@ fn handleJob(c: Context, session: Listening, body: []const u8) !Cycle {
     if (c.gate) |gate| gate.assigned(admission.jobKey(g.repository, g.workflow_ref, job_name));
     defer if (c.gate) |gate| if (gate.ended()) |learned| sayUnallocated(
         c,
-        "job '{s}' raised the engine's memory by {f} at most; reserving {f} for it while it starts",
-        .{ job_name, admission.gb(learned.seen_mb), admission.gb(learned.estimate_mb) },
+        "job '{s}' raised the engine's memory by {f} at most ({s}); reserving {f} for it while " ++
+            "it starts",
+        .{
+            job_name,
+            admission.gb(learned.seen_mb),
+            if (learned.alone) "alone" else "beside other jobs",
+            admission.gb(learned.estimate_mb),
+        },
     );
 
     // GitHub cancels a job (in its UI, or at the job's timeout-minutes) through the runner's
