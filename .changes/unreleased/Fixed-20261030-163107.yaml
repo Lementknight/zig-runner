@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A step''s `if:` and `name:` can read the step''s own `env:`, as on GitHub, and a step whose `env:` fails to evaluate fails even when its `if:` is false (#103).'
+time: 2026-10-30T16:31:07.000000-04:00

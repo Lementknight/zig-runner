@@ -1244,10 +1244,11 @@ fn runStep(
     if (cancel) |c| if (c.requested.load(.acquire)) {
         ev.cancelled = true;
     };
-    // 1. The condition, with the job env visible.
-    const sc0 = try stepCondition(x, step, res, num) orelse return null;
-
-    // 2. Step env and continue-on-error, then the step's own inputs.
+    // 1. Step env, with the job env visible. GitHub's runner evaluates it before the condition,
+    // so `if:` sees it, and an error fails the step whatever its condition says
+    // (`StepsRunner.cs` ~114-139).
+    ev.diag = "";
+    const sc0 = try ev.scope(&.{});
     const step_env = ev.renderEnv(step.env, sc0) catch {
         const msg = try std.fmt.allocPrint(arena, "could not evaluate env: {s}", .{ev.diag});
         // Still the step's failure, so its continue-on-error holds, read without its env: the
@@ -1258,6 +1259,10 @@ fn runStep(
         return null;
     };
     const sc1 = try ev.scope(step_env);
+
+    // 2. The name and condition, with the step env visible; then continue-on-error and the
+    // step's own inputs.
+    if (!try stepCondition(x, step, res, num, sc1)) return null;
     const coe = std.mem.eql(u8, ev.render(step.continue_on_error, sc1) catch "false", "true");
     res.continued = coe;
     const limit: ?[]const u8 = if (step.timeout_minutes) |t| ev.render(t, sc1) catch null else null;
@@ -1331,32 +1336,30 @@ test "timeoutMs reads timeout-minutes, and a number too large to hold is a year"
     try std.testing.expectEqual(year, timeoutMs("inf"));
 }
 
-/// The step's name and condition, evaluated with the job env visible. Returns the scope the rest of
-/// the step is evaluated in, or null when the step was skipped or could not be evaluated — in both
-/// cases it has been recorded and the loop moves on.
-fn stepCondition(x: *Exec, step: job_mod.Step, res: *StepResult, num: u32) !?expr.Scope {
+/// The step's name and condition, evaluated in `sc` (the job env and the step's). False when the
+/// step was skipped or its condition could not be evaluated: it has been recorded and the loop
+/// moves on.
+fn stepCondition(x: *Exec, step: job_mod.Step, res: *StepResult, num: u32, sc: expr.Scope) !bool {
     const ev = x.ev;
     const arena = x.arena;
-    ev.diag = "";
-    const sc0 = try ev.scope(&.{});
     // Evaluated with `secrets` in scope, and shown on GitHub, in the live view and in the database.
-    if (step.name_expr) |ne| res.name = try x.sh.redacted(arena, expr.evalString(arena, ne, sc0) catch step.name);
-    const should_run = expr.evalCondition(arena, step.condition, sc0) catch {
+    if (step.name_expr) |ne| res.name = try x.sh.redacted(arena, expr.evalString(arena, ne, sc) catch step.name);
+    const should_run = expr.evalCondition(arena, step.condition, sc) catch {
         const msg = try std.fmt.allocPrint(
             arena,
             "could not evaluate the condition '{s}': {s}",
             .{ step.condition, ev.diag },
         );
         try failStep(ev, x.sh, x.observer, step, res, num, msg, false);
-        return null;
+        return false;
     };
     if (!should_run) {
         res.outcome = .skipped;
         try ev.record(step, .skipped, false, &.{});
         if (x.observer) |o| o.finished(num, res.*);
-        return null;
+        return false;
     }
-    return sc0;
+    return true;
 }
 
 /// A `uses:` action or a `docker://` image step: timed, watched for its timeout, and recorded.
@@ -3465,6 +3468,37 @@ test "a step whose env fails to evaluate keeps its continue-on-error" {
     try std.testing.expectEqual(@as(usize, 2), fake.seen.items.len);
     try std.testing.expectEqual(Outcome.failure, res.steps[0].outcome);
     try std.testing.expect(res.steps[0].continued);
+}
+
+test "a step's if: and name see its own env, and an env error fails it whatever its if: says" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var gated = testStep("gated");
+    gated.env = &.{.{ .name = "GO", .value = .{ .lit = "yes" } }};
+    gated.condition = "env.GO == 'yes'";
+    gated.name_expr = "format('go {0}', env.GO)";
+    var bad = testStep("bad");
+    bad.env = &.{.{ .name = "BAD", .value = .{ .expr = "fromJSON('{')" } }};
+    bad.condition = "false";
+    const steps = [_]job_mod.Step{ gated, bad };
+    const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, "") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+    }, testJob(&steps), &log);
+    try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
+    try std.testing.expectEqualStrings("go yes", res.steps[0].name);
+    try std.testing.expectEqual(@as(usize, 2), fake.seen.items.len);
+    // GitHub evaluates the env first and fails the step on an error, before its `if:`.
+    try std.testing.expectEqual(Outcome.failure, res.steps[1].outcome);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "could not evaluate env: ") != null);
+    try std.testing.expect(!res.succeeded);
 }
 
 test "round trips: the job setup's query is sent again without the secrets when it fails with them" {
