@@ -137,8 +137,13 @@ pub fn scope(ev: *Evaluator, step_env: []const job_mod.EnvVar) !expr.Scope {
     for (env_list.items, env_entries) |e, *o|
         o.* = .{ .key = e.name, .value = .{ .string = e.value } };
 
-    const step_entries = try arena.alloc(expr.Value.Entry, ev.steps.items.len);
-    for (ev.steps.items, step_entries) |sc, *o| {
+    // A step without an `id:` of its own has no name (the job's) or a generated one starting with
+    // `__` (`__run`, a composite step's `__1`), and GitHub leaves it out of `steps`, so
+    // `steps.*.outcome` lists only steps the workflow named (actions/runner
+    // src/Runner.Worker/ExecutionContext.cs 652-660, 713-720).
+    var step_entries: std.ArrayList(expr.Value.Entry) = .empty;
+    for (ev.steps.items) |sc| {
+        if (sc.id.len == 0 or std.mem.startsWith(u8, sc.id, "__")) continue;
         const outs = try arena.alloc(expr.Value.Entry, sc.outputs.len);
         for (sc.outputs, outs) |ov, *oo|
             oo.* = .{ .key = ov.name, .value = .{ .string = ov.value } };
@@ -146,7 +151,7 @@ pub fn scope(ev: *Evaluator, step_env: []const job_mod.EnvVar) !expr.Scope {
         fields[0] = .{ .key = "outputs", .value = .{ .object = outs } };
         fields[1] = .{ .key = "outcome", .value = .{ .string = sc.outcome } };
         fields[2] = .{ .key = "conclusion", .value = .{ .string = sc.conclusion } };
-        o.* = .{ .key = sc.id, .value = .{ .object = fields } };
+        try step_entries.append(arena, .{ .key = sc.id, .value = .{ .object = fields } });
     }
 
     const job_fields = try arena.alloc(expr.Value.Entry, if (ev.services != null) 2 else 1);
@@ -171,7 +176,7 @@ pub fn scope(ev: *Evaluator, step_env: []const job_mod.EnvVar) !expr.Scope {
     const ctxs = try arena.alloc(expr.Value.Entry, 11);
     ctxs[0] = .{ .key = "github", .value = ev.github };
     ctxs[1] = .{ .key = "env", .value = .{ .object = env_entries } };
-    ctxs[2] = .{ .key = "steps", .value = .{ .object = step_entries } };
+    ctxs[2] = .{ .key = "steps", .value = .{ .object = step_entries.items } };
     ctxs[3] = .{ .key = "job", .value = .{ .object = job_fields } };
     ctxs[4] = .{ .key = "runner", .value = .{ .object = runner_fields } };
     ctxs[5] = .{ .key = "inputs", .value = ev.inputs };
@@ -250,9 +255,8 @@ pub fn record(
         .skipped, .not_run => "skipped",
     };
     const conclusion: []const u8 = if (outcome == .failure and continued) "success" else raw;
-    const id = if (step.context_name.len > 0) step.context_name else step.id;
     try ev.steps.append(ev.arena, .{
-        .id = id,
+        .id = step.context_name,
         .outcome = raw,
         .conclusion = conclusion,
         .outputs = outputs,
