@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'Problem matchers behave as on GitHub (#103): a matched line is logged as the error or warning itself (without color codes) instead of as plain output, the most recently added matcher is tried first, a match with an empty message or a severity other than error, warning or notice makes no annotation, and an annotation names a file only when it is inside the workspace.'
+time: 2026-10-30T17:30:00.000000-04:00

@@ -131,11 +131,8 @@ fn stepOutput(sh: *JobLog, step: u32, text: []const u8) void {
     const cmd = commands_mod.parseWorkflow(scratch, line, st.stop_token) catch
         return sh.appendLocked(step, line);
     switch (cmd) {
-        // Not a command: log it, then let the problem matchers see it.
-        .none => {
-            sh.appendLocked(step, text);
-            sh.matchLocked(step, text);
-        },
+        // Not a command: the problem matchers' issue, or else the line as it is.
+        .none => if (!sh.matchLocked(step, text)) sh.appendLocked(step, text),
         .add_mask => |value| sh.addMask(value),
         .group => |title| sh.appendScratch(step, "##[group]{s}", .{title}),
         .endgroup => sh.appendLocked(step, "##[endgroup]"),
@@ -361,11 +358,12 @@ pub fn warnUnlocked(sh: *JobLog, step: u32, text: []const u8) void {
     sh.appendLocked(step, text);
 }
 
-/// Offers a line to the problem matchers and annotates whatever they complete. Called with `mu`
-/// held, straight after the line was logged, so `annotateLocked` can point an annotation
-/// without a file at the line it came from.
-fn matchLocked(sh: *JobLog, step: u32, text: []const u8) void {
-    if (sh.matchers.count() == 0) return;
+/// Offers a line to the problem matchers. When they make an issue of it, logs the line as the
+/// issue, `##[<level>]<line>` without its color codes, in place of the line itself, and
+/// annotates it, as GitHub's runner does (`OnDataReceived` in OutputManager.cs, `AddIssue` with
+/// the line as the log message); true then. Called with `mu` held.
+fn matchLocked(sh: *JobLog, step: u32, text: []const u8) bool {
+    if (sh.matchers.count() == 0) return false;
     // **The line must be duplicated first.** Everything a match captures is a slice of it, and
     // a direct session's line lives only as long as its log record — the same reason the
     // command path above dupes a line containing `::`. Storing an annotation that points into
@@ -376,12 +374,13 @@ fn matchLocked(sh: *JobLog, step: u32, text: []const u8) void {
     // Into the scratch arena, with the matchers' work: an annotation keeps a copy of what it
     // needs (`annotateLocked`), and the rest goes when `stepOutput` resets the scratch.
     const scratch = sh.scratchAllocator();
-    const line = scratch.dupe(u8, std.mem.trimEnd(u8, text, "\r")) catch return;
-    const found = sh.matchers.feed(scratch, line) catch return;
-    for (found) |f| sh.annotateLocked(step, .{
+    const line = withoutColors(scratch, std.mem.trimEnd(u8, text, "\r")) catch return false;
+    const f = (sh.matchers.feed(scratch, line) catch return false) orelse return false;
+    sh.appendScratch(step, "##[{s}]{s}", .{ f.level, line });
+    sh.annotateLocked(step, .{
         .level = f.level,
         .message = f.message,
-        .file = f.file,
+        .file = if (f.file) |file| repositoryFile(scratch, sh.workspace, file) else null,
         .line = f.line,
         .end_line = f.end_line,
         .col = f.col,
@@ -389,6 +388,42 @@ fn matchLocked(sh: *JobLog, step: u32, text: []const u8) void {
         // GitHub shows a matcher's `code` as the annotation's title.
         .title = f.code,
     });
+    return true;
+}
+
+/// A copy of `text` without its terminal color codes, which GitHub's runner removes before the
+/// matchers see a line (`_colorCodeRegex`, `\x1b\[[0-9;]*m?`, in OutputManager.cs).
+fn withoutColors(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (std.mem.startsWith(u8, text[i..], "\x1b[")) {
+            i += 2;
+            while (i < text.len and (std.ascii.isDigit(text[i]) or text[i] == ';')) i += 1;
+            if (i < text.len and text[i] == 'm') i += 1;
+            continue;
+        }
+        try out.append(arena, text[i]);
+        i += 1;
+    }
+    return out.items;
+}
+
+/// A matched file as GitHub's runner keeps it: rooted at the workspace when relative, made
+/// normal, and then named relative to the repository, or dropped when it is not inside it
+/// (`ConvertToIssue` in OutputManager.cs). GitHub also drops a file that does not exist, and
+/// finds the repository by its `.git/config`; this runner sees neither from the log, and takes
+/// the workspace, where the job's repository is checked out, as the repository.
+fn repositoryFile(arena: Allocator, workspace: []const u8, file: []const u8) ?[]const u8 {
+    if (std.mem.trim(u8, file, " \t").len == 0) return null;
+    const root = if (workspace.len > 0) workspace else "/";
+    const full = std.fs.path.resolvePosix(arena, &.{ root, file }) catch return null;
+    const inside = if (std.mem.eql(u8, root, "/"))
+        full.len > 1
+    else
+        full.len > root.len + 1 and std.mem.startsWith(u8, full, root) and full[root.len] == '/';
+    if (!inside) return null;
+    return full[@min(full.len, std.mem.trimEnd(u8, root, "/").len + 1)..];
 }
 
 /// Keeps an annotation for completejob. Like GitHub's runner, at most `max_annotations` of each
@@ -1281,4 +1316,55 @@ test "stop-commands lasts to the end of its exec, and a refused token stops noth
     sh.stepOutput(1, "::add-mask::x");
     try std.testing.expect(f.cmds[0].stop_token == null);
     try std.testing.expect(!sh.holdsSecret("x", 1));
+}
+
+test "a matched line is logged as the issue; a file outside the workspace is dropped" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out.writer } };
+    var live: [1]std.atomic.Value(u32) = .{.init(0)};
+    var ended: [1]std.atomic.Value(bool) = .{.init(false)};
+    var replayed: [1]bool = .{false};
+    var cmds: [1]StepCommands = .{.{}};
+    var line_counts: [2]u32 = .{ 0, 0 };
+    var sh: JobLog = .{
+        .io = std.testing.io,
+        .arena = arena,
+        .log = &log,
+        .sink_job_id = 0,
+        .live_lines = &live,
+        .ended = &ended,
+        .replayed_steps = &replayed,
+        .commands = &cmds,
+        .line_counts = &line_counts,
+        .workspace = "/home/runner/work/r/r",
+    };
+    const gcc =
+        \\{"problemMatcher":[{"owner":"gcc","pattern":[{"regexp":"^(.+):(\\d+):(\\d+): (error|warning|note): (.*)$","file":1,"line":2,"column":3,"severity":4,"message":5}]}]}
+    ;
+    sh.addMatchers((try matcher.load(arena, gcc)).matchers);
+    sh.stepOutput(1, "\x1b[1msrc/a.c:3:7: error: \x1b[31mexpected ';'\x1b[0m");
+    sh.stepOutput(1, "/usr/include/stdio.h:12:1: warning: from the system");
+    sh.stepOutput(1, "./src/../src/b.c:1:1: error: normalised");
+    sh.stepOutput(1, "/home/runner/work/r/r/src/c.c:2:2: error: absolute, inside");
+    // `note` is not a severity GitHub knows: the line is left as it is.
+    sh.stepOutput(1, "src/a.c:4:1: note: declared here");
+    try std.testing.expectEqualStrings(
+        "[job 0 step 1 stdout] ##[error]src/a.c:3:7: error: expected ';'\n" ++
+            "[job 0 step 1 stdout] ##[warning]/usr/include/stdio.h:12:1: warning: from the system\n" ++
+            "[job 0 step 1 stdout] ##[error]./src/../src/b.c:1:1: error: normalised\n" ++
+            "[job 0 step 1 stdout] ##[error]/home/runner/work/r/r/src/c.c:2:2: error: absolute, inside\n" ++
+            "[job 0 step 1 stdout] src/a.c:4:1: note: declared here\n",
+        out.written(),
+    );
+    const got = sh.annotations.items;
+    try std.testing.expectEqual(@as(usize, 4), got.len);
+    try std.testing.expectEqualStrings("src/a.c", got[0].an.file.?);
+    try std.testing.expectEqualStrings("expected ';'", got[0].an.message);
+    try std.testing.expect(got[1].an.file == null);
+    try std.testing.expectEqualStrings("12", got[1].an.line.?);
+    try std.testing.expectEqualStrings("src/b.c", got[2].an.file.?);
+    try std.testing.expectEqualStrings("src/c.c", got[3].an.file.?);
 }
