@@ -10,6 +10,10 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.18.0 - 2026-10-30
+### Fixed
+* The memory gate no longer learns a job's reservation from runs that shared the engine with another job (#144): on razorbill the first `zig build test` runs overlapped another and were learned at 2.9 and 3.1 GB against 1.6 GB alone, which raised the worst case too and held runners for memory no job needed. A job now reserves the most of its recent runs alone, and only while it has none, the least of its recent runs beside other jobs. The end-of-job log line says which it was.
+
 ## v0.17.0 - 2026-10-29
 ### Added
 * The memory gate learns what each job takes (#144): once a runner knows which job it was handed (by repository, workflow file and job name), the job reserves, while it starts, the most its last 5 runs raised the engine's working set by, instead of `RUNNER_MEM_PER_JOB_MB` for every job. On razorbill a uv job takes about 300 MB and `zig build test` 1.6 GB, so light jobs no longer hold the next runner back as if they were heavy. Runners polling, and jobs not seen yet, reserve the worst case: `RUNNER_MEM_PER_JOB_MB`, or the most any job took if that is more. Learned only where the engine's cgroup is found, and in memory only; a job whose run changed its reservation is logged once.

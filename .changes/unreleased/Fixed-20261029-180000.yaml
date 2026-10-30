@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'The memory gate no longer learns a job''s reservation from runs that shared the engine with another job (#144): on razorbill the first `zig build test` runs overlapped another and were learned at 2.9 and 3.1 GB against 1.6 GB alone, which raised the worst case too and held runners for memory no job needed. A job now reserves the most of its recent runs alone, and only while it has none, the least of its recent runs beside other jobs. The end-of-job log line says which it was.'
-time: 2026-10-29T18:00:00.000000-04:00
