@@ -690,6 +690,7 @@ fn completeJobWithRetry(
         step_json,
         result.outputs,
         annotations_json,
+        result.environment_url,
     ) catch |e|
         return try fail(c, "completejob", e);
     if (done.status.class() != .success) {
@@ -698,7 +699,16 @@ fn completeJobWithRetry(
                 "without them\n",
             .{ @backingInt(done.status), done.body[0..@min(done.body.len, 200)] },
         );
-        done = completeJob(c, jr, job, conclusion, "[]", result.outputs, "[]") catch |e|
+        done = completeJob(
+            c,
+            jr,
+            job,
+            conclusion,
+            "[]",
+            result.outputs,
+            "[]",
+            result.environment_url,
+        ) catch |e|
             return try fail(c, "completejob", e);
         if (done.status.class() != .success) return try failBody(c, "completejob", done);
     }
@@ -716,6 +726,7 @@ fn completeJob(
     step_json: []const u8,
     outputs: []const job_mod.EnvVar,
     annotations_json: []const u8,
+    environment_url: ?[]const u8,
 ) !broker.Response {
     const delays = [_]i64{ 2, 5, 10 };
     var attempt: usize = 0;
@@ -731,6 +742,7 @@ fn completeJob(
             step_json,
             outputs,
             annotations_json,
+            environment_url,
         );
         const retry = if (r) |resp| resp.status.class() == .server_error else |_| true;
         if (!retry or attempt == delays.len) return r;

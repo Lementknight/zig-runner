@@ -244,6 +244,9 @@ pub const Result = struct {
     /// about them in "Complete job".
     outputs: []const job_mod.EnvVar = &.{},
     output_lines: []const []const u8 = &.{},
+    /// `environment.url`, evaluated after the steps, for completejob; null when there is none or
+    /// it was not set (see `environmentUrl`).
+    environment_url: ?[]const u8 = null,
     annotations: []const Annotation = &.{},
     /// $GITHUB_STEP_SUMMARY per log step (index = log step - 1; empty when none was written).
     summaries: []const []const u8 = &.{},
@@ -1641,7 +1644,43 @@ fn finishJob(x: *Exec, opts: Options, results: []StepResult) !Result {
     result.next_log_step = x.next_log_step;
     result.summaries = x.summaries;
     try jobOutputs(arena, x.ev, x.sh, job.*, &result);
+    try environmentUrl(arena, x.ev, x.sh, job.*, &result);
     return result;
+}
+
+/// Evaluates `environment.url` after the job outputs, as GitHub's runner does when it finishes a
+/// job (`FinalizeJob` in JobExtension.cs): one that would carry a secret is not set, with GitHub's
+/// warning, and one that cannot be evaluated fails the job.
+fn environmentUrl(
+    arena: Allocator,
+    ev: *Evaluator,
+    sh: *JobLog,
+    job: job_mod.Job,
+    result: *Result,
+) !void {
+    const url = job.environment.url orelse return;
+    var lines: std.ArrayList([]const u8) = .empty;
+    try lines.appendSlice(arena, result.output_lines);
+    try lines.append(arena, "Evaluate and set environment url");
+    defer result.output_lines = lines.items;
+    ev.diag = "";
+    const value = ev.render(url, try ev.scope(&.{})) catch {
+        try lines.append(arena, "##[error]Failed to evaluate environment url");
+        if (ev.diag.len > 0)
+            try lines.append(arena, try std.fmt.allocPrint(arena, "##[error]{s}", .{ev.diag}));
+        result.succeeded = false;
+        return;
+    };
+    if (containsSecret(job, value) or sh.holdsSecret(value, 1)) {
+        try lines.append(arena, try std.fmt.allocPrint(arena, "##[warning]Skip setting " ++
+            "environment url as environment '{s}' may contain secret.", .{job.environment.name}));
+        return;
+    }
+    try lines.append(
+        arena,
+        try std.fmt.allocPrint(arena, "Evaluated environment url: {s}", .{value}),
+    );
+    result.environment_url = value;
 }
 
 /// Evaluates the job's outputs as GitHub's runner does when it finishes a job: against the final
@@ -2874,6 +2913,41 @@ test "job outputs are evaluated after the steps; one carrying a secret is skippe
     const want = [_][]const u8{ "Evaluate and set job outputs", "Set output 'version'", "Set output 'literal'", "Set output 'combined'", "##[warning]Skip output 'leak' since it may contain secret." };
     try std.testing.expectEqual(want.len, res.output_lines.len);
     for (want, res.output_lines) |wnt, got| try std.testing.expectEqualStrings(wnt, got);
+}
+
+test "environment.url is evaluated after the steps and reported, unless it carries a secret" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var st = testStep("echo page=https://pr-7.example.test >> $GITHUB_OUTPUT");
+    st.context_name = "deploy";
+    const steps = [_]job_mod.Step{st};
+    const Case = struct { url: job_mod.Template, want: ?[]const u8, line: []const u8, ok: bool };
+    const cases = [_]Case{
+        .{ .url = .{ .expr = "steps.deploy.outputs.page" }, .want = "https://pr-7.example.test", .line = "Evaluated environment url: https://pr-7.example.test", .ok = true },
+        .{ .url = .{ .lit = "https://x.test/?t=s3cr3t-value" }, .want = null, .line = "##[warning]Skip setting environment url as environment 'preview' may contain secret.", .ok = true },
+        // GitHub fails the job when the url cannot be evaluated.
+        .{ .url = .{ .expr = "fromJSON('not json')" }, .want = null, .line = "##[error]Failed to evaluate environment url", .ok = false },
+    };
+    for (cases) |c| {
+        var job = testJob(&steps);
+        job.secrets = &.{"s3cr3t-value"};
+        job.environment = .{ .name = "preview", .url = c.url };
+        const answers = [_][]const u8{
+            base_answer,
+            "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"id\":\"C1\",\"exitCode\":0,\"stdout\":\"\",\"stderr\":\"\",\"fc_output\":{\"contents\":\"page=https://pr-7.example.test\\n\"}}}}}",
+        };
+        var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+        try std.testing.expectEqual(c.ok, res.succeeded);
+        if (c.want) |u| try std.testing.expectEqualStrings(u, res.environment_url.?) else try std.testing.expect(res.environment_url == null);
+        try std.testing.expectEqualStrings("Evaluate and set environment url", res.output_lines[0]);
+        try std.testing.expectEqualStrings(c.line, res.output_lines[1]);
+    }
 }
 
 test "steps get the engine (privileged nesting) unless it is turned off" {

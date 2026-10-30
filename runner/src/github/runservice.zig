@@ -101,6 +101,9 @@ pub fn complete(
     outputs: []const EnvVar,
     /// JSON array of annotations (see `upload.annotationsJson`).
     annotations: []const u8,
+    /// The evaluated `environment.url`, the deployment's link; left out when null, as GitHub's
+    /// runner leaves it out (`CompleteJobRequest.EnvironmentUrl`, `EmitDefaultValue = false`).
+    environment_url: ?[]const u8,
 ) !broker.Response {
     // Outputs as the runner sends them: name -> {value, isSecret} (actions/runner's VariableValue).
     var out_json: std.Io.Writer.Allocating = .init(arena);
@@ -114,13 +117,39 @@ pub fn complete(
         try w.writeAll(",\"isSecret\":false}");
     }
     try w.writeByte('}');
+    const outputs_json = out_json.written();
     const body = try std.fmt.allocPrint(
         arena,
         "{{\"planId\":\"{s}\",\"jobId\":\"{s}\",\"conclusion\":\"{s}\",\"outputs\":{s}," ++
-            "\"stepResults\":{s},\"annotations\":{s},\"telemetry\":[]}}",
-        .{ plan_id, job_id, @tagName(conclusion), out_json.written(), step_results, annotations },
+            "\"stepResults\":{s},\"annotations\":{s}{s},\"telemetry\":[]}}",
+        .{
+            plan_id,
+            job_id,
+            @tagName(conclusion),
+            outputs_json,
+            step_results,
+            annotations,
+            try environmentUrlField(arena, environment_url),
+        },
     );
     return post(arena, io, req, token, "completejob", body);
+}
+
+/// `,"environmentUrl":"<url>"` for completejob's body, or nothing without a url.
+fn environmentUrlField(arena: Allocator, url: ?[]const u8) ![]const u8 {
+    const u = url orelse return "";
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try out.writer.writeAll(",\"environmentUrl\":");
+    try std.json.Stringify.value(u, .{}, &out.writer);
+    return out.written();
+}
+
+test "completejob's environmentUrl: JSON-quoted, and absent without a url" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const field = try environmentUrlField(a.allocator(), "https://x.test/?q=\"a\"");
+    try std.testing.expectEqualStrings(",\"environmentUrl\":\"https://x.test/?q=\\\"a\\\"\"", field);
+    try std.testing.expectEqualStrings("", try environmentUrlField(a.allocator(), null));
 }
 
 test "parse nested job request and build endpoint" {
