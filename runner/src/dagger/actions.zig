@@ -162,11 +162,13 @@ pub fn runAction(
     const saved_inputs = ev.inputs;
     const saved_github = ev.github;
     const saved_failed = ev.job_failed;
+    const saved_status = ev.status_failed;
     defer {
         ev.steps = saved_steps;
         ev.inputs = saved_inputs;
         ev.github = saved_github;
         ev.job_failed = saved_failed;
+        ev.status_failed = saved_status;
     }
     try x.enterAction(act, inputs);
 
@@ -202,6 +204,8 @@ pub fn enterAction(x: *Exec, act: Loaded, inputs: []const expr.Value.Entry) !voi
         .{ .key = "action_repository", .value = .{ .string = act.repository } },
         .{ .key = "action_ref", .value = .{ .string = act.ref } },
     });
+    // `job.status` keeps the job's (`Evaluator.status_failed`); `success()` is the action's.
+    if (ev.status_failed == null) ev.status_failed = ev.job_failed;
     ev.job_failed = false;
 }
 
@@ -1068,6 +1072,38 @@ test "action failures: an image that cannot be pulled, a missing action.yml, and
     // As GitHub's runner logs a script that exits non-zero.
     try std.testing.expect(std.mem.indexOf(u8, out, "##[error]Process completed with exit code 3.") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "o/none@v1 has no action.yml or action.yaml") != null);
+}
+
+test "inside a composite action, job.status is the job's, while success() is the action's" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    // On GitHub the job's status changes only between the job's own steps, and an action's steps
+    // share the job's `job` context (actions/runner src/Runner.Worker/StepsRunner.cs, where
+    // `JobContext.Status` is set before each step).
+    const yml = "runs:\n  using: composite\n  steps:\n    - shell: bash\n" ++
+        "      run: echo status=${{ job.status }}\n";
+    var after = usesStep("act", "o", "act", "v1", &.{});
+    after.condition = "always()";
+    const steps = [_]job_mod.Step{ testStep("exit 1"), after };
+    const answers = [_][]const u8{
+        base_answer,
+        try treeAnswer(arena, "D1", &.{"action.yml"}),
+        try fileAnswer(arena, yml),
+        try exec(arena, "C1", 1, ""),
+        try exec(arena, "C2", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(!res.succeeded);
+    try std.testing.expectEqual(Outcome.success, res.steps[1].outcome);
+    const seen = fake.seen.items;
+    try std.testing.expectEqual(@as(usize, 5), seen.len);
+    try std.testing.expect(std.mem.indexOf(u8, seen[4], "echo status=failure") != null);
 }
 
 test "a local action is read from the workspace when its step runs, and is not mounted" {

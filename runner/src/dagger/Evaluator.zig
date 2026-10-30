@@ -29,6 +29,8 @@ matrix: expr.Value,
 needs: expr.Value,
 strategy: expr.Value,
 vars: expr.Value,
+/// `job` from contextData (`check_run_id`, `workflow_ref`, ...), which GitHub copies whole into
+/// the `job` context before adding `status`, `services` and `container`.
 job_context: expr.Value,
 /// Workflow- and job-level env, evaluated once.
 job_env: std.ArrayList(job_mod.EnvVar) = .empty,
@@ -46,6 +48,13 @@ job_failed: bool = false,
 cancelled: bool = false,
 /// `job.services`: `{<name>: {id, network, ports: {<container port>: <host port>}}}`.
 services: ?expr.Value = null,
+/// `job.container`: `{id, network}` in a `container:` job, `{network}` in a job with only
+/// services, as GitHub sets it when it starts the job's containers.
+container: ?expr.Value = null,
+/// Inside a composite action: whether the job had failed when the outermost action started.
+/// `job.status` reads it there, as on GitHub, where the job's status changes only between the
+/// job's own steps; `job_failed` is the action's own, for its steps' `success()`.
+status_failed: ?bool = null,
 diag: []const u8 = "",
 /// Reads the job's files for `hashFiles()`, once the job's container exists.
 hash_files: ?expr.HashFiles = null,
@@ -185,20 +194,28 @@ pub fn scope(ev: *Evaluator, step_env: []const job_mod.EnvVar) !expr.Scope {
         try step_entries.append(arena, .{ .key = sc.id, .value = .{ .object = fields } });
     }
 
-    const job_fields = try arena.alloc(expr.Value.Entry, if (ev.services != null) 2 else 1);
-    job_fields[0] = .{
-        .key = "status",
-        .value = .{ .string = ev.jobStatus() },
+    // contextData's `job` first, then what the runner sets (actions/runner
+    // src/Runner.Worker/ExecutionContext.cs 1023-1033, ContainerOperationProvider.cs).
+    var job_fields: std.ArrayList(expr.Value.Entry) = .empty;
+    if (ev.job_context == .object) for (ev.job_context.object) |e| {
+        const ours = std.ascii.eqlIgnoreCase(e.key, "status") or
+            std.ascii.eqlIgnoreCase(e.key, "services") or
+            std.ascii.eqlIgnoreCase(e.key, "container");
+        if (!ours) try job_fields.append(arena, e);
     };
-    if (ev.services) |v| job_fields[1] = .{ .key = "services", .value = v };
-    const runner_fields = try arena.alloc(expr.Value.Entry, if (ev.runner_debug) 7 else 6);
+    try job_fields.append(arena, .{ .key = "status", .value = .{ .string = ev.jobStatus() } });
+    if (ev.services) |v| try job_fields.append(arena, .{ .key = "services", .value = v });
+    if (ev.container) |v| try job_fields.append(arena, .{ .key = "container", .value = v });
+    const runner_fields = try arena.alloc(expr.Value.Entry, if (ev.runner_debug) 8 else 7);
     runner_fields[0] = .{ .key = "os", .value = .{ .string = "Linux" } };
     runner_fields[1] = .{ .key = "arch", .value = .{ .string = broker.arch } };
     runner_fields[2] = .{ .key = "name", .value = .{ .string = ev.runner_name } };
     runner_fields[3] = .{ .key = "temp", .value = .{ .string = ev.temp } };
     runner_fields[4] = .{ .key = "tool_cache", .value = .{ .string = "/opt/hostedtoolcache" } };
     runner_fields[5] = .{ .key = "environment", .value = .{ .string = "self-hosted" } };
-    if (ev.runner_debug) runner_fields[6] = .{ .key = "debug", .value = .{ .string = "1" } };
+    // RUNNER_WORKSPACE's value: the directory above the workspace (JobExtension.cs 213-215).
+    runner_fields[6] = .{ .key = "workspace", .value = .{ .string = ev.runnerWorkspace() } };
+    if (ev.runner_debug) runner_fields[7] = .{ .key = "debug", .value = .{ .string = "1" } };
 
     const secret_entries = try arena.alloc(expr.Value.Entry, ev.job.secret_vars.len);
     for (ev.job.secret_vars, secret_entries) |sv, *o|
@@ -208,7 +225,7 @@ pub fn scope(ev: *Evaluator, step_env: []const job_mod.EnvVar) !expr.Scope {
     ctxs[0] = .{ .key = "github", .value = ev.github };
     ctxs[1] = .{ .key = "env", .value = .{ .object = env_entries } };
     ctxs[2] = .{ .key = "steps", .value = .{ .object = step_entries.items } };
-    ctxs[3] = .{ .key = "job", .value = .{ .object = job_fields } };
+    ctxs[3] = .{ .key = "job", .value = .{ .object = job_fields.items } };
     ctxs[4] = .{ .key = "runner", .value = .{ .object = runner_fields } };
     ctxs[5] = .{ .key = "inputs", .value = ev.inputs };
     ctxs[6] = .{ .key = "matrix", .value = ev.matrix };
@@ -245,11 +262,28 @@ pub fn renderEnv(
 /// `job.status` as the expression language sees it.
 fn jobStatus(ev: *const Evaluator) []const u8 {
     if (ev.cancelled) return "cancelled";
-    return if (ev.job_failed) "failure" else "success";
+    return if (ev.status_failed orelse ev.job_failed) "failure" else "success";
 }
 
-pub fn setServices(ev: *Evaluator, running: []const Exec.RunningService) !void {
+/// `runner.workspace` and RUNNER_WORKSPACE.
+fn runnerWorkspace(ev: *const Evaluator) []const u8 {
+    return std.fs.path.dirnamePosix(ev.workspace) orelse "/";
+}
+
+/// `job.services` from the running services, and `job.container`: `container_id` is the job
+/// container's, null in a job with only services.
+pub fn setServices(
+    ev: *Evaluator,
+    running: []const Exec.RunningService,
+    container_id: ?[]const u8,
+) !void {
     const arena = ev.arena;
+    const container = try arena.alloc(expr.Value.Entry, if (container_id != null) 2 else 1);
+    container[0] = .{ .key = "network", .value = .{ .string = "dagger" } };
+    if (container_id) |id| {
+        container[1] = .{ .key = "id", .value = .{ .string = try stableId(arena, id) } };
+    }
+    ev.container = .{ .object = container };
     const entries = try arena.alloc(expr.Value.Entry, running.len);
     for (running, entries) |r, *e| {
         const ports = try arena.alloc(expr.Value.Entry, r.ports.len);
@@ -257,19 +291,21 @@ pub fn setServices(ev: *Evaluator, running: []const Exec.RunningService) !void {
             .key = try std.fmt.allocPrint(arena, "{d}", .{p.container}),
             .value = .{ .string = try std.fmt.allocPrint(arena, "{d}", .{p.host}) },
         };
-        // A stable id of the running service (GitHub gives the container's id).
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(r.id, &digest, .{});
         const fields = try arena.alloc(expr.Value.Entry, 3);
-        fields[0] = .{
-            .key = "id",
-            .value = .{ .string = try std.fmt.allocPrint(arena, "{x}", .{&digest}) },
-        };
+        fields[0] = .{ .key = "id", .value = .{ .string = try stableId(arena, r.id) } };
         fields[1] = .{ .key = "network", .value = .{ .string = "dagger" } };
         fields[2] = .{ .key = "ports", .value = .{ .object = ports } };
         e.* = .{ .key = r.name, .value = .{ .object = fields } };
     }
     ev.services = .{ .object = entries };
+}
+
+/// A stable id for a running container, from its Dagger id (GitHub gives the Docker container's
+/// id, which no step here can use, so only its shape matters).
+fn stableId(arena: Allocator, dagger_id: []const u8) ![]const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(dagger_id, &digest, .{});
+    return std.fmt.allocPrint(arena, "{x}", .{&digest});
 }
 
 pub fn record(
@@ -337,8 +373,7 @@ pub fn defaultEnv(ev: *const Evaluator) ![]const job_mod.EnvVar {
         .{ .name = "RUNNER_NAME", .value = ev.runner_name },
         .{ .name = "RUNNER_TEMP", .value = ev.temp },
         .{ .name = "RUNNER_TOOL_CACHE", .value = "/opt/hostedtoolcache" },
-        .{ .name = "RUNNER_WORKSPACE", .value = std.fs.path.dirnamePosix(ev.workspace) orelse
-            "/" },
+        .{ .name = "RUNNER_WORKSPACE", .value = ev.runnerWorkspace() },
         .{ .name = "RUNNER_ENVIRONMENT", .value = "self-hosted" },
         .{ .name = "GITHUB_EVENT_PATH", .value = event_path },
         // Set in every step, empty outside an action's own steps (which set them), as on
@@ -476,4 +511,29 @@ test "github.workspace is the job's workspace, as actions' input defaults expect
     var ev = try Evaluator.init(arena, &job);
     try std.testing.expectEqualStrings("/home/runner/work/r/r", ev.githubString("workspace"));
     try std.testing.expectEqualStrings("/home/runner/work/r/r", try ev.render(.{ .expr = "github.workspace" }, try ev.scope(&.{})));
+}
+
+test "the job context is contextData's job, with status, services and container from the runner" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const steps = [_]job_mod.Step{testStep("true")};
+    var job = testJob(&steps);
+    job.context_data = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"github":{"t":2,"d":[{"k":"repository","v":"o/r"}]},
+        \\ "job":{"t":2,"d":[{"k":"check_run_id","v":123},{"k":"workflow_ref","v":"o/r/.github/workflows/ci.yml@refs/heads/main"},{"k":"status","v":"stale"}]}}
+    , .{});
+    var ev = try Evaluator.init(arena, &job);
+    const Case = struct { []const u8, []const u8 };
+    for ([_]Case{
+        .{ "job.check_run_id", "123" },
+        .{ "job.workflow_ref", "o/r/.github/workflows/ci.yml@refs/heads/main" },
+        .{ "job.status", "success" },
+        .{ "job.container.network", "" },
+        .{ "runner.workspace", "/home/runner/work/r" },
+    }) |c| try std.testing.expectEqualStrings(c[1], try ev.render(.{ .expr = c[0] }, try ev.scope(&.{})));
+    // A container job's containers have started: `job.container` has its network and an id.
+    try ev.setServices(&.{}, "C0");
+    try std.testing.expectEqualStrings("dagger", try ev.render(.{ .expr = "job.container.network" }, try ev.scope(&.{})));
+    try std.testing.expectEqual(@as(usize, 64), (try ev.render(.{ .expr = "job.container.id" }, try ev.scope(&.{}))).len);
 }
