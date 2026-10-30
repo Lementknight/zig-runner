@@ -82,6 +82,22 @@ pub const StepCommands = struct {
     /// From the deprecated `::set-output` and `::save-state`.
     outputs: std.ArrayList(job_mod.EnvVar) = .empty,
     state: std.ArrayList(job_mod.EnvVar) = .empty,
+    /// The running exec's env sets ACTIONS_ALLOW_UNSECURE_COMMANDS to `true`, so `::set-env`
+    /// and `::add-path` work (`allowUnsecureCommands`).
+    unsecure_commands: bool = false,
+    /// What those set, since the last `takeUnsecure`.
+    env: std.ArrayList(job_mod.EnvVar) = .empty,
+    paths: std.ArrayList([]const u8) = .empty,
+    /// A command failed, which fails the step whatever its exit code, as GitHub's
+    /// `CommandResult = Failed` does (ActionCommandManager.cs, `TryProcessCommand`).
+    failed: bool = false,
+};
+
+/// What the unsecure commands of a step's exec left (`takeUnsecure`).
+pub const Unsecure = struct {
+    env: []const job_mod.EnvVar,
+    paths: []const []const u8,
+    failed: bool,
 };
 
 /// A line from the runner itself; never read as a workflow command.
@@ -142,18 +158,36 @@ fn stepOutput(sh: *JobLog, step: u32, text: []const u8) void {
         .resume_commands => st.stop_token = null,
         .set_output => |kv| if (sh.keepVar(kv)) |v| st.outputs.append(sh.arena, v) catch {},
         .save_state => |kv| if (sh.keepVar(kv)) |v| st.state.append(sh.arena, v) catch {},
-        .disabled => |name| {
-            const msg = std.fmt.allocPrint(
-                scratch,
-                "The `{s}` command is disabled. Please upgrade to using Environment Files " ++
-                    "or opt " ++
-                    "into unsecure command execution by setting the " ++
-                    "`ACTIONS_ALLOW_UNSECURE_COMMANDS` environment variable to `true`. " ++
-                    "For more information see: " ++
-                    "https://github.blog/changelog/2020-10-01-github-actions-deprecating-set-env-and-add-path-commands/",
-                .{name},
-            ) catch return;
-            sh.errorLineLocked(step, msg);
+        .set_env => |se| {
+            if (!st.unsecure_commands) return sh.unsecureDisabledLocked(step, line, "set-env");
+            const name = se.name orelse "";
+            if (name.len == 0) return sh.commandFailedLocked(
+                step,
+                line,
+                "Required field 'name' is missing in ##[set-env] command.",
+            );
+            // Refused as from GITHUB_ENV (`Exec.collect`); an error, and the step goes on.
+            if (commands_mod.isBlockedEnvName(name))
+                return sh.errorLineLocked(step, "Can't update NODE_OPTIONS environment " ++
+                    "variable using ::set-env:: command.");
+            if (commands_mod.isRunnerEnvName(name)) {
+                const msg = std.fmt.allocPrint(scratch, "Can't update {s} environment " ++
+                    "variable using ::set-env:: command: it is the runner's own.", .{name}) catch
+                    return;
+                return sh.errorLineLocked(step, msg);
+            }
+            const kv = sh.keepVar(.{ .name = name, .value = se.value }) orelse return;
+            st.env.append(sh.arena, kv) catch {};
+        },
+        .add_path => |dir| {
+            if (!st.unsecure_commands) return sh.unsecureDisabledLocked(step, line, "add-path");
+            if (dir.len == 0) return sh.commandFailedLocked(
+                step,
+                line,
+                "Parameter 'path' cannot be null or empty.",
+            );
+            const kept = sh.arena.dupe(u8, dir) catch return;
+            st.paths.append(sh.arena, kept) catch {};
         },
         .echo => {},
     }
@@ -171,6 +205,69 @@ pub fn errorLine(sh: *JobLog, step: u32, msg: []const u8) void {
 fn errorLineLocked(sh: *JobLog, step: u32, msg: []const u8) void {
     sh.appendScratch(step, "##[error]{s}", .{msg});
     sh.annotateLocked(step, .{ .level = "error", .message = msg });
+}
+
+/// A workflow command that could not be carried out, as GitHub's runner reports one: the line,
+/// then why, both errors; the step fails (`TryProcessCommand` in ActionCommandManager.cs).
+fn commandFailedLocked(sh: *JobLog, step: u32, line: []const u8, why: []const u8) void {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    const msg = std.fmt.allocPrint(
+        sh.scratchAllocator(),
+        "Unable to process command '{s}' successfully.",
+        .{trimmed},
+    ) catch return;
+    sh.errorLineLocked(step, msg);
+    sh.errorLineLocked(step, why);
+    sh.commands[step - 1].failed = true;
+}
+
+/// `set-env` or `add-path` without ACTIONS_ALLOW_UNSECURE_COMMANDS (GitHub's
+/// `UnsupportedCommandMessageDisabled`).
+fn unsecureDisabledLocked(sh: *JobLog, step: u32, line: []const u8, name: []const u8) void {
+    const why = std.fmt.allocPrint(
+        sh.scratchAllocator(),
+        "The `{s}` command is disabled. Please upgrade to using Environment Files or opt " ++
+            "into unsecure command execution by setting the " ++
+            "`ACTIONS_ALLOW_UNSECURE_COMMANDS` environment variable to `true`. " ++
+            "For more information see: " ++
+            "https://github.blog/changelog/2020-10-01-github-actions-deprecating-set-env-and-add-path-commands/",
+        .{name},
+    ) catch return;
+    sh.commandFailedLocked(step, line, why);
+}
+
+/// Whether `env`, an exec's env context, opts into `::set-env` and `::add-path`: GitHub reads
+/// ACTIONS_ALLOW_UNSECURE_COMMANDS with .NET's `bool.TryParse`, which takes `true` in any case,
+/// with surrounding whitespace (`SetEnvCommandExtension`).
+pub fn allowUnsecureCommands(env: []const job_mod.EnvVar) bool {
+    var allowed = false;
+    for (env) |e| if (std.mem.eql(u8, e.name, "ACTIONS_ALLOW_UNSECURE_COMMANDS")) {
+        allowed = std.ascii.eqlIgnoreCase(std.mem.trim(u8, e.value, " \t\r\n"), "true");
+    };
+    return allowed;
+}
+
+/// Sets whether the exec about to run as `step` may use `::set-env` and `::add-path`.
+pub fn setUnsecureCommands(sh: *JobLog, step: u32, allowed: bool) void {
+    sh.mu.lockUncancelable(sh.io);
+    defer sh.mu.unlock(sh.io);
+    if (step == 0 or step > sh.commands.len) return;
+    sh.commands[step - 1].unsecure_commands = allowed;
+}
+
+/// What `::set-env` and `::add-path` did in `step` since the last call, and whether a command
+/// failed it.
+pub fn takeUnsecure(sh: *JobLog, step: u32) Unsecure {
+    sh.mu.lockUncancelable(sh.io);
+    defer sh.mu.unlock(sh.io);
+    if (step == 0 or step > sh.commands.len) return .{ .env = &.{}, .paths = &.{}, .failed = false };
+    const st = &sh.commands[step - 1];
+    defer {
+        st.env = .empty;
+        st.paths = .empty;
+        st.failed = false;
+    }
+    return .{ .env = st.env.items, .paths = st.paths.items, .failed = st.failed };
 }
 
 /// The allocator for work on the current line, with `mu` held; the caller resets it with

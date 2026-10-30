@@ -191,8 +191,11 @@ pub const Workflow = union(enum) {
     /// Deprecated `set-output` and `save-state`, still honoured.
     set_output: job_mod.EnvVar,
     save_state: job_mod.EnvVar,
-    /// `set-env` and `add-path`, which GitHub disabled.
-    disabled: []const u8,
+    /// `::set-env name=<name>::<value>` and `::add-path::<dir>`, which GitHub disabled: they fail
+    /// the step unless its env sets ACTIONS_ALLOW_UNSECURE_COMMANDS to `true`. The name is null
+    /// when the command has none.
+    set_env: struct { name: ?[]const u8, value: []const u8 },
+    add_path: []const u8,
     /// `::echo::on|off` only changes whether commands are echoed; this runner never echoes them.
     echo,
     /// `::add-matcher::<path>`: register the problem matchers in that file (see matcher.zig). The
@@ -254,7 +257,11 @@ pub fn parseWorkflow(
     if (eql(name, "debug")) return .{ .debug = try unescape(arena, data, false) };
     if (eql(name, "echo")) return .echo;
     if (eql(name, "stop-commands")) return if (data.len > 0) .{ .stop = data } else .none;
-    if (eql(name, "set-env") or eql(name, "add-path")) return .{ .disabled = name };
+    if (eql(name, "set-env")) return .{ .set_env = .{
+        .name = try property(arena, props, "name"),
+        .value = try unescape(arena, data, false),
+    } };
+    if (eql(name, "add-path")) return .{ .add_path = try unescape(arena, data, false) };
     for ([_][]const u8{ "error", "warning", "notice" }) |level| if (eql(name, level))
         return .{ .annotation = .{
             .level = level,
@@ -342,7 +349,11 @@ test "workflow commands" {
     try std.testing.expectEqualStrings("v\n2", out.value);
     try std.testing.expectEqualStrings("isPost", (try parseWorkflow(ar, "::save-state name=isPost::true", null)).save_state.name);
     try std.testing.expect(try parseWorkflow(ar, "::set-output::no name", null) == .none);
-    try std.testing.expectEqualStrings("set-env", (try parseWorkflow(ar, "::set-env name=X::1", null)).disabled);
+    const set_env = (try parseWorkflow(ar, "::set-env name=X::1%0A2", null)).set_env;
+    try std.testing.expectEqualStrings("X", set_env.name.?);
+    try std.testing.expectEqualStrings("1\n2", set_env.value);
+    try std.testing.expect((try parseWorkflow(ar, "::set-env::1", null)).set_env.name == null);
+    try std.testing.expectEqualStrings("/opt/bin", (try parseWorkflow(ar, "::ADD-PATH::/opt/bin", null)).add_path);
     try std.testing.expect(try parseWorkflow(ar, "::echo::on", null) == .echo);
     // stop-commands: everything is plain text until the token comes back
     try std.testing.expectEqualStrings("tok123", (try parseWorkflow(ar, "::stop-commands::tok123", null)).stop);

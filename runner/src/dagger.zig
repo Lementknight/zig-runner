@@ -2841,7 +2841,7 @@ test "workflow commands in a step's output: masks, groups, annotations, debug, s
         "before s3cr3t-token\\n::add-mask::s3cr3t-token\\nafter s3cr3t-token\\n" ++
         "::group::Install%25\\ninside\\n::endgroup::\\n" ++
         "::error file=a.js,line=1::bad%0Asecond line\\n::warning::careful\\n::debug::hidden\\n" ++
-        "::set-output name=legacy::42\\n::set-env name=X::1\\n" ++
+        "::set-output name=legacy::42\\n" ++
         "::stop-commands::tok\\n::group::not a group\\n::add-mask::not-masked\\n::tok::\\n::notice::back\\n";
     const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, out1), try exec(arena, "C2", 0, "s3cr3t-token in step 2\\n") };
     var fake: FakeSession = .{ .answers = &answers, .arena = arena };
@@ -2859,7 +2859,6 @@ test "workflow commands in a step's output: masks, groups, annotations, debug, s
         \\[job 0 step 1 stdout] ##[error]bad
         \\[job 0 step 1 stdout] second line
         \\[job 0 step 1 stdout] ##[warning]careful
-        \\[job 0 step 1 stdout] ##[error]The `set-env` command is disabled.
     ;
     const got = w.buffered();
     var it = std.mem.splitScalar(u8, want, '\n');
@@ -2882,7 +2881,7 @@ test "workflow commands in a step's output: masks, groups, annotations, debug, s
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "echo got=42") != null);
     // Annotations for completejob: the error points to its file; the others, to their line in the
     // step's log.
-    try std.testing.expectEqual(@as(usize, 4), res.annotations.len);
+    try std.testing.expectEqual(@as(usize, 3), res.annotations.len);
     const err = res.annotations[0];
     try std.testing.expectEqual(@as(u32, 1), err.step);
     try std.testing.expectEqualStrings("a.js", err.an.file.?);
@@ -2897,9 +2896,55 @@ test "workflow commands in a step's output: masks, groups, annotations, debug, s
     }
     try std.testing.expectEqualStrings("warning", res.annotations[1].an.level);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "{d}", .{n}), res.annotations[1].an.line.?);
-    try std.testing.expect(std.mem.startsWith(u8, res.annotations[2].an.message, "The `set-env` command is disabled."));
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "{d}", .{n + 1}), res.annotations[2].an.line.?);
-    try std.testing.expectEqualStrings("notice", res.annotations[3].an.level);
+    try std.testing.expectEqualStrings("notice", res.annotations[2].an.level);
+}
+
+test "set-env and add-path fail the step, unless ACTIONS_ALLOW_UNSECURE_COMMANDS is true" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var after = testStep("");
+    after.action.script.script = .{ .expr = "format('echo x={0}', env.X)" };
+    after.condition = "always()";
+    const steps = [_]job_mod.Step{ testStep("x"), after };
+    const out1 = "::set-env name=X::1\\n::add-path::/opt/x\\n" ++
+        "::set-env name=NODE_OPTIONS::--require=/x.js\\n";
+    for ([_]?[]const u8{ null, "false", "True" }) |allow| {
+        var job = testJob(&steps);
+        if (allow) |v| job.env = &.{.{ .name = "ACTIONS_ALLOW_UNSECURE_COMMANDS", .value = .{ .lit = v } }};
+        const allowed = allow != null and std.mem.eql(u8, allow.?, "True");
+        const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, out1), try exec(arena, "C2", 0, "") };
+        var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+        var buf: [8192]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+        const got = w.buffered();
+        const step2 = fake.seen.items[2];
+        if (allowed) {
+            // As GitHub: the variable and the directory reach the next step; NODE_OPTIONS is
+            // refused with an error that does not fail the step.
+            try std.testing.expect(res.succeeded);
+            try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
+            try std.testing.expect(std.mem.indexOf(u8, step2, "withEnvVariable(name:\"X\",value:\"1\")") != null);
+            try std.testing.expect(std.mem.indexOf(u8, step2, "withEnvVariable(name:\"PATH\",value:\"/opt/x:$PATH\",expand:true)") != null);
+            try std.testing.expect(std.mem.indexOf(u8, step2, "echo x=1") != null);
+            try std.testing.expect(std.mem.indexOf(u8, step2, "NODE_OPTIONS") == null);
+            try std.testing.expect(std.mem.indexOf(u8, got, "##[error]Can't update NODE_OPTIONS environment variable using ::set-env:: command.") != null);
+            try std.testing.expect(std.mem.indexOf(u8, got, "is disabled") == null);
+        } else {
+            // Each command is an error that fails the step, though its process succeeded.
+            try std.testing.expect(!res.succeeded);
+            try std.testing.expectEqual(Outcome.failure, res.steps[0].outcome);
+            try std.testing.expect(std.mem.indexOf(u8, got, "##[error]Unable to process command '::set-env name=X::1' successfully.") != null);
+            try std.testing.expect(std.mem.indexOf(u8, got, "##[error]The `set-env` command is disabled.") != null);
+            try std.testing.expect(std.mem.indexOf(u8, got, "##[error]Unable to process command '::add-path::/opt/x' successfully.") != null);
+            try std.testing.expect(std.mem.indexOf(u8, got, "##[error]The `add-path` command is disabled.") != null);
+            try std.testing.expect(std.mem.indexOf(u8, step2, "name:\"X\"") == null);
+            try std.testing.expect(std.mem.indexOf(u8, step2, "/opt/x") == null);
+        }
+    }
 }
 
 test "ACTIONS_STEP_DEBUG shows ::debug:: lines" {
