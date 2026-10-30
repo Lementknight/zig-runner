@@ -181,15 +181,26 @@ pub fn logs(
         };
 
     var uploads: std.ArrayList(Upload) = .empty;
-    // Steps whose log went up as they finished: only reported, or uploaded again if that failed.
-    const Covered = struct { early: *StepLogs.Early, name: []const u8, blob: results.Blob };
+    // Steps whose log went up as they finished: only reported, or uploaded again once that upload
+    // is done if it failed or lacks what the step logged after it finished (`whole`). Started any
+    // sooner, the step's whole log could go up first and be overwritten by the shorter one (#167).
+    const Covered = struct {
+        early: *StepLogs.Early,
+        name: []const u8,
+        blob: results.Blob,
+        whole: bool,
+    };
     var covered: std.ArrayList(Covered) = .empty;
     for (shown) |s| {
         const size = sizes[s.log_step];
         if (size.lines == 0) continue;
         const blob = try keptBlob(c, kept, s.log_step, size);
-        if (early) |e| if (e.done(s.log_step, s.id, size.lines, size.text_bytes)) |d| {
-            try covered.append(c.arena, .{ .early = d, .name = s.name, .blob = blob });
+        if (early) |e| if (e.done(s.log_step, s.id)) |d| {
+            const whole = d.blob.line_count == size.lines and d.text_bytes == size.text_bytes;
+            try covered.append(
+                c.arena,
+                .{ .early = d, .name = s.name, .blob = blob, .whole = whole },
+            );
             continue;
         };
         try uploads.append(
@@ -236,12 +247,12 @@ pub fn logs(
         .{ job.check_run_id, @divTrunc(up.early_wait.nanoseconds, std.time.ns_per_s) },
     );
     for (covered.items) |cv| {
-        if (cv.early.result.ok) continue;
+        if (cv.whole and cv.early.result.ok) continue;
         uploads.appendAssumeCapacity(.{
             .what = .{ .log = .{ .step = cv.early.id } },
             .name = cv.name,
             .blob = cv.blob,
-            .again = cv.early.result.detail,
+            .again = if (cv.whole) cv.early.result.detail else null,
         });
         const u = &uploads.items[uploads.items.len - 1];
         group.concurrent(c.io, Upload.run, .{ u, c.gpa, c.io, job, up }) catch
@@ -250,7 +261,7 @@ pub fn logs(
     // Whatever is still running at the limit is cancelled, and reported as failed (Canceled).
     _ = awaitAtMost(c.io, &group, up.limit);
     defer for (uploads.items) |*u| u.arena.deinit();
-    for (covered.items) |cv| if (cv.early.result.ok) try c.err.print(
+    for (covered.items) |cv| if (cv.whole and cv.early.result.ok) try c.err.print(
         "job {d}: log upload '{s}': ok, {s} (as the step finished)\n",
         .{ job.check_run_id, cv.name, cv.early.result.detail },
     );
@@ -554,16 +565,14 @@ pub const StepLogs = struct {
         s.group.concurrent(s.io, Early.run, .{ e, s.gpa, s.io, s.job, s.up }) catch {};
     }
 
-    /// The upload made as `log_step` finished, when it holds exactly the step's log (`id`,
-    /// `line_count` lines, `text_bytes` bytes without timestamps); null when there is none, or the
-    /// step logged more since. Its result is final only after `wait`.
-    fn done(s: *StepLogs, log_step: u32, id: []const u8, line_count: usize, text_bytes: usize) ?*Early {
+    /// The upload made as `log_step` (`id`) finished; null when there is none. It may lack what the
+    /// step logged after it finished. Its result is final only after `wait`.
+    fn done(s: *StepLogs, log_step: u32, id: []const u8) ?*Early {
         s.mu.lockUncancelable(s.io);
         defer s.mu.unlock(s.io);
         for (s.sent.items) |e| {
             if (e.log_step != log_step) continue;
             if (!std.mem.eql(u8, e.id, id)) return null;
-            if (e.blob.line_count != line_count or e.text_bytes != text_bytes) return null;
             return e;
         }
         return null;
@@ -936,7 +945,7 @@ test "a step that finishes after the job's uploads began is uploaded at the end,
     // Line forwarded, and the extra-step events this live view does not take are not offered.
     try std.testing.expectEqual(@as(u32, 1), fake.lines.load(.monotonic));
     try std.testing.expect(o.extraStartedFn == null and o.postsFn == null);
-    try std.testing.expect(step_logs.done(1, "a", 1, 1) == null);
+    try std.testing.expect(step_logs.done(1, "a") == null);
 }
 
 /// The results service over a dead connection: the first upload of step "a" and every upload of
