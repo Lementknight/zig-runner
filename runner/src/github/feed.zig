@@ -24,8 +24,57 @@ pub const Socket = struct {
     req: std.http.Client.Request,
     local: ?*std.http.Client,
 
-    /// Connects (`wss://` is HTTPS with an `Upgrade`). The Socket must not move afterwards.
+    /// Connects (`wss://` is HTTPS with an `Upgrade`), within `http.request_deadline`. The Socket
+    /// must not move afterwards.
     pub fn open(s: *Socket, gpa: Allocator, io: std.Io, url: []const u8, token: []const u8) !void {
+        s.* = try openWithin(gpa, io, url, token, http.request_deadline);
+    }
+
+    /// `connect`, given up at `limit` (`error.Timeout`): it runs next to a timer and whichever ends
+    /// first cancels the other, as `http.within` does. A feed endpoint that accepted and never
+    /// answered the handshake or the upgrade held the job's start, or, opened again from
+    /// `Live.run`, its end, for good (#100).
+    fn openWithin(
+        gpa: Allocator,
+        io: std.Io,
+        url: []const u8,
+        token: []const u8,
+        limit: std.Io.Duration,
+    ) !Socket {
+        const Ended = union(enum) { done: anyerror!Socket, timeout: void };
+        var buf: [2]Ended = undefined;
+        var sel: std.Io.Select(Ended) = .init(io, &buf);
+        sel.concurrent(.done, connect, .{ gpa, io, url, token }) catch
+            return connect(gpa, io, url, token);
+        // Without a timer it is only waited for.
+        sel.concurrent(.timeout, sleep, .{ io, limit }) catch {};
+        const first = sel.await() catch |e| {
+            drain(&sel, gpa);
+            return e;
+        };
+        drain(&sel, gpa);
+        return switch (first) {
+            .done => |r| r,
+            .timeout => error.Timeout,
+        };
+    }
+
+    /// Ends what `openWithin` still runs, closing a feed opened just as the time ran out.
+    fn drain(sel: anytype, gpa: Allocator) void {
+        while (sel.cancel()) |ended| switch (ended) {
+            .done => |r| if (r) |sock| {
+                var s = sock;
+                s.close(gpa);
+            } else |_| {},
+            .timeout => {},
+        };
+    }
+
+    fn sleep(io: std.Io, d: std.Io.Duration) void {
+        io.sleep(d, .awake) catch {};
+    }
+
+    fn connect(gpa: Allocator, io: std.Io, url: []const u8, token: []const u8) anyerror!Socket {
         const https = if (std.mem.startsWith(u8, url, "wss://"))
             try std.fmt.allocPrint(gpa, "https://{s}", .{url["wss://".len..]})
         else if (std.mem.startsWith(u8, url, "ws://"))
@@ -73,7 +122,7 @@ pub const Socket = struct {
         try req.sendBodiless();
         const resp = try req.receiveHead(&.{});
         if (resp.head.status != .switching_protocols) return error.WebSocketRefused;
-        s.* = .{ .io = io, .req = req, .local = local };
+        return .{ .io = io, .req = req, .local = local };
     }
 
     /// One text message: frames of at most 1 KiB, the first a text frame, the rest continuations.
@@ -151,4 +200,26 @@ test "client frames are masked, with the length in 7, 16 or 64 bits" {
     const long: [300]u8 = @splat(0);
     try writeFrameMasked(&w, 0x0, false, &long, .{ 0, 0, 0, 0 });
     try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x80 | 126, 0x01, 0x2C }, w.buffered()[0..4]);
+}
+
+test "a feed that accepts and never answers the upgrade is given up at its deadline" {
+    const io = std.testing.io;
+    // Connections complete in the listener's backlog and are never answered.
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    var buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(
+        &buf,
+        "ws://127.0.0.1:{d}/_ws/ingest.sock",
+        .{listener.socket.address.getPort()},
+    );
+
+    const started = std.Io.Clock.awake.now(io);
+    try std.testing.expectError(
+        error.Timeout,
+        Socket.openWithin(std.testing.allocator, io, url, "token", .fromMilliseconds(200)),
+    );
+    const took = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+    try std.testing.expect(took >= 200 and took < 2_000);
 }
