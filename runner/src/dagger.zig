@@ -2291,7 +2291,7 @@ test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH
         \\  {"type":"action","reference":{"type":"script"},"id":"s1","contextName":"build","name":"build","condition":"success()",
         \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo producing"}}]}},
         \\  {"type":"action","reference":{"type":"script"},"id":"s2","contextName":"use","name":"use","condition":"success()",
-        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"format('echo version={0} multi={1} env=$FROM_ENV', steps.build.outputs.version, steps.build.outputs.notes)"}}]}},
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"format('echo version={0} multi={1} env=$FROM_ENV sha={2}', steps.build.outputs.version, steps.build.outputs.notes, env.GITHUB_SHA)"}}]}},
         \\  {"type":"action","reference":{"type":"script"},"id":"s3","contextName":"bad","name":"bad","condition":"success()",
         \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo writes garbage"}}]}},
         \\  {"type":"action","reference":{"type":"script"},"id":"s4","contextName":"after","name":"after","condition":"always()",
@@ -2301,7 +2301,8 @@ test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH
     const job = try job_mod.parse(arena, json);
     const answers = [_][]const u8{
         base_answer,
-        try execFc(arena, "C1", "producing\\n", "version=1.2.3\\nnotes<<EOF\\nline a\\nline b\\nEOF\\n", "FROM_ENV=hello\\nGITHUB_SHA=evil\\n", "/opt/tool/bin\\n"),
+        try execFc(arena, "C1", "producing\\n", "version=1.2.3\\nnotes<<EOF\\nline a\\nline b\\nEOF\\n", "FROM_ENV=hello\\nGITHUB_SHA=evil\\nCI=false\\nGITHUB_TOKEN=pat\\n" ++
+            "NODE_OPTIONS=--require=/x.js\\n", "/opt/tool/bin\\n"),
         try execFc(arena, "C2", "x\\n", "", "", ""),
         try execFc(arena, "C3", "y\\n", "this is not valid\\n", "", ""),
         try execFc(arena, "C4", "z\\n", "", "", ""),
@@ -2321,12 +2322,19 @@ test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "fc_all: file(path:\"/github/file_commands/all_1\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "fc_output: file(") == null);
     // Outputs (including a multi-line one) were evaluated into step 2's script.
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "echo version=1.2.3 multi=line a\\nline b env=$FROM_ENV") != null);
-    // GITHUB_ENV and GITHUB_PATH apply to the next step's container; reserved names are refused.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "echo version=1.2.3 multi=line a\\nline b env=$FROM_ENV sha=evil") != null);
+    // GITHUB_ENV and GITHUB_PATH apply to the next step's container, GITHUB_* and CI included.
+    // A default GitHub sets again over the env context keeps its value in the container, but
+    // the env context has what the step wrote (above); NODE_OPTIONS alone is refused, as an
+    // error annotation that does not fail the step.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withEnvVariable(name:\"FROM_ENV\",value:\"hello\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withEnvVariable(name:\"PATH\",value:\"/opt/tool/bin:$PATH\",expand:true)") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "name:\"GITHUB_SHA\",value:\"evil\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "ignored GITHUB_ENV entry 'GITHUB_SHA'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withEnvVariable(name:\"CI\",value:\"false\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withEnvVariable(name:\"GITHUB_TOKEN\",value:\"pat\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "NODE_OPTIONS") == null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]Can't store NODE_OPTIONS output parameter using '$GITHUB_ENV' command.") != null);
+    try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
     // ...and only once: step 3 no longer re-applies them.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[3], "withEnvVariable") == null);
     // A malformed GITHUB_OUTPUT fails the step that wrote it; always() still runs.

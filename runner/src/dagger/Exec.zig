@@ -695,14 +695,19 @@ pub fn collect(x: *Exec, num: u32, data: std.json.Value, recorded: Recorded) !Ou
             "the GITHUB_OUTPUT file command: {s}", .{why}),
     };
     if (fileCommand(data, "fc_env")) |text| switch (try commands.parseKeyValues(arena, text)) {
-        .ok => |kv| for (kv) |e| {
-            if (commands.isProtectedEnvName(e.name)) {
-                x.sh.append(num, try std.fmt.allocPrint(arena, "Warning: ignored " ++
-                    "GITHUB_ENV entry '{s}' (reserved name)", .{e.name}));
-                continue;
+        .ok => |kv| {
+            var set: std.ArrayList(job_mod.EnvVar) = .empty;
+            for (kv) |e| {
+                // An error annotation, and the step goes on (`SetEnvFileCommand`).
+                if (commands.isBlockedEnvName(e.name)) {
+                    x.sh.errorLine(num, "Can't store NODE_OPTIONS output parameter using " ++
+                        "'$GITHUB_ENV' command.");
+                    continue;
+                }
+                try Evaluator.putEnv(arena, &ev.job_env, e.name, e.value);
+                try set.append(arena, e);
             }
-            try Evaluator.putEnv(arena, &ev.job_env, e.name, e.value);
-            try ev.pending_env.append(arena, e);
+            try ev.pending_env.appendSlice(arena, try ev.withoutReapplied(set.items));
         },
         .invalid => |why| cmd_error = try std.fmt.allocPrint(arena, "Unable to process " ++
             "the GITHUB_ENV file command: {s}", .{why}),

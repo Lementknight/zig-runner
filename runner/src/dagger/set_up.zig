@@ -357,8 +357,9 @@ fn writeRunEnv(q: *Query, ev: *Evaluator, plan: BasePlan) !void {
     }
 }
 
-/// Workflow- and job-level env is part of every step's environment; what carries a secret goes in
-/// as a Dagger secret.
+/// Workflow- and job-level env is part of every step's environment, but for the defaults GitHub
+/// sets again over it (`Evaluator.withoutReapplied`); what carries a secret goes in as a Dagger
+/// secret.
 fn writeJobEnv(
     q: *Query,
     arena: Allocator,
@@ -376,7 +377,7 @@ fn writeJobEnv(
         job,
         null,
         secrets,
-        ev.job_env.items,
+        try ev.withoutReapplied(ev.job_env.items),
         &plain,
         &secret,
         err_msg,
@@ -716,7 +717,8 @@ pub fn execFor(
 ) !Exec {
     // What the base container set as Dagger secrets (`writeJobEnv`, `writeImage`).
     var secret_vars: std.StringHashMapUnmanaged(void) = .empty;
-    for ([_][]const job_mod.EnvVar{ ev.job_env.items, plan.container_env }) |env| for (env) |e| {
+    const job_env = try ev.withoutReapplied(ev.job_env.items);
+    for ([_][]const job_mod.EnvVar{ job_env, plan.container_env }) |env| for (env) |e| {
         if (containsSecret(job.*, e.value)) try secret_vars.put(arena, e.name, {});
     };
     return .{
