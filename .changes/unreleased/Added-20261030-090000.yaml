@@ -1,0 +1,3 @@
+kind: Added
+body: 'BENCHMARKS.md: how many jobs a Raspberry Pi runs at once, from four days of stress tests on razorbill: one `zig build test` at a time, about 2 jobs a minute in a mixed load, without thrashing.'
+time: 2026-10-30T09:00:00.000000-04:00

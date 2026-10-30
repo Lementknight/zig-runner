@@ -103,6 +103,48 @@ compiled it three times (the image twice from source, 175 s and 187 s; the binar
 against 118.7 s through `zig build`. Only a pull request that touches the packaging still pays it,
 once, to check that `zig build` makes the same binary.
 
+## How many jobs a Pi can run at once
+
+*2026-10-27 to 2026-10-30, zig-runner v0.14.0 to v0.18.0.* A stress harness, kept in a private bench
+repository, drove a third pool of 6 runners on razorbill, beside the production pools on the same
+engine, with a mix of `zig build test` and `uv sync` jobs. The Pi's memory, pressure and the engine's cgroup were sampled every second.
+The harness stops a run, cancels its jobs and stops its pool when the Pi falls under 1.5 GB of
+available memory or adds 1 GB of swap.
+
+**Without a limit, four jobs thrash the Pi.** On v0.14.0, four `zig build test` jobs at once pushed
+the engine to its 4 GB cap and into swap on the SD card, and razorbill thrashed for six hours,
+until the engine was restarted. Runners now take a job only while the machine and the engine's
+cgroup have room for it: the memory gate (#126), which reserves memory for every job that may start
+before it shows.
+
+| Run | Jobs | Result |
+| --- | --- | --- |
+| Churn, v0.16.0: tiny jobs as fast as GitHub hands them out, 10 min | 208 | 20.8 jobs/min; median 0.35 s from a job's end to its wrap-up, 0.78 s to listening again |
+| Soak, v0.16.0: 4 jobs at a time, 1 GB a job | 144 in 93 min | all passed, run times flat (median 133-144 s); ended by a laptop reboot, not the Pi |
+| The same soak, restarted on an idle engine | 5 | safety stop after 80 s: swap +1.07 GB |
+| 1.5 GB a job, 15 min | 28 | all passed; 1.64 jobs/min |
+| 1.5 GB a job, engine cap 5.5 GB, 15 min | 7 | safety stop after 3.5 min: 1.4 GB available |
+| Learned estimates, v0.17.0, engine cap 5.5 GB, 15 min | 32 | all passed; 1.98 jobs/min |
+| Learned from runs alone, v0.18.0, engine cap 5.5 GB, 60 min | 124 | all passed; 2.02 jobs/min; at least 1.8 GB available, swap +858 MB, pressure peak 8.9% |
+
+The restart failed because two `zig build test` jobs, started 9 s apart, took the engine from 1.5 GB
+to its cap. The gate had let them both through, as each was reserved 1 GB, but a job peaks at about
+1.6 GB of the engine's memory within 45 s of starting. The steady soak had survived because its jobs
+started at different times. With a 5.5 GB cap the engine held, and the Pi ran out of memory
+instead: two such jobs leave razorbill about 1.5 GB.
+
+From v0.17.0 the gate reserves for each job what jobs of its name have been seen to take: about 1.6
+GB for `zig build test`, 0.1 GB for `uv sync`. On v0.17.0 the first `zig build test` runs had
+shared the engine with another and were learned at 2.9 and 3.1 GB. A job is now learned from its
+runs alone, and a run beside other jobs only bounds it from above (#144).
+
+**So this Pi runs one `zig build test` at a time, safely, at about 2 jobs a minute in this mix.**
+That is not a limit of the runner: a runner cannot know which job it will get before it asks for
+one, so every runner that asks must have room for the heaviest. Light jobs wait behind a heavy one
+(`uv sync` waited a median of 94 s to run for 10). Production asks far less: razorbill ran 40 jobs
+in the 30 days before, all `zig build test`. The runner itself stayed between 24 and 38 MB over the
+hour-long soak, and flat after the first 20 minutes.
+
 ## Earlier measurements
 
 These come from the study in
