@@ -728,47 +728,42 @@ pub fn collect(x: *Exec, num: u32, data: std.json.Value, recorded: Recorded) !Ou
     try ev.pending_path.appendSlice(arena, unsecure.paths);
     if (unsecure.failed and code == 0) code = 1;
 
-    // File commands: outputs for `steps.<id>.outputs`, env and PATH for the steps that follow.
+    // File commands: outputs for `steps.<id>.outputs`, env and PATH for the steps that follow,
+    // state for the action's later phases. A file with a bad line counts up to it, and then
+    // fails the step, each file on its own (`ProcessFiles` in FileCommandManager.cs).
     var outputs: []const job_mod.EnvVar = &.{};
-    var cmd_error: ?[]const u8 = null;
-    const fc_output = fileCommand(data, "fc_output");
-    if (fc_output) |text| switch (try commands.parseKeyValues(arena, text)) {
-        .ok => |kv| outputs = kv,
-        .invalid => |why| cmd_error = try std.fmt.allocPrint(arena, "Unable to process " ++
-            "the GITHUB_OUTPUT file command: {s}", .{why}),
-    };
-    if (fileCommand(data, "fc_env")) |text| switch (try commands.parseKeyValues(arena, text)) {
-        .ok => |kv| {
-            var set: std.ArrayList(job_mod.EnvVar) = .empty;
-            for (kv) |e| {
-                // An error annotation, and the step goes on (`SetEnvFileCommand`).
-                if (commands.isBlockedEnvName(e.name)) {
-                    x.sh.errorLine(num, "Can't store NODE_OPTIONS output parameter using " ++
-                        "'$GITHUB_ENV' command.");
-                    continue;
-                }
-                // Likewise the runner's own variables (not in GitHub's runner).
-                if (commands.isRunnerEnvName(e.name)) {
-                    x.sh.errorLine(num, try std.fmt.allocPrint(arena, "Can't store {s} using " ++
-                        "'$GITHUB_ENV' command: it is the runner's own.", .{e.name}));
-                    continue;
-                }
-                try Evaluator.putEnv(arena, &ev.job_env, e.name, e.value);
-                try set.append(arena, e);
+    var file_failed = false;
+    if (fileCommand(data, "fc_output")) |text| {
+        const parsed = try commands.parseKeyValues(arena, text);
+        outputs = parsed.pairs;
+        if (parsed.invalid) |why| file_failed = try x.fileCommandFailed(num, "output", why);
+    }
+    if (fileCommand(data, "fc_env")) |text| {
+        const parsed = try commands.parseKeyValues(arena, text);
+        var set: std.ArrayList(job_mod.EnvVar) = .empty;
+        for (parsed.pairs) |e| {
+            // An error annotation, and the step goes on (`SetEnvFileCommand`).
+            if (commands.isBlockedEnvName(e.name)) {
+                x.sh.errorLine(num, "Can't store NODE_OPTIONS output parameter using " ++
+                    "'$GITHUB_ENV' command.");
+                continue;
             }
-            try ev.pending_env.appendSlice(arena, try ev.withoutReapplied(set.items));
-        },
-        .invalid => |why| cmd_error = try std.fmt.allocPrint(arena, "Unable to process " ++
-            "the GITHUB_ENV file command: {s}", .{why}),
-    };
+            // Likewise the runner's own variables (not in GitHub's runner).
+            if (commands.isRunnerEnvName(e.name)) {
+                x.sh.errorLine(num, try std.fmt.allocPrint(arena, "Can't store {s} using " ++
+                    "'$GITHUB_ENV' command: it is the runner's own.", .{e.name}));
+                continue;
+            }
+            try Evaluator.putEnv(arena, &ev.job_env, e.name, e.value);
+            try set.append(arena, e);
+        }
+        try ev.pending_env.appendSlice(arena, try ev.withoutReapplied(set.items));
+        if (parsed.invalid) |why| file_failed = try x.fileCommandFailed(num, "env", why);
+    }
     if (fileCommand(data, "fc_path")) |text| {
         for (try commands.parsePaths(arena, text)) |dir| try ev.addPath(dir);
     }
     if (fileCommand(data, "fc_step_summary")) |text| try x.appendSummary(num, text);
-    if (cmd_error) |msg| {
-        x.sh.append(num, msg);
-        if (code == 0) code = 1;
-    }
     // GitHub's runner sets each output in turn into a case-insensitive dictionary: the deprecated
     // `::set-output` lines as they are printed, then GITHUB_OUTPUT's pairs after the step
     // (`FileCommandManager.cs` ~346, `StepsContext.SetOutput`). So the last value of a name wins,
@@ -776,12 +771,12 @@ pub fn collect(x: *Exec, num: u32, data: std.json.Value, recorded: Recorded) !Ou
     const legacy = x.sh.takeOutputs(num);
     outputs = try lastWins(arena, try std.mem.concat(arena, job_mod.EnvVar, &.{ legacy, outputs }));
     var state: []const job_mod.EnvVar = x.sh.takeState(num);
-    const fc_state = fileCommand(data, "fc_state");
-    if (fc_state) |text| switch (try commands.parseKeyValues(arena, text)) {
-        .ok => |kv| state = try std.mem.concat(arena, job_mod.EnvVar, &.{ state, kv }),
-        .invalid => |why| x.sh.append(num, try std.fmt.allocPrint(arena, "Unable to " ++
-            "process the GITHUB_STATE file command: {s}", .{why})),
-    };
+    if (fileCommand(data, "fc_state")) |text| {
+        const parsed = try commands.parseKeyValues(arena, text);
+        state = try std.mem.concat(arena, job_mod.EnvVar, &.{ state, parsed.pairs });
+        if (parsed.invalid) |why| file_failed = try x.fileCommandFailed(num, "state", why);
+    }
+    if (file_failed and code == 0) code = 1;
     // Bun's message is on stderr, which the step's script sends to its stdout
     // (`stream_prologue`): in a line that arrived live, or in the recorded output replayed.
     const refused = code != 0 and (x.sh.bun_refused.load(.acquire) == num or
@@ -818,19 +813,33 @@ fn ranThisRun(x: *Exec, data: std.json.Value) ?bool {
 /// GitHub's runner's words.
 fn appendSummary(x: *Exec, num: u32, text: []const u8) !void {
     if (text.len == 0 or num > x.summaries.len) return;
-    const so_far = x.summaries[num - 1];
-    if (so_far.len + text.len > max_summary_bytes) {
-        x.sh.append(num, try std.fmt.allocPrint(
+    // The limit is per file, which is per exec: GitHub checks each step's file, a composite's
+    // inner steps' and an action's phases' each on its own (`CreateStepSummaryCommand`).
+    if (text.len > max_summary_bytes) {
+        x.sh.errorLine(num, try std.fmt.allocPrint(
             x.arena,
-            "##[error]$GITHUB_STEP_SUMMARY upload aborted, supports content up to a size of " ++
+            "$GITHUB_STEP_SUMMARY upload aborted, supports content up to a size of " ++
                 "{d}k, got {d}k. For more information see: https://docs.github.com/actions/" ++
                 "using-workflows/workflow-commands-for-github-actions" ++
                 "#adding-a-markdown-summary",
-            .{ max_summary_bytes / 1024, (so_far.len + text.len) / 1024 },
+            .{ max_summary_bytes / 1024, text.len / 1024 },
         ));
         return;
     }
-    x.summaries[num - 1] = try std.mem.concat(x.arena, u8, &.{ so_far, text });
+    x.summaries[num - 1] = try std.mem.concat(x.arena, u8, &.{ x.summaries[num - 1], text });
+}
+
+/// A file command that could not be read to its end, reported as GitHub's runner reports one:
+/// two errors, the file's context name and then why (`ProcessFiles` in FileCommandManager.cs).
+/// True, for the caller to fail the step.
+fn fileCommandFailed(x: *Exec, num: u32, name: []const u8, why: []const u8) !bool {
+    x.sh.errorLine(num, try std.fmt.allocPrint(
+        x.arena,
+        "Unable to process file command '{s}' successfully.",
+        .{name},
+    ));
+    x.sh.errorLine(num, why);
+    return true;
 }
 
 pub const ActionOut = struct {

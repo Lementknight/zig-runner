@@ -64,6 +64,7 @@ const execFc = @import("dagger/testing.zig").execFc;
 const testStep = @import("dagger/testing.zig").testStep;
 const testJob = @import("dagger/testing.zig").testJob;
 const fileAnswer = @import("dagger/testing.zig").fileAnswer;
+const treeAnswer = @import("dagger/testing.zig").treeAnswer;
 const usesStep = @import("dagger/testing.zig").usesStep;
 const braceBalanced = @import("dagger/testing.zig").braceBalanced;
 
@@ -1119,7 +1120,13 @@ fn prepareScript(
     };
     // `defaults.run` fills in a shell the step leaves out or empty, and a working directory it
     // leaves out (actions/runner src/Runner.Worker/Handlers/ScriptHandler.cs 155-180).
-    const own_shell: ?[]const u8 = if (sc.shell) |t| (ev.render(t, sc1) catch null) else null;
+    // An expression in either that cannot be evaluated fails the step, as the script's does:
+    // GitHub's runner evaluates them with the step's inputs (`EvaluateStepInputs`).
+    const own_shell: ?[]const u8 = if (sc.shell) |t| ev.render(t, sc1) catch {
+        const msg = try std.fmt.allocPrint(arena, "could not evaluate shell: {s}", .{ev.diag});
+        try failStep(ev, x.sh, x.observer, step, res, num, msg, coe);
+        return null;
+    } else null;
     const shell = if (own_shell != null and own_shell.?.len > 0) own_shell else x.default_shell;
     if (shell) |sh_name| if (!job_mod.validShell(sh_name)) {
         try failStep(
@@ -1134,10 +1141,15 @@ fn prepareScript(
         );
         return null;
     };
-    const wd: ?[]const u8 = if (sc.working_directory) |t|
-        (ev.render(t, sc1) catch null)
-    else
-        x.default_working_directory;
+    const wd: ?[]const u8 = if (sc.working_directory) |t| ev.render(t, sc1) catch {
+        const msg = try std.fmt.allocPrint(
+            arena,
+            "could not evaluate working-directory: {s}",
+            .{ev.diag},
+        );
+        try failStep(ev, x.sh, x.observer, step, res, num, msg, coe);
+        return null;
+    } else x.default_working_directory;
     try logRunHeader(
         arena,
         x.sh,
@@ -1271,8 +1283,13 @@ fn runStep(
     if (!try stepCondition(x, step, res, num, sc1)) return null;
     const coe = std.mem.eql(u8, ev.render(step.continue_on_error, sc1) catch "false", "true");
     res.continued = coe;
-    const limit: ?[]const u8 = if (step.timeout_minutes) |t| ev.render(t, sc1) catch null else null;
-    const timeout_ms = timeoutMs(limit);
+    const written: ?[]const u8 = if (step.timeout_minutes) |t| ev.render(t, sc1) catch null else null;
+    const timeout_ms = timeoutMs(written);
+    // GitHub's message on a timeout names the whole minutes it waited.
+    const limit: ?[]const u8 = if (timeout_ms > 0)
+        try std.fmt.allocPrint(arena, "{d}", .{@divTrunc(timeout_ms, 60_000)})
+    else
+        written;
 
     // Env that carries a secret goes in as a Dagger secret, the rest in the script.
     var plain: std.ArrayList(job_mod.EnvVar) = .empty;
@@ -1345,18 +1362,23 @@ fn survivesCancel(ev: *Evaluator, condition: []const u8, step_env: []const job_m
     return expr.evalCondition(ev.arena, condition, try ev.scope(step_env)) catch false;
 }
 
-/// `timeout-minutes` as written, in milliseconds; 0 when absent, unparsable or not positive. At
-/// most a year: a larger number (`1e300`, `inf`) would not fit, and converting it panics.
+/// `timeout-minutes` in milliseconds, whole minutes: GitHub's runner casts the number to an
+/// `Int32` (`ConvertToStepTimeout` in PipelineTemplateConverter.cs), so `1.5` is one minute and
+/// `0.5` no timeout at all. 0 when absent, unparsable or not positive. At most a year: a larger
+/// number (`1e300`, `inf`) would not fit, and converting it panics.
 fn timeoutMs(timeout: ?[]const u8) i64 {
     const t = timeout orelse return 0;
     const minutes = std.fmt.parseFloat(f64, std.mem.trim(u8, t, " ")) catch return 0;
-    if (!(minutes > 0)) return 0;
-    return @intFromFloat(@min(minutes, 366 * 24 * 60) * 60_000);
+    if (!(minutes >= 1)) return 0;
+    return @intFromFloat(@trunc(@min(minutes, 366 * 24 * 60)) * 60_000);
 }
 
 test "timeoutMs reads timeout-minutes, and a number too large to hold is a year" {
     try std.testing.expectEqual(@as(i64, 0), timeoutMs(null));
-    try std.testing.expectEqual(@as(i64, 90_000), timeoutMs(" 1.5 "));
+    // Whole minutes, as GitHub's cast to an integer leaves them.
+    try std.testing.expectEqual(@as(i64, 60_000), timeoutMs(" 1.5 "));
+    try std.testing.expectEqual(@as(i64, 0), timeoutMs("0.5"));
+    try std.testing.expectEqual(@as(i64, 120_000), timeoutMs("2.99"));
     try std.testing.expectEqual(@as(i64, 0), timeoutMs("-1"));
     try std.testing.expectEqual(@as(i64, 0), timeoutMs("nan"));
     const year: i64 = 366 * 24 * 60 * 60_000;
@@ -2493,6 +2515,36 @@ test "defaults.run that cannot be evaluated fails Set up job, and no step runs" 
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "defaults.run.shell: ") != null);
 }
 
+test "a step's shell or working-directory that cannot be evaluated fails the step" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var bad_shell = testStep("echo never");
+    bad_shell.action.script.shell = .{ .expr = "no_such_function()" };
+    var bad_wd = testStep("echo never");
+    bad_wd.action.script.working_directory = .{ .expr = "fromJSON('not json')" };
+    bad_wd.condition = "always()";
+    var after = testStep("echo after");
+    after.condition = "always()";
+    const steps = [_]job_mod.Step{ bad_shell, bad_wd, after };
+    const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, "") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(!res.succeeded);
+    try std.testing.expectEqual(Outcome.failure, res.steps[0].outcome);
+    try std.testing.expectEqual(Outcome.failure, res.steps[1].outcome);
+    try std.testing.expectEqual(Outcome.success, res.steps[2].outcome);
+    // Neither ran: the only exec is the last step's.
+    try std.testing.expectEqual(@as(usize, 2), fake.seen.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "echo after") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "could not evaluate shell: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "could not evaluate working-directory: ") != null);
+}
+
 test "the steps context holds only steps with an id of their own, as on GitHub" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -2554,7 +2606,7 @@ test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH
         try execFc(arena, "C1", "producing\\n", "version=1.2.3\\nnotes<<EOF\\nline a\\nline b\\nEOF\\n", "FROM_ENV=hello\\nGITHUB_SHA=evil\\nCI=false\\nGITHUB_TOKEN=pat\\n" ++
             "NODE_OPTIONS=--require=/x.js\\n", "/opt/tool/bin\\n"),
         try execFc(arena, "C2", "x\\n", "", "", ""),
-        try execFc(arena, "C3", "y\\n", "this is not valid\\n", "", ""),
+        try execFc(arena, "C3", "y\\n", "this is not valid\\n", "BEFORE=1\\nnope\\nAFTER=2\\n", ""),
         try execFc(arena, "C4", "z\\n", "", "", ""),
     };
     var fake: FakeSession = .{ .answers = &answers, .arena = arena };
@@ -2587,9 +2639,14 @@ test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH
     try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
     // ...and only once: step 3 no longer re-applies them.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[3], "withEnvVariable") == null);
-    // A malformed GITHUB_OUTPUT fails the step that wrote it; always() still runs.
+    // A malformed file command fails the step that wrote it, with GitHub's two errors; always()
+    // still runs. What came before the bad line applies, as on GitHub; nothing after it.
     try std.testing.expectEqual(Outcome.failure, res.steps[2].outcome);
-    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Unable to process the GITHUB_OUTPUT file command: invalid format 'this is not valid' on line 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]Unable to process file command 'output' successfully.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]invalid format 'this is not valid' on line 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]Unable to process file command 'env' successfully.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[4], "withEnvVariable(name:\"BEFORE\",value:\"1\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[4], "AFTER") == null);
     try std.testing.expectEqual(Outcome.success, res.steps[3].outcome);
 }
 
@@ -3230,6 +3287,68 @@ test "what a step writes to GITHUB_STEP_SUMMARY is kept for upload" {
     try std.testing.expectEqualStrings("", res.summaries[1]);
     // The query reads the file back.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "fc_all: file(path:") != null);
+}
+
+test "a malformed GITHUB_STATE fails the step that wrote it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("x")};
+    const bad_state = "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"id\":\"C1\",\"exitCode\":0,\"stdout\":\"\",\"stderr\":\"\",\"fc_state\":{\"contents\":\"pid=7\\nnot state\\n\"}}}}}";
+    const answers = [_][]const u8{ base_answer, bad_state };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(!res.succeeded);
+    try std.testing.expectEqual(Outcome.failure, res.steps[0].outcome);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]Unable to process file command 'state' successfully.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]invalid format 'not state' on line 2") != null);
+}
+
+test "the 1 MiB summary limit is per file: a composite's steps add up past it, one file over is dropped" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const composite =
+        \\runs:
+        \\  using: composite
+        \\  steps:
+        \\    - shell: bash
+        \\      run: one
+        \\    - shell: bash
+        \\      run: two
+    ;
+    const steps = [_]job_mod.Step{ usesStep("sum", "o", "sum", "v1", &.{}), testStep("big") };
+    const summary = struct {
+        fn answer(ar: Allocator, id: []const u8, size: usize) ![]const u8 {
+            const text = try ar.alloc(u8, size);
+            @memset(text, 'a');
+            return std.fmt.allocPrint(ar, "{{\"data\":{{\"loadContainerFromID\":{{\"withExec\":" ++
+                "{{\"id\":\"{s}\",\"exitCode\":0,\"stdout\":\"\",\"stderr\":\"\"," ++
+                "\"fc_step_summary\":{{\"contents\":\"{s}\"}}}}}}}}}}", .{ id, text });
+        }
+    }.answer;
+    const answers = [_][]const u8{
+        base_answer,
+        try treeAnswer(arena, "D1", &.{"action.yml"}),
+        try fileAnswer(arena, composite),
+        try summary(arena, "C1", 700 * 1024),
+        try summary(arena, "C2", 700 * 1024),
+        try summary(arena, "C3", 1024 * 1024 + 1),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expectEqual(@as(usize, 1400 * 1024), res.summaries[0].len);
+    try std.testing.expectEqual(@as(usize, 0), res.summaries[1].len);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "[job 0 step 2 stdout] ##[error]$GITHUB_STEP_SUMMARY upload aborted, supports content up to a size of 1024k, got 1024k.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "step 1 stdout] ##[error]$GITHUB_STEP_SUMMARY") == null);
 }
 
 test "step caching: run-specific values are volatile, steps with secrets always run, workflows can opt out" {

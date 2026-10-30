@@ -14,19 +14,22 @@ const job_mod = @import("job.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const Parsed = union(enum) {
-    ok: []const job_mod.EnvVar,
-    /// Why the file could not be read (names the offending line).
-    invalid: []const u8,
+pub const Parsed = struct {
+    /// The entries before the first malformed line, or all of them.
+    pairs: []const job_mod.EnvVar,
+    /// Why the file could not be read to its end (names the offending line); null when it was.
+    invalid: ?[]const u8 = null,
 };
 
-/// The `name=value` and `name<<DELIMITER` entries of a `GITHUB_OUTPUT` or `GITHUB_ENV` file, in the
-/// order written; or, for the first malformed line, why.
+/// The `name=value` and `name<<DELIMITER` entries of a `GITHUB_OUTPUT`, `GITHUB_ENV` or
+/// `GITHUB_STATE` file, in the order written, up to the first malformed line, and why that one is.
+/// GitHub's runner reads the entries one at a time and applies each as it goes, so those before a
+/// bad line take effect (`EnvFileKeyValuePairs` in FileCommandManager.cs).
 pub fn parseKeyValues(arena: Allocator, text: []const u8) Allocator.Error!Parsed {
     var out: std.ArrayList(job_mod.EnvVar) = .empty;
     var lines = std.mem.splitScalar(u8, text, '\n');
     var line_no: usize = 0;
-    while (lines.next()) |raw| {
+    const why: []const u8 = while (lines.next()) |raw| {
         line_no += 1;
         const line = std.mem.trimEnd(u8, raw, "\r");
         if (line.len == 0) continue;
@@ -36,34 +39,33 @@ pub fn parseKeyValues(arena: Allocator, text: []const u8) Allocator.Error!Parsed
         if (heredoc != null and (eq == null or heredoc.? < eq.?)) {
             const name = line[0..heredoc.?];
             const delim = line[heredoc.? + 2 ..];
-            if (name.len == 0 or delim.len == 0)
-                return .{ .invalid = try std.fmt.allocPrint(
-                    arena,
-                    "invalid format '{s}' on line {d}: expected name<<DELIMITER",
-                    .{ line, line_no },
-                ) };
+            if (name.len == 0 or delim.len == 0) break try std.fmt.allocPrint(
+                arena,
+                "invalid format '{s}' on line {d}: expected name<<DELIMITER",
+                .{ line, line_no },
+            );
             const value = try heredocValue(arena, &lines, &line_no, delim) orelse
-                return .{ .invalid = try std.fmt.allocPrint(
+                break try std.fmt.allocPrint(
                     arena,
                     "matching delimiter '{s}' not found for '{s}'",
                     .{ delim, name },
-                ) };
+                );
             try out.append(arena, .{ .name = name, .value = value });
             continue;
         }
-        const e = eq orelse return .{ .invalid = try std.fmt.allocPrint(
+        const e = eq orelse break try std.fmt.allocPrint(
             arena,
             "invalid format '{s}' on line {d}: expected name=value",
             .{ line, line_no },
-        ) };
-        if (e == 0) return .{ .invalid = try std.fmt.allocPrint(
+        );
+        if (e == 0) break try std.fmt.allocPrint(
             arena,
             "invalid format '{s}' on line {d}: the name is empty",
             .{ line, line_no },
-        ) };
+        );
         try out.append(arena, .{ .name = line[0..e], .value = line[e + 1 ..] });
-    }
-    return .{ .ok = out.items };
+    } else return .{ .pairs = out.items };
+    return .{ .pairs = out.items, .invalid = why };
 }
 
 /// The lines of a multi-line value up to the line that is `delim`, joined with `\n` and taken from
@@ -120,39 +122,45 @@ test "name=value, blank lines, and = inside values" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const p = try parseKeyValues(a.allocator(), "a=1\n\nb=x=y\nempty=\n");
-    try std.testing.expectEqual(@as(usize, 3), p.ok.len);
-    try std.testing.expectEqualStrings("a", p.ok[0].name);
-    try std.testing.expectEqualStrings("1", p.ok[0].value);
-    try std.testing.expectEqualStrings("x=y", p.ok[1].value);
-    try std.testing.expectEqualStrings("", p.ok[2].value);
+    try std.testing.expectEqual(@as(usize, 3), p.pairs.len);
+    try std.testing.expectEqualStrings("a", p.pairs[0].name);
+    try std.testing.expectEqualStrings("1", p.pairs[0].value);
+    try std.testing.expectEqualStrings("x=y", p.pairs[1].value);
+    try std.testing.expectEqualStrings("", p.pairs[2].value);
 }
 
 test "multi-line values with a delimiter, including = and << inside the value" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const p = try parseKeyValues(a.allocator(), "msg<<EOF_1\nline one\nk=v << not a heredoc\nEOF_1\nafter=ok\n");
-    try std.testing.expectEqual(@as(usize, 2), p.ok.len);
-    try std.testing.expectEqualStrings("msg", p.ok[0].name);
-    try std.testing.expectEqualStrings("line one\nk=v << not a heredoc", p.ok[0].value);
-    try std.testing.expectEqualStrings("ok", p.ok[1].value);
+    try std.testing.expectEqual(@as(usize, 2), p.pairs.len);
+    try std.testing.expectEqualStrings("msg", p.pairs[0].name);
+    try std.testing.expectEqualStrings("line one\nk=v << not a heredoc", p.pairs[0].value);
+    try std.testing.expectEqualStrings("ok", p.pairs[1].value);
 }
 
 test "CRLF line endings" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const p = try parseKeyValues(a.allocator(), "a=1\r\nb<<D\r\nx\r\nD\r\n");
-    try std.testing.expectEqualStrings("1", p.ok[0].value);
-    try std.testing.expectEqualStrings("x", p.ok[1].value);
+    try std.testing.expectEqualStrings("1", p.pairs[0].value);
+    try std.testing.expectEqualStrings("x", p.pairs[1].value);
 }
 
 test "malformed input is reported with the line" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const ar = a.allocator();
-    try std.testing.expect(std.mem.indexOf(u8, (try parseKeyValues(ar, "a=1\njust text\n")).invalid, "line 2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, (try parseKeyValues(ar, "=v\n")).invalid, "name is empty") != null);
-    try std.testing.expect(std.mem.indexOf(u8, (try parseKeyValues(ar, "m<<EOF\nnever closed\n")).invalid, "delimiter 'EOF' not found") != null);
-    try std.testing.expect(std.mem.indexOf(u8, (try parseKeyValues(ar, "m<<\nx\n")).invalid, "name<<DELIMITER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, (try parseKeyValues(ar, "a=1\njust text\n")).invalid.?, "line 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, (try parseKeyValues(ar, "=v\n")).invalid.?, "name is empty") != null);
+    try std.testing.expect(std.mem.indexOf(u8, (try parseKeyValues(ar, "m<<EOF\nnever closed\n")).invalid.?, "delimiter 'EOF' not found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, (try parseKeyValues(ar, "m<<\nx\n")).invalid.?, "name<<DELIMITER") != null);
+    // What came before the bad line is kept, as GitHub applies it; nothing after.
+    const partial = try parseKeyValues(ar, "a=1\nb<<E\nx\nE\nbad line\nc=3\n");
+    try std.testing.expectEqual(@as(usize, 2), partial.pairs.len);
+    try std.testing.expectEqualStrings("x", partial.pairs[1].value);
+    try std.testing.expect(partial.invalid != null);
+    try std.testing.expect((try parseKeyValues(ar, "a=1\n")).invalid == null);
 }
 
 test "paths and the blocked name" {
