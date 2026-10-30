@@ -550,6 +550,7 @@ pub fn containerEnv(x: *Exec, dr: DockerRun, state: []const job_mod.EnvVar) !Con
         arena,
         x.transport,
         x.job.*,
+        x.sh,
         &x.secrets,
         env.items,
         &plain,

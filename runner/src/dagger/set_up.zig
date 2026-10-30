@@ -243,6 +243,7 @@ fn writeImage(
         arena,
         transport,
         job,
+        null,
         secrets,
         plan.container_env,
         &plain,
@@ -373,6 +374,7 @@ fn writeJobEnv(
         arena,
         transport,
         job,
+        null,
         secrets,
         ev.job_env.items,
         &plain,
@@ -712,6 +714,11 @@ pub fn execFor(
     secrets: Secrets,
     step_cache: bool,
 ) !Exec {
+    // What the base container set as Dagger secrets (`writeJobEnv`, `writeImage`).
+    var secret_vars: std.StringHashMapUnmanaged(void) = .empty;
+    for ([_][]const job_mod.EnvVar{ ev.job_env.items, plan.container_env }) |env| for (env) |e| {
+        if (containsSecret(job.*, e.value)) try secret_vars.put(arena, e.name, {});
+    };
     return .{
         .arena = arena,
         .io = io,
@@ -730,8 +737,8 @@ pub fn execFor(
         .outputs_volume = plan.outputs_volume,
         .outputs_days = opts.output_keys_days,
         .event_from_env = step_cache and (try ev.eventJson()).len <= max_event_env,
-        .job_secret_env = jobEnvHasSecret(job.*, ev.job_env.items) or
-            jobEnvHasSecret(job.*, plan.container_env),
+        .job_secret_env = secret_vars.count() > 0,
+        .secret_vars = secret_vars,
         // Per job, not per run: a run's matrix jobs share its id and attempt, and a step that must
         // run in each of them would otherwise be replayed from the first one's result.
         .run_nonce = try std.fmt.allocPrint(
@@ -808,11 +815,6 @@ fn emptySlices(arena: Allocator, comptime T: type, n: usize) ![][]const T {
 
 /// Linux limits one environment string to 128 KiB; larger payloads are written as a file instead.
 const max_event_env = 100 * 1024;
-
-fn jobEnvHasSecret(job: job_mod.Job, job_env: []const job_mod.EnvVar) bool {
-    for (job_env) |e| if (containsSecret(job, e.value)) return true;
-    return false;
-}
 
 /// `<run_id>.<run_attempt>`, or the time when the job has no run id (`--exec-job`).
 fn runNonce(arena: Allocator, io: std.Io, ev: *const Evaluator) ![]const u8 {

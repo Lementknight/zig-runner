@@ -39,7 +39,7 @@ const jsonStrings = @import("../dagger.zig").jsonStrings;
 const idOf = @import("../dagger.zig").idOf;
 const newSecret = @import("../dagger.zig").newSecret;
 const splitEnv = @import("../dagger.zig").splitEnv;
-const containsSecret = @import("../dagger.zig").containsSecret;
+const holdsSecret = @import("../dagger.zig").holdsSecret;
 const envContext = @import("../dagger.zig").envContext;
 const firstLine = @import("../dagger.zig").firstLine;
 const readsRunSpecific = @import("../dagger.zig").readsRunSpecific;
@@ -116,6 +116,9 @@ outputs_ms: i64 = 0,
 event_from_env: bool,
 /// Workflow-, job- or `container:`-level env carries a secret, so every step uses secrets.
 job_secret_env: bool,
+/// The variables the job's container holds as Dagger secrets (`withSecretVariable`), by name:
+/// one set again as a plain variable (`writePendingEnv`) loses its secret first.
+secret_vars: std.StringHashMapUnmanaged(void) = .empty,
 /// Differs for every job (the run, its attempt, and `ran_marker`): makes steps that use secrets
 /// run every time, in every job.
 run_nonce: []const u8,
@@ -344,10 +347,8 @@ fn resolveRunStep(
     var resolved = resolved_in;
     if (resolved != .run) return .{ .resolved = resolved, .secret_env = &.{} };
     var secret_env: []const SecretRef = secret_env_in;
-    const uses_secrets = secret_env.len > 0 or x.job_secret_env or containsSecret(
-        x.job.*,
-        resolved.run.script,
-    );
+    const uses_secrets = secret_env.len > 0 or x.job_secret_env or x.envHoldsSecret() or
+        holdsSecret(x.job.*, x.sh, resolved.run.script);
     const oidc = try x.idToken();
     if (oidc) |t| {
         resolved.run.env = try std.mem.concat(
@@ -387,13 +388,42 @@ fn resolveRunStep(
     return .{ .resolved = resolved, .secret_env = secret_env };
 }
 
+/// Whether the env the job's steps get (workflow, job, GITHUB_ENV) holds a secret or a mask: a
+/// step can pass one on through GITHUB_ENV, or mask a value already there, and every step after
+/// it then has it (#101).
+fn envHoldsSecret(x: *Exec) bool {
+    for (x.ev.job_env.items) |e| if (holdsSecret(x.job.*, x.sh, e.value)) return true;
+    return false;
+}
+
 /// Variables and PATH entries the previous steps asked for through $GITHUB_ENV / $GITHUB_PATH,
-/// written and then forgotten: the container after this step has them.
+/// written and then forgotten: the container after this step has them. A value that holds a
+/// secret or a mask goes in as a Dagger secret, as the job's env does: as a plain variable it
+/// would be in every later exec's key and the engine's metadata (#101).
 fn writePendingEnv(x: *Exec, q: *Query) !void {
     const arena = x.arena;
     const ev = x.ev;
+    var values: std.ArrayList([]const u8) = .empty;
     for (ev.pending_env.items) |e|
-        try q.call("withEnvVariable", .{ .name = e.name, .value = e.value });
+        if (holdsSecret(x.job.*, x.sh, e.value)) try values.append(arena, e.value);
+    x.secrets.register(arena, x.transport, values.items, &x.err_msg) catch
+        return error.EngineFailed;
+    // A variable is plain or secret, never both: with both, which one a step sees would be the
+    // engine's choice.
+    for (ev.pending_env.items) |e| {
+        if (holdsSecret(x.job.*, x.sh, e.value)) {
+            try q.call("withoutEnvVariable", .{ .name = e.name });
+            try q.call(
+                "withSecretVariable",
+                .{ .name = e.name, .secret = x.secrets.ids.get(e.value).? },
+            );
+            try x.secret_vars.put(arena, e.name, {});
+        } else {
+            if (x.secret_vars.remove(e.name))
+                try q.call("withoutSecretVariable", .{ .name = e.name });
+            try q.call("withEnvVariable", .{ .name = e.name, .value = e.value });
+        }
+    }
     if (ev.pending_path.items.len > 0) {
         const joined = try std.mem.join(arena, ":", ev.pending_path.items);
         const value = try std.fmt.allocPrint(arena, "{s}:$PATH", .{joined});
@@ -726,7 +756,17 @@ pub fn splitStepEnv(
     secret: *std.ArrayList(SecretRef),
 ) !void {
     const counter = &x.secrets;
-    return splitEnv(x.arena, x.transport, x.job.*, counter, env, plain, secret, &x.err_msg);
+    return splitEnv(
+        x.arena,
+        x.transport,
+        x.job.*,
+        x.sh,
+        counter,
+        env,
+        plain,
+        secret,
+        &x.err_msg,
+    );
 }
 
 pub fn actionFailed(x: *Exec, num: u32, comptime fmt: []const u8, args: anytype) !ActionOut {

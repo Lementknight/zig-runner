@@ -342,6 +342,7 @@ pub fn nestedEnv(
         arena,
         x.transport,
         x.job.*,
+        x.sh,
         &x.secrets,
         nested_env,
         plain,
