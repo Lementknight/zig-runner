@@ -1,0 +1,3 @@
+kind: Changed
+body: 'Docker actions (the image pulled or built, the command run under busybox, the workspace copied in and back) and registry credentials for private images moved with their tests from dagger.zig to dagger/docker.zig, the eighth step in splitting dagger.zig into smaller files (#148).'
+time: 2026-10-30T02:15:00.000000-04:00

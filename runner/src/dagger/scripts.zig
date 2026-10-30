@@ -16,7 +16,7 @@ const mark_env = @import("../dagger.zig").mark_env;
 const ran_env = @import("../dagger.zig").ran_env;
 const volatile_env = @import("../dagger.zig").volatile_env;
 const volatile_sentinel = @import("../dagger.zig").volatile_sentinel;
-const containerScript = @import("../dagger.zig").containerScript;
+const containerScript = @import("docker.zig").containerScript;
 const readsRunSpecific = @import("../dagger.zig").readsRunSpecific;
 
 const Allocator = std.mem.Allocator;
