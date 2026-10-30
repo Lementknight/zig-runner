@@ -217,19 +217,22 @@ pub const Set = struct {
     /// lives inside the job's `JobLog`, which several call sites build field by field, and an
     /// `undefined` allocator there would be a landmine for whichever of them never adds a matcher.
     ///
-    /// Adds every matcher in a file. An owner already present is replaced, as GitHub does, so an
-    /// action re-registering its matcher does not match twice.
+    /// Adds every matcher in a file, each in front of those already there: GitHub's runner tries
+    /// the newest first, and prepends a file's matchers one by one, so its last comes first
+    /// (`OnMatcherChanged` in OutputManager.cs). An owner already present, in any case, is
+    /// replaced, so an action re-registering its matcher does not match twice.
     pub fn add(s: *Set, arena: Allocator, matchers: []const Matcher) Allocator.Error!void {
         for (matchers) |m| {
             s.removeOwner(m.owner);
-            try s.entries.append(arena, .{ .matcher = m, .keep = arena });
+            try s.entries.insert(arena, 0, .{ .matcher = m, .keep = arena });
         }
     }
 
+    /// Withdraws an owner's matcher; owners compare in any case, as in GitHub's runner.
     pub fn removeOwner(s: *Set, owner: []const u8) void {
         var i: usize = 0;
         while (i < s.entries.items.len) {
-            if (std.mem.eql(u8, s.entries.items[i].matcher.owner, owner)) {
+            if (std.ascii.eqlIgnoreCase(s.entries.items[i].matcher.owner, owner)) {
                 _ = s.entries.orderedRemove(i);
             } else i += 1;
         }
@@ -239,29 +242,31 @@ pub const Set = struct {
         return s.entries.items.len;
     }
 
-    /// Offers one line of output to every matcher. Returns the annotations it completed — usually
-    /// none, occasionally one; a list because a looping pattern can complete on every line.
-    ///
-    /// Matchers are tried in the order they were registered, and the first to *advance* on this
-    /// line takes it: a line consumed by one matcher's sequence is not also offered to the next,
-    /// which is what keeps two matchers for the same tool from doubling every annotation.
+    /// Offers one line of output to the matchers, newest first, as GitHub's runner does
+    /// (`OnDataReceived` in OutputManager.cs). Returns the annotation the line makes, if any: the
+    /// first matcher to complete a match on it makes one, unless GitHub would drop it (`issue`),
+    /// and then the next matcher is tried. A completed match starts every other matcher's
+    /// sequence again. A line that only advances a sequence goes on to the next matcher too.
     ///
     /// `arena` holds the result and the regex engine's work, and need only last until the result
     /// has been read: the runner resets it after every line, and the job's memory stays flat however
     /// long the output is (it grew by 18.8 GB over 1M lines with setup-node's tsc matcher when every
     /// line's work stayed in the job's arena). What a sequence carries to its next line is copied
     /// into the set's own buffers. `line` itself must outlive the result, which may point into it.
-    pub fn feed(s: *Set, arena: Allocator, line: []const u8) Error![]const Found {
-        var out: std.ArrayList(Found) = .empty;
-        for (s.entries.items) |*e| {
-            const advanced = try step(arena, e, line, &out);
-            if (advanced) break;
+    pub fn feed(s: *Set, arena: Allocator, line: []const u8) Error!?Found {
+        for (s.entries.items, 0..) |*e, i| {
+            const done = try step(arena, e, line) orelse continue;
+            for (s.entries.items, 0..) |*other, j| if (j != i) {
+                other.progress = 0;
+                other.carried = .{};
+            };
+            if (issue(done, e.matcher.severity)) |found| return found;
         }
-        return out.items;
+        return null;
     }
 
-    /// One matcher's turn at a line. True when the line belonged to this matcher's sequence.
-    fn step(arena: Allocator, e: *Entry, line: []const u8, out: *std.ArrayList(Found)) Error!bool {
+    /// One matcher's turn at a line: what it found when the line completes its sequence.
+    fn step(arena: Allocator, e: *Entry, line: []const u8) Error!?Found {
         const pats = e.matcher.patterns;
         const last = pats.len - 1;
         const at = if (e.progress > last) last else e.progress;
@@ -272,13 +277,13 @@ pub const Set = struct {
             // failing the job, and let the sequence reset.
             e.progress = 0;
             e.carried = .{};
-            return false;
+            return null;
         } orelse {
             // A looping last pattern that stops matching ends the sequence; so does a break
-            // anywhere else. Either way the line is free for another matcher to claim.
+            // anywhere else.
             e.progress = 0;
             e.carried = .{};
-            return false;
+            return null;
         };
 
         carry(&e.carried, pat, m, line);
@@ -287,14 +292,14 @@ pub const Set = struct {
         if (!on_last) {
             e.progress = at + 1;
             try e.own();
-            return true;
+            return null;
         }
 
         // In `arena`: what was carried is overwritten by the lines after this one.
         const c = e.carried;
-        try out.append(arena, .{
-            .level = try dupeOpt(arena, c.severity) orelse e.matcher.severity,
-            .message = try dupeOpt(arena, c.message) orelse line,
+        const found: Found = .{
+            .level = try dupeOpt(arena, c.severity) orelse "",
+            .message = try dupeOpt(arena, c.message) orelse "",
             .file = resolveFile(arena, try dupeOpt(arena, c.file), c.from_path),
             .line = try dupeOpt(arena, c.line),
             .end_line = try dupeOpt(arena, c.end_line),
@@ -302,7 +307,7 @@ pub const Set = struct {
             .end_column = try dupeOpt(arena, c.end_column),
             .code = try dupeOpt(arena, c.code),
             .owner = e.matcher.owner,
-        });
+        };
 
         if (pat.loop) {
             // Stay on the looping pattern, keeping what earlier patterns captured: the filename
@@ -314,9 +319,39 @@ pub const Set = struct {
             e.progress = 0;
             e.carried = .{};
         }
-        return true;
+        return found;
     }
 };
+
+/// A match as GitHub's runner turns it into an issue (`ConvertToIssue` in OutputManager.cs), or
+/// null where it drops it: no message (or only whitespace), or a severity other than `error`,
+/// `warning` or `notice` in any case; none captured is the matcher's own. A line or column that
+/// is not a plain number is left out, and a code is trimmed.
+fn issue(f: Found, default_severity: []const u8) ?Found {
+    if (std.mem.trim(u8, f.message, " \t\r\n").len == 0) return null;
+    const severity = if (f.level.len > 0) f.level else default_severity;
+    const level = for ([_][]const u8{ "error", "warning", "notice" }) |l| {
+        if (std.ascii.eqlIgnoreCase(severity, l)) break l;
+    } else return null;
+    var out = f;
+    out.level = level;
+    out.line = number(f.line);
+    out.col = number(f.col);
+    out.code = if (f.code) |c| code: {
+        const t = std.mem.trim(u8, c, " \t\r\n");
+        break :code if (t.len > 0) t else null;
+    } else null;
+    return out;
+}
+
+/// `text` when .NET's `int.TryParse` with `NumberStyles.None` takes it: digits only, in range.
+fn number(text: ?[]const u8) ?[]const u8 {
+    const t = text orelse return null;
+    if (t.len == 0) return null;
+    for (t) |ch| if (!std.ascii.isDigit(ch)) return null;
+    _ = std.fmt.parseInt(i32, t, 10) catch return null;
+    return t;
+}
 
 /// Resolves a reported file against the directory of the pattern's `fromPath`, as GitHub's runner
 /// does. A tool invoked on a project file often reports paths relative to *that* file rather than
@@ -403,22 +438,22 @@ test "a single-pattern matcher annotates each matching line" {
     try set.add(ar, loaded.matchers);
 
     const with_position = try set.feed(ar, "main.go:9:2: undefined: foo");
-    try testing.expectEqual(@as(usize, 1), with_position.len);
-    try testing.expectEqualStrings("error", with_position[0].level); // the default severity
-    try testing.expectEqualStrings("main.go", with_position[0].file.?);
-    try testing.expectEqualStrings("9", with_position[0].line.?);
-    try testing.expectEqualStrings("2", with_position[0].col.?);
-    try testing.expectEqualStrings("undefined: foo", with_position[0].message);
+    try testing.expect(with_position != null);
+    try testing.expectEqualStrings("error", with_position.?.level); // the default severity
+    try testing.expectEqualStrings("main.go", with_position.?.file.?);
+    try testing.expectEqualStrings("9", with_position.?.line.?);
+    try testing.expectEqualStrings("2", with_position.?.col.?);
+    try testing.expectEqualStrings("undefined: foo", with_position.?.message);
 
     // The optional group absent: a message with no line or column still annotates.
     const without = try set.feed(ar, "pkg/a.go: build failed");
-    try testing.expectEqual(@as(usize, 1), without.len);
-    try testing.expectEqualStrings("pkg/a.go", without[0].file.?);
-    try testing.expect(without[0].line == null);
-    try testing.expect(without[0].col == null);
+    try testing.expect(without != null);
+    try testing.expectEqualStrings("pkg/a.go", without.?.file.?);
+    try testing.expect(without.?.line == null);
+    try testing.expect(without.?.col == null);
 
     // An unrelated line annotates nothing.
-    try testing.expectEqual(@as(usize, 0), (try set.feed(ar, "go: downloading example.com/x v1.2.3")).len);
+    try testing.expect(try set.feed(ar, "go: downloading example.com/x v1.2.3") == null);
 }
 
 test "a two-pattern matcher carries the filename to every error beneath it" {
@@ -431,30 +466,30 @@ test "a two-pattern matcher carries the filename to every error beneath it" {
     try set.add(ar, loaded.matchers);
 
     // The filename line matches the first pattern and annotates nothing by itself.
-    try testing.expectEqual(@as(usize, 0), (try set.feed(ar, "src/app.js")).len);
+    try testing.expect(try set.feed(ar, "src/app.js") == null);
 
     // Each error line completes the sequence, and keeps the filename from the line above.
     const first = try set.feed(ar, "  12:34  error  Unexpected console statement  no-console");
-    try testing.expectEqual(@as(usize, 1), first.len);
-    try testing.expectEqualStrings("src/app.js", first[0].file.?);
-    try testing.expectEqualStrings("12", first[0].line.?);
-    try testing.expectEqualStrings("34", first[0].col.?);
-    try testing.expectEqualStrings("error", first[0].level);
-    try testing.expectEqualStrings("Unexpected console statement", first[0].message);
-    try testing.expectEqualStrings("no-console", first[0].code.?);
+    try testing.expect(first != null);
+    try testing.expectEqualStrings("src/app.js", first.?.file.?);
+    try testing.expectEqualStrings("12", first.?.line.?);
+    try testing.expectEqualStrings("34", first.?.col.?);
+    try testing.expectEqualStrings("error", first.?.level);
+    try testing.expectEqualStrings("Unexpected console statement", first.?.message);
+    try testing.expectEqualStrings("no-console", first.?.code.?);
 
     // `loop: true`: the second error line annotates too, with the same file.
     const second = try set.feed(ar, "  40:5  warning  Missing radix parameter  radix");
-    try testing.expectEqual(@as(usize, 1), second.len);
-    try testing.expectEqualStrings("src/app.js", second[0].file.?);
-    try testing.expectEqualStrings("warning", second[0].level); // captured, not the default
-    try testing.expectEqualStrings("radix", second[0].code.?);
+    try testing.expect(second != null);
+    try testing.expectEqualStrings("src/app.js", second.?.file.?);
+    try testing.expectEqualStrings("warning", second.?.level); // captured, not the default
+    try testing.expectEqualStrings("radix", second.?.code.?);
 
     // A blank-ish line breaks the sequence, and the next filename starts a new one.
-    try testing.expectEqual(@as(usize, 0), (try set.feed(ar, "")).len);
-    try testing.expectEqual(@as(usize, 0), (try set.feed(ar, "src/other.js")).len);
+    try testing.expect(try set.feed(ar, "") == null);
+    try testing.expect(try set.feed(ar, "src/other.js") == null);
     const third = try set.feed(ar, "  1:1  error  Parsing error  syntax");
-    try testing.expectEqualStrings("src/other.js", third[0].file.?);
+    try testing.expectEqualStrings("src/other.js", third.?.file.?);
 }
 
 test "owners: re-registering replaces, removing withdraws" {
@@ -466,11 +501,11 @@ test "owners: re-registering replaces, removing withdraws" {
     try set.add(ar, (try load(ar, go_matcher)).matchers);
     try set.add(ar, (try load(ar, go_matcher)).matchers); // the same owner twice
     try testing.expectEqual(@as(usize, 1), set.count()); // replaced, not doubled
-    try testing.expectEqual(@as(usize, 1), (try set.feed(ar, "main.go:1:1: x")).len);
+    try testing.expect(try set.feed(ar, "main.go:1:1: x") != null);
 
     set.removeOwner("go");
     try testing.expectEqual(@as(usize, 0), set.count());
-    try testing.expectEqual(@as(usize, 0), (try set.feed(ar, "main.go:1:1: x")).len);
+    try testing.expect(try set.feed(ar, "main.go:1:1: x") == null);
 }
 
 test "a matcher whose pattern this engine refuses goes inert, and says which" {
@@ -524,8 +559,8 @@ test "the default severity applies only when no pattern captures one" {
     var set: Set = .{};
     try set.add(ar, (try load(ar, warned)).matchers);
     const got = try set.feed(ar, "something happened");
-    try testing.expectEqualStrings("warning", got[0].level);
-    try testing.expectEqualStrings("something happened", got[0].message);
+    try testing.expectEqualStrings("warning", got.?.level);
+    try testing.expectEqualStrings("something happened", got.?.message);
 }
 
 /// The shape every `fromPath` matcher has: one pattern catching the file a tool was invoked on, and
@@ -549,29 +584,29 @@ test "fromPath resolves a reported file against the directory of the project fil
     try set.add(ar, (try load(ar, from_path_matcher)).matchers);
 
     // The first line only establishes where the following paths are rooted, and annotates nothing.
-    try testing.expectEqual(@as(usize, 0), (try set.feed(ar, "Building src/app/app.proj")).len);
+    try testing.expect(try set.feed(ar, "Building src/app/app.proj") == null);
 
     // `Program.cs` is relative to src/app/, not to the workspace. Before this worked, the
     // annotation said "Program.cs" and pointed at a file that is not there.
     const one = try set.feed(ar, "Program.cs(12,5): error CS0103: The name 'x' does not exist.");
-    try testing.expectEqual(@as(usize, 1), one.len);
-    try testing.expectEqualStrings("src/app/Program.cs", one[0].file.?);
-    try testing.expectEqualStrings("12", one[0].line.?);
-    try testing.expectEqualStrings("CS0103", one[0].code.?);
-    try testing.expectEqualStrings("error", one[0].level);
+    try testing.expect(one != null);
+    try testing.expectEqualStrings("src/app/Program.cs", one.?.file.?);
+    try testing.expectEqualStrings("12", one.?.line.?);
+    try testing.expectEqualStrings("CS0103", one.?.code.?);
+    try testing.expectEqualStrings("error", one.?.level);
 
     // The looping pattern keeps the carried fromPath, so every diagnostic under one project line
     // resolves the same way.
     const two = try set.feed(ar, "sub/Other.cs(3,1): warning CS0168: unused.");
-    try testing.expectEqualStrings("src/app/sub/Other.cs", two[0].file.?);
+    try testing.expectEqualStrings("src/app/sub/Other.cs", two.?.file.?);
 
     // `..` in the reported path is normalised rather than left in place.
     const up = try set.feed(ar, "../shared/Util.cs(7,2): error CS0246: missing type.");
-    try testing.expectEqualStrings("src/shared/Util.cs", up[0].file.?);
+    try testing.expectEqualStrings("src/shared/Util.cs", up.?.file.?);
 
     // An already-rooted path is left exactly as reported.
     const abs = try set.feed(ar, "/opt/sdk/Gen.cs(1,1): error CS0001: generated.");
-    try testing.expectEqualStrings("/opt/sdk/Gen.cs", abs[0].file.?);
+    try testing.expectEqualStrings("/opt/sdk/Gen.cs", abs.?.file.?);
 }
 
 test "a matcher with no fromPath still reports the file as captured" {
@@ -583,7 +618,7 @@ test "a matcher with no fromPath still reports the file as captured" {
     var set: Set = .{};
     try set.add(ar, (try load(ar, go_matcher)).matchers);
     const got = try set.feed(ar, "pkg/thing/x.go:12:5: undefined: alpha");
-    try testing.expectEqualStrings("pkg/thing/x.go", got[0].file.?);
+    try testing.expectEqualStrings("pkg/thing/x.go", got.?.file.?);
 }
 
 // A project file at the repository root: `dirname` gives an empty directory, and the reported path
@@ -596,5 +631,57 @@ test "fromPath at the root leaves the path alone" {
     try set.add(ar, (try load(ar, from_path_matcher)).matchers);
     _ = try set.feed(ar, "Building app.proj");
     const got = try set.feed(ar, "Program.cs(1,1): error CS0001: x.");
-    try testing.expectEqualStrings("Program.cs", got[0].file.?);
+    try testing.expectEqualStrings("Program.cs", got.?.file.?);
+}
+
+test "the newest matcher is tried first, and one GitHub would drop passes the line on" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const anything =
+        \\{ "problemMatcher": [ { "owner": "any", "severity": "warning", "pattern": [
+        \\  { "regexp": "^(.+)$", "message": 1 } ] } ] }
+    ;
+    var set: Set = .{};
+    try set.add(ar, (try load(ar, go_matcher)).matchers);
+    try set.add(ar, (try load(ar, anything)).matchers);
+    // Added last, tried first.
+    try testing.expectEqualStrings("any", (try set.feed(ar, "main.go:1:1: x")).?.owner);
+    // Re-registered in another case: replaced, and first again.
+    set.removeOwner("ANY");
+    try testing.expectEqual(@as(usize, 1), set.count());
+    try testing.expectEqualStrings("go", (try set.feed(ar, "main.go:1:1: x")).?.owner);
+
+    // In one file, the last matcher comes first.
+    var two: Set = .{};
+    const pair =
+        \\{ "problemMatcher": [
+        \\  { "owner": "first", "pattern": [ { "regexp": "^(.+)$", "message": 1 } ] },
+        \\  { "owner": "second", "pattern": [ { "regexp": "^(.+)$", "message": 1 } ] } ] }
+    ;
+    try two.add(ar, (try load(ar, pair)).matchers);
+    try testing.expectEqualStrings("second", (try two.feed(ar, "x")).?.owner);
+
+    // An empty message, or a severity GitHub does not know, makes no issue: the next matcher
+    // gets the line.
+    var drops: Set = .{};
+    const fallback =
+        \\{ "problemMatcher": [ { "owner": "fallback", "pattern": [
+        \\  { "regexp": "^(.*)$", "message": 1 } ] } ] }
+    ;
+    const picky =
+        \\{ "problemMatcher": [ { "owner": "picky", "pattern": [
+        \\  { "regexp": "^(\\w+): (.*)$", "severity": 1, "message": 2, "line": 1 } ] } ] }
+    ;
+    try drops.add(ar, (try load(ar, fallback)).matchers);
+    try drops.add(ar, (try load(ar, picky)).matchers);
+    try testing.expectEqualStrings("fallback", (try drops.feed(ar, "info: not a severity")).?.owner);
+    try testing.expectEqualStrings("fallback", (try drops.feed(ar, "error:  ")).?.owner);
+    const known = (try drops.feed(ar, "WARNING: careful")).?;
+    try testing.expectEqualStrings("picky", known.owner);
+    try testing.expectEqualStrings("warning", known.level);
+    // `line` captured "WARNING", which is not a number: left out.
+    try testing.expect(known.line == null);
+    // Nothing at all: no issue.
+    try testing.expect(try drops.feed(ar, "") == null);
 }
