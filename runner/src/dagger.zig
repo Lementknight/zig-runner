@@ -3625,3 +3625,32 @@ test "a script with a secret written in reaches its file as a mounted Dagger sec
         try std.testing.expect(std.mem.indexOf(u8, after, "> /tmp/zig-runner-step-2.sh") != null);
     }
 }
+
+test "a secret in a service's env reaches the service as a Dagger secret" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const secret = "db_s3cr3t-value";
+    const steps = [_]job_mod.Step{testStep("./migrate.sh")};
+    var job = testJob(&steps);
+    job.secrets = &.{secret};
+    job.services = &.{.{
+        .name = "postgres",
+        .image = .{ .lit = "postgres:17" },
+        .env = &.{
+            .{ .name = "POSTGRES_PASSWORD", .value = .{ .lit = secret } },
+            .{ .name = "POSTGRES_DB", .value = .{ .lit = "app" } },
+        },
+        .ports = &.{.{ .lit = "5432:5432" }},
+    }};
+    var auto: AutoSession = .{ .arena = arena };
+    _ = try roundTrips(arena, &auto, .{}, job);
+    try expectSecretOnlyInSetSecret(&auto, secret);
+    // In the query that starts the service.
+    try std.testing.expectEqual(@as(usize, 1), auto.count("withSecretVariable(name:" ++
+        "\"POSTGRES_PASSWORD\",secret:\"ID"));
+    for (auto.seen.items) |d| if (std.mem.indexOf(u8, d, "POSTGRES_PASSWORD") != null)
+        try std.testing.expect(std.mem.indexOf(u8, d, "asService(") != null);
+    try std.testing.expectEqual(@as(usize, 1), auto.count("withEnvVariable(name:\"POSTGRES_DB\"," ++
+        "value:\"app\")"));
+}
