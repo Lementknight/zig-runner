@@ -21,6 +21,7 @@ const stepScriptFc = @import("scripts.zig").stepScriptFc;
 const fcPath = @import("scripts.zig").fcPath;
 const fc_marker = @import("scripts.zig").fc_marker;
 const secretAlias = @import("scripts.zig").secretAlias;
+const scriptPath = @import("scripts.zig").scriptPath;
 const Port = @import("services.zig").Port;
 const Transport = @import("../dagger.zig").Transport;
 const SecretRef = @import("../dagger.zig").SecretRef;
@@ -281,7 +282,19 @@ pub fn execScript(
         try q.splice(env.fragment());
         try writeActionSecrets(arena, &q, secret_env);
         try q.splice(mount_nodes.fragment());
-        const output_at = try x.writeScriptExec(&q, script, fc, secret_env);
+        // Readable by the step's user, whoever that is in a job container's image; owned by the
+        // runner user when steps run as it.
+        const script_mount: ?[]const u8 = if (step_run.script_secret) |id| mount: {
+            const path = try scriptPath(arena, fc, resolved.run.shell);
+            try q.call("withMountedSecret", .{
+                .path = path,
+                .source = id,
+                .owner = x.dir_owner,
+                .mode = @as(u32, 0o444),
+            });
+            break :mount path;
+        } else null;
+        const output_at = try x.writeScriptExec(&q, script, fc, secret_env, script_mount);
         // A step whose output may key the next steps: what `outputKeyed` needs of the container
         // before it comes in the same query, as a field of its own (nothing is run for it).
         const keyed = x.output_keys != null and resolved == .run and
@@ -331,7 +344,12 @@ pub fn execScript(
 
 /// A step as it will run: the script's secret aliases and OIDC token set, and under step
 /// caching its always-run reason or its volatile withholding decided.
-const ScriptRun = struct { resolved: Resolved, secret_env: []const SecretRef };
+const ScriptRun = struct {
+    resolved: Resolved,
+    secret_env: []const SecretRef,
+    /// The script as a Dagger secret, when it holds one (`Resolved.run.script_mounted`).
+    script_secret: ?[]const u8 = null,
+};
 
 /// Secret variables are for scripts only; they reach them through aliases (`secretAlias`). With
 /// `id-token: write`, every step can request OIDC tokens, as on GitHub (`curl
@@ -347,8 +365,16 @@ fn resolveRunStep(
     var resolved = resolved_in;
     if (resolved != .run) return .{ .resolved = resolved, .secret_env = &.{} };
     var secret_env: []const SecretRef = secret_env_in;
+    // A script with a secret written in (`${{ secrets.X }}`) reaches its file as a Dagger
+    // secret: in the command, the plaintext would be in the engine's cache metadata (#101).
+    const script_secret: ?[]const u8 = if (holdsSecret(x.job.*, x.sh, resolved.run.script))
+        newSecret(arena, x.transport, &x.secrets, resolved.run.script, &x.err_msg) catch
+            return error.EngineFailed
+    else
+        null;
+    resolved.run.script_mounted = script_secret != null;
     const uses_secrets = secret_env.len > 0 or x.job_secret_env or x.envHoldsSecret() or
-        holdsSecret(x.job.*, x.sh, resolved.run.script);
+        script_secret != null;
     const oidc = try x.idToken();
     if (oidc) |t| {
         resolved.run.env = try std.mem.concat(
@@ -385,7 +411,7 @@ fn resolveRunStep(
             // (`volatile_sentinel`).
         else resolved.run.withhold_volatile = x.enforce_volatile;
     }
-    return .{ .resolved = resolved, .secret_env = secret_env };
+    return .{ .resolved = resolved, .secret_env = secret_env, .script_secret = script_secret };
 }
 
 /// Whether the env the job's steps get (workflow, job, GITHUB_ENV) holds a secret or a mask: a
@@ -462,6 +488,8 @@ fn writeScriptExec(
     script: []const u8,
     fc: u32,
     secret_env: []const SecretRef,
+    /// Where the script is mounted as a secret, if it is: unmounted with the step's secrets.
+    script_mount: ?[]const u8,
 ) !usize {
     const arena = x.arena;
     const nesting: ?bool = if (x.nesting) true else null;
@@ -477,6 +505,7 @@ fn writeScriptExec(
     try q.close(1);
     for (secret_env, 0..) |_, i|
         try q.call("withoutSecretVariable", .{ .name = try secretAlias(arena, i) });
+    if (script_mount) |path| try q.call("withoutMount", .{ .path = path });
     try q.leaf("id");
     return output_at;
 }

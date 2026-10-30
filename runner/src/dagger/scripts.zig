@@ -141,9 +141,11 @@ fn writeRunScript(
     // The script is a file, as on GitHub: `$0`, BASH_SOURCE and error messages name it, and
     // a Python traceback names it too — hence the extension following the shell.
     const path = try scriptPath(arena, fc, sc.shell);
-    try w.writeAll("printf '%s' ");
-    try shellQuote(w, sc.script);
-    try w.print(" > {s}\n", .{path});
+    if (!sc.script_mounted) {
+        try w.writeAll("printf '%s' ");
+        try shellQuote(w, sc.script);
+        try w.print(" > {s}\n", .{path});
+    }
     if (sc.shell == null) try w.writeAll("if command -v bash >/dev/null 2>&1; then " ++
         "zig_shell=bash; else zig_shell=sh; fi\n");
     try w.writeAll("( ");
@@ -165,8 +167,10 @@ fn writeRunScript(
     );
     try writeShellCommand(w, arena, sc.shell, path);
     // The script file goes once it ran: otherwise every later step's filesystem holds it,
-    // and with it whatever the script embeds (a commit from `${{ github.sha }}`).
-    try w.print(")\nrc=$?\nrm -f {s}\n", .{path});
+    // and with it whatever the script embeds (a commit from `${{ github.sha }}`). A mounted one
+    // is unmounted by the query instead.
+    try w.writeAll(")\nrc=$?\n");
+    if (!sc.script_mounted) try w.print("rm -f {s}\n", .{path});
 }
 
 /// After a step: its file commands in one file (`all_<fc>`), each after a
@@ -310,7 +314,7 @@ pub fn shellLine(arena: Allocator, shell: ?[]const u8) ![]const u8 {
 }
 
 /// Where a step's script is written for its shell, as GitHub writes it under RUNNER_TEMP.
-fn scriptPath(arena: Allocator, fc: u32, shell: ?[]const u8) ![]const u8 {
+pub fn scriptPath(arena: Allocator, fc: u32, shell: ?[]const u8) ![]const u8 {
     return std.fmt.allocPrint(
         arena,
         "/tmp/zig-runner-step-{d}.{s}",
