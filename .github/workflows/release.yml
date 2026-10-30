@@ -40,8 +40,15 @@ env:
   # The tag released: pushed, or given by hand.
   TAG: ${{ inputs.tag || github.ref_name }}
   PUBLISH: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
-  # Trivy's own image; the digest is what is pinned, the tag says which release it is.
+  # Images by digest; the tag says which release each is (Renovate follows them, renovate.json).
+  # Trivy's own;
   TRIVY_IMAGE: aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+  # BuildKit, which builds the image (setup-buildx-action would take buildx-stable-1, a moving tag);
+  BUILDKIT_IMAGE: moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+  # and the scanner that writes the image's SBOM (BuildKit would take stable-1, a moving tag).
+  SBOM_SCANNER_IMAGE: docker/buildkit-syft-scanner:1.12.0@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
+  # Where Trivy's vulnerability database comes from, in order: Google's mirror, then GitHub's.
+  TRIVY_DB: mirror.gcr.io/aquasec/trivy-db:2,ghcr.io/aquasec/trivy-db:2
 
 jobs:
   binaries:
@@ -240,13 +247,14 @@ jobs:
           grep -qE '^FROM .* AS prebuilt$' <<<"$dockerfile" ||
             { echo "::error::$TAG's Dockerfile has no prebuilt stage: only v0.14.0 and later can be rebuilt"; exit 1; }
 
-  # From the release's own binaries: a tag's, once the binaries job published them (checked against
-  # SHA256SUMS and their provenance); a pull request's or merge group's from its check; by hand, the
-  # tag's release, once the rebuild is approved. Each needed job is either skipped (binaries but on
-  # a tag, binaries-check on one, rebuild but by hand) or must not have failed; by hand, the
-  # rebuild must have been approved. A check that found the change cannot affect the packaging
-  # built no binaries (`run` false): the steps skip, and the job still reports. `run` is empty on a
-  # tag or by hand, where binaries-check is skipped, and everything runs.
+  # The image's checks, from the release's own binaries: a tag's, once the binaries job published
+  # them (checked against SHA256SUMS and their provenance); a pull request's or merge group's from
+  # its check; by hand, the tag's release, once the rebuild is approved. Each needed job is either
+  # skipped (binaries but on a tag, binaries-check on one, rebuild but by hand) or must not have
+  # failed; by hand, the rebuild must have been approved. A check that found the change cannot
+  # affect the packaging built no binaries (`run` false): the steps skip, and the job still
+  # reports. `run` is empty on a tag or by hand, where binaries-check is skipped, and everything
+  # runs. It only reads: pushing is image-publish's, after this, on a tag or by hand.
   image:
     name: Image
     needs: [binaries, binaries-check, rebuild]
@@ -257,10 +265,6 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read # to check out the code, and download the release's binaries
-      packages: write # to push the image to ghcr.io
-      id-token: write # to sign the image's provenance with Sigstore
-      attestations: write # to store that provenance
-      artifact-metadata: write # to record the pushed image as the attestation's artifact
     env:
       RUN: ${{ needs.binaries-check.outputs.run != 'false' }}
     steps:
@@ -274,6 +278,8 @@ jobs:
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         if: env.RUN == 'true'
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
 
       - name: The pull request's binaries
         if: env.RUN == 'true' && env.PUBLISH != 'true'
@@ -299,27 +305,26 @@ jobs:
           install -m 0755 dist/zig-runner-linux-x86_64 runner/prebuilt/runner-amd64
           install -m 0755 dist/zig-runner-linux-aarch64 runner/prebuilt/runner-arm64
 
-      # Registry names must be lowercase; owners often are not (Open-Blue). `latest` is the newest
-      # version tag's image: a rebuild of an older one leaves it where it is.
-      - name: Image name
-        if: env.RUN == 'true'
-        env:
-          OWNER: ${{ github.repository_owner }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "IMAGE=ghcr.io/${OWNER,,}/zig-runner" >> "$GITHUB_ENV"
-          if [[ $PUBLISH == true ]]; then
-            newest=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" --jq '.[].ref' |
-              sed -n 's|^refs/tags/\(v[0-9]*\.[0-9]*\.[0-9]*\)$|\1|p' | sort -V | tail -n1)
-            echo "newest version tag: $newest"
-            echo "LATEST=$([[ $newest == "$TAG" ]] && echo true || echo false)" >> "$GITHUB_ENV"
-          fi
-
       - name: Scan the Dockerfile
         if: env.RUN == 'true'
         run: |
           docker run --rm -v "$PWD:/src:ro" -w /src "$TRIVY_IMAGE" config \
             --exit-code 1 --severity HIGH,CRITICAL --ignorefile .trivyignore.yaml runner/
+
+      # Trivy's vulnerability database, fetched once, with retries, from Google's mirror of it
+      # first (GitHub's registry limits anonymous pulls): on a tag the release is already public,
+      # and a fetch that failed once would leave it with no image and no deployment.
+      - name: Trivy's database
+        if: env.RUN == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/trivy"
+          for attempt in 1 2 3 4 5; do
+            docker run --rm -v "$RUNNER_TEMP/trivy:/cache" "$TRIVY_IMAGE" image --cache-dir /cache \
+              --download-db-only --db-repository "$TRIVY_DB" && exit 0
+            echo "::warning::could not fetch Trivy's database (attempt $attempt of 5)"
+            ((attempt < 5)) && sleep $((attempt * 20))
+          done
+          exit 1
 
       # Scanned before anything is pushed: one platform, loaded into the local Docker.
       - name: Build for the scan
@@ -335,37 +340,100 @@ jobs:
       - name: Scan the image
         if: env.RUN == 'true'
         run: |
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" image \
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$RUNNER_TEMP/trivy:/cache" \
+            "$TRIVY_IMAGE" image --cache-dir /cache --skip-db-update \
             --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed zig-runner:scan
 
+      # Both platforms, with BuildKit's provenance and SBOM, as image-publish builds them, under a
+      # local name: a pull request's ref (`123/merge`) or a merge group's is no image tag. On a tag
+      # or by hand image-publish builds the same, so it is not built twice.
+      - name: Build both platforms
+        if: env.RUN == 'true' && env.PUBLISH != 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: runner
+          target: prebuilt
+          platforms: linux/amd64,linux/arm64
+          provenance: mode=max
+          attests: type=sbom,generator=${{ env.SBOM_SCANNER_IMAGE }}
+          tags: zig-runner:check
+
+  # The image pushed, for a tag or by hand, once `image` has scanned it: the only job here that can
+  # write packages, so a pull request's never holds that. From the same binaries, checked again, and
+  # the same Dockerfile, pinned by digest. A job of its own rather than steps of `image`, whose
+  # check name ("Image") the merge queue requires, on pull requests, where it must not have these
+  # permissions.
+  image-publish:
+    name: Image (publish)
+    needs: image
+    if: >-
+      ${{ !cancelled() && needs.image.result == 'success'
+      && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read # to check out the code, and download the release's binaries
+      packages: write # to push the image to ghcr.io
+      id-token: write # to sign the image's provenance with Sigstore
+      attestations: write # to store that provenance
+      artifact-metadata: write # to record the pushed image as the attestation's artifact
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+
+      - name: The release's binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: .github/scripts/release-binaries.sh "$TAG" dist
+
+      - name: Into the build context
+        run: |
+          mkdir -p runner/prebuilt
+          install -m 0755 dist/zig-runner-linux-x86_64 runner/prebuilt/runner-amd64
+          install -m 0755 dist/zig-runner-linux-aarch64 runner/prebuilt/runner-arm64
+
+      # Registry names must be lowercase; owners often are not (Open-Blue). `latest` is the newest
+      # version tag's image: a rebuild of an older one leaves it where it is.
+      - name: Image name
+        env:
+          OWNER: ${{ github.repository_owner }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "IMAGE=ghcr.io/${OWNER,,}/zig-runner" >> "$GITHUB_ENV"
+          newest=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" --jq '.[].ref' |
+            sed -n 's|^refs/tags/\(v[0-9]*\.[0-9]*\.[0-9]*\)$|\1|p' | sort -V | tail -n1)
+          echo "newest version tag: $newest"
+          echo "LATEST=$([[ $newest == "$TAG" ]] && echo true || echo false)" >> "$GITHUB_ENV"
+
       - name: Log in to the registry
-        if: env.RUN == 'true' && env.PUBLISH == 'true'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Build (and push, for a tag or by hand)
+      - name: Build and push
         id: build
-        if: env.RUN == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: runner
           target: prebuilt
           platforms: linux/amd64,linux/arm64
-          push: ${{ env.PUBLISH == 'true' }}
+          push: true
           # BuildKit's own provenance and SBOM, stored with the image in the registry.
           provenance: mode=max
-          sbom: true
-          # A pull request's ref (`123/merge`) or a merge group's is no image tag; it builds under a
-          # local name.
+          attests: type=sbom,generator=${{ env.SBOM_SCANNER_IMAGE }}
           tags: >-
-            ${{ env.PUBLISH == 'true' && format('{0}:{1}{2}', env.IMAGE, env.TAG,
-            env.LATEST == 'true' && format(',{0}:latest', env.IMAGE) || '') || 'zig-runner:check' }}
+            ${{ format('{0}:{1}{2}', env.IMAGE, env.TAG,
+            env.LATEST == 'true' && format(',{0}:latest', env.IMAGE) || '') }}
 
       - name: Attest the image
-        if: env.RUN == 'true' && env.PUBLISH == 'true'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}
@@ -381,13 +449,13 @@ jobs:
   # unlike one with GITHUB_TOKEN, starts ci.yml's push run on the commit, at the same time as this.
   deploy:
     name: Deploy to razorbill
-    needs: [binaries, image]
+    needs: [binaries, image-publish]
     # Explicit results, not the implicit success(): that also requires every job before these to
     # have succeeded, and on a tag "Binaries (check)", which the image job waits for, is skipped.
     # Without this, v0.14.0 was released and never deployed.
     if: >-
       ${{ !cancelled() && startsWith(github.ref, 'refs/tags/')
-      && needs.binaries.result == 'success' && needs.image.result == 'success' }}
+      && needs.binaries.result == 'success' && needs.image-publish.result == 'success' }}
     runs-on: ubuntu-latest
     # The wait for the checks (WAIT_MINUTES), and a little.
     timeout-minutes: 45
@@ -398,14 +466,16 @@ jobs:
     env:
       # What must have passed on the tagged commit, one per line: ci.yml's jobs that run on a push
       # to main (not "Branch name", pull requests' only, which is skipped here), and this run's
-      # Binaries and Image, which this job needs, so they are done before it starts. A name that
-      # never runs on a push to main would hold every deploy for the whole wait, then fail it.
+      # Binaries, Image and Image (publish), which this job waits for, so they are done before it
+      # starts. A name that never runs on a push to main would hold every deploy for the whole
+      # wait, then fail it.
       REQUIRED_CHECKS: |-
         Format, build and test
         Database tests
         Workflows
         Binaries
         Image
+        Image (publish)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

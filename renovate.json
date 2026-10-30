@@ -107,13 +107,13 @@
       "extractVersionTemplate": "^v(?<version>.*)$"
     },
     {
-      "description": "Trivy's image, pinned by digest in release.yml.",
+      "description": "The images release.yml pins by digest: Trivy, BuildKit and BuildKit's SBOM scanner.",
       "customType": "regex",
       "managerFilePatterns": [
         "/^\\.github/workflows/release\\.yml$/"
       ],
       "matchStrings": [
-        "TRIVY_IMAGE: (?<depName>aquasec/trivy):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+        "(?:TRIVY|BUILDKIT|SBOM_SCANNER)_IMAGE: (?<depName>[a-z0-9./-]+):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
       ],
       "datasourceTemplate": "docker"
     },
