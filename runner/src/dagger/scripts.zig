@@ -1,0 +1,475 @@
+//! The `sh -c` script each step runs: its file commands, its env and shell, and the markers
+//! around its output.
+
+const std = @import("std");
+const job_mod = @import("../job.zig");
+const Resolved = @import("../dagger.zig").Resolved;
+const shellQuote = @import("../dagger.zig").shellQuote;
+const marker = @import("../dagger.zig").marker;
+const checkoutLog = @import("../dagger.zig").checkoutLog;
+const checkoutRefCommands = @import("../dagger.zig").checkoutRefCommands;
+const event_dir = @import("../dagger.zig").event_dir;
+const event_path = @import("../dagger.zig").event_path;
+const event_env = @import("../dagger.zig").event_env;
+const withheld_event = @import("../dagger.zig").withheld_event;
+const mark_env = @import("../dagger.zig").mark_env;
+const ran_env = @import("../dagger.zig").ran_env;
+const volatile_env = @import("../dagger.zig").volatile_env;
+const volatile_sentinel = @import("../dagger.zig").volatile_sentinel;
+const containerScript = @import("../dagger.zig").containerScript;
+const readsRunSpecific = @import("../dagger.zig").readsRunSpecific;
+
+const Allocator = std.mem.Allocator;
+
+pub const fc_dir = "/github/file_commands";
+/// GITHUB_STATE is written by JavaScript actions (`core.saveState`) for their post scripts.
+pub const fc_kinds = [_][]const u8{ "output", "env", "path", "step_summary", "state" };
+
+pub fn fcPath(arena: Allocator, kind: []const u8, n: u32) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}/{s}_{d}", .{ fc_dir, kind, n });
+}
+
+/// The `sh -c` script of step number `n` (1-based). Its exit code is the step's.
+///
+/// The script creates the step's file commands first and touches them again afterwards, so the
+/// query can always read them even if the step deleted them. A `run:` step sees them as
+/// `$GITHUB_OUTPUT`, `$GITHUB_ENV`, `$GITHUB_PATH` and `$GITHUB_STEP_SUMMARY`.
+///
+/// This text is part of every step's cache key, so none of it is only for the log: changing the
+/// markers, the file-command paths or the order of the lines gives every step of every job a new
+/// key, and the first run after such a change replays nothing. What keeps two steps of one job
+/// apart is not the number here but the container each starts from (see proofs/,
+/// `Runner.Counterexamples.SameStepTwice`).
+///
+/// The script's stderr goes to its stdout (`stream_prologue`), so its output is one stream in the
+/// order it was written: the live log and a replay of the recorded stdout are the same lines in
+/// the same order (issue #71).
+pub fn stepScript(arena: Allocator, n: u32, r: Resolved, action_name: []const u8) ![]const u8 {
+    return stepScriptFc(arena, n, n, r, action_name);
+}
+
+/// As `stepScript`, with file commands numbered `fc` instead of `n`. The steps of a composite
+/// action all log as their `uses:` step (`n`), but each needs its own file commands.
+pub fn stepScriptFc(
+    arena: Allocator,
+    n: u32,
+    fc: u32,
+    r: Resolved,
+    action_name: []const u8,
+) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll(stream_prologue);
+    try writeMarkerEcho(w, "begin", n);
+    try w.writeAll("mkdir -p " ++ fc_dir ++ " && : ");
+    for (fc_kinds) |k| try w.print("> {s} ", .{try fcPath(arena, k, fc)});
+    try w.writeByte('\n');
+    switch (r) {
+        .run => |sc| try writeRunScript(w, arena, sc, fc, action_name),
+        .checkout => |f| {
+            // The tree is mounted by the query (`withDirectory`); the step reports it in the shape
+            // actions/checkout's log has (the same folds, and the commit last), with what happened.
+            for (try checkoutLog(arena, f)) |line| {
+                try w.writeAll("printf '%s\\n' ");
+                try shellQuote(w, line);
+                try w.writeByte('\n');
+            }
+            if (f.git_ref) |ref| try w.writeAll(try checkoutRefCommands(arena, f.mount, ref));
+            try w.writeAll("printf '%s\\n' '##[endgroup]'\n");
+            // The commit, as actions/checkout ends (it runs the same git command).
+            try w.writeAll("git -C ");
+            try shellQuote(w, f.mount);
+            try w.writeAll(" log -1 --format=%H 2>/dev/null\nrc=0\n");
+        },
+    }
+    try w.writeAll("mkdir -p " ++ fc_dir ++ " && : ");
+    for (fc_kinds) |k| try w.print(">> {s} ", .{try fcPath(arena, k, fc)});
+    try w.writeByte('\n');
+    try writeCombinedFileCommands(w, arena, "", fc);
+    try writeMarkerEcho(w, "end", n);
+    try w.writeAll("exit $rc\n");
+    return aw.written();
+}
+
+/// The first line of every step's script: its stderr from here on is its stdout.
+///
+/// Why one stream. A step's output is logged as it streams, and replayed from the exec's recorded
+/// `stdout` and `stderr` when Dagger serves the exec from cache. Recorded as two strings, the order
+/// between them is lost, and workflow commands depend on it: an `::add-mask::` on stdout masks a
+/// stderr line after it, `::stop-commands::` turns later lines of either stream into text, and
+/// problem matchers read lines in order. With one stream the recorded stdout is the log in the
+/// order it was written, which is what the live log shows too, and the live log gets the exact
+/// order as well, where two pipes read apart could reorder lines close in time.
+///
+/// What it costs: a step's programs see one pipe for both, where GitHub's runner gives two and
+/// merges them as it reads them. Nothing in this runner tells the streams apart for a step: its
+/// lines are all logged alike (`Shared.appendLocked`), GitHub's log has no stream either, and
+/// workflow commands and problem matchers are read on both. The one place that read `stderr` alone
+/// (`bun_load_errors`) reads both. A program can still tell, by comparing its file descriptors,
+/// but none a workflow runs is known to care. Recording a second, ordered copy of the output (a
+/// `tee` of both streams into a file command) would keep the pipes apart, at the price of every
+/// step's output stored twice and a process between the step and its output, and was not worth
+/// it.
+pub const stream_prologue = "exec 2>&1\n";
+
+/// `echo '<marker><kind> <n>' "$ZIG_RUNNER_MARK"`: a marker that carries the job's secret (see
+/// `mark_env`). The variable's name, not its value, is in the script, so the script text (part of
+/// the step's cache key) is the same in every job.
+pub fn writeMarkerEcho(w: *std.Io.Writer, kind: []const u8, n: u32) !void {
+    try w.print("echo '{s}{s} {d}' \"${{" ++ mark_env ++ "-}}\"\n", .{ marker, kind, n });
+}
+
+/// The `run:` part of a step's script: the event file when asked, the script written to its file,
+/// then run under its shell in a subshell with the step's env, and removed.
+fn writeRunScript(
+    w: *std.Io.Writer,
+    arena: Allocator,
+    sc: anytype,
+    fc: u32,
+    action_name: []const u8,
+) !void {
+    if (sc.always_run) |why| {
+        try w.writeAll(": ");
+        try shellQuote(w, why);
+        try w.writeByte('\n');
+    }
+    // A replayable step is given the withheld payload, not this run's (`withheld_event`).
+    if (sc.write_event) try w.writeAll(if (sc.withhold_volatile)
+        "mkdir -p " ++ event_dir ++ " && printf '%s' '" ++ withheld_event ++ "' > " ++ event_path ++ "\n"
+    else
+        "if [ -n \"${" ++ event_env ++ "+x}\" ]; then mkdir -p " ++
+            event_dir ++ " && printf '%s' \"$" ++ event_env ++ "\" > " ++ event_path ++ "; fi\n");
+    // The script is a file, as on GitHub: `$0`, BASH_SOURCE and error messages name it, and
+    // a Python traceback names it too — hence the extension following the shell.
+    const path = try scriptPath(arena, fc, sc.shell);
+    try w.writeAll("printf '%s' ");
+    try shellQuote(w, sc.script);
+    try w.print(" > {s}\n", .{path});
+    if (sc.shell == null) try w.writeAll("if command -v bash >/dev/null 2>&1; then " ++
+        "zig_shell=bash; else zig_shell=sh; fi\n");
+    try w.writeAll("( ");
+    if (sc.working_directory) |wd| {
+        try w.writeAll("cd ");
+        try shellQuote(w, wd);
+        try w.writeAll(" && ");
+    }
+    try writeEnvCommand(
+        w,
+        arena,
+        "env ",
+        sc.env,
+        sc.secret_env,
+        sc.write_event,
+        sc.withhold_volatile,
+        fc,
+        action_name,
+    );
+    try writeShellCommand(w, arena, sc.shell, path);
+    // The script file goes once it ran: otherwise every later step's filesystem holds it,
+    // and with it whatever the script embeds (a commit from `${{ github.sha }}`).
+    try w.print(")\nrc=$?\nrm -f {s}\n", .{path});
+}
+
+/// After a step: its file commands in one file (`all_<fc>`), each after a
+/// `::zig-file-command::<kind>` line and followed by one newline, so the query reads one file
+/// instead of one per kind (each read mounts the step's snapshot in the engine). Only `cat` and
+/// `printf` are needed.
+pub fn writeCombinedFileCommands(
+    w: *std.Io.Writer,
+    arena: Allocator,
+    prefix: []const u8,
+    fc: u32,
+) !void {
+    try w.writeAll("{ ");
+    for (fc_kinds) |k| try w.print(
+        "printf '%s\\n' '" ++ fc_marker ++ "{s}'; {s}cat {s}; printf '\\n'; ",
+        .{ k, prefix, try fcPath(arena, k, fc) },
+    );
+    // The job's marker (see `ran_env`): a result replayed from Dagger's cache has an earlier job's.
+    try w.writeAll("printf '%s\\n%s\\n' '" ++ fc_marker ++ "ran' \"${" ++ ran_env ++ "-}\"; ");
+    try w.print("}} > {s}\n", .{try fcPath(arena, "all", fc)});
+}
+
+pub const fc_marker = "::zig-file-command::";
+
+/// `<env_cmd>-u <aliases> NAME=value ... GITHUB_OUTPUT=... GITHUB_ACTION=... `: what a step's
+/// command starts with, so it gets its env (secret values expanded from their aliases, see
+/// `Resolved.run`).
+pub fn writeEnvCommand(
+    w: *std.Io.Writer,
+    arena: Allocator,
+    env_cmd: []const u8,
+    env: []const job_mod.EnvVar,
+    secret_env: []const []const u8,
+    write_event: bool,
+    withhold_volatile: bool,
+    fc: u32,
+    action_name: []const u8,
+) !void {
+    try w.writeAll(env_cmd);
+    for (secret_env, 0..) |_, i| try w.print("-u {s} ", .{try secretAlias(arena, i)});
+    if (write_event) try w.writeAll("-u " ++ event_env ++ " ");
+    try w.writeAll("-u " ++ ran_env ++ " -u " ++ mark_env ++ " ");
+    // Before the step's own env, so a workflow that sets one of these itself still wins.
+    if (withhold_volatile) for (volatile_env) |name| {
+        try shellQuote(w, try std.fmt.allocPrint(arena, "{s}=" ++ volatile_sentinel, .{name}));
+        try w.writeByte(' ');
+    };
+    for (env) |e| {
+        const pair = try std.fmt.allocPrint(arena, "{s}={s}", .{ e.name, e.value });
+        try shellQuote(w, pair);
+        try w.writeByte(' ');
+    }
+    // The value is expanded by the shell from the alias; only the variable's name is in the
+    // command.
+    for (secret_env, 0..) |name, i| {
+        try shellQuote(w, try std.fmt.allocPrint(arena, "{s}=", .{name}));
+        try w.print("\"${s}\" ", .{try secretAlias(arena, i)});
+    }
+    // Set after the step's own env, so a step cannot point these somewhere else.
+    const names = [_][]const u8{
+        "GITHUB_OUTPUT",
+        "GITHUB_ENV",
+        "GITHUB_PATH",
+        "GITHUB_STEP_SUMMARY",
+        "GITHUB_STATE",
+    };
+    for (names, fc_kinds) |name, kind| {
+        try shellQuote(
+            w,
+            try std.fmt.allocPrint(arena, "{s}={s}", .{ name, try fcPath(arena, kind, fc) }),
+        );
+        try w.writeByte(' ');
+    }
+    try shellQuote(w, try std.fmt.allocPrint(arena, "GITHUB_ACTION={s}", .{action_name}));
+    try w.writeByte(' ');
+}
+
+/// The command template for a step's `shell:` as GitHub runs it, `{0}` being the script file: no
+/// `shell:` is `bash -e {0}` (`sh -e {0}` when the image has no bash, decided in the script),
+/// `bash` adds pipefail and skips the profile and rc files, `sh` is `sh -e {0}`, `python` is
+/// `python {0}`, and a custom command is used as written.
+fn shellTemplate(shell: ?[]const u8) []const u8 {
+    const s = shell orelse return "bash -e {0}";
+    if (std.mem.eql(u8, s, "bash")) return "bash --noprofile --norc -e -o pipefail {0}";
+    if (std.mem.eql(u8, s, "sh")) return "sh -e {0}";
+    // GitHub's own template, so a script that works there works here. The name is `python` and not
+    // `python3` because that is what GitHub runs; the default image provides it (SPEC §6), and an
+    // image that only has `python3` needs `shell: python3 {0}`, which is accepted.
+    if (std.mem.eql(u8, s, "python")) return "python {0}";
+    return s;
+}
+
+/// A script's file extension for its shell. GitHub writes a `python` step to a `.py` file, and the
+/// name reaches the step's own output — a traceback names the file it came from — so it is not
+/// cosmetic.
+fn shellExtension(shell: ?[]const u8) []const u8 {
+    const s = shell orelse return "sh";
+    var it = std.mem.tokenizeAny(u8, s, " \t");
+    const prog = std.fs.path.basenamePosix(it.next() orelse return "sh");
+    if (std.mem.eql(u8, prog, "python") or std.mem.eql(u8, prog, "python3")) return "py";
+    return "sh";
+}
+
+/// The command that runs the script file `path`: the template's words, quoted, with `{0}` replaced.
+fn writeShellCommand(
+    w: *std.Io.Writer,
+    arena: Allocator,
+    shell: ?[]const u8,
+    path: []const u8,
+) !void {
+    var it = std.mem.tokenizeAny(u8, shellTemplate(shell), " \t");
+    var first = true;
+    while (it.next()) |word| {
+        // No `shell:`: bash, or sh where the image has no bash (`$zig_shell`, set by the script).
+        if (first and shell == null) {
+            try w.writeAll("\"$zig_shell\" ");
+        } else {
+            try shellQuote(w, try std.mem.replaceOwned(u8, arena, word, "{0}", path));
+            try w.writeByte(' ');
+        }
+        first = false;
+    }
+}
+
+/// The `shell:` line of a run step's log header, as GitHub's runner prints it: the template, with a
+/// bare `bash` or `sh` as its full path.
+pub fn shellLine(arena: Allocator, shell: ?[]const u8) ![]const u8 {
+    const t = shellTemplate(shell);
+    var it = std.mem.tokenizeAny(u8, t, " \t");
+    const prog = it.next() orelse return std.fmt.allocPrint(arena, "shell: {s}", .{t});
+    const rest = std.mem.trimStart(u8, t[prog.len..], " \t");
+    // Verified against `ubuntu-latest` on the same workflow: a bare `python` prints as
+    // `shell: /usr/bin/python {0}`, exactly as bash and sh do.
+    const bare = std.mem.eql(
+        u8,
+        prog,
+        "bash",
+    ) or std.mem.eql(u8, prog, "sh") or std.mem.eql(u8, prog, "python");
+    const full = if (bare) try std.fmt.allocPrint(arena, "/usr/bin/{s}", .{prog}) else prog;
+    return std.fmt.allocPrint(arena, "shell: {s} {s}", .{ full, rest });
+}
+
+/// Where a step's script is written for its shell, as GitHub writes it under RUNNER_TEMP.
+fn scriptPath(arena: Allocator, fc: u32, shell: ?[]const u8) ![]const u8 {
+    return std.fmt.allocPrint(
+        arena,
+        "/tmp/zig-runner-step-{d}.{s}",
+        .{ fc, shellExtension(shell) },
+    );
+}
+
+/// The name under which a step's `i`th secret variable is attached to the container. Dagger
+/// silently drops variables whose names are not identifiers (`INPUT_GITHUB-TOKEN`), and a variable
+/// attached to the container would outlive the step; the alias is removed again after the step's
+/// exec.
+pub fn secretAlias(arena: Allocator, i: usize) ![]const u8 {
+    return std.fmt.allocPrint(arena, "ZIG_SECRET_{d}", .{i});
+}
+
+test "script quotes, applies env, shell and working directory, and propagates the exit code" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const w = try stepScript(a.allocator(), 2, .{ .run = .{
+        .script = "echo 'hi' && echo $X",
+        .shell = "sh",
+        .working_directory = "sub dir",
+        .env = &.{.{ .name = "X", .value = "a b" }},
+    } }, "build");
+    try std.testing.expect(std.mem.indexOf(u8, w, "cd 'sub dir' && env -u ZIG_RUNNER_RAN -u ZIG_RUNNER_MARK 'X=a b' 'GITHUB_OUTPUT=/github/file_commands/output_2'") != null);
+    // The script is written to a file that the shell runs, as GitHub does.
+    try std.testing.expect(std.mem.indexOf(u8, w, "printf '%s' 'echo '\\''hi'\\'' && echo $X' > /tmp/zig-runner-step-2.sh\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w, "'GITHUB_ACTION=build' 'sh' '-e' '/tmp/zig-runner-step-2.sh' )") != null);
+    // A custom bash command, with {0} replaced by the file.
+    const custom = try stepScript(a.allocator(), 3, .{ .run = .{ .script = "echo hi", .shell = "bash -l {0}", .working_directory = null, .env = &.{} } }, "x");
+    try std.testing.expect(std.mem.indexOf(u8, custom, "'bash' '-l' '/tmp/zig-runner-step-3.sh' )") != null);
+    try std.testing.expect(std.mem.indexOf(u8, custom, "zig_shell") == null);
+    // No shell: bash -e, or sh -e where the image has no bash.
+    const default = try stepScript(a.allocator(), 4, .{ .run = .{ .script = "echo hi", .shell = null, .working_directory = null, .env = &.{} } }, "x");
+    try std.testing.expect(std.mem.indexOf(u8, default, "if command -v bash >/dev/null 2>&1; then zig_shell=bash; else zig_shell=sh; fi\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default, "\"$zig_shell\" '-e' '/tmp/zig-runner-step-4.sh' )") != null);
+    try std.testing.expectEqualStrings("shell: /usr/bin/bash -e {0}", try shellLine(a.allocator(), null));
+    try std.testing.expectEqualStrings("shell: /usr/bin/bash -l {0}", try shellLine(a.allocator(), "bash -l {0}"));
+    try std.testing.expectEqualStrings("shell: /bin/bash --login -eo pipefail {0}", try shellLine(a.allocator(), "/bin/bash --login -eo pipefail {0}"));
+
+    // `shell: python`, as GitHub runs it. All three expectations were read off `ubuntu-latest` on
+    // the same workflow: the log line, the interpreter, and the `.py` file whose name reaches the
+    // step's own output (`sys.argv[0]` there was `..._temp/<uuid>.py`).
+    try std.testing.expectEqualStrings("shell: /usr/bin/python {0}", try shellLine(a.allocator(), "python"));
+    const py = try stepScript(a.allocator(), 5, .{ .run = .{ .script = "print(1)", .shell = "python", .working_directory = null, .env = &.{} } }, "x");
+    try std.testing.expect(std.mem.indexOf(u8, py, "'python' '/tmp/zig-runner-step-5.py' )") != null);
+    try std.testing.expect(std.mem.indexOf(u8, py, "> /tmp/zig-runner-step-5.py\n") != null);
+    // An image with no `python` can still name one, and that keeps the extension.
+    const py3 = try stepScript(a.allocator(), 6, .{ .run = .{ .script = "print(1)", .shell = "python3 {0}", .working_directory = null, .env = &.{} } }, "x");
+    try std.testing.expect(std.mem.indexOf(u8, py3, "'python3' '/tmp/zig-runner-step-6.py' )") != null);
+    // A bash step is unaffected: still `.sh`.
+    try std.testing.expect(std.mem.indexOf(u8, custom, ".sh' )") != null);
+    // The file commands exist before the step and are touched again after it.
+    try std.testing.expect(std.mem.indexOf(u8, w, ": > /github/file_commands/output_2 > /github/file_commands/env_2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w, ">> /github/file_commands/path_2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w, marker ++ "begin 2") != null);
+    try std.testing.expect(std.mem.endsWith(u8, w, "exit $rc\n"));
+    // One stream from the first line, and markers with the job's secret by name only (#71).
+    try std.testing.expect(std.mem.startsWith(u8, w, "exec 2>&1\necho '" ++ marker ++ "begin 2' \"${ZIG_RUNNER_MARK-}\"\n"));
+    try std.testing.expect(std.mem.indexOf(u8, w, "echo '" ++ marker ++ "end 2' \"${ZIG_RUNNER_MARK-}\"\nexit $rc\n") != null);
+    // A Docker action's script too.
+    const c = try containerScript(a.allocator(), 3, 3, &.{"/entry"}, &.{}, &.{}, null, false, false, "x");
+    try std.testing.expect(std.mem.startsWith(u8, c, "exec 2>&1\necho '" ++ marker ++ "begin 3' \"${ZIG_RUNNER_MARK-}\"\n"));
+    try std.testing.expect(std.mem.indexOf(u8, c, "-u ZIG_RUNNER_MARK ") != null);
+    try std.testing.expect(std.mem.endsWith(u8, c, "echo '" ++ marker ++ "end 3' \"${ZIG_RUNNER_MARK-}\"\nexit $rc\n"));
+}
+
+test "secret variables reach the script through aliases, whatever their names" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const w = try stepScript(a.allocator(), 1, .{ .run = .{
+        .script = "node main.js",
+        .shell = "sh",
+        .working_directory = null,
+        .env = &.{.{ .name = "PLAIN", .value = "p" }},
+        .secret_env = &.{ "INPUT_GITHUB-TOKEN", "TOKEN" },
+    } }, "a");
+    // Aliases are unset before the assignments; the real names come after the plain env.
+    try std.testing.expect(std.mem.indexOf(u8, w, "env -u ZIG_SECRET_0 -u ZIG_SECRET_1 -u ZIG_RUNNER_RAN -u ZIG_RUNNER_MARK 'PLAIN=p' 'INPUT_GITHUB-TOKEN='\"$ZIG_SECRET_0\" 'TOKEN='\"$ZIG_SECRET_1\" ") != null);
+}
+
+test "enforcement: a replayable step is not given the run-specific values, an always-run step is" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The same step, told once that it is replayable and once that it always runs.
+    const plain = try stepScript(arena, 1, .{ .run = .{
+        .script = "echo hi",
+        .shell = null,
+        .working_directory = null,
+        .env = &.{},
+        .withhold_volatile = true,
+    } }, "");
+    const marked = try stepScript(arena, 1, .{ .run = .{
+        .script = "echo hi",
+        .shell = null,
+        .working_directory = null,
+        .env = &.{},
+        .always_run = "zig-runner runs this step every time: it uses secrets (run 1.1, job j1)",
+    } }, "");
+
+    // A replayable step gets the sentinel for every name in `volatile_env`, in the script's own env
+    // prefix, so the value is part of its cache key and cannot differ between runs.
+    for (volatile_env) |name| {
+        const pair = try std.fmt.allocPrint(arena, "{s}={s}", .{ name, volatile_sentinel });
+        try std.testing.expect(std.mem.indexOf(u8, plain, pair) != null);
+        try std.testing.expect(std.mem.indexOf(u8, marked, pair) == null);
+    }
+    // And a step that always runs is given nothing of the sort: it is never replayed, so the real
+    // values the container carries are safe for it to read.
+    try std.testing.expect(std.mem.indexOf(u8, marked, volatile_sentinel) == null);
+}
+
+test "enforcement: a replayable step finds the withheld payload at GITHUB_EVENT_PATH, an always-run step the real one" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const plain = try stepScript(arena, 1, .{ .run = .{
+        .script = "./build-release.sh",
+        .shell = null,
+        .working_directory = null,
+        .env = &.{},
+        .write_event = true,
+        .withhold_volatile = true,
+    } }, "");
+    const marked = try stepScript(arena, 1, .{ .run = .{
+        .script = "jq -r .inputs.version \"$GITHUB_EVENT_PATH\"",
+        .shell = null,
+        .working_directory = null,
+        .env = &.{},
+        .write_event = true,
+        .always_run = "zig-runner runs this step every time: it reads run- or commit-specific values (run 1.1, job j1)",
+    } }, "");
+    // Issue #68: the payload is not in the key, so a replayable step must not see it. It gets a
+    // constant instead, which is in its script (so its key) and the same in every run.
+    try std.testing.expect(std.mem.indexOf(u8, plain, "printf '%s' '\"zig-runner-withheld\"' > " ++ event_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "\"$" ++ event_env ++ "\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, marked, "\"$" ++ event_env ++ "\" > " ++ event_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, marked, withheld_event) == null);
+    // Naming the variable or the file is reading the payload; a script in a file cannot be seen.
+    try std.testing.expect(readsRunSpecific("jq . \"$GITHUB_EVENT_PATH\""));
+    try std.testing.expect(readsRunSpecific("cat /github/workflow/event.json"));
+    try std.testing.expect(!readsRunSpecific("./build-release.sh"));
+}
+
+test "enforcement: off by configuration, a replayable step keeps GitHub's behaviour" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // `withhold_volatile` is what `Options.enforce_volatile` decides; with it false the script has
+    // no sentinel in it, which is what RUNNER_ENFORCE_VOLATILE=false asks for.
+    const script = try stepScript(arena, 1, .{ .run = .{
+        .script = "echo hi",
+        .shell = null,
+        .working_directory = null,
+        .env = &.{},
+        .withhold_volatile = false,
+    } }, "");
+    try std.testing.expect(std.mem.indexOf(u8, script, volatile_sentinel) == null);
+}
