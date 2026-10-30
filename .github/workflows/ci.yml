@@ -66,11 +66,22 @@ jobs:
       - name: changie's checksum
         run: .github/scripts/install-changie.sh
 
+      # zizmor's online audits ask GitHub (its advisories, the pinned commits). A request that fails
+      # makes zizmor exit 1, the code for its own failure, which once took a pull request out of
+      # the merge queue (#194). Only that is tried again, twice, after a pause: findings (exit 10
+      # to 14) and anything else fail at once, and the online audits run everywhere.
       - name: zizmor
         env:
           # Read-only; zizmor asks GitHub whether the pinned actions' commits are what they say.
           GH_TOKEN: ${{ github.token }}
-        run: pipx run zizmor==1.31.1 --format github .github/workflows
+        run: |
+          for attempt in 1 2 3; do
+            status=0
+            pipx run zizmor==1.31.1 --format github .github/workflows || status=$?
+            ((status == 1 && attempt < 3)) || exit "$status"
+            echo "::warning::zizmor could not run (exit 1; attempt $attempt of 3), most likely a failed request to GitHub: trying again"
+            sleep $((attempt * 15))
+          done
 
   # The database tests, which skip themselves without a database: here against TimescaleDB, as
   # deployments use, and required to run (ZIG_TEST_REQUIRE_DB), so this job cannot pass by skipping
