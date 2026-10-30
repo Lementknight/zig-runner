@@ -27,7 +27,7 @@ pub fn stopRequested() bool {
     return stop_signals.load(.acquire) > 0;
 }
 
-pub const Context = struct {
+pub const Runner = struct {
     /// Lives for one cycle (`serve` frees it after each job).
     arena: Allocator,
     /// Backs each cycle's arena.
@@ -88,7 +88,7 @@ pub const SlowOutputs = struct {
     }
 };
 
-pub fn say(c: Context, comptime fmt: []const u8, args: anytype) !void {
+pub fn say(c: Runner, comptime fmt: []const u8, args: anytype) !void {
     const text = try std.fmt.allocPrint(c.arena, fmt, args);
     try c.log.say(text);
 }
@@ -114,7 +114,7 @@ pub const Cycle = union(enum) {
 /// after another (`serve`) with its own registrations, memory per job and Dagger session per job.
 /// They share the configuration, the log sinks and the database connection (all safe to share).
 /// Returns once every runner has stopped: the most severe exit code among them.
-pub fn pool(c: Context, n: u32) !Exit {
+pub fn pool(c: Runner, n: u32) !Exit {
     const slots = try c.arena.alloc(Slot, n);
     // One per process, so what one runner learns about a repository the others use too.
     const slow = try c.arena.create(SlowOutputs);
@@ -164,7 +164,7 @@ pub fn pool(c: Context, n: u32) !Exit {
 /// One runner of a pool. Its error messages go through its own buffer, flushed a cycle at a time,
 /// so runners' messages do not interleave mid-line.
 const Slot = struct {
-    c: Context,
+    c: Runner,
     exit: Exit = .done,
     gate: admission.Gate = undefined,
     err_buf: [4096]u8 = undefined,
@@ -186,7 +186,7 @@ const Slot = struct {
 /// next. A cycle that fails before running a job is retried with a growing delay (`backoffSecs`),
 /// unless GitHub rejected the registration itself (bad token or scope), which retrying cannot fix.
 /// With `--once`, returns after the first cycle: 0 if its job succeeded.
-pub fn serve(c: Context) !Exit {
+pub fn serve(c: Runner) !Exit {
     var ending: ?std.Io.Future(void) = null;
     defer if (ending) |*f| f.await(c.io);
     var next: ?*Registering = null;
@@ -267,7 +267,7 @@ pub fn serve(c: Context) !Exit {
 /// Waits, held at the memory gate for `hold`, until the machine has the memory for one more job:
 /// true then, false if a stop is requested first. The hold and its end are each logged once, not
 /// at every look.
-fn admit(c: Context, g: *admission.Gate, hold: admission.Hold) !bool {
+fn admit(c: Runner, g: *admission.Gate, hold: admission.Hold) !bool {
     holdingBack(c, g, hold);
     while (true) {
         // In steps, so a stop is not kept waiting.
@@ -286,7 +286,7 @@ fn admit(c: Context, g: *admission.Gate, hold: admission.Hold) !bool {
 
 /// `Gate.check`, and what it learned about the engine's cgroup when that changed: found at start,
 /// or not and why, which tells an operator whether the engine's cap is being watched.
-fn checkGate(c: Context, g: *admission.Gate) ?admission.Hold {
+fn checkGate(c: Runner, g: *admission.Gate) ?admission.Hold {
     const hold = g.check();
     var buf: [512]u8 = undefined;
     if (g.pool.engineNews(&buf)) |news| sayUnallocated(c, "{s}", .{news});
@@ -294,27 +294,27 @@ fn checkGate(c: Context, g: *admission.Gate) ?admission.Hold {
 }
 
 /// Logs a hold, unless this one already was (`listen` finds it, `admit` waits it out).
-fn holdingBack(c: Context, g: *admission.Gate, hold: admission.Hold) void {
+fn holdingBack(c: Runner, g: *admission.Gate, hold: admission.Hold) void {
     if (g.announced) return;
     sayUnallocated(c, "'{s}' holding back from new jobs: {f}", .{ c.name, hold });
     g.announced = true;
 }
 
-/// As `say`, on the stack: `serve`'s context has the process's arena, which a line for every hold
+/// As `say`, on the stack: `serve`'s runner has the process's arena, which a line for every hold
 /// would grow for as long as the runner runs.
-pub fn sayUnallocated(c: Context, comptime fmt: []const u8, args: anytype) void {
+pub fn sayUnallocated(c: Runner, comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, fmt, args) catch return;
     c.log.say(text) catch {};
 }
 
 /// A new registration name: the prefix and a random suffix.
-fn runnerName(arena: Allocator, c: Context) ![]const u8 {
+fn runnerName(arena: Allocator, c: Runner) ![]const u8 {
     var buf: [256]u8 = undefined;
     return arena.dupe(u8, try runnerNameBuf(&buf, c));
 }
 
-fn runnerNameBuf(buf: []u8, c: Context) ![]const u8 {
+fn runnerNameBuf(buf: []u8, c: Runner) ![]const u8 {
     var suffix: [4]u8 = undefined;
     c.io.random(&suffix);
     return std.fmt.bufPrint(buf, "{s}-{x}", .{ c.cfg.name_prefix, suffix });
@@ -334,7 +334,7 @@ fn runnerNameBuf(buf: []u8, c: Context) ![]const u8 {
 /// or `discard` when no cycle does (the runner stopping).
 pub const Registering = struct {
     arena: std.heap.ArenaAllocator,
-    c: Context,
+    c: Runner,
     name: []const u8,
     future: std.Io.Future(void) = undefined,
     /// GitHub's calls, replaced in tests.
@@ -349,19 +349,19 @@ pub const Registering = struct {
 
     const Calls = struct {
         generate: *const @TypeOf(jitconfig.generate) = jitconfig.generate,
-        remove: *const fn (Context, u64, []const u8) void = removeRegistration,
-        open: *const fn (Context, jitconfig.Jit) ?Session = openSession,
-        delete: *const fn (Context, []const u8, []const u8, []const u8) void = deleteSession,
+        remove: *const fn (Runner, u64, []const u8) void = removeRegistration,
+        open: *const fn (Runner, jitconfig.Jit) ?Session = openSession,
+        delete: *const fn (Runner, []const u8, []const u8, []const u8) void = deleteSession,
     };
 
     /// What the next cycle takes over: copied into its arena.
     const Taken = struct { result: @FieldType(Registering, "result"), session: ?Session };
 
-    pub fn start(c: Context) !*Registering {
+    pub fn start(c: Runner) !*Registering {
         return startWith(c, .{});
     }
 
-    fn startWith(c: Context, calls: Calls) !*Registering {
+    fn startWith(c: Runner, calls: Calls) !*Registering {
         const r = try c.gpa.create(Registering);
         errdefer c.gpa.destroy(r);
         r.* = .{ .arena = .init(c.gpa), .c = c, .name = undefined, .calls = calls };
@@ -408,7 +408,7 @@ pub const Registering = struct {
     }
 
     /// Never used: waited for, and its session and registration removed.
-    fn discard(r: *Registering, c: Context) void {
+    fn discard(r: *Registering, c: Runner) void {
         r.future.await(c.io);
         r.end();
         r.free();
@@ -448,7 +448,7 @@ const Session = struct {
 
 /// Opens a session for a registered runner, as `cycle` does, for `Registering`; null when any step
 /// fails (the cycle then tries again and reports what went wrong).
-fn openSession(c: Context, jit: jitconfig.Jit) ?Session {
+fn openSession(c: Runner, jit: jitconfig.Jit) ?Session {
     const creds = auth.parseCredentials(c.arena, jit.files) catch return null;
     const settings = broker.parseSettings(c.arena, jit.files) catch return null;
     var status: std.http.Status = .ok;
@@ -488,7 +488,7 @@ pub const poll_timeout: std.Io.Duration = .fromSeconds(90);
 /// `timeout` passes: the poll runs next to a watcher and a timer, and whichever ends first cancels
 /// the others (a blocked read is interrupted, and its connection is not reused). The cycle's
 /// cleanup then deletes the session and the registration.
-fn poll(c: Context, url: []const u8, token: []const u8, timeout: std.Io.Duration) !Polled {
+fn poll(c: Runner, url: []const u8, token: []const u8, timeout: std.Io.Duration) !Polled {
     var buf: [3]Polled = undefined;
     var sel: std.Io.Select(Polled) = .init(c.io, &buf);
     // A task that could not start must not leave the ones that did running on `buf`.
@@ -517,7 +517,7 @@ fn pollOnce(
 
 var stop_announced: std.atomic.Value(bool) = .init(false);
 
-fn waitForStop(c: Context) void {
+fn waitForStop(c: Runner) void {
     while (!stopRequested()) c.io.sleep(.fromMilliseconds(200), .awake) catch return;
     if (stop_announced.swap(true, .acq_rel)) return;
     // On the stack. (The cycle's arena would do even with the poll using it at the same time: std's
@@ -533,7 +533,7 @@ fn waitForStop(c: Context) void {
 /// Deletes the cycle's runner registration, trying again (after 1 s, then 2 s) when GitHub refuses
 /// for now (422 right after a job, 5xx) or the request fails; a registration still left is reported
 /// instead of being dropped silently. 404: already gone.
-fn removeRegistration(c: Context, id: u64, name: []const u8) void {
+fn removeRegistration(c: Runner, id: u64, name: []const u8) void {
     var last: []const u8 = "";
     for (0..3) |attempt| {
         if (attempt > 0)
@@ -562,7 +562,7 @@ const Ending = struct {
     session: ?struct { base: []const u8, sid: []const u8 } = null,
     token: []const u8 = "",
 
-    fn now(e: Ending, c: Context) void {
+    fn now(e: Ending, c: Runner) void {
         if (e.session) |s| deleteSession(c, s.base, s.sid, e.token);
         removeRegistration(c, e.id, e.name);
     }
@@ -572,7 +572,7 @@ const Ending = struct {
 /// once its job completes; an idle one must be removed). In a pool this runs in the background, so
 /// the next cycle registers at once instead of after both answer (0.65 s between jobs). The previous
 /// cycle's ending, long finished by then, is awaited first, and `serve` awaits the last.
-fn endCycle(c: Context, e: Ending) void {
+fn endCycle(c: Runner, e: Ending) void {
     const slot = c.ending orelse return e.now(c);
     if (slot.*) |*f| f.await(c.io);
     slot.* = null;
@@ -583,10 +583,10 @@ fn endCycle(c: Context, e: Ending) void {
 /// keeps copies of what it needs in memory of its own, freed when it is done.
 const EndingTask = struct {
     arena: std.heap.ArenaAllocator,
-    c: Context,
+    c: Runner,
     e: Ending,
 
-    fn start(c: Context, e: Ending) !std.Io.Future(void) {
+    fn start(c: Runner, e: Ending) !std.Io.Future(void) {
         const t = try c.gpa.create(EndingTask);
         errdefer c.gpa.destroy(t);
         t.arena = .init(c.gpa);
@@ -617,7 +617,7 @@ const EndingTask = struct {
 };
 
 /// One registration and at most one job.
-pub fn cycle(c: Context) !Cycle {
+pub fn cycle(c: Runner) !Cycle {
     var status: std.http.Status = .ok;
     var message: []const u8 = "";
     // Made while the previous job finished, when there was one (`Registering`).
@@ -683,7 +683,7 @@ pub fn cycle(c: Context) !Cycle {
 /// rather than sit registered and silent, and `serve` waits for memory before registering again.
 /// `token` is kept fresh for the cycle's end, which deletes the session with it.
 fn listen(
-    c: Context,
+    c: Runner,
     creds: auth.Credentials,
     base: []const u8,
     sid: []const u8,
@@ -741,7 +741,7 @@ fn listen(
 /// Why the runner could not be registered, with what the token must allow when GitHub refused it.
 /// Rejected credentials or scope will be rejected again; anything else may be transient.
 fn registrationFailed(
-    c: Context,
+    c: Runner,
     e: anyerror,
     status: std.http.Status,
     message: []const u8,
@@ -773,12 +773,12 @@ fn withSlash(arena: Allocator, url: []const u8) ![]const u8 {
 }
 
 /// Ends the broker session; best effort, on the way out.
-fn deleteSession(c: Context, base: []const u8, sid: []const u8, token: []const u8) void {
+fn deleteSession(c: Runner, base: []const u8, sid: []const u8, token: []const u8) void {
     const url = std.fmt.allocPrint(c.arena, "{s}session?sessionId={s}", .{ base, sid }) catch "";
     _ = broker.call(c.arena, c.io, .DELETE, url, token, null) catch {};
 }
 
-pub fn mintToken(c: Context, creds: auth.Credentials, status: *std.http.Status) !([]const u8) {
+pub fn mintToken(c: Runner, creds: auth.Credentials, status: *std.http.Status) !([]const u8) {
     var jti: [8]u8 = undefined;
     c.io.random(&jti);
     const now = std.Io.Clock.real.now(c.io).toSeconds();
@@ -800,14 +800,14 @@ pub fn jsonString(arena: Allocator, body: []const u8, key: []const u8) ?[]const 
 
 const github_failure: Cycle = .{ .failed = .{ .exit = .github } };
 
-pub fn fail(c: Context, what: []const u8, e: anyerror) !Cycle {
+pub fn fail(c: Runner, what: []const u8, e: anyerror) !Cycle {
     try c.err.print("error during {s}: ", .{what});
     try redact.write(c.err, @errorName(e), c.secrets);
     try c.err.writeByte('\n');
     return github_failure;
 }
 
-fn failHttp(c: Context, what: []const u8, e: anyerror, status: std.http.Status) !Cycle {
+fn failHttp(c: Runner, what: []const u8, e: anyerror, status: std.http.Status) !Cycle {
     try c.err.print(
         "error during {s}: {s} (HTTP {d})\n",
         .{ what, @errorName(e), @backingInt(status) },
@@ -815,7 +815,7 @@ fn failHttp(c: Context, what: []const u8, e: anyerror, status: std.http.Status) 
     return github_failure;
 }
 
-pub fn failBody(c: Context, what: []const u8, r: broker.Response) !Cycle {
+pub fn failBody(c: Runner, what: []const u8, r: broker.Response) !Cycle {
     // Error bodies are short JSON documents without credentials.
     try c.err.print(
         "error during {s}: HTTP {d}: {s}\n",
@@ -832,8 +832,8 @@ test "backoffSecs doubles from 5s up to 5 minutes" {
     try std.testing.expectEqual(@as(u32, 300), backoffSecs(1000));
 }
 
-/// A context for tests that make requests but run no job: its log lines go to `log`.
-pub fn testContext(arena: Allocator, log: *sink.LogSink, err: *std.Io.Writer, cfg: *Config) Context {
+/// A runner for tests that make requests but run no job: its log lines go to `log`.
+pub fn testRunner(arena: Allocator, log: *sink.LogSink, err: *std.Io.Writer, cfg: *Config) Runner {
     return .{
         .arena = arena,
         .gpa = std.testing.allocator,
@@ -862,7 +862,7 @@ const FakeGitHub = struct {
         return error.GithubRejected;
     }
 
-    fn remove(_: Context, id: u64, _: []const u8) void {
+    fn remove(_: Runner, id: u64, _: []const u8) void {
         removed = id;
         removes += 1;
     }
@@ -882,18 +882,18 @@ const FakeGitHub = struct {
         deleted_len = 0;
     }
 
-    fn open(c: Context, jit: jitconfig.Jit) ?Session {
+    fn open(c: Runner, jit: jitconfig.Jit) ?Session {
         opens += 1;
         const sid = std.fmt.allocPrint(c.arena, "s-{d}", .{jit.runner_id}) catch return null;
         return .{ .base = "https://broker.test/", .sid = sid, .token = "tok", .token_at = 42 };
     }
 
-    fn noSession(_: Context, _: jitconfig.Jit) ?Session {
+    fn noSession(_: Runner, _: jitconfig.Jit) ?Session {
         opens += 1;
         return null;
     }
 
-    fn delete(_: Context, _: []const u8, sid: []const u8, _: []const u8) void {
+    fn delete(_: Runner, _: []const u8, sid: []const u8, _: []const u8) void {
         deletes += 1;
         deleted_len = @min(sid.len, deleted_sid.len);
         @memcpy(deleted_sid[0..deleted_len], sid[0..deleted_len]);
@@ -909,7 +909,7 @@ test "the next registration, made while a job finishes, is taken over, or remove
     var w: std.Io.Writer = .fixed(&buf);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
     var cfg: Config = .{ .gh_token = "", .scope = undefined, .name_prefix = "r" };
-    const c = testContext(a.allocator(), &log, &w, &cfg);
+    const c = testRunner(a.allocator(), &log, &w, &cfg);
 
     // Taken over: copied into the cycle's arena, and the background task's memory freed (the
     // testing allocator would report it otherwise). Its session too, which is the cycle's to
@@ -962,7 +962,7 @@ test "a session the next registration could not open is left to the cycle, and n
     var w: std.Io.Writer = .fixed(&buf);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
     var cfg: Config = .{ .gh_token = "", .scope = undefined, .name_prefix = "r" };
-    const c = testContext(a.allocator(), &log, &w, &cfg);
+    const c = testRunner(a.allocator(), &log, &w, &cfg);
     var calls = FakeGitHub.calls;
     calls.open = FakeGitHub.noSession;
 
@@ -989,7 +989,7 @@ test "a registration made as the runner stops opens no session, and is removed o
     var w: std.Io.Writer = .fixed(&buf);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
     var cfg: Config = .{ .gh_token = "", .scope = undefined, .name_prefix = "r" };
-    const c = testContext(a.allocator(), &log, &w, &cfg);
+    const c = testRunner(a.allocator(), &log, &w, &cfg);
 
     FakeGitHub.reset();
     stop_signals.store(1, .release);
@@ -1037,7 +1037,7 @@ test "a runner short of memory stops asking for jobs, and asks again once memory
     var err_buf: [1024]u8 = undefined;
     var err: std.Io.Writer = .fixed(&err_buf);
     var cfg: Config = .{ .gh_token = "", .scope = undefined };
-    var c = testContext(arena, &log, &err, &cfg);
+    var c = testRunner(arena, &log, &err, &cfg);
     c.gate = &gate;
     // A token minted now is not refreshed, so the credentials are never read.
     const creds: auth.Credentials = undefined;
@@ -1052,7 +1052,7 @@ test "a runner short of memory stops asking for jobs, and asks again once memory
     // `serve` then waits, looking again every 10 ms, and still asks for nothing.
     const Waiter = struct {
         done: std.atomic.Value(bool) = .init(false),
-        fn run(w: *@This(), cc: Context, g: *admission.Gate, h: admission.Hold) anyerror!bool {
+        fn run(w: *@This(), cc: Runner, g: *admission.Gate, h: admission.Hold) anyerror!bool {
             defer w.done.store(true, .release);
             return admit(cc, g, h);
         }
@@ -1129,7 +1129,7 @@ test "a runner holds while the engine is near its own cap, though the machine ha
     var err_buf: [1024]u8 = undefined;
     var err: std.Io.Writer = .fixed(&err_buf);
     var cfg: Config = .{ .gh_token = "", .scope = undefined };
-    var c = testContext(arena, &log, &err, &cfg);
+    var c = testRunner(arena, &log, &err, &cfg);
     c.gate = &gate;
     const creds: auth.Credentials = undefined;
     var token: []const u8 = "tok";
@@ -1171,7 +1171,7 @@ test "a poll that is never answered is given up after its timeout" {
     var err_buf: [1024]u8 = undefined;
     var err: std.Io.Writer = .fixed(&err_buf);
     var cfg: Config = .{ .gh_token = "", .scope = undefined };
-    const c = testContext(a.allocator(), &log, &err, &cfg);
+    const c = testRunner(a.allocator(), &log, &err, &cfg);
 
     const started = std.Io.Clock.awake.now(io).toMilliseconds();
     const r = try poll(c, url, "token", .fromMilliseconds(300));

@@ -25,7 +25,7 @@ const keptBuffer = @import("upload.zig").keptBuffer;
 const StepLogs = @import("upload.zig").StepLogs;
 const annotationsJson = @import("upload.zig").annotationsJson;
 const stepResultsJson = @import("upload.zig").stepResultsJson;
-const Context = @import("../loop.zig").Context;
+const Runner = @import("../loop.zig").Runner;
 const Cycle = @import("../loop.zig").Cycle;
 const Registering = @import("../loop.zig").Registering;
 const stopRequested = @import("../loop.zig").stopRequested;
@@ -38,7 +38,7 @@ const mintToken = @import("../loop.zig").mintToken;
 const jsonString = @import("../loop.zig").jsonString;
 const fail = @import("../loop.zig").fail;
 const failBody = @import("../loop.zig").failBody;
-const testContext = @import("../loop.zig").testContext;
+const testRunner = @import("../loop.zig").testRunner;
 
 const Allocator = std.mem.Allocator;
 
@@ -203,7 +203,7 @@ const Listening = struct {
 };
 
 /// Whether `repo`'s jobs have spent too long on output keys lately (see `SlowOutputs`).
-fn slowOutputs(c: Context, repo: []const u8) bool {
+fn slowOutputs(c: Runner, repo: []const u8) bool {
     const so = c.slow_outputs orelse return false;
     return so.spent(repo) != null;
 }
@@ -215,7 +215,7 @@ const acquire_retry_ms = [_]i64{ 500, 1000, 2000, 4000, 8000 };
 /// acquire failed stays assigned to this runner until GitHub gives it to another, about 70 s later:
 /// three jobs whose acquires failed at once with HostUnreachable started 72 s after the rest.
 fn acquire(
-    c: Context,
+    c: Runner,
     jr: runservice.JobRequest,
     token: []const u8,
     retry_ms: []const i64,
@@ -237,7 +237,7 @@ fn acquire(
     }
 }
 
-pub fn handleJob(c: Context, session: Listening, body: []const u8) !Cycle {
+pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
     const runner_token = session.token;
     const jr = runservice.parseJobRequest(c.arena, body) catch |e| return fail(c, "job request", e);
     const acq = acquire(c, jr, runner_token, &acquire_retry_ms) catch |e|
@@ -366,7 +366,7 @@ fn sayJob(
 
 /// The run-state rows at the job's end, and a note when any of its writes failed.
 fn finishReporter(
-    c: Context,
+    c: Runner,
     r: *Reporter,
     job: job_mod.Job,
     result: dagger.Result,
@@ -449,7 +449,7 @@ const JobSpool = struct {
     }
 };
 
-fn openSpool(c: Context, job: job_mod.Job, collect: *sink.LogSink) !?*JobSpool {
+fn openSpool(c: Runner, job: job_mod.Job, collect: *sink.LogSink) !?*JobSpool {
     if (c.cfg.log_spool_dir.len == 0) return null;
     const path = std.fmt.allocPrint(
         c.arena,
@@ -477,7 +477,7 @@ fn reporterConclusion(result: dagger.Result) []const u8 {
 
 /// Run state in the database, when there is one and the job can be identified. The reporter is
 /// returned by value and the caller keeps it, because the spool pointer into `collect` is set here.
-fn startReporter(c: Context, job: job_mod.Job, job_started_ms: i64) !?Reporter {
+fn startReporter(c: Runner, job: job_mod.Job, job_started_ms: i64) !?Reporter {
     const st = c.store orelse return null;
     const run_id = std.fmt.parseInt(u64, job.github.run_id, 10) catch 0;
     if (run_id == 0 or job.check_run_id == 0) {
@@ -500,7 +500,7 @@ fn startReporter(c: Context, job: job_mod.Job, job_started_ms: i64) !?Reporter {
 /// (`trust.zig`), or one whose `container:` or `services:` it does not support, rather than run
 /// in ways that would fail confusingly without them.
 fn runJobSteps(
-    c: Context,
+    c: Runner,
     job: job_mod.Job,
     log: *sink.LogSink,
     cancel: *dagger.Cancel,
@@ -576,7 +576,7 @@ test "a job failed before its steps fails in Set up job" {
 /// "Complete job", as GitHub's runner ends a job (the job's containers went with its session).
 /// Returns where that step sits, for `shownSteps`.
 fn logCompleteJob(
-    c: Context,
+    c: Runner,
     job: job_mod.Job,
     log: *sink.LogSink,
     live: *Live,
@@ -608,7 +608,7 @@ fn logCompleteJob(
 /// (`dagger.reused_note`) — what step caching saved this job, next to what output keys cost it. A
 /// job with a step replayed is not learned from by the memory gate (`admission.Gate.replayed`).
 fn reportCacheAndKeys(
-    c: Context,
+    c: Runner,
     job: job_mod.Job,
     log: *sink.LogSink,
     result: dagger.Result,
@@ -676,7 +676,7 @@ fn liveFinals(arena: std.mem.Allocator, shown: []const Shown) ![]const Live.Fina
 /// a held job blocks the run for minutes, so it is always finished. Returns the failed Cycle when
 /// even that did not succeed.
 fn completeJobWithRetry(
-    c: Context,
+    c: Runner,
     jr: runservice.JobRequest,
     job: job_mod.Job,
     conclusion: runservice.Conclusion,
@@ -714,7 +714,7 @@ fn completeJobWithRetry(
 /// a job not completed stays held, and once its hold runs out GitHub fails it ("lost
 /// communication") whatever its steps did. The hold is still being renewed meanwhile.
 fn completeJob(
-    c: Context,
+    c: Runner,
     jr: runservice.JobRequest,
     job: job_mod.Job,
     conclusion: runservice.Conclusion,
@@ -759,7 +759,7 @@ fn completeJob(
 /// has memory of its own and reports through the runner's shared (locked) sink, not the job's log.
 const Renewer = struct {
     fn init(
-        c: Context,
+        c: Runner,
         job: job_mod.Job,
         jr: runservice.JobRequest,
         cancel: *dagger.Cancel,
@@ -775,7 +775,7 @@ const Renewer = struct {
         };
     }
 
-    c: Context,
+    c: Runner,
     token: []const u8,
     jr: runservice.JobRequest,
     plan_id: []const u8,
@@ -848,7 +848,7 @@ const Renewer = struct {
 /// job definition does not carry it). The timeout is the grace period for what still runs after the
 /// cancel (`if: always()` steps, post scripts); past it, the job's queries are ended too.
 const CancelWatch = struct {
-    fn init(c: Context, session: Listening, job: job_mod.Job, cancel: *dagger.Cancel) CancelWatch {
+    fn init(c: Runner, session: Listening, job: job_mod.Job, cancel: *dagger.Cancel) CancelWatch {
         return .{
             .c = c,
             .session = session,
@@ -858,7 +858,7 @@ const CancelWatch = struct {
         };
     }
 
-    c: Context,
+    c: Runner,
     session: Listening,
     job_id: []const u8,
     log_job: u64,
@@ -931,7 +931,7 @@ const CancelWatch = struct {
 /// GitHub's: the running step is stopped, `if: always()` steps and post scripts get
 /// `stop_cancel_ms`, and the job is reported cancelled.
 const StopDeadline = struct {
-    c: Context,
+    c: Runner,
     cancel: *dagger.Cancel,
     log_job: u64,
     stop: std.atomic.Value(bool) = .init(false),
@@ -1000,7 +1000,7 @@ test "the job's log is spooled, and the spool file goes when the job ends" {
     var err_buf: [1024]u8 = undefined;
     var err: std.Io.Writer = .fixed(&err_buf);
     var cfg: Config = .{ .gh_token = "", .scope = undefined, .log_spool_dir = dir };
-    const c: Context = .{
+    const c: Runner = .{
         .arena = arena,
         .gpa = std.testing.allocator,
         .io = io,
@@ -1082,7 +1082,7 @@ test "a job's cancel watch stops at once when the job ends, mid-poll" {
     var err_buf: [1024]u8 = undefined;
     var err: std.Io.Writer = .fixed(&err_buf);
     var cfg: Config = .{ .gh_token = "", .scope = undefined };
-    const c: Context = .{
+    const c: Runner = .{
         .arena = arena,
         .gpa = std.testing.allocator,
         .io = io,
@@ -1127,7 +1127,7 @@ test "a stop cancels a running job once its grace has passed, and not a job that
     var out: std.Io.Writer = .fixed(&out_buf);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
     var cfg: Config = .{ .gh_token = "", .scope = undefined, .stop_grace_secs = 0 };
-    const c: Context = .{
+    const c: Runner = .{
         .arena = undefined,
         .gpa = std.testing.allocator,
         .io = io,
@@ -1188,7 +1188,7 @@ test "acquirejob is tried again after a 5xx or a failed connection, not after a 
         var out_buf: [4096]u8 = undefined;
         var out: std.Io.Writer = .fixed(&out_buf);
         var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
-        const c = testContext(arena, &log, &err, &cfg);
+        const c = testRunner(arena, &log, &err, &cfg);
         const jr: runservice.JobRequest = .{
             .runner_request_id = "r",
             .run_service_url = try arena.dupe(
@@ -1205,7 +1205,7 @@ test "acquirejob is tried again after a 5xx or a failed connection, not after a 
         var out_buf: [4096]u8 = undefined;
         var out: std.Io.Writer = .fixed(&out_buf);
         var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
-        const c = testContext(arena, &log, &err, &cfg);
+        const c = testRunner(arena, &log, &err, &cfg);
         const jr: runservice.JobRequest = .{
             .runner_request_id = "r",
             .run_service_url = try arena.dupe(u8, server.url(&url_buf, "127.0.0.1", "/nowhere")),
@@ -1225,7 +1225,7 @@ test "acquirejob is tried again after a 5xx or a failed connection, not after a 
         var out_buf: [4096]u8 = undefined;
         var out: std.Io.Writer = .fixed(&out_buf);
         var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
-        const c = testContext(arena, &log, &err, &cfg);
+        const c = testRunner(arena, &log, &err, &cfg);
         const jr: runservice.JobRequest = .{
             .runner_request_id = "r",
             .run_service_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{port}),

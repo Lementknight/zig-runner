@@ -12,8 +12,8 @@ const sink = @import("../sink.zig");
 const redact = @import("../redact.zig");
 const timefmt = @import("../timefmt.zig");
 const Live = @import("../live.zig").Live;
-const Context = @import("../loop.zig").Context;
-const testContext = @import("../loop.zig").testContext;
+const Runner = @import("../loop.zig").Runner;
+const testRunner = @import("../loop.zig").testRunner;
 
 const Allocator = std.mem.Allocator;
 
@@ -158,7 +158,7 @@ fn extraShown(ids: []const []const u8, e: dagger.ExtraStep) Shown {
 /// never stop the job from completing, and however many uploads hang, this returns within
 /// `Uploader.limit` (a request's deadline bounds each one already; this bounds them all).
 pub fn uploadLogs(
-    c: Context,
+    c: Runner,
     job: job_mod.Job,
     shown: []const Shown,
     kept: *const sink.Kept,
@@ -340,7 +340,7 @@ fn awaitGroup(group: *std.Io.Group, io: std.Io) void {
 /// One step's log (`log_step` set) or the job's, read from `kept` as it goes up. Each upload reads
 /// with a buffer of its own: they run at once.
 fn keptBlob(
-    c: Context,
+    c: Runner,
     kept: *const sink.Kept,
     log_step: ?u32,
     size: results.KeptBlob.Size,
@@ -358,7 +358,7 @@ fn keptBlob(
 
 /// Room for reading the kept log: a spool record's header has to fit (a few dozen bytes); more
 /// only means fewer reads.
-pub fn keptBuffer(c: Context) ![]u8 {
+pub fn keptBuffer(c: Runner) ![]u8 {
     return c.arena.alloc(u8, 64 * 1024);
 }
 
@@ -819,7 +819,7 @@ test "each step's log goes up as the step finishes, and the job's end uploads on
     var err_buf: [4096]u8 = undefined;
     var err: std.Io.Writer = .fixed(&err_buf);
     var cfg: Config = .{ .gh_token = "", .scope = undefined };
-    const c = testContext(arena, &log, &err, &cfg);
+    const c = testRunner(arena, &log, &err, &cfg);
     FakeResults.n = 0;
 
     const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 9, .secrets = &.{}, .steps = &.{} };
@@ -982,7 +982,7 @@ test "hung uploads hold up the job's end no longer than its limit, and a hung st
     var err_buf: [4096]u8 = undefined;
     var err: std.Io.Writer = .fixed(&err_buf);
     var cfg: Config = .{ .gh_token = "", .scope = undefined };
-    const c = testContext(arena, &log, &err, &cfg);
+    const c = testRunner(arena, &log, &err, &cfg);
     HungResults.a_calls = .init(0);
 
     const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 9, .secrets = &.{}, .steps = &.{} };
