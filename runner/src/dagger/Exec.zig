@@ -715,10 +715,12 @@ pub fn collect(x: *Exec, num: u32, data: std.json.Value, recorded: Recorded) !Ou
         x.sh.append(num, msg);
         if (code == 0) code = 1;
     }
-    // Outputs set with the deprecated `::set-output` come after GITHUB_OUTPUT's, which win.
+    // GitHub's runner sets each output in turn into a case-insensitive dictionary: the deprecated
+    // `::set-output` lines as they are printed, then GITHUB_OUTPUT's pairs after the step
+    // (`FileCommandManager.cs` ~346, `StepsContext.SetOutput`). So the last value of a name wins,
+    // with its first spelling (`DictionaryContextData`'s indexer keeps the casing).
     const legacy = x.sh.takeOutputs(num);
-    if (legacy.len > 0)
-        outputs = try std.mem.concat(arena, job_mod.EnvVar, &.{ outputs, legacy });
+    outputs = try lastWins(arena, try std.mem.concat(arena, job_mod.EnvVar, &.{ legacy, outputs }));
     var state: []const job_mod.EnvVar = x.sh.takeState(num);
     const fc_state = fileCommand(data, "fc_state");
     if (fc_state) |text| switch (try commands.parseKeyValues(arena, text)) {
@@ -734,6 +736,20 @@ pub fn collect(x: *Exec, num: u32, data: std.json.Value, recorded: Recorded) !Ou
             if (in_out or std.mem.indexOf(u8, stderr, e) != null) break true;
         } else false);
     return .{ .code = code, .outputs = outputs, .state = state, .bun_refused = refused };
+}
+
+/// `pairs` with one entry per name, compared without case: the first spelling and position, the
+/// last value.
+fn lastWins(arena: Allocator, pairs: []const job_mod.EnvVar) ![]const job_mod.EnvVar {
+    var out: std.ArrayList(job_mod.EnvVar) = try .initCapacity(arena, pairs.len);
+    next: for (pairs) |p| {
+        for (out.items) |*o| if (std.ascii.eqlIgnoreCase(o.name, p.name)) {
+            o.value = p.value;
+            continue :next;
+        };
+        out.appendAssumeCapacity(p);
+    }
+    return out.items;
 }
 
 /// Whether the step ran in this job (true), was replayed from an earlier run (false), or did
