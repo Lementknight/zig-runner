@@ -93,9 +93,17 @@ repository:
   until its checksums are updated. changie's is checked only when the release installs it, so a
   pull request for a new one passes regardless: update its checksum before it merges.
 - **Verifiable releases.** Every binary and image has a signed provenance attestation saying which
-  workflow built it from which commit:
-  `gh attestation verify zig-runner-linux-x86_64 --repo Open-Blue/zig-runner`, or
-  `gh attestation verify oci://ghcr.io/open-blue/zig-runner:<tag> --repo Open-Blue/zig-runner`.
+  workflow built it from which commit. Check a binary as razorbill does, built by `release.yml` from
+  its tag on GitHub's own runners:
+
+  ```sh
+  gh attestation verify zig-runner-linux-x86_64 --repo Open-Blue/zig-runner \
+    --signer-workflow Open-Blue/zig-runner/.github/workflows/release.yml \
+    --source-ref refs/tags/<tag> --deny-self-hosted-runners
+  ```
+
+  and the image the same way (`oci://ghcr.io/open-blue/zig-runner:<tag>`); an image rebuilt by hand
+  was built from `main`, so its `--source-ref` is `refs/heads/main`.
   The binaries' release also carries their SBOM (`zig-runner.spdx.json`: tls.zig and Zig's
   standard library, the only code compiled in besides the runner's own), attested too, and both
   attestations' bundles for checking offline (`--bundle zig-runner.provenance.jsonl`). A release is
@@ -211,6 +219,10 @@ deploy job waits, up to 40 minutes, until "Format, build and test", "Database te
 one has not succeeded or once the wait runs out. (The deployment cannot list them as
 `required_contexts`: GitHub matches those against commit statuses only, not Actions check runs.)
 Once the check passes (re-run it), re-run the release's failed jobs: that is the deploy job alone.
+Re-running all of its jobs works too: the binaries job finds the release published, checks that
+it is complete and attested, and leaves it alone. To rebuild one tag's image, run `release` by hand
+from `main` with the tag (v0.14.0 or later): it waits for approval in `prod`, and moves `latest`
+only for the newest version tag.
 
 When CI cannot pass for a reason that is not the release's (a prod runner that is down, perhaps
 because the release before broke it), a maintainer deploys by hand, with a token that can write

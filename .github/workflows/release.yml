@@ -8,8 +8,10 @@
 # On pull requests and in the merge queue, the same builds and scans, publishing nothing: required
 # checks, which skip their steps, still reporting, on a change that cannot affect the packaging
 # (ci-scope.sh packaging), as a path filter would not report at all.
-# Run by hand with a tag to (re)build and push that tag's image, from its release's binaries: only
-# tags after v0.13.2 (#93), whose Dockerfile has the `prebuilt` stage this builds.
+# Run by hand with a tag to (re)build and push that tag's image, from its release's binaries: from
+# main, once the maintainer approves it in the prod environment (which deploys only from main), and
+# only for v0.14.0 or later (#93), whose Dockerfile has the `prebuilt` stage this builds. `latest`
+# moves only for the newest version tag.
 name: release
 
 on:
@@ -18,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "An existing version tag after v0.13.2 whose image to build and push (v0.14.0)"
+        description: "An existing version tag, v0.14.0 or later, whose image to rebuild and push from its release's binaries"
         required: true
   pull_request:
   # The merge queue's runs; without this the required checks never report there.
@@ -27,10 +29,11 @@ on:
 # Nothing by default; each job asks for what it needs.
 permissions: {}
 
-# One release of a tag at a time, run to the end; a pull request's new push replaces the checks of
-# its old one, as in ci.yml.
+# One release of a tag at a time, run to the end, whether the tag's push or a run by hand started
+# it (both by the tag's name, so they cannot push the same image tags at once); a pull request's new
+# push replaces the checks of its old one, as in ci.yml.
 concurrency:
-  group: release-${{ inputs.tag || github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -55,15 +58,37 @@ jobs:
         with:
           persist-credentials: false
 
+      # A re-run of the whole release after this job published it ("Re-run all jobs", for a failed
+      # image or deploy) finds the release published, which cannot be created again: it checks
+      # that every file is there and the binaries are the ones this workflow attested for the tag,
+      # and leaves the release alone. The image and the deploy then run as on the first run.
+      - name: Whether the release is published already
+        id: published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [[ $(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null) == false ]]; then
+            .github/scripts/release-binaries.sh --complete "$TAG" dist
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install Zig
+        if: steps.published.outputs.published == 'false'
         run: .github/scripts/install-zig.sh
 
       - name: Build
+        if: steps.published.outputs.published == 'false'
         run: .github/scripts/build-binaries.sh "$TAG" dist
 
       # A draft until it is attested and complete (below). A draft a failed run left is replaced.
-      # The version's changie notes, or GitHub's generated ones for a tag cut without them.
+      # The version's changie notes, or GitHub's generated ones when they have no entries: changie
+      # writes the version's heading regardless, so a release of Renovate's updates alone (which add
+      # none) would otherwise say nothing.
       - name: Draft the release
+        if: steps.published.outputs.published == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -71,21 +96,24 @@ jobs:
           if [[ $(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null) == true ]]; then
             gh release delete "$TAG" --yes
           fi
-          if [[ -f ".changes/$TAG.md" ]]; then notes=(--notes-file ".changes/$TAG.md"); else notes=(--generate-notes); fi
+          if grep -qs '^\* ' ".changes/$TAG.md"; then notes=(--notes-file ".changes/$TAG.md"); else notes=(--generate-notes); fi
           gh release create "$TAG" --draft --verify-tag --title "$TAG" "${notes[@]}" \
             dist/zig-runner-linux-x86_64 dist/zig-runner-linux-aarch64 dist/SHA256SUMS
 
       # SHA256SUMS names every binary with its digest, so this covers each under its release name.
       - name: Attest the binaries' provenance
+        if: steps.published.outputs.published == 'false'
         id: provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: dist/SHA256SUMS
 
       - name: SBOM
+        if: steps.published.outputs.published == 'false'
         run: .github/scripts/sbom.sh "$TAG" dist/SHA256SUMS > dist/zig-runner.spdx.json
 
       - name: Attest the SBOM
+        if: steps.published.outputs.published == 'false'
         id: sbom
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
@@ -96,6 +124,7 @@ jobs:
       # to download it (a draft's files are not public). The bundles verify offline:
       # `gh attestation verify BINARY --repo Open-Blue/zig-runner --bundle zig-runner.provenance.jsonl`.
       - name: Attach the SBOM and attestations, and publish
+        if: steps.published.outputs.published == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -188,16 +217,42 @@ jobs:
           wait "$direct"
           cmp "$RUNNER_TEMP/zig-build/bin/runner" dist/zig-runner-linux-x86_64
 
+  # A run by hand pushes an image for a tag that is already released, so it waits for the
+  # maintainer's approval in the prod environment, which also refuses a run from any branch but
+  # main. The tag must be a version tag whose Dockerfile has the `prebuilt` stage (v0.14.0, #93,
+  # and later): an earlier one would fail only after the approval, in the build.
+  rebuild:
+    name: Approve the image rebuild
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: prod
+    permissions:
+      contents: read # to read the tag's Dockerfile
+    steps:
+      - name: Check the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::not a version tag: $TAG"; exit 1; }
+          dockerfile=$(gh api "repos/$GITHUB_REPOSITORY/contents/runner/Dockerfile?ref=refs/tags/$TAG" \
+            -H 'Accept: application/vnd.github.raw') || { echo "::error::no tag $TAG with a runner/Dockerfile"; exit 1; }
+          grep -qE '^FROM .* AS prebuilt$' <<<"$dockerfile" ||
+            { echo "::error::$TAG's Dockerfile has no prebuilt stage: only v0.14.0 and later can be rebuilt"; exit 1; }
+
   # From the release's own binaries: a tag's, once the binaries job published them (checked against
   # SHA256SUMS and their provenance); a pull request's or merge group's from its check; by hand, the
-  # tag's release. Each needed job is either skipped (binaries but on a tag, binaries-check on one)
-  # or must not have failed. A check that found the change cannot affect the packaging built no
-  # binaries (`run` false): the steps skip, and the job still reports. `run` is empty on a tag or by
-  # hand, where binaries-check is skipped, and everything runs.
+  # tag's release, once the rebuild is approved. Each needed job is either skipped (binaries but on
+  # a tag, binaries-check on one, rebuild but by hand) or must not have failed; by hand, the
+  # rebuild must have been approved. A check that found the change cannot affect the packaging
+  # built no binaries (`run` false): the steps skip, and the job still reports. `run` is empty on a
+  # tag or by hand, where binaries-check is skipped, and everything runs.
   image:
     name: Image
-    needs: [binaries, binaries-check]
-    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
+    needs: [binaries, binaries-check, rebuild]
+    if: >-
+      ${{ !cancelled() && !contains(needs.*.result, 'failure')
+      && (github.event_name != 'workflow_dispatch' || needs.rebuild.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -227,18 +282,14 @@ jobs:
           name: binaries
           path: dist
 
+      # Checked as razorbill checks them: against SHA256SUMS, and built by this workflow from the
+      # tag on GitHub's own runners.
       - name: The release's binaries
         if: env.RUN == 'true' && env.PUBLISH == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: |
-          gh release download "$TAG" -D dist -p 'zig-runner-linux-*' -p SHA256SUMS
-          (cd dist && sha256sum --check --strict SHA256SUMS)
-          for f in dist/zig-runner-linux-*; do
-            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" >/dev/null
-          done
+        run: .github/scripts/release-binaries.sh "$TAG" dist
 
       # Where the Dockerfile's `prebuilt` stage takes them, by Docker's name for each architecture.
       - name: Into the build context
@@ -248,12 +299,21 @@ jobs:
           install -m 0755 dist/zig-runner-linux-x86_64 runner/prebuilt/runner-amd64
           install -m 0755 dist/zig-runner-linux-aarch64 runner/prebuilt/runner-arm64
 
-      # Registry names must be lowercase; owners often are not (Open-Blue).
+      # Registry names must be lowercase; owners often are not (Open-Blue). `latest` is the newest
+      # version tag's image: a rebuild of an older one leaves it where it is.
       - name: Image name
         if: env.RUN == 'true'
         env:
           OWNER: ${{ github.repository_owner }}
-        run: echo "IMAGE=ghcr.io/${OWNER,,}/zig-runner" >> "$GITHUB_ENV"
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "IMAGE=ghcr.io/${OWNER,,}/zig-runner" >> "$GITHUB_ENV"
+          if [[ $PUBLISH == true ]]; then
+            newest=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" --jq '.[].ref' |
+              sed -n 's|^refs/tags/\(v[0-9]*\.[0-9]*\.[0-9]*\)$|\1|p' | sort -V | tail -n1)
+            echo "newest version tag: $newest"
+            echo "LATEST=$([[ $newest == "$TAG" ]] && echo true || echo false)" >> "$GITHUB_ENV"
+          fi
 
       - name: Scan the Dockerfile
         if: env.RUN == 'true'
@@ -286,7 +346,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Build (and push, for a tag)
+      - name: Build (and push, for a tag or by hand)
         id: build
         if: env.RUN == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -300,7 +360,9 @@ jobs:
           sbom: true
           # A pull request's ref (`123/merge`) or a merge group's is no image tag; it builds under a
           # local name.
-          tags: ${{ env.PUBLISH == 'true' && format('{0}:{1},{0}:latest', env.IMAGE, env.TAG) || 'zig-runner:check' }}
+          tags: >-
+            ${{ env.PUBLISH == 'true' && format('{0}:{1}{2}', env.IMAGE, env.TAG,
+            env.LATEST == 'true' && format(',{0}:latest', env.IMAGE) || '') || 'zig-runner:check' }}
 
       - name: Attest the image
         if: env.RUN == 'true' && env.PUBLISH == 'true'
