@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The `steps` context now holds only steps with an `id:` of their own, as on GitHub, so `contains(steps.*.outcome, ''failure'')` no longer counts a step without one (#103).'
+time: 2026-10-30T20:10:00.000000-04:00

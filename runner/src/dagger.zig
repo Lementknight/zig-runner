@@ -2264,7 +2264,8 @@ test "run evaluates expressions in conditions, names, env, scripts and the steps
     // Evaluated scripts reached Dagger: sha, step env, job env (from an expression), steps.* outcomes.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "echo abc123 $STEP_ENV main-job") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "STEP_ENV=abc123") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[4], "echo outcome=success skipped=skipped") != null);
+    // `__run_2` is a generated id, which GitHub leaves out of the steps context: it reads as empty.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[4], "echo outcome=success skipped='") != null);
     // Job-level env is part of the base container: the plain value inline, the secret as a Dagger secret.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withEnvVariable(name:\"JOB_ENV\",value:\"main-job\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withSecretVariable(name:\"JOB_SECRET\",secret:\"SEC_JOB\")") != null);
@@ -2348,6 +2349,42 @@ test "defaults.run that cannot be evaluated fails Set up job, and no step runs" 
     try std.testing.expect(res.set_up_failed);
     try std.testing.expectEqual(@as(usize, 1), fake.seen.items.len);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "defaults.run.shell: ") != null);
+}
+
+test "the steps context holds only steps with an id of their own, as on GitHub" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    // A step without `id:` fails but continues on error; GitHub leaves its generated `__run` out
+    // of `steps`, so `contains(steps.*.outcome, 'failure')` is false. A step without any name is
+    // left out too.
+    var unnamed_fails = testStep("exit 1");
+    unnamed_fails.context_name = "__run";
+    unnamed_fails.continue_on_error = .{ .lit = "true" };
+    const nameless = testStep("true");
+    var named = testStep("true");
+    named.context_name = "build";
+    var check = testStep("");
+    check.action.script.script = .{ .expr = "format('echo any-failure={0} generated={1} " ++
+        "named={2}', contains(steps.*.outcome, 'failure'), steps.__run.outcome, " ++
+        "join(steps.*.outcome, ','))" };
+    const steps = [_]job_mod.Step{ unnamed_fails, nameless, named, check };
+    const answers = [_][]const u8{
+        base_answer,
+        try exec(arena, "C1", 1, ""),
+        try exec(arena, "C2", 0, ""),
+        try exec(arena, "C3", 0, ""),
+        try exec(arena, "C4", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    try std.testing.expectEqual(@as(usize, 5), fake.seen.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[4], "echo any-failure=false generated= named=success'") != null);
 }
 
 test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH reach later steps" {
