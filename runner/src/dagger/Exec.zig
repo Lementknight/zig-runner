@@ -21,7 +21,7 @@ const stepScriptFc = @import("scripts.zig").stepScriptFc;
 const fcPath = @import("scripts.zig").fcPath;
 const fc_marker = @import("scripts.zig").fc_marker;
 const secretAlias = @import("scripts.zig").secretAlias;
-const ServicePort = @import("services.zig").ServicePort;
+const Port = @import("services.zig").Port;
 const Transport = @import("../dagger.zig").Transport;
 const SecretRef = @import("../dagger.zig").SecretRef;
 const Secrets = @import("../dagger.zig").Secrets;
@@ -153,7 +153,7 @@ forward_prelude: []const u8 = "",
 pub const RunningService = struct {
     name: []const u8,
     id: []const u8,
-    ports: []const ServicePort,
+    ports: []const Port,
 };
 
 const Post = struct {

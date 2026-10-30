@@ -23,12 +23,12 @@ const Allocator = std.mem.Allocator;
 
 /// A published service port: steps reach `localhost:<host>`, forwarded to the service's
 /// `container`.
-pub const ServicePort = struct { host: u16, container: u16 };
+pub const Port = struct { host: u16, container: u16 };
 
 /// `5432`, `5432:5432`, `127.0.0.1:15432:5432`, `5432/tcp`. On GitHub a bare container port is
 /// published on a random host port (read back as `job.services.<name>.ports[...]`); here it keeps
 /// its own number. Null for UDP and what is not a port.
-pub fn parseServicePort(text: []const u8) ?ServicePort {
+pub fn parsePort(text: []const u8) ?Port {
     var t = std.mem.trim(u8, text, " ");
     if (std.mem.indexOfScalar(u8, t, '/')) |slash| {
         if (!std.ascii.eqlIgnoreCase(t[slash + 1 ..], "tcp")) return null;
@@ -69,7 +69,7 @@ fn forwardPrelude(arena: Allocator, services: []const Exec.RunningService) ![]co
 
 /// The `options:` of a service that are not carried out, as written. Health checks are: the service
 /// is ready when its ports accept connections (`--health-*` is accepted and not run).
-fn ignoredServiceOptions(arena: Allocator, options: []const u8) ![]const u8 {
+fn ignoredOptions(arena: Allocator, options: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var it = std.mem.tokenizeAny(u8, options, " \t\n");
     var skip_value = false;
@@ -245,13 +245,13 @@ pub fn startService(
 }
 
 /// A service's `image`, `env` and `ports` as written, evaluated; its unsupported options noted.
-const ServiceSpec = struct {
+const Spec = struct {
     image: []const u8,
     env: []const job_mod.EnvVar,
-    ports: []const ServicePort,
+    ports: []const Port,
 };
 
-pub fn serviceSpec(x: *Exec, ls: u32, sc: expr.Scope, svc: job_mod.Service) !?ServiceSpec {
+pub fn serviceSpec(x: *Exec, ls: u32, sc: expr.Scope, svc: job_mod.Service) !?Spec {
     const arena = x.arena;
     const ev = x.ev;
     const image = ev.render(svc.image, sc) catch "";
@@ -273,10 +273,10 @@ pub fn serviceSpec(x: *Exec, ls: u32, sc: expr.Scope, svc: job_mod.Service) !?Se
         );
         return null;
     };
-    var ports: std.ArrayList(ServicePort) = .empty;
+    var ports: std.ArrayList(Port) = .empty;
     for (svc.ports) |t| {
         const text = ev.render(t, sc) catch "";
-        const port = parseServicePort(text) orelse {
+        const port = parsePort(text) orelse {
             x.sh.errorLine(
                 ls,
                 try std.fmt.allocPrint(arena, "Unsupported port '{s}' for service '{s}' " ++
@@ -289,7 +289,7 @@ pub fn serviceSpec(x: *Exec, ls: u32, sc: expr.Scope, svc: job_mod.Service) !?Se
     }
     x.sh.append(ls, try std.fmt.allocPrint(arena, "Image: {s}", .{image}));
     if (svc.options) |t| {
-        const ignored = try ignoredServiceOptions(arena, ev.render(t, sc) catch "");
+        const ignored = try ignoredOptions(arena, ev.render(t, sc) catch "");
         if (ignored.len > 0) x.sh.append(
             ls,
             try std.fmt.allocPrint(arena, "##[warning]Service options not supported and " ++
@@ -404,7 +404,7 @@ pub fn startServiceContainer(
     ls: u32,
     svc: job_mod.Service,
     svc_index: usize,
-    spec: ServiceSpec,
+    spec: Spec,
     head: ImageHead,
     cfg: ServiceConfig,
     busybox: []const u8,
@@ -537,21 +537,21 @@ pub fn stopServices(x: *Exec) !void {
 }
 
 test "service ports: as GitHub writes them" {
-    try std.testing.expectEqual(ServicePort{ .host = 5432, .container = 5432 }, parseServicePort("5432:5432").?);
-    try std.testing.expectEqual(ServicePort{ .host = 6379, .container = 6379 }, parseServicePort("6379").?);
-    try std.testing.expectEqual(ServicePort{ .host = 15432, .container = 5432 }, parseServicePort("127.0.0.1:15432:5432").?);
-    try std.testing.expectEqual(ServicePort{ .host = 80, .container = 80 }, parseServicePort(" 80/tcp ").?);
-    try std.testing.expect(parseServicePort("53/udp") == null);
-    try std.testing.expect(parseServicePort("http") == null);
-    try std.testing.expect(parseServicePort("0") == null);
+    try std.testing.expectEqual(Port{ .host = 5432, .container = 5432 }, parsePort("5432:5432").?);
+    try std.testing.expectEqual(Port{ .host = 6379, .container = 6379 }, parsePort("6379").?);
+    try std.testing.expectEqual(Port{ .host = 15432, .container = 5432 }, parsePort("127.0.0.1:15432:5432").?);
+    try std.testing.expectEqual(Port{ .host = 80, .container = 80 }, parsePort(" 80/tcp ").?);
+    try std.testing.expect(parsePort("53/udp") == null);
+    try std.testing.expect(parsePort("http") == null);
+    try std.testing.expect(parsePort("0") == null);
 }
 
 test "service options: health checks are accepted, the rest reported" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const ar = a.allocator();
-    try std.testing.expectEqualStrings("", try ignoredServiceOptions(ar, "--health-cmd \"pg_isready -U postgres\" --health-interval 2s --health-timeout=5s --health-retries 30"));
-    try std.testing.expectEqualStrings("--shm-size 1g", try ignoredServiceOptions(ar, "--health-cmd 'redis-cli ping' --shm-size 1g"));
+    try std.testing.expectEqualStrings("", try ignoredOptions(ar, "--health-cmd \"pg_isready -U postgres\" --health-interval 2s --health-timeout=5s --health-retries 30"));
+    try std.testing.expectEqualStrings("--shm-size 1g", try ignoredOptions(ar, "--health-cmd 'redis-cli ping' --shm-size 1g"));
 }
 
 test "each published port is forwarded from localhost to its service" {
