@@ -246,14 +246,21 @@ jq -n --arg ref v1.2.3 '{ref: $ref, environment: "razorbill", auto_merge: false,
 On razorbill,
 `zig-runner-deploy.timer` asks every minute; for a new deployment `deploy/zig-runner-deploy`:
 
-1. downloads the release's binary, checks it against `SHA256SUMS`, and checks its provenance:
-   built by `release.yml`, from that tag, on GitHub's own runners (`gh attestation verify`);
-2. installs it and restarts every runner instance (`zig-runner.service` and `zig-runner@*.service`,
+1. refuses a version older than the one installed, unless `ALLOW_DOWNGRADE` in
+   `/etc/zig-runner-deploy.env` names it (a rollback on purpose);
+2. downloads the release's binary, checks it against `SHA256SUMS`, and checks its provenance:
+   built by `release.yml`, from that tag, on GitHub's own runners (`gh attestation verify`, offline,
+   on the attestations and Sigstore trust root it fetched). A fetch that fails for a reason of the
+   moment (no network, a rate limit, a timeout, Sigstore's CDN) reports nothing, and the timer
+   tries again a minute later, up to `ATTEMPTS` (30) times before it reports failure; a check that
+   fails reports failure at once;
+3. installs it and restarts every runner instance (`zig-runner.service` and `zig-runner@*.service`,
    or `UNITS`), each finishing its running jobs first;
-3. reports success once each instance is listening for jobs again, or puts the previous binary
+4. reports success once each instance is listening for jobs again, or puts the previous binary
    back and reports failure.
 
-The outcome shows under the repository's Environments, on the deployment. Nothing reaches into the
+The outcome shows under the repository's Environments, on the deployment. The `razorbill`
+environment takes deployments of `v*` tags only (its deployment tag policy). Nothing reaches into the
 machine: it asks GitHub, with a token that can only read and report deployments. To set it up, on
 the machine, with `gh` 2.68 or later from [cli.github.com](https://cli.github.com) (Debian's
 package cannot verify provenance) and a fine-grained token for this repository with Deployments

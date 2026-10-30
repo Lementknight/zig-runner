@@ -4,9 +4,16 @@
 # zig-runner-deploy.timer runs it every minute; with nothing new to deploy it only asks GitHub.
 #
 # A release is installed only once its binary matches SHA256SUMS and its build provenance says
-# release.yml built it from that tag on GitHub's own runners (gh attestation verify). If an instance
-# does not come back listening for jobs, the previous binary is put back and the deployment is
-# reported failed.
+# release.yml built it from that tag on GitHub's own runners (gh attestation verify), and only if it
+# is not older than the one installed (ALLOW_DOWNGRADE). If an instance does not come back
+# listening for jobs, the previous binary is put back and the deployment is reported failed.
+#
+# Fetching the release can fail for reasons of the moment: no network, GitHub's rate limit, a
+# timeout, Sigstore's TUF CDN. Such a failure reports nothing and exits; the timer tries again a
+# minute later, and only after ATTEMPTS tries of the same deployment is it reported failed (the
+# tries are counted in STATE_DIR). What was fetched is then checked offline, so a check that fails
+# is the release's fault, and is reported failed at once: a checksum or provenance mismatch, or a
+# release, binary or attestation that does not exist.
 #
 # Settings, from /etc/zig-runner-deploy.env (deploy/zig-runner-deploy.env.example):
 #   GH_TOKEN      fine-grained token: Deployments read/write, Attestations and Contents read
@@ -16,7 +23,13 @@
 #                 zig-runner@*.service here
 #   BIN           the installed binary (/usr/local/bin/zig-runner)
 #   GH_TIMEOUT    seconds any one call to GitHub may take (120)
-#   DRY_RUN       set to check a deployment without reporting, installing or restarting
+#   ATTEMPTS      tries of a deployment whose release could not be fetched before it is reported
+#                 failed, one a minute (30)
+#   STATE_DIR     where the tries are counted (systemd's STATE_DIRECTORY, else
+#                 /var/lib/zig-runner-deploy)
+#   ALLOW_DOWNGRADE  the one older version tag that may replace the installed one (v1.2.3), for a
+#                 rollback on purpose; anything older is refused otherwise
+#   DRY_RUN       set to check a deployment without reporting, installing, restarting or counting
 set -euo pipefail
 
 : "${GH_TOKEN:?GH_TOKEN must be set}"
@@ -27,6 +40,9 @@ BIN=${BIN:-/usr/local/bin/zig-runner}
 DRY_RUN=${DRY_RUN:-}
 HEALTH_SECONDS=${HEALTH_SECONDS:-120}
 GH_TIMEOUT=${GH_TIMEOUT:-120}
+ATTEMPTS=${ATTEMPTS:-30}
+STATE_DIR=${STATE_DIR:-${STATE_DIRECTORY:-/var/lib/zig-runner-deploy}}
+ALLOW_DOWNGRADE=${ALLOW_DOWNGRADE:-}
 export GH_TOKEN GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1
 
 # Every call to GitHub has a time limit: the service has none of its own (an instance's restart
@@ -147,10 +163,43 @@ fail() {
 	exit 1
 }
 
+# A try at deployment $id failed for a reason of the moment ($1): exits without reporting, so the
+# timer tries again, until the ATTEMPTS-th try, which reports the deployment failed.
+transient() {
+	local tries=1 last_id last_tries
+	if read -r last_id last_tries 2>/dev/null <"$STATE_DIR/tries" && [[ $last_id == "$id" ]]; then
+		tries=$((last_tries + 1))
+	fi
+	((tries < ATTEMPTS)) || fail "gave up after $tries tries: $1"
+	if [[ -z $DRY_RUN ]]; then
+		echo "$id $tries" >"$STATE_DIR/tries" || log "could not count the try in $STATE_DIR/tries"
+	fi
+	log "deployment $id: try $tries of $ATTEMPTS: $1; trying again next time"
+	exit 0
+}
+
+# fetch WHAT GH_ARGS...: runs gh, its output going where this function's goes. A release, asset
+# or attestation that does not exist fails the deployment; any other failure is transient.
+fetch() {
+	local what=$1 err status=0
+	shift
+	{ err=$(gh "$@" 2>&1 1>&3 3>&-); } 3>&1 || status=$?
+	((status == 0)) && return 0
+	if ((status == 124)); then err="timed out after $GH_TIMEOUT s"; fi
+	err=$(tail -n1 <<<"${err:-gh exited $status}")
+	case $err in
+	*"HTTP 404"* | *"release not found"* | *"no assets match"*) fail "$what: $err" ;;
+	*) transient "$what: $err" ;;
+	esac
+}
+
+# Whether version tag $1 is older than version tag $2.
+older() { [[ $1 != "$2" && $(printf '%s\n' "$1" "$2" | sort -V | head -n1) == "$1" ]]; }
+
 # What this machine needs is checked before any deployment is touched: a deployment reported failed
 # for a missing tool would never be tried again, so this exits and the timer tries next minute.
 attestation_help=$(gh attestation verify --help 2>&1) || true
-for flag in --signer-workflow --source-ref --deny-self-hosted-runners; do
+for flag in --signer-workflow --source-ref --deny-self-hosted-runners --custom-trusted-root; do
 	if [[ $attestation_help != *"$flag"* ]]; then
 		log "$(gh --version | head -n1) cannot verify provenance (gh attestation verify $flag):" \
 			"install gh 2.68 or later from https://cli.github.com (Debian's package is too old)"
@@ -178,8 +227,14 @@ mapfile -t units < <(instances)
 mapfile -t unknown < <(unknown_units "${units[@]}")
 ((${#unknown[@]} == 0)) || fail "no unit ${unknown[*]} on $(hostname) (UNITS); nothing installed"
 
-# Installed already: done if every instance runs it; otherwise restart those that do not.
 current=$(version_of "$BIN" || true)
+# Anyone who can create a deployment could otherwise put back an older release, attested as
+# genuinely as any, with the bugs since fixed.
+if [[ $current =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && older "$tag" "$current" && [[ $ALLOW_DOWNGRADE != "$tag" ]]; then
+	fail "$tag is older than the installed $current: refused (ALLOW_DOWNGRADE=$tag on $(hostname) allows it)"
+fi
+
+# Installed already: done if every instance runs it; otherwise restart those that do not.
 if [[ $current == "$tag" ]]; then
 	stale=()
 	for unit in "${units[@]}"; do runs_installed "$unit" || stale+=("$unit"); done
@@ -195,12 +250,19 @@ report "$id" in_progress "installing $tag on $(hostname) (was ${current:-none})"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 asset="zig-runner-linux-$(uname -m)"
-gh release download "$tag" -R "$REPO" -D "$work" -p "$asset" -p SHA256SUMS ||
-	fail "$tag has no $asset"
-grep -q "  $asset\$" "$work/SHA256SUMS" || fail "$asset is not in $tag's SHA256SUMS"
-(cd "$work" && sha256sum --check --ignore-missing --quiet SHA256SUMS) ||
+# Each check runs offline, on what was fetched before it, into $work (gh attestation download
+# writes there): the binary and SHA256SUMS, then the attestations of the binary's digest and
+# Sigstore's trust root.
+cd "$work"
+fetch "could not download $tag's $asset" release download "$tag" -R "$REPO" -D "$work" -p "$asset" -p SHA256SUMS
+grep -q "  $asset\$" SHA256SUMS || fail "$asset is not in $tag's SHA256SUMS"
+sha256sum --check --ignore-missing --quiet SHA256SUMS ||
 	fail "$asset does not match $tag's SHA256SUMS"
+digest=$(sha256sum "$asset" | cut -d' ' -f1)
+fetch "could not fetch $asset's attestations" attestation download "$asset" -R "$REPO" >/dev/null
+fetch "could not fetch Sigstore's trust root" attestation trusted-root >"$work/trusted_root.jsonl"
 gh attestation verify "$work/$asset" --repo "$REPO" \
+	--bundle "$work/sha256:$digest.jsonl" --custom-trusted-root "$work/trusted_root.jsonl" \
 	--signer-workflow "$REPO/.github/workflows/release.yml" \
 	--source-ref "refs/tags/$tag" --deny-self-hosted-runners >/dev/null ||
 	fail "$asset has no provenance from release.yml at $tag"
