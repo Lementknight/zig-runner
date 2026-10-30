@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A run-state database that accepts connections and never answers no longer holds up the end of a job (#100): connecting is given up after 10 s and a statement after 30 s, the job''s end reads the last database error without waiting for the writer, and the next connection attempt waits 2 s from when the last one ended.'
+time: 2026-10-30T23:00:00.000000-04:00

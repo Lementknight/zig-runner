@@ -157,9 +157,12 @@ pub const Store = struct {
     /// Not dialled again before this, so a database that is down costs one attempt every two
     /// seconds instead of one per row. `PgSink` backs off the same way, for the same reason.
     retry_after_ms: i64 = 0,
-    /// The most recent failure, for `Reporter` to report when the job ends.
+    /// The most recent failure, for `Reporter` to report when the job ends. Under `error_mu`, not
+    /// `mu`: the writer holds `mu` through a connect or a statement, and the job's end waited
+    /// behind one that the database never answered, before completejob (#100).
     last_error: [256]u8 = undefined,
     last_error_len: usize = 0,
+    error_mu: Io.Mutex = .init,
     /// Writes that failed, for the life of the process. `Reporter` reports those made while its
     /// job ran: with a writer, a row's failure comes after the call that queued it has returned.
     failed: std.atomic.Value(u64) = .init(0),
@@ -255,15 +258,17 @@ pub const Store = struct {
         }
     }
 
-    /// What went wrong most recently, empty if nothing has. Copied, under `mu`: the writer may be
-    /// recording a newer failure.
+    /// What went wrong most recently, empty if nothing has. Copied, under `error_mu`: the writer
+    /// may be recording a newer failure.
     pub fn lastError(s: *Store, arena: Allocator) []const u8 {
-        s.mu.lockUncancelable(s.io);
-        defer s.mu.unlock(s.io);
+        s.error_mu.lockUncancelable(s.io);
+        defer s.error_mu.unlock(s.io);
         return arena.dupe(u8, s.last_error[0..s.last_error_len]) catch "";
     }
 
     fn remember(s: *Store, what: []const u8, detail: []const u8) void {
+        s.error_mu.lockUncancelable(s.io);
+        defer s.error_mu.unlock(s.io);
         const t = std.fmt.bufPrint(&s.last_error, "{s}: {s}", .{ what, detail }) catch
             s.last_error[0..0];
         s.last_error_len = t.len;
@@ -281,8 +286,10 @@ pub const Store = struct {
         if (s.client) |c| return c;
         const t = Io.Clock.real.now(s.io).toMilliseconds();
         if (t < s.retry_after_ms) return error.ConnectionClosed;
-        s.retry_after_ms = t + retry_ms;
         s.dial() catch |e| {
+            // From when the attempt ended: one that took its whole time (a database that accepts
+            // and never answers) was followed at once by the next, and `mu` was hardly ever free.
+            s.retry_after_ms = Io.Clock.real.now(s.io).toMilliseconds() + retry_ms;
             s.remember("connect failed", @errorName(e));
             return error.ConnectionClosed;
         };
@@ -331,9 +338,15 @@ pub const Store = struct {
             );
             // A connection the server has dropped is let go, so the next row dials again instead
             // of failing for the life of the process. A `ServerError` is the statement's problem,
-            // not the connection's, so that one is kept.
+            // not the connection's, so that one is kept. One given up mid-statement (`Timeout`,
+            // `Canceled`) cannot be used again.
             switch (e) {
-                error.ConnectionClosed, error.BadMessage, error.UnexpectedMessage => {
+                error.ConnectionClosed,
+                error.BadMessage,
+                error.UnexpectedMessage,
+                error.Timeout,
+                error.Canceled,
+                => {
                     c.close();
                     s.client = null;
                 },
@@ -458,4 +471,59 @@ test "with its writer, a row is queued at once though the database does not answ
         .status = "in_progress",
     });
     try std.testing.expect(Io.Clock.awake.now(io).toMilliseconds() - started < 500);
+}
+
+test "a database that accepts and never answers holds up neither the job's end nor the next row" {
+    const io = std.testing.io;
+    // Connections complete in the listener's backlog and are never answered.
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const connect_ms = 300;
+    const cfg: pg.Config = .{
+        .host = "127.0.0.1",
+        .port = listener.socket.address.getPort(),
+        .user = "u",
+        .database = "d",
+        .sslmode = .disable,
+        .connect_timeout = .fromMilliseconds(connect_ms),
+    };
+    var store: Store = .init(std.testing.allocator, io, cfg, null);
+    store.close_wait_ms = 300;
+    try store.startWriter();
+    defer store.close();
+
+    const started = Io.Clock.real.now(io).toMilliseconds();
+    try store.upsertStep(.{ .job_id = 1, .number = 1, .name = "step", .status = "in_progress" });
+    io.sleep(.fromMilliseconds(50), .awake) catch {};
+    // The writer is dialling, holding `mu`. The job's end asks what failed (`finishReporter`),
+    // before completejob: it is answered at once, not when the connect is given up.
+    const Ask = struct {
+        fn run(st: *Store, done: *std.atomic.Value(bool)) void {
+            std.testing.allocator.free(st.lastError(std.testing.allocator));
+            done.store(true, .release);
+        }
+    };
+    var done: std.atomic.Value(bool) = .init(false);
+    var asking = try io.concurrent(Ask.run, .{ &store, &done });
+    var waited: u32 = 0;
+    while (!done.load(.acquire) and waited < 100) : (waited += 10)
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    const answered = done.load(.acquire);
+
+    // The connect is given up at its deadline, where it used to wait for good.
+    waited = 0;
+    while (store.failed.load(.acquire) == 0 and waited < 5_000) : (waited += 10)
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    asking.await(io);
+    try std.testing.expect(answered);
+    try std.testing.expectEqual(@as(u64, 1), store.failed.load(.acquire));
+    const last = store.lastError(std.testing.allocator);
+    defer std.testing.allocator.free(last);
+    try std.testing.expectEqualStrings("connect failed: Timeout", last);
+    // The next dial waits `retry_ms` from when this one ended, not from when it began.
+    store.mu.lockUncancelable(io);
+    const retry_after = store.retry_after_ms;
+    store.mu.unlock(io);
+    try std.testing.expect(retry_after >= started + connect_ms + Store.retry_ms);
 }
