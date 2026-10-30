@@ -18,8 +18,8 @@
 //!   `*`, `?`, `[...]` classes (with `!`/`^`, ranges and POSIX classes), `\` escapes and `**`.
 //!
 //! The file system is whatever `Fs` answers, many paths at a time: Dagger's API in a job
-//! (`dagger.zig`), the local disk in `tools/hashfilescorpus.zig`, which compares this with GitHub's
-//! script (`.github/scripts/hashfiles-diff.sh`).
+//! (`dagger/hash_files.zig`), the local disk in `tools/hashfilescorpus.zig`, which compares this
+//! with GitHub's script (`.github/scripts/hashfiles-diff.sh`).
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
