@@ -21,7 +21,6 @@ const shownInputs = @import("../dagger.zig").shownInputs;
 const splitEnv = @import("../dagger.zig").splitEnv;
 const scriptRun = @import("../dagger.zig").scriptRun;
 const ActionOut = @import("Exec.zig").ActionOut;
-const ExecOut = @import("Exec.zig").ExecOut;
 const Loaded = @import("Exec.zig").Loaded;
 const Phase = @import("Exec.zig").Phase;
 const ContainerEnv = @import("docker.zig").ContainerEnv;
@@ -208,7 +207,7 @@ pub fn runJsScript(
     step_env: []const job_mod.EnvVar,
     step_secret: []const SecretRef,
     state: []const job_mod.EnvVar,
-) !?ExecOut {
+) !?Exec.Out {
     const arena = x.arena;
     var mounts: std.ArrayList(Mount) = .empty;
     if (!x.js_mounted) {

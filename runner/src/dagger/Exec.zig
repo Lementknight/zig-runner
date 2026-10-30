@@ -227,7 +227,7 @@ pub const Phase = enum {
     }
 };
 
-pub const ExecOut = struct {
+pub const Out = struct {
     code: i32,
     outputs: []const job_mod.EnvVar,
     /// From GITHUB_STATE and `::save-state`; a JavaScript action's later phases get it as
@@ -247,7 +247,7 @@ pub fn execScript(
     action_name: []const u8,
     secret_env_in: []const SecretRef,
     mounts: []const Mount,
-) !ExecOut {
+) !Out {
     const arena = x.arena;
     // What the runner adds for the step, apart from its secrets: the variables earlier steps
     // set, which the container before this step lacks, and the mounts. `outputKeyed` reuses
@@ -597,7 +597,7 @@ pub fn beginExec(x: *Exec, num: u32) void {
 
 /// An exec's result (`exitCode fc_<kind> { contents }`): its output, replayed if it was cached
 /// (`Recorded`), and its file commands applied.
-pub fn collect(x: *Exec, num: u32, data: std.json.Value, recorded: Recorded) !ExecOut {
+pub fn collect(x: *Exec, num: u32, data: std.json.Value, recorded: Recorded) !Out {
     const arena = x.arena;
     const ev = x.ev;
     var code = exitCode(data);
