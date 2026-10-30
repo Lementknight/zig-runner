@@ -6,8 +6,7 @@ const job_mod = @import("../job.zig");
 const Resolved = @import("../dagger.zig").Resolved;
 const shellQuote = @import("../dagger.zig").shellQuote;
 const marker = @import("../dagger.zig").marker;
-const checkoutLog = @import("checkout.zig").checkoutLog;
-const checkoutRefCommands = @import("checkout.zig").checkoutRefCommands;
+const checkout = @import("checkout.zig");
 const event_dir = @import("../dagger.zig").event_dir;
 const event_path = @import("../dagger.zig").event_path;
 const event_env = @import("../dagger.zig").event_env;
@@ -69,12 +68,12 @@ pub fn stepScriptFc(
         .checkout => |f| {
             // The tree is mounted by the query (`withDirectory`); the step reports it in the shape
             // actions/checkout's log has (the same folds, and the commit last), with what happened.
-            for (try checkoutLog(arena, f)) |line| {
+            for (try checkout.log(arena, f)) |line| {
                 try w.writeAll("printf '%s\\n' ");
                 try shellQuote(w, line);
                 try w.writeByte('\n');
             }
-            if (f.git_ref) |ref| try w.writeAll(try checkoutRefCommands(arena, f.mount, ref));
+            if (f.git_ref) |ref| try w.writeAll(try checkout.refCommands(arena, f.mount, ref));
             try w.writeAll("printf '%s\\n' '##[endgroup]'\n");
             // The commit, as actions/checkout ends (it runs the same git command).
             try w.writeAll("git -C ");

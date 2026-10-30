@@ -1,0 +1,3 @@
+kind: Changed
+body: 'dagger/checkout.zig''s names no longer repeat "checkout" (`fetchCheckout`, `checkoutQuery`, `checkoutLog` and `checkoutRefCommands` became `fetch`, `query`, `log` and `refCommands`), and its callers use them as `checkout.fetch` and so on (#148).'
+time: 2026-10-30T12:00:00.000000-04:00

@@ -28,9 +28,7 @@ const envContext = @import("../dagger.zig").envContext;
 const ActionOut = @import("Exec.zig").ActionOut;
 const LoadResult = @import("Exec.zig").LoadResult;
 const Loaded = @import("Exec.zig").Loaded;
-const isSha = @import("checkout.zig").isSha;
-const looksLikeAuthFailure = @import("checkout.zig").looksLikeAuthFailure;
-const fetchCheckout = @import("checkout.zig").fetchCheckout;
+const checkout = @import("checkout.zig");
 const shellLine = @import("scripts.zig").shellLine;
 const FakeSession = @import("testing.zig").FakeSession;
 const fake_child = @import("testing.zig").fake_child;
@@ -64,7 +62,7 @@ fn unresolvedMessage(
             "Unable to resolve action `{s}/{s}@{s}`, unable to find version `{s}`",
             .{ u.owner, u.name, u.ref, u.ref },
         );
-    if (looksLikeAuthFailure(msg)) {
+    if (checkout.looksLikeAuthFailure(msg)) {
         const repo = try std.ascii.allocLowerString(
             arena,
             try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name }),
@@ -560,7 +558,7 @@ pub fn runNestedCheckout(
         .ok => |c| c,
         .unsupported => |why| return x.actionFailed(num, "{s}", .{why}),
     };
-    const f = try fetchCheckout(arena, x.transport, x.job.*, co, x.gitAuth());
+    const f = try checkout.fetch(arena, x.transport, x.job.*, co, x.gitAuth());
     if (f.result == .failed) return x.actionFailed(num, "{s}", .{f.result.failed});
     const m = [_]Mount{.{ .dir = .{
         .path = f.mount,
@@ -865,7 +863,7 @@ pub fn actionTreeQuery(
     const auth_user: ?[]const u8 = if (auth != null) "x-access-token" else null;
     var q: Query = .init(arena);
     try q.call("git", .{ .url = url, .httpAuthUsername = auth_user, .httpAuthToken = auth });
-    if (isSha(u.ref)) {
+    if (checkout.isSha(u.ref)) {
         try q.call("commit", .{ .id = u.ref });
     } else {
         try q.call("ref", .{ .name = u.ref });

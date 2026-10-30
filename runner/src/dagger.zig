@@ -51,8 +51,7 @@ pub const reused_note = @import("dagger/JobLog.zig").reused_note;
 const noteReusedSteps = @import("dagger/JobLog.zig").noteReusedSteps;
 const Evaluator = @import("dagger/Evaluator.zig");
 const StepCtx = @import("dagger/Evaluator.zig").StepCtx;
-pub const checkoutQuery = @import("dagger/checkout.zig").checkoutQuery;
-const fetchCheckout = @import("dagger/checkout.zig").fetchCheckout;
+const checkout = @import("dagger/checkout.zig");
 pub const stepScript = @import("dagger/scripts.zig").stepScript;
 const stream_prologue = @import("dagger/scripts.zig").stream_prologue;
 const writeMarkerEcho = @import("dagger/scripts.zig").writeMarkerEcho;
@@ -137,7 +136,7 @@ pub const Fetched = struct {
     mount: []const u8,
     /// The ref the checkout stands for (`refs/heads/main`, `refs/pull/7/merge`, a bare name from
     /// `with: ref:`), or null for a sha or a repository's default branch. See
-    /// `checkoutRefCommands`.
+    /// `checkout.refCommands`.
     git_ref: ?[]const u8 = null,
     /// What was asked for, for the step's log: the URL, the ref or commit, the depth and tags.
     url: []const u8 = "",
@@ -1154,7 +1153,7 @@ fn prepareCheckout(
             return null;
         },
     };
-    const f = try fetchCheckout(arena, x.transport, x.job.*, co, x.gitAuth());
+    const f = try checkout.fetch(arena, x.transport, x.job.*, co, x.gitAuth());
     if (f.result == .failed) {
         try failStep(ev, sh, x.observer, step, res, num, f.result.failed, coe);
         return null;
@@ -3145,7 +3144,7 @@ test "round trips: documents sent per step kind, before and after" {
     const secret = "s3cr3t-value";
     var with_secret = testStep("deploy");
     with_secret.env = &.{.{ .name = "TOKEN", .value = .{ .lit = secret } }};
-    const checkout: job_mod.Step = .{ .id = "co", .name = "co", .condition = "success()", .action = .{ .checkout = &.{} } };
+    const checkout_step: job_mod.Step = .{ .id = "co", .name = "co", .condition = "success()", .action = .{ .checkout = &.{} } };
     const matcher_json = "{\"problemMatcher\":[]}";
     var docker = testStep("");
     docker.action = .{ .docker = .{ .image = "alpine:3.22", .inputs = &.{} } };
@@ -3178,8 +3177,8 @@ test "round trips: documents sent per step kind, before and after" {
         .{ .name = "3 run steps with the same secret env", .steps = &.{ with_secret, with_secret, with_secret }, .was = 7, .docs = 5, .secret_docs = 1 },
         // The job env's secret is registered in the cache volumes' query.
         .{ .name = "run step, job env secret, package caches", .steps = &.{testStep("a")}, .opts = .{ .package_caches = true }, .job_env_secret = true, .was = 4, .docs = 3, .secret_docs = 1 },
-        .{ .name = "checkout + run step", .steps = &.{ checkout, testStep("a") }, .was = 5, .docs = 5, .secret_docs = 1 },
-        .{ .name = "checkout + run step, package caches", .steps = &.{ checkout, testStep("a") }, .opts = .{ .package_caches = true }, .was = 6, .docs = 5, .secret_docs = 1 },
+        .{ .name = "checkout + run step", .steps = &.{ checkout_step, testStep("a") }, .was = 5, .docs = 5, .secret_docs = 1 },
+        .{ .name = "checkout + run step, package caches", .steps = &.{ checkout_step, testStep("a") }, .opts = .{ .package_caches = true }, .was = 6, .docs = 5, .secret_docs = 1 },
         // The action fetched once; its two tokens registered once, together.
         .{ .name = "JS action in 2 steps, main + post each", .steps = &js2, .files = &js_files, .was = 18, .docs = 9, .secret_docs = 1 },
         .{ .name = "JS action in 2 steps, package caches", .steps = &js2, .files = &js_files, .opts = .{ .package_caches = true }, .was = 19, .docs = 9, .secret_docs = 1 },
