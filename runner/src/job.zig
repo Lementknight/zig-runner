@@ -22,6 +22,14 @@ pub const Template = union(enum) {
 /// A named input or environment variable. The name is always literal.
 pub const Input = struct { name: []const u8, value: Template };
 
+/// A job's deployment environment (`actionsEnvironment`, actions/runner's
+/// `ActionsEnvironmentReference`).
+pub const Environment = struct {
+    name: []const u8 = "",
+    /// Null when the workflow gives no `url`.
+    url: ?Template = null,
+};
+
 pub const Action = union(enum) {
     script: struct {
         script: Template,
@@ -119,6 +127,9 @@ pub const Job = struct {
     /// The job's `outputs:` (the message's `jobOutputs`), evaluated after its steps and sent with
     /// completejob, so later jobs read them as `needs.<job>.outputs.<name>`.
     outputs: []const Input = &.{},
+    /// `environment:` (the message's `actionsEnvironment`): its `url`, evaluated after the steps
+    /// and sent with completejob, is the link GitHub shows on the deployment.
+    environment: Environment = .{},
     /// Literal values that must never reach a log: the job token and every variable marked
     /// `isSecret`.
     secrets: []const []const u8,
@@ -243,6 +254,7 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
         .services_error = services.err,
         .token_permissions = variable(root, "system.github.token.permissions") orelse "",
         .outputs = try jobOutputs(arena, root),
+        .environment = environment(root),
         .runner_group = variable(root, "system.runnerGroupName") orelse "",
         .steps = steps,
     };
@@ -318,6 +330,18 @@ fn jobDefaults(arena: Allocator, root: Value) Allocator.Error!JobDefaults {
         }
     }
     return out;
+}
+
+/// `actionsEnvironment`. The url is a template token, or a plain string as a literal token
+/// without a position is written; anything else counts as no url.
+fn environment(root: Value) Environment {
+    const env = root.object.get("actionsEnvironment") orelse return .{};
+    if (env != .object) return .{};
+    const url = env.object.get("url") orelse .null;
+    return .{
+        .name = path(env, &.{"name"}) orelse "",
+        .url = if (url == .string) .{ .lit = url.string } else tokenTemplate(url),
+    };
 }
 
 /// `jobOutputs`; an unreadable mapping counts as none.
@@ -1325,4 +1349,29 @@ test "uses: references keep their directory and inputs; local actions; docker://
     try std.testing.expectEqualStrings("alpine:3.22", docker.image);
     try std.testing.expectEqualStrings("args", docker.inputs[0].name);
     try std.testing.expectEqualStrings("Run docker://alpine:3.22", job.steps[4].name);
+}
+
+test "actionsEnvironment: the name, and the url as a token or a plain string" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const head =
+        \\{"plan":{"planId":"p"},"jobId":"j","steps":[],
+        \\ "resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"t"}}}]},
+    ;
+    const expr_url = try parse(arena, head ++
+        \\"actionsEnvironment":{"name":"preview","url":{"type":3,"expr":"steps.d.outputs.page"}}}
+    );
+    try std.testing.expectEqualStrings("preview", expr_url.environment.name);
+    try std.testing.expectEqualStrings("steps.d.outputs.page", expr_url.environment.url.?.expr);
+    const lit_url = try parse(arena, head ++
+        \\"actionsEnvironment":{"name":"prod","url":"https://example.test"}}
+    );
+    try std.testing.expectEqualStrings("https://example.test", lit_url.environment.url.?.lit);
+    const no_url = try parse(arena, head ++
+        \\"actionsEnvironment":{"name":"prod"}}
+    );
+    try std.testing.expect(no_url.environment.url == null);
+    const none = try parse(arena, head ++ "\"jobName\":\"x\"}");
+    try std.testing.expect(none.environment.url == null and none.environment.name.len == 0);
 }

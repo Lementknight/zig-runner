@@ -368,6 +368,7 @@ fn tryStepResultShapes(
             cand,
             &.{},
             "[]",
+            null,
         );
         try out.print(
             "POST completejob (stepResults variant {d}) -> HTTP {d}\n",
