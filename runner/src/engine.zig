@@ -19,6 +19,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const hpack = @import("hpack.zig");
+const http = @import("github/http.zig");
 
 pub const default_container = "dagger-engine-v0.21.10";
 pub const default_docker_socket = "/var/run/docker.sock";
@@ -742,6 +743,10 @@ pub const Conn = struct {
         else |_|
             try (Io.net.HostName.init(host) catch
                 return error.InvalidEngineHost).connect(io, port, .{ .mode = .stream });
+        // A remote engine's host that went away (it slept, the network dropped) is then noticed
+        // within about 90 s by a query that is only waiting for its answer, as GitHub's and the
+        // database's connections are; it was waited on for good (#100).
+        http.keepAlive(stream.socket.handle);
         c.initStream(io, stream);
     }
 
@@ -911,6 +916,10 @@ pub const Session = struct {
     /// Set when the log stream has ended (the engine closes it once the session is gone).
     logs_ended: std.atomic.Value(bool) = .init(false),
     closed: bool = false,
+    /// How long `close` waits for `/shutdown` to be answered before it ends the request
+    /// (`abort`). An engine that never answered it held the job's end, after its steps, for good
+    /// (#100). Telemetry still being flushed past this is lost, nothing else.
+    shutdown_timeout: Io.Duration = .fromSeconds(10),
 
     /// Opens a session: the callback connection (serving health checks), `/init`, and, with a
     /// handler, the log subscription. The Session must not move afterwards.
@@ -1081,6 +1090,13 @@ pub const Session = struct {
         return true;
     }
 
+    /// Ends the request in flight once `limit` has passed (`close`'s `/shutdown`). Tried again
+    /// until it takes: the request may not have begun yet when the time runs out.
+    fn abortAfter(s: *Session, limit: Io.Duration) void {
+        s.io.sleep(limit, .awake) catch return;
+        while (!s.abort()) s.io.sleep(.fromMilliseconds(50), .awake) catch return;
+    }
+
     /// A GraphQL query; the response body, `error.ResponseTooLarge` past `limit` bytes.
     pub fn query(s: *Session, arena: Allocator, doc: []const u8, limit: usize) ![]const u8 {
         var body: Io.Writer.Allocating = .init(arena);
@@ -1099,7 +1115,10 @@ pub const Session = struct {
         s.closed = true;
         var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena_state.deinit();
+        var timer: ?Io.Future(void) = s.io.concurrent(abortAfter, .{ s, s.shutdown_timeout }) catch
+            null;
         _ = s.request(arena_state.allocator(), "POST", "/shutdown", "", no_limit) catch {};
+        if (timer) |*t| t.cancel(s.io);
         if (s.logs_task) |*t| {
             // The engine ends the stream once the session is gone; don't wait forever if it
             // doesn't.
@@ -1433,4 +1452,82 @@ test "a session whose /init is refused is torn down once, not twice (#97)" {
     const host = try std.fmt.bufPrint(&host_buf, "tcp://127.0.0.1:{d}", .{listener.socket.address.getPort()});
     var s: Session = undefined;
     try std.testing.expectError(error.SessionInitFailed, s.open(gpa, io, .{ .host = host }, null));
+}
+
+test "a remote engine's connection has TCP keepalive" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    var host_buf: [32]u8 = undefined;
+    const port = listener.socket.address.getPort();
+    const host = try std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{port});
+    var c: Conn = undefined;
+    try c.initTcp(io, host);
+    defer c.close();
+    const linux = std.os.linux;
+    var on: c_int = 0;
+    var len: linux.socklen_t = @sizeOf(c_int);
+    const fd = c.stream.socket.handle;
+    const rc = linux.getsockopt(
+        fd,
+        linux.SOL.SOCKET,
+        linux.SO.KEEPALIVE,
+        std.mem.asBytes(&on),
+        &len,
+    );
+    try std.testing.expectEqual(@as(usize, 0), rc);
+    try std.testing.expectEqual(@as(c_int, 1), on);
+}
+
+test "a session whose engine never answers /shutdown is closed at its deadline" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    // Attaches the session and answers /init, then reads /shutdown and never answers it.
+    const Fake = struct {
+        fn head(s: Io.net.Stream) !void {
+            var buf: [4096]u8 = undefined;
+            var r = s.reader(std.testing.io, &buf);
+            var last: [4]u8 = .{ 0, 0, 0, 0 };
+            while (!std.mem.eql(u8, &last, "\r\n\r\n")) {
+                const b = try r.interface.takeByte();
+                last = .{ last[1], last[2], last[3], b };
+            }
+        }
+        fn send(s: Io.net.Stream, text: []const u8) !void {
+            var buf: [256]u8 = undefined;
+            var w = s.writer(std.testing.io, &buf);
+            try w.interface.writeAll(text);
+            try w.interface.flush();
+        }
+        fn run(l: *Io.net.Server) void {
+            const a = l.accept(std.testing.io) catch return;
+            defer a.close(std.testing.io);
+            head(a) catch return;
+            send(a, "HTTP/1.1 101 Switching Protocols\r\n\r\n") catch return;
+            const b = l.accept(std.testing.io) catch return;
+            defer b.close(std.testing.io);
+            head(b) catch return;
+            send(b, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n") catch return;
+            head(b) catch return; // /shutdown
+            // Until the client goes.
+            head(b) catch {};
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Fake.run, .{&listener});
+    defer t.join();
+    var host_buf: [64]u8 = undefined;
+    const port = listener.socket.address.getPort();
+    const host = try std.fmt.bufPrint(&host_buf, "tcp://127.0.0.1:{d}", .{port});
+    var s: Session = undefined;
+    try s.open(gpa, io, .{ .host = host }, null);
+    s.shutdown_timeout = .fromMilliseconds(200);
+    const started = Io.Clock.awake.now(io);
+    s.close();
+    const took = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    try std.testing.expect(took >= 200 and took < 2_000);
 }
