@@ -154,7 +154,7 @@ pub fn startServices(x: *Exec) !bool {
         return false;
     }
     x.forward_prelude = try forwardPrelude(arena, x.services.items);
-    try ev.setServices(x.services.items);
+    try ev.setServices(x.services.items, if (x.job.container != null) x.container_id else null);
     return true;
 }
 

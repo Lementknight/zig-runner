@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The `job` context now has everything GitHub sends for it (`job.check_run_id`, `job.workflow_ref` and the like) and `job.container`, `runner.workspace` is set, and `job.status` inside a composite action reports the job''s status instead of always "success", as on GitHub (#103).'
+time: 2026-10-30T20:20:00.000000-04:00
