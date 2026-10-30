@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const job_mod = @import("../job.zig");
+const JobLog = @import("JobLog.zig");
 const sink = @import("../sink.zig");
 const Query = @import("query.zig").Query;
 const Raw = @import("query.zig").Raw;
@@ -510,6 +511,13 @@ pub fn runContainer(
     try q.leaf("id");
     try q.close(1);
 
+    // The step's env after the job's: the last ACTIONS_ALLOW_UNSECURE_COMMANDS decides.
+    const env_context = try std.mem.concat(
+        arena,
+        job_mod.EnvVar,
+        &.{ x.ev.job_env.items, dr.step_env },
+    );
+    x.sh.setUnsecureCommands(num, JobLog.allowUnsecureCommands(env_context));
     x.beginExec(num);
     const doc = try q.finish();
     const data = gql(arena, x.transport, doc, &x.err_msg) catch return error.EngineFailed;

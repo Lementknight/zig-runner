@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The deprecated `::set-env` and `::add-path` commands behave as on GitHub (#103): they fail the step, where before they only logged an error, and with `ACTIONS_ALLOW_UNSECURE_COMMANDS: true` in the step''s env they set the variable or add the directory for later steps, which before they never did.'
+time: 2026-10-30T17:00:00.000000-04:00

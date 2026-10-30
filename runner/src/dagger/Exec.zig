@@ -308,6 +308,12 @@ pub fn execScript(
             try writeOlder(&q, before, pre.fragment());
         }
 
+        const step_env = switch (resolved) {
+            .run => |r| r.env,
+            .checkout => &.{},
+        };
+        const env_context = try envContext(arena, x.ev.job_env.items, step_env);
+        x.sh.setUnsecureCommands(num, JobLog.allowUnsecureCommands(env_context));
         x.beginExec(num);
         const doc = try q.finish();
         const answer = gql(arena, x.transport, doc, &x.err_msg) catch return error.EngineFailed;
@@ -712,6 +718,15 @@ pub fn collect(x: *Exec, num: u32, data: std.json.Value, recorded: Recorded) !Ou
     }
     const stdout = output.stdout;
     const stderr = output.stderr;
+
+    // `::set-env` and `::add-path` before the file commands: GitHub's runner applies them as
+    // they are printed, and the file commands after the step, so a file command's value wins.
+    // A command that failed fails the step.
+    const unsecure = x.sh.takeUnsecure(num);
+    for (unsecure.env) |e| try Evaluator.putEnv(arena, &ev.job_env, e.name, e.value);
+    try ev.pending_env.appendSlice(arena, try ev.withoutReapplied(unsecure.env));
+    try ev.pending_path.appendSlice(arena, unsecure.paths);
+    if (unsecure.failed and code == 0) code = 1;
 
     // File commands: outputs for `steps.<id>.outputs`, env and PATH for the steps that follow.
     var outputs: []const job_mod.EnvVar = &.{};
