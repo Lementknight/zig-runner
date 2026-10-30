@@ -86,9 +86,12 @@ when either changes and weekly ("Proofs"). The workflows are written to be hard 
 repository:
 
 - **Least privilege.** Each workflow grants nothing by default; each job asks for only what it
-  needs, with a comment saying why. Checkouts keep no credentials for later steps.
+  needs, with a comment saying why. Checkouts keep no credentials for later steps. Only the
+  release's own jobs can publish: pull requests' and the merge queue's checks hold read access
+  alone ("Image" scans and builds; "Image (publish)", on a tag, pushes and attests).
 - **Pinned inputs.** Actions are pinned by commit and images by digest, not by tag, which their
-  owner (or whoever takes their repository) can move; [Renovate](https://docs.renovatebot.com)
+  owner (or whoever takes their repository) can move, BuildKit and its SBOM scanner included;
+  [Renovate](https://docs.renovatebot.com)
   proposes updates a week after their release. The exception is the Dagger engine in
   `deploy/compose.yaml`, pinned by tag and held there on purpose: the runner speaks one engine
   version's protocol, and a new engine starts with an empty cache. tls.zig and GitHub's expression
@@ -112,7 +115,8 @@ repository:
   standard library, the only code compiled in besides the runner's own), attested too, and both
   attestations' bundles for checking offline (`--bundle zig-runner.provenance.jsonl`). A release is
   published only once all of it is attached.
-- **Scanned.** Trivy checks the Dockerfile and the image before a push; accepted findings are in
+- **Scanned.** Trivy checks the Dockerfile and the image before a push, with its vulnerability
+  database fetched once, with retries, from Google's mirror first; accepted findings are in
   `.trivyignore.yaml`, each with why. GitHub's secret scanning blocks pushes carrying credentials.
 - **Checked.** actionlint and zizmor check the workflows, shellcheck every shell script
   (`.github/scripts/shellcheck.sh`), and CodeQL the workflows, the Go tools and the Python
@@ -219,7 +223,7 @@ the tagged commit, `release` records a GitHub deployment of the version to the `
 environment. The tagged commit is the release commit `version` pushes to `main`, which the merge
 queue never checked; the push starts `ci` on it, on prod, at the same time as `release`. So the
 deploy job waits, up to 40 minutes, until "Format, build and test", "Database tests", "Workflows",
-"Binaries" and "Image" have each completed on that commit, and fails, naming the check, as soon as
+"Binaries", "Image" and "Image (publish)" have each completed on that commit, and fails, naming the check, as soon as
 one has not succeeded or once the wait runs out. (The deployment cannot list them as
 `required_contexts`: GitHub matches those against commit statuses only, not Actions check runs.)
 Once the check passes (re-run it), re-run the release's failed jobs: that is the deploy job alone.
