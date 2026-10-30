@@ -248,77 +248,73 @@ pub fn writeEnvCommand(
     try w.writeByte(' ');
 }
 
-/// The command template for a step's `shell:` as GitHub runs it, `{0}` being the script file: no
-/// `shell:` is `bash -e {0}` (`sh -e {0}` when the image has no bash, decided in the script),
-/// `bash` adds pipefail and skips the profile and rc files, `sh` is `sh -e {0}`, `python` is
-/// `python {0}`, and a custom command is used as written.
-fn shellTemplate(shell: ?[]const u8) []const u8 {
-    const s = shell orelse return "bash -e {0}";
-    if (std.mem.eql(u8, s, "bash")) return "bash --noprofile --norc -e -o pipefail {0}";
-    if (std.mem.eql(u8, s, "sh")) return "sh -e {0}";
-    // GitHub's own template, so a script that works there works here. The name is `python` and not
-    // `python3` because that is what GitHub runs; the default image provides it (SPEC §6), and an
-    // image that only has `python3` needs `shell: python3 {0}`, which is accepted.
-    if (std.mem.eql(u8, s, "python")) return "python {0}";
-    return s;
+/// The program and arguments for a step's `shell:` as GitHub runs it, `{0}` being the script
+/// file: no `shell:` is `bash -e {0}` (`sh -e {0}` when the image has no bash, decided in the
+/// script), and a program named alone gets GitHub's arguments for it (`job.Shell`): `bash` adds
+/// pipefail and skips the profile and rc files, `sh` is `sh -e {0}`, `python` is `python {0}`.
+/// The name is `python` and not `python3` because that is what GitHub runs; the default image
+/// provides it (SPEC §6), and an image that only has `python3` needs `shell: python3 {0}`.
+fn shellTemplate(shell: ?[]const u8) job_mod.Shell {
+    const s = shell orelse return .{ .program = "bash", .args = "-e {0}" };
+    return job_mod.Shell.parse(s);
 }
 
-/// A script's file extension for its shell. GitHub writes a `python` step to a `.py` file, and the
-/// name reaches the step's own output — a traceback names the file it came from — so it is not
-/// cosmetic.
+/// A script's file extension for its shell: `.sh` for bash and sh, `.py` for python, and none for
+/// any other program, as GitHub names it (actions/runner
+/// src/Runner.Worker/Handlers/ScriptHandlerHelpers.cs, `_extensions`). The name reaches the
+/// step's own output — a traceback names the file it came from — so it is not cosmetic. Unlike
+/// GitHub, a path (`/bin/bash`) and `python3` are known by their name, so `python3 {0}` gets `.py`.
 fn shellExtension(shell: ?[]const u8) []const u8 {
     const s = shell orelse return "sh";
-    var it = std.mem.tokenizeAny(u8, s, " \t");
-    const prog = std.fs.path.basenamePosix(it.next() orelse return "sh");
-    if (std.mem.eql(u8, prog, "python") or std.mem.eql(u8, prog, "python3")) return "py";
-    return "sh";
+    const prog = std.fs.path.basenamePosix(job_mod.Shell.parse(s).program);
+    if (std.ascii.eqlIgnoreCase(prog, "bash") or std.ascii.eqlIgnoreCase(prog, "sh")) return "sh";
+    if (std.ascii.eqlIgnoreCase(prog, "python") or std.mem.eql(u8, prog, "python3")) return "py";
+    return "";
 }
 
-/// The command that runs the script file `path`: the template's words, quoted, with `{0}` replaced.
+/// The command that runs the script file `path`: the program and each argument, quoted, with
+/// `{0}` replaced.
 fn writeShellCommand(
     w: *std.Io.Writer,
     arena: Allocator,
     shell: ?[]const u8,
     path: []const u8,
 ) !void {
-    var it = std.mem.tokenizeAny(u8, shellTemplate(shell), " \t");
-    var first = true;
+    const t = shellTemplate(shell);
+    // No `shell:`: bash, or sh where the image has no bash (`$zig_shell`, set by the script).
+    if (shell == null) try w.writeAll("\"$zig_shell\" ") else {
+        try shellQuote(w, t.program);
+        try w.writeByte(' ');
+    }
+    var it = std.mem.tokenizeAny(u8, t.args, " \t");
     while (it.next()) |word| {
-        // No `shell:`: bash, or sh where the image has no bash (`$zig_shell`, set by the script).
-        if (first and shell == null) {
-            try w.writeAll("\"$zig_shell\" ");
-        } else {
-            try shellQuote(w, try std.mem.replaceOwned(u8, arena, word, "{0}", path));
-            try w.writeByte(' ');
-        }
-        first = false;
+        try shellQuote(w, try std.mem.replaceOwned(u8, arena, word, "{0}", path));
+        try w.writeByte(' ');
     }
 }
 
-/// The `shell:` line of a run step's log header, as GitHub's runner prints it: the template, with a
-/// bare `bash` or `sh` as its full path.
+/// The `shell:` line of a run step's log header, as GitHub's runner prints it: the program and its
+/// arguments, with a bare `bash`, `sh` or `python` as its full path.
 pub fn shellLine(arena: Allocator, shell: ?[]const u8) ![]const u8 {
     const t = shellTemplate(shell);
-    var it = std.mem.tokenizeAny(u8, t, " \t");
-    const prog = it.next() orelse return std.fmt.allocPrint(arena, "shell: {s}", .{t});
-    const rest = std.mem.trimStart(u8, t[prog.len..], " \t");
     // Verified against `ubuntu-latest` on the same workflow: a bare `python` prints as
     // `shell: /usr/bin/python {0}`, exactly as bash and sh do.
-    const bare = std.mem.eql(
-        u8,
-        prog,
-        "bash",
-    ) or std.mem.eql(u8, prog, "sh") or std.mem.eql(u8, prog, "python");
-    const full = if (bare) try std.fmt.allocPrint(arena, "/usr/bin/{s}", .{prog}) else prog;
-    return std.fmt.allocPrint(arena, "shell: {s} {s}", .{ full, rest });
+    const bare = std.mem.eql(u8, t.program, "bash") or std.mem.eql(u8, t.program, "sh") or
+        std.mem.eql(u8, t.program, "python");
+    const full = if (bare)
+        try std.fmt.allocPrint(arena, "/usr/bin/{s}", .{t.program})
+    else
+        t.program;
+    return std.fmt.allocPrint(arena, "shell: {s} {s}", .{ full, t.args });
 }
 
 /// Where a step's script is written for its shell, as GitHub writes it under RUNNER_TEMP.
 pub fn scriptPath(arena: Allocator, fc: u32, shell: ?[]const u8) ![]const u8 {
+    const ext = shellExtension(shell);
     return std.fmt.allocPrint(
         arena,
-        "/tmp/zig-runner-step-{d}.{s}",
-        .{ fc, shellExtension(shell) },
+        "/tmp/zig-runner-step-{d}{s}{s}",
+        .{ fc, if (ext.len > 0) "." else "", ext },
     );
 }
 
@@ -367,6 +363,13 @@ test "script quotes, applies env, shell and working directory, and propagates th
     try std.testing.expect(std.mem.indexOf(u8, py3, "'python3' '/tmp/zig-runner-step-6.py' )") != null);
     // A bash step is unaffected: still `.sh`.
     try std.testing.expect(std.mem.indexOf(u8, custom, ".sh' )") != null);
+    // Any other program runs the script as GitHub runs it: its file has no extension, and the
+    // arguments are split at spaces.
+    const node = try stepScript(a.allocator(), 7, .{ .run = .{ .script = "console.log(1)", .shell = "node  --no-warnings {0}", .working_directory = null, .env = &.{} } }, "x");
+    try std.testing.expect(std.mem.indexOf(u8, node, "> /tmp/zig-runner-step-7\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, node, "'node' '--no-warnings' '/tmp/zig-runner-step-7' )") != null);
+    try std.testing.expectEqualStrings("shell: node --no-warnings {0}", try shellLine(a.allocator(), "node  --no-warnings {0}"));
+    try std.testing.expectEqualStrings("shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}", try shellLine(a.allocator(), "bash"));
     // The file commands exist before the step and are touched again after it.
     try std.testing.expect(std.mem.indexOf(u8, w, ": > /github/file_commands/output_2 > /github/file_commands/env_2") != null);
     try std.testing.expect(std.mem.indexOf(u8, w, ">> /github/file_commands/path_2") != null);
