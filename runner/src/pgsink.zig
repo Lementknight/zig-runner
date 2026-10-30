@@ -227,7 +227,7 @@ pub const PgSink = struct {
         const n = s.writeRows(batch.items) catch |e| {
             s.mu.lockUncancelable(s.io);
             defer s.mu.unlock(s.io);
-            s.writeFailed(e, t);
+            s.writeFailed(e);
             // Put back, in front: the batch, then what arrived while it was being written.
             batch.appendSlice(s.gpa, s.rows.items) catch {
                 // No memory to put it back: the failed batch is lost, and counted as dropped.
@@ -263,14 +263,16 @@ pub const PgSink = struct {
         s.last_error_len = t.len;
     }
 
-    /// After a write that began at `t` failed: says why, lets the connection go (the next write
-    /// dials again) and backs off. Called with `mu` held, by the only writer there is.
-    fn writeFailed(s: *PgSink, e: anyerror, t: i64) void {
+    /// After a write failed: says why, lets the connection go (the next write dials again) and
+    /// backs off, from now: a write that took its whole time (`pg.Config.query_timeout`) would
+    /// otherwise be followed at once by the next (#100). Called with `mu` held, by the only writer
+    /// there is.
+    fn writeFailed(s: *PgSink, e: anyerror) void {
         const detail = if (s.client) |c| c.lastErrorText() else "";
         s.remember("log write failed", if (detail.len > 0) detail else @errorName(e));
         if (s.client) |c| c.close();
         s.client = null;
-        s.retry_after_ms = t + retry_ms;
+        s.retry_after_ms = now(s.io) + retry_ms;
     }
 
     /// Writes the buffered rows; on failure keeps them and backs off. Called with `mu` held, and
@@ -280,7 +282,7 @@ pub const PgSink = struct {
         const t = now(s.io);
         if (t < s.retry_after_ms) return;
         const n = s.writeRows(s.rows.items) catch |e| {
-            s.writeFailed(e, t);
+            s.writeFailed(e);
             return;
         };
         s.written += n;

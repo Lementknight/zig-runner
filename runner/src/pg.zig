@@ -38,6 +38,13 @@ pub const Config = struct {
     database: []const u8,
     sslmode: SslMode = .require,
     application_name: []const u8 = "zig-actions-runner",
+    /// How long connecting may take, through TLS and authentication, before it is given up
+    /// (`error.Timeout`). A host that accepts and never answers, or a network that dropped the
+    /// connection silently, held a connect for good, and the run-state writer held its lock
+    /// through it, so the job's end waited behind it (#100).
+    connect_timeout: Io.Duration = .fromSeconds(10),
+    /// How long one statement may wait for its answer (`Client.query_timeout`).
+    query_timeout: Io.Duration = .fromSeconds(30),
 };
 
 pub const ParseError = error{ InvalidUrl, InvalidSslMode, OutOfMemory };
@@ -371,6 +378,10 @@ pub const Error = error{
     TlsRefused,
     TlsFailed,
     ConnectionClosed,
+    /// No answer within `Config.query_timeout`. The connection is then in the middle of a
+    /// statement and cannot be used again: the caller closes it.
+    Timeout,
+    Canceled,
     OutOfMemory,
 };
 
@@ -390,10 +401,49 @@ pub const Client = struct {
     /// "ERROR 42P01: relation ... does not exist": the last ErrorResponse from the server.
     last_error: []const u8 = "",
     error_buf: [512]u8 = undefined,
+    /// How long `query`, `exec` and `copyIn` wait for the server (`Config.query_timeout`).
+    /// Keepalive and `TCP_USER_TIMEOUT` notice a host that went away, not one that is there and
+    /// never answers.
+    query_timeout: Io.Duration,
 
     const plain_buf_len = 16 * 1024;
 
-    pub fn connect(gpa: Allocator, io: Io, cfg: Config) !*Client {
+    /// Connects within `cfg.connect_timeout` (`error.Timeout`): it runs next to a timer, and
+    /// whichever ends first cancels the other, which interrupts a blocked connect, read or write.
+    /// std's own connect timeout is not implemented yet, and `SO_RCVTIMEO` would make a read end
+    /// in `EAGAIN`, which std treats as a bug.
+    pub fn connect(gpa: Allocator, io: Io, cfg: Config) anyerror!*Client {
+        const Ended = union(enum) { done: anyerror!*Client, timeout: void };
+        var buf: [2]Ended = undefined;
+        var sel: Io.Select(Ended) = .init(io, &buf);
+        sel.concurrent(.done, connectUnbounded, .{ gpa, io, cfg }) catch
+            return connectUnbounded(gpa, io, cfg);
+        // Without a timer it is only waited for.
+        sel.concurrent(.timeout, sleep, .{ io, cfg.connect_timeout }) catch {};
+        const first = sel.await() catch |e| {
+            drain(&sel);
+            return e;
+        };
+        drain(&sel);
+        return switch (first) {
+            .done => |r| r,
+            .timeout => error.Timeout,
+        };
+    }
+
+    /// Ends what `connect` still runs, closing a connection made just as the time ran out.
+    fn drain(sel: anytype) void {
+        while (sel.cancel()) |ended| switch (ended) {
+            .done => |r| if (r) |c| c.close() else |_| {},
+            .timeout => {},
+        };
+    }
+
+    fn sleep(io: Io, d: Io.Duration) void {
+        io.sleep(d, .awake) catch {};
+    }
+
+    fn connectUnbounded(gpa: Allocator, io: Io, cfg: Config) anyerror!*Client {
         const host: Io.net.HostName = try .init(cfg.host);
         const stream = try host.connect(io, cfg.port, .{ .mode = .stream });
         errdefer stream.close(io);
@@ -420,6 +470,7 @@ pub const Client = struct {
             .r = undefined,
             .w = undefined,
             .buffers = buffers,
+            .query_timeout = cfg.query_timeout,
         };
         c.r = &c.stream_reader.interface;
         c.w = &c.stream_writer.interface;
@@ -646,6 +697,16 @@ pub const Client = struct {
 
     /// Runs a statement and returns all rows of its last result as text. Rows live in `arena`.
     pub fn query(c: *Client, arena: Allocator, sql: []const u8) Error!Rows {
+        return c.bounded(Rows, queryUnbounded, .{ c, arena, sql });
+    }
+
+    /// `function(args)` within `query_timeout`: `error.Timeout` when it ran out (see `Error`).
+    fn bounded(c: *Client, comptime T: type, function: anytype, args: anytype) Error!T {
+        const r = try http.within(c.io, c.query_timeout, function, args);
+        return r orelse error.Timeout;
+    }
+
+    fn queryUnbounded(c: *Client, arena: Allocator, sql: []const u8) Error!Rows {
         try c.sendQuery(arena, sql);
         return c.readResults(arena);
     }
@@ -687,6 +748,10 @@ pub const Client = struct {
     /// `sql` must be `COPY ... FROM STDIN` in text format. Returns the number of rows the server
     /// stored.
     pub fn copyIn(c: *Client, sql: []const u8, data: []const u8) Error!u64 {
+        return c.bounded(u64, copyInUnbounded, .{ c, sql, data });
+    }
+
+    fn copyInUnbounded(c: *Client, sql: []const u8, data: []const u8) Error!u64 {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -913,4 +978,56 @@ test "integration: a wrong password is refused" {
     var cfg = try testConfig(arena);
     cfg.password = "definitely-not-the-password";
     try std.testing.expectError(error.ServerError, Client.connect(std.testing.allocator, std.testing.io, cfg));
+}
+
+test "a server that accepts and never answers is given up, connecting and in a statement" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const quick: Config = .{
+        .host = "127.0.0.1",
+        .user = "u",
+        .database = "d",
+        .sslmode = .disable,
+        .connect_timeout = .fromMilliseconds(200),
+        .query_timeout = .fromMilliseconds(200),
+    };
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+
+    // Connected in the listener's backlog and never answered: the startup waited for good.
+    var silent = try addr.listen(io, .{ .reuse_address = true });
+    defer silent.deinit(io);
+    var cfg = quick;
+    cfg.port = silent.socket.address.getPort();
+    var started = Io.Clock.awake.now(io);
+    try std.testing.expectError(error.Timeout, Client.connect(gpa, io, cfg));
+    try std.testing.expect(started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 2_000);
+
+    // Ready for queries, then silent: a statement is given up too.
+    const Server = struct {
+        fn run(l: *Io.net.Server) !void {
+            const stream = try l.accept(io);
+            defer stream.close(io);
+            var rbuf: [1024]u8 = undefined;
+            var r = stream.reader(io, &rbuf);
+            const len = try r.interface.takeInt(u32, .big);
+            try r.interface.discardAll(len - 4);
+            var wbuf: [64]u8 = undefined;
+            var w = stream.writer(io, &wbuf);
+            // AuthenticationOk, then ReadyForQuery (idle).
+            try w.interface.writeAll(&.{ 'R', 0, 0, 0, 8, 0, 0, 0, 0, 'Z', 0, 0, 0, 5, 'I' });
+            try w.interface.flush();
+            // Reads what comes, and never answers it, until the client goes.
+            _ = r.interface.discardRemaining() catch {};
+        }
+    };
+    var ready = try addr.listen(io, .{ .reuse_address = true });
+    defer ready.deinit(io);
+    var serving = try io.concurrent(Server.run, .{&ready});
+    defer serving.await(io) catch {};
+    cfg.port = ready.socket.address.getPort();
+    const c = try Client.connect(gpa, io, cfg);
+    defer c.close();
+    started = Io.Clock.awake.now(io);
+    try std.testing.expectError(error.Timeout, c.exec("select 1"));
+    try std.testing.expect(started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 2_000);
 }
