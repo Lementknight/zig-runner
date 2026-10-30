@@ -268,12 +268,14 @@ pub fn dockerEnv(
     action_env: []const action.KeyValue,
     sc: expr.Scope,
     step_env: []const job_mod.EnvVar,
+    step_secret: []const SecretRef,
     inputs: []const expr.Value.Entry,
 ) !?[]const job_mod.EnvVar {
     const arena = x.arena;
     var env: std.ArrayList(job_mod.EnvVar) = .empty;
     try env.appendSlice(arena, step_env);
     try env.appendSlice(arena, try inputEnv(arena, inputs));
+    const given = env.items.len;
     for (action_env) |e| {
         const value = expr.interpolate(arena, e.value, sc) catch {
             _ = try x.actionFailed(num, "could not evaluate env '{s}' of {s}: {s}", .{
@@ -283,7 +285,16 @@ pub fn dockerEnv(
             });
             return null;
         };
-        try env.append(arena, .{ .name = e.name, .value = value });
+        // The action's env only fills names the job's env, the step's and its inputs leave
+        // unset, as GitHub's `ContainerActionHandler.cs` (~160-169) does.
+        const set = for (env.items[0..given]) |g| {
+            if (std.mem.eql(u8, g.name, e.name)) break true;
+        } else for (step_secret) |sr| {
+            if (std.mem.eql(u8, sr.name, e.name)) break true;
+        } else for (x.ev.job_env.items) |j| {
+            if (std.mem.eql(u8, j.name, e.name)) break true;
+        } else false;
+        if (!set) try env.append(arena, .{ .name = e.name, .value = value });
     }
     return env.items;
 }
@@ -319,7 +330,7 @@ pub fn dockerRunFor(
         };
         args = out;
     }
-    const env = try x.dockerEnv(num, act, dk.env, sc, step_env, inputs) orelse return null;
+    const env = try x.dockerEnv(num, act, dk.env, sc, step_env, step_secret, inputs) orelse return null;
 
     const image: DockerRun.Image = if (std.mem.startsWith(u8, dk.image, "docker://"))
         .{ .pull = dk.image["docker://".len..] }
@@ -809,6 +820,62 @@ test "Docker actions: built or pulled, the workspace copied in and back, args, e
     try std.testing.expect(std.mem.indexOf(u8, out, "[job 0 step 3 stdout] Post job cleanup.") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Post") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "image: alpine:3.22") != null);
+}
+
+test "a Docker action's runs.env only fills names the job, the step and its inputs leave unset" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+
+    const action_yml =
+        \\inputs:
+        \\  who:
+        \\    default: nobody
+        \\runs:
+        \\  using: docker
+        \\  image: Dockerfile
+        \\  env:
+        \\    GREETING: from the action
+        \\    FROM_JOB: from the action
+        \\    INPUT_WHO: from the action
+        \\    ONLY_ACTION: from the action
+    ;
+    const inputs = [_]job_mod.Input{.{ .name = "who", .value = .{ .lit = "world" } }};
+    var step = usesStep("dock", "o", "dock", "v1", &inputs);
+    step.env = &.{.{ .name = "GREETING", .value = .{ .lit = "from the step" } }};
+    const steps = [_]job_mod.Step{step};
+    var job = testJob(&steps);
+    job.env = &.{.{ .name = "FROM_JOB", .value = .{ .lit = "from the job" } }};
+    job.secrets = &.{"ghs_jobtoken"};
+    job.job_token = "ghs_jobtoken";
+
+    const answers = [_][]const u8{
+        base_answer,
+        try treeAnswer(arena, "D1", &.{"action.yml"}),
+        try fileAnswer(arena, action_yml),
+        "{\"data\":{\"bb\":{\"from\":{\"file\":{\"id\":\"BB\"}}},\"empty\":{\"id\":\"EMPTY\"}}}",
+        "{\"data\":{\"loadDirectoryFromID\":{\"directory\":{\"dockerBuild\":{\"id\":\"IMG\"," ++
+            "\"entrypoint\":[\"/entry.sh\"],\"defaultArgs\":[],\"user\":\"\"}}}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"directory\":{\"id\":\"WS0\"}}}}",
+        "{\"data\":{\"zsec0\":{\"id\":\"SEC\"}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"exitCode\":0,\"stdout\":\"\"," ++
+            "\"stderr\":\"\",\"ws\":{\"id\":\"WS1\"},\"home\":{\"id\":\"H1\"}}}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"withoutDirectory\":{\"withDirectory\":" ++
+            "{\"id\":\"CB\"}}}}}",
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    try std.testing.expect(res.succeeded);
+    const exec = fake.seen.items[7];
+    try std.testing.expect(std.mem.indexOf(u8, exec, "'GREETING=from the step'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exec, "'FROM_JOB=from the job'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exec, "'INPUT_WHO=world'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exec, "'ONLY_ACTION=from the action'") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, exec, "from the action"));
 }
 
 test "splitArgs splits like a command line, with double quotes" {
