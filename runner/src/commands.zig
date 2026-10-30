@@ -184,7 +184,8 @@ pub const Workflow = union(enum) {
     /// `error`, `warning` or `notice`, logged as `##[<level>]<message>`.
     annotation: Annotation,
     debug: []const u8,
-    /// `::stop-commands::<token>`: no commands until `::<token>::`.
+    /// `::stop-commands::<token>`: no commands until `::<token>::`. The token may be one GitHub
+    /// refuses (`stopTokenRefused`).
     stop: []const u8,
     /// `::<token>::` while commands are stopped.
     resume_commands,
@@ -233,14 +234,14 @@ pub fn parseWorkflow(
     const section = rest[0..end];
     const data = rest[end + 2 ..];
 
-    if (stopped_token) |token| {
-        return if (std.mem.eql(u8, section, token)) .resume_commands else .none;
-    }
-
     const space = std.mem.indexOfScalar(u8, section, ' ');
     const name = section[0 .. space orelse section.len];
     const props = if (space) |s| section[s + 1 ..] else "";
     const eql = std.ascii.eqlIgnoreCase;
+
+    // The token is a command's name while commands are stopped, matched as one is: in any case,
+    // with whatever properties and data (`TryProcessCommand` in ActionCommandManager.cs).
+    if (stopped_token) |token| return if (eql(name, token)) .resume_commands else .none;
 
     if (eql(name, "add-mask")) return .{ .add_mask = try unescape(arena, data, false) };
     if (eql(name, "add-matcher")) {
@@ -256,7 +257,8 @@ pub fn parseWorkflow(
     if (eql(name, "endgroup")) return .endgroup;
     if (eql(name, "debug")) return .{ .debug = try unescape(arena, data, false) };
     if (eql(name, "echo")) return .echo;
-    if (eql(name, "stop-commands")) return if (data.len > 0) .{ .stop = data } else .none;
+    // Even with no token: the log refuses it (`stopTokenRefused`).
+    if (eql(name, "stop-commands")) return .{ .stop = try unescape(arena, data, false) };
     if (eql(name, "set-env")) return .{ .set_env = .{
         .name = try property(arena, props, "name"),
         .value = try unescape(arena, data, false),
@@ -279,6 +281,21 @@ pub fn parseWorkflow(
         return if (eql(name, "set-output")) .{ .set_output = kv } else .{ .save_state = kv };
     }
     return .none;
+}
+
+/// Whether GitHub refuses `token` for `::stop-commands::`: an empty one, `pause-logging`, or the
+/// name of a command, which would end the pause or be taken for one (`ValidateStopToken` in
+/// ActionCommandManager.cs, against its registered commands), in any case.
+pub fn stopTokenRefused(token: []const u8) bool {
+    const registered = [_][]const u8{
+        "stop-commands", "add-mask",   "add-matcher", "remove-matcher", "debug",
+        "echo",          "error",      "warning",     "notice",         "group",
+        "endgroup",      "set-output", "save-state",  "set-env",        "add-path",
+        "pause-logging",
+    };
+    if (token.len == 0) return true;
+    for (registered) |r| if (std.ascii.eqlIgnoreCase(token, r)) return true;
+    return false;
 }
 
 /// The value of property `key` in `k=v,k2=v2`.
@@ -357,9 +374,19 @@ test "workflow commands" {
     try std.testing.expect(try parseWorkflow(ar, "::echo::on", null) == .echo);
     // stop-commands: everything is plain text until the token comes back
     try std.testing.expectEqualStrings("tok123", (try parseWorkflow(ar, "::stop-commands::tok123", null)).stop);
-    try std.testing.expect(try parseWorkflow(ar, "::stop-commands::", null) == .none);
+    try std.testing.expectEqualStrings("", (try parseWorkflow(ar, "::stop-commands::", null)).stop);
     try std.testing.expect(try parseWorkflow(ar, "::add-mask::x", "tok123") == .none);
     try std.testing.expect(try parseWorkflow(ar, "::tok123::", "tok123") == .resume_commands);
+    // The token is matched as a command name: any case, any properties or data.
+    try std.testing.expect(try parseWorkflow(ar, "::TOK123 x=1::y", "tok123") == .resume_commands);
+    try std.testing.expect(try parseWorkflow(ar, "::tok1234::", "tok123") == .none);
+}
+
+test "stop-commands tokens GitHub refuses" {
+    for ([_][]const u8{ "", "pause-logging", "Add-Mask", "stop-commands", "endgroup" }) |t|
+        try std.testing.expect(stopTokenRefused(t));
+    for ([_][]const u8{ "tok123", "a1b2c3d4e5", "groups" }) |t|
+        try std.testing.expect(!stopTokenRefused(t));
 }
 
 test "add-matcher and remove-matcher" {

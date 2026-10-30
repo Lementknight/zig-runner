@@ -2720,7 +2720,9 @@ test "a replay logs what the live run logged: one stream, in order, blank lines 
             "[job 0 step 1 stdout] \n" ++
             "[job 0 step 1 stdout] err: *** again\n" ++
             "[job 0 step 1 stdout] \n" ++
+            "[job 0 step 1 stdout] ::stop-commands::tok\n" ++
             "[job 0 step 1 stdout] ::group::not a group\n" ++
+            "[job 0 step 1 stdout] ::tok::\n" ++
             "[job 0 step 1 stdout] " ++ marker ++ "end 1 another-jobs-secret\n" ++
             "[job 0 step 1 stdout] " ++ marker ++ "begin 2\n" ++
             "[job 0 step 1 stdout] no newline\n",
@@ -3002,6 +3004,10 @@ test "workflow commands in a step's output: masks, groups, annotations, debug, s
         \\[job 0 step 1 stdout] ##[error]bad
         \\[job 0 step 1 stdout] second line
         \\[job 0 step 1 stdout] ##[warning]careful
+        \\[job 0 step 1 stdout] ::stop-commands::tok
+        \\[job 0 step 1 stdout] ::group::not a group
+        \\[job 0 step 1 stdout] ::tok::
+        \\[job 0 step 1 stdout] ##[notice]back
     ;
     const got = w.buffered();
     var it = std.mem.splitScalar(u8, want, '\n');
@@ -3013,8 +3019,9 @@ test "workflow commands in a step's output: masks, groups, annotations, debug, s
         };
         pos = i + line.len;
     }
-    // Lines that must not be logged: the mask command, debug (ACTIONS_STEP_DEBUG is off), stop/resume.
-    for ([_][]const u8{ "add-mask::s3cr3t", "hidden", "::stop-commands", "::tok::", "::set-output" }) |no| try std.testing.expect(std.mem.indexOf(u8, got, no) == null);
+    // Lines that must not be logged: the mask command, debug (ACTIONS_STEP_DEBUG is off). The
+    // lines that stop and resume commands are, as GitHub logs them.
+    for ([_][]const u8{ "add-mask::s3cr3t", "hidden", "::set-output" }) |no| try std.testing.expect(std.mem.indexOf(u8, got, no) == null);
     // While stopped, commands are plain text; afterwards they work again.
     try std.testing.expect(std.mem.indexOf(u8, got, "] ::group::not a group") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "] ::add-mask::not-masked") != null);
@@ -3040,6 +3047,43 @@ test "workflow commands in a step's output: masks, groups, annotations, debug, s
     try std.testing.expectEqualStrings("warning", res.annotations[1].an.level);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "{d}", .{n}), res.annotations[1].an.line.?);
     try std.testing.expectEqualStrings("notice", res.annotations[2].an.level);
+}
+
+test "stop-commands: a long token is masked, a refused one fails the step and stops nothing" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("x")};
+    const out1 = "::stop-commands::a1b2c3d4e5f6\\n::warning::stopped\\n::a1b2c3d4e5f6::\\n" ++
+        "::stop-commands::pause-logging\\n::add-mask::hidden-after\\nsee hidden-after\\n";
+    const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, out1) };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    const want =
+        \\[job 0 step 1 stdout] ::stop-commands::***
+        \\[job 0 step 1 stdout] ::warning::stopped
+        \\[job 0 step 1 stdout] ::***::
+        \\[job 0 step 1 stdout] ##[error]You cannot use a endToken that is an empty string, the string 'pause-logging', or another workflow command.
+        \\[job 0 step 1 stdout] see ***
+    ;
+    const got = w.buffered();
+    var it = std.mem.splitScalar(u8, want, '\n');
+    var pos: usize = 0;
+    while (it.next()) |line| {
+        const i = std.mem.indexOfPos(u8, got, pos, line) orelse {
+            std.debug.print("missing, in order: {s}\n--- log:\n{s}\n", .{ line, got });
+            return error.TestUnexpectedResult;
+        };
+        pos = i + line.len;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, got, "a1b2c3d4e5f6") == null);
+    // The refused token failed the step, though its process succeeded.
+    try std.testing.expect(!res.succeeded);
+    try std.testing.expectEqual(Outcome.failure, res.steps[0].outcome);
 }
 
 test "set-env and add-path fail the step, unless ACTIONS_ALLOW_UNSECURE_COMMANDS is true" {

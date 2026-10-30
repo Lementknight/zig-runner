@@ -83,8 +83,10 @@ pub const StepCommands = struct {
     outputs: std.ArrayList(job_mod.EnvVar) = .empty,
     state: std.ArrayList(job_mod.EnvVar) = .empty,
     /// The running exec's env sets ACTIONS_ALLOW_UNSECURE_COMMANDS to `true`, so `::set-env`
-    /// and `::add-path` work (`allowUnsecureCommands`).
+    /// and `::add-path` work, or ACTIONS_ALLOW_UNSECURE_STOPCOMMAND_TOKENS, so a token GitHub
+    /// refuses stops commands all the same (`beginCommands`).
     unsecure_commands: bool = false,
+    unsecure_stop_tokens: bool = false,
     /// What those set, since the last `takeUnsecure`.
     env: std.ArrayList(job_mod.EnvVar) = .empty,
     paths: std.ArrayList([]const u8) = .empty,
@@ -154,8 +156,30 @@ fn stepOutput(sh: *JobLog, step: u32, text: []const u8) void {
             sh.pending_matchers.append(sh.arena, p) catch {}
         else |_| {},
         .remove_matcher => |owner| sh.matchers.removeOwner(owner),
-        .stop => |token| st.stop_token = sh.arena.dupe(u8, token) catch null,
-        .resume_commands => st.stop_token = null,
+        // As `TryProcessCommand` in ActionCommandManager.cs: a token GitHub refuses fails the
+        // step and stops nothing; a long one is masked, so the line that stops commands and
+        // the one that resumes them, both logged as they are, show it as ***.
+        .stop => |token| {
+            if (commands_mod.stopTokenRefused(token) and !st.unsecure_stop_tokens) {
+                sh.errorLineLocked(step, "You cannot use a endToken that is an empty " ++
+                    "string, the string 'pause-logging', or another workflow command. For " ++
+                    "more information see: https://docs.github.com/actions/learn-github-" ++
+                    "actions/workflow-commands-for-github-actions#example-stopping-and-" ++
+                    "starting-workflow-commands or opt into insecure command execution by " ++
+                    "setting the `ACTIONS_ALLOW_UNSECURE_STOPCOMMAND_TOKENS` environment " ++
+                    "variable to `true`.");
+                st.failed = true;
+                return;
+            }
+            const kept = sh.arena.dupe(u8, token) catch return;
+            if (kept.len > 6) sh.addMask(kept);
+            st.stop_token = kept;
+            sh.appendLocked(step, text);
+        },
+        .resume_commands => {
+            st.stop_token = null;
+            sh.appendLocked(step, text);
+        },
         .set_output => |kv| if (sh.keepVar(kv)) |v| st.outputs.append(sh.arena, v) catch {},
         .save_state => |kv| if (sh.keepVar(kv)) |v| st.state.append(sh.arena, v) catch {},
         .set_env => |se| {
@@ -236,23 +260,33 @@ fn unsecureDisabledLocked(sh: *JobLog, step: u32, line: []const u8, name: []cons
     sh.commandFailedLocked(step, line, why);
 }
 
-/// Whether `env`, an exec's env context, opts into `::set-env` and `::add-path`: GitHub reads
-/// ACTIONS_ALLOW_UNSECURE_COMMANDS with .NET's `bool.TryParse`, which takes `true` in any case,
-/// with surrounding whitespace (`SetEnvCommandExtension`).
-pub fn allowUnsecureCommands(env: []const job_mod.EnvVar) bool {
-    var allowed = false;
-    for (env) |e| if (std.mem.eql(u8, e.name, "ACTIONS_ALLOW_UNSECURE_COMMANDS")) {
-        allowed = std.ascii.eqlIgnoreCase(std.mem.trim(u8, e.value, " \t\r\n"), "true");
+/// The value `env`, an exec's env context, gives `name`, the last one; null when unset.
+fn envValue(env: []const job_mod.EnvVar, name: []const u8) ?[]const u8 {
+    var value: ?[]const u8 = null;
+    for (env) |e| if (std.mem.eql(u8, e.name, name)) {
+        value = e.value;
     };
-    return allowed;
+    return value;
 }
 
-/// Sets whether the exec about to run as `step` may use `::set-env` and `::add-path`.
-pub fn setUnsecureCommands(sh: *JobLog, step: u32, allowed: bool) void {
+/// The workflow-command state of the exec about to run as `step`, whose env context is `env`.
+/// Commands start unstopped: each of GitHub's step handlers has its own ActionCommandManager
+/// (`Handler.Initialize` creates one), so a `::stop-commands::` lasts to the end of its exec.
+/// The env opts into `::set-env` and `::add-path` with ACTIONS_ALLOW_UNSECURE_COMMANDS, read
+/// with .NET's `bool.TryParse` (`true` in any case, around whitespace; `SetEnvCommandExtension`),
+/// and into refused stop tokens with ACTIONS_ALLOW_UNSECURE_STOPCOMMAND_TOKENS, read with
+/// `StringUtil.ConvertToBoolean` (`true`, `1` or `$true`, in any case; `ValidateStopToken`).
+pub fn beginCommands(sh: *JobLog, step: u32, env: []const job_mod.EnvVar) void {
+    const commands = envValue(env, "ACTIONS_ALLOW_UNSECURE_COMMANDS") orelse "";
+    const tokens = envValue(env, "ACTIONS_ALLOW_UNSECURE_STOPCOMMAND_TOKENS") orelse "";
+    const eql = std.ascii.eqlIgnoreCase;
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     if (step == 0 or step > sh.commands.len) return;
-    sh.commands[step - 1].unsecure_commands = allowed;
+    const st = &sh.commands[step - 1];
+    st.stop_token = null;
+    st.unsecure_commands = eql(std.mem.trim(u8, commands, " \t\r\n"), "true");
+    st.unsecure_stop_tokens = eql(tokens, "true") or eql(tokens, "1") or eql(tokens, "$true");
 }
 
 /// What `::set-env` and `::add-path` did in `step` since the last call, and whether a command
@@ -1219,4 +1253,32 @@ test "masks cost memory in proportion to their number, and a repeated one costs 
     );
     try std.testing.expect(sh.holdsSecret("x secret-value-12 y", 1));
     try std.testing.expectEqualStrings("a *** b", try sh.redacted(a.allocator(), "a job-secret b"));
+}
+
+test "stop-commands lasts to the end of its exec, and a refused token stops nothing unless allowed" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f: LogPathFixture = undefined;
+    f.init(a.allocator());
+    const sh = &f.sh;
+    sh.beginCommands(1, &.{});
+    sh.stepOutput(1, "::stop-commands::tok123");
+    try std.testing.expectEqualStrings("tok123", f.cmds[0].stop_token.?);
+    // The next exec (a composite's next step, an action's next phase) starts unstopped.
+    sh.beginCommands(1, &.{});
+    try std.testing.expect(f.cmds[0].stop_token == null);
+
+    // A command's name as the token: refused, the step fails, nothing is stopped.
+    sh.stepOutput(1, "::stop-commands::ADD-MASK");
+    try std.testing.expect(f.cmds[0].stop_token == null and f.cmds[0].failed);
+    try std.testing.expect(sh.takeUnsecure(1).failed);
+    // ...unless the env allows it, as ConvertToBoolean reads it.
+    sh.beginCommands(1, &.{.{ .name = "ACTIONS_ALLOW_UNSECURE_STOPCOMMAND_TOKENS", .value = "1" }});
+    sh.stepOutput(1, "::stop-commands::ADD-MASK");
+    try std.testing.expectEqualStrings("ADD-MASK", f.cmds[0].stop_token.?);
+    try std.testing.expect(!f.cmds[0].failed);
+    // Which is why GitHub refuses it: the command resumes instead of running.
+    sh.stepOutput(1, "::add-mask::x");
+    try std.testing.expect(f.cmds[0].stop_token == null);
+    try std.testing.expect(!sh.holdsSecret("x", 1));
 }

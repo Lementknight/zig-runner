@@ -313,7 +313,7 @@ pub fn execScript(
             .checkout => &.{},
         };
         const env_context = try envContext(arena, x.ev.job_env.items, step_env);
-        x.sh.setUnsecureCommands(num, JobLog.allowUnsecureCommands(env_context));
+        x.sh.beginCommands(num, env_context);
         x.beginExec(num);
         const doc = try q.finish();
         const answer = gql(arena, x.transport, doc, &x.err_msg) catch return error.EngineFailed;
