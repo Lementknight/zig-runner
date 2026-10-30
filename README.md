@@ -40,7 +40,11 @@ which CI checks; the largest bump among them wins:
 pull request carries the `breaking` label. In a stack, each pull request merged into `main`
 counts toward the next release; one merged into another's branch instead counts toward that one's
 bump when it reaches `main`. The release commits the version to `runner/build.zig.zon`
-and the changelog on `main`, and tags that commit.
+and the changelog on `main`, and tags that commit. It does so only once `main`'s own checks have
+passed on the commit it releases ("Format, build and test", "Database tests", "Workflows" and
+"Proofs" on the push to `main`), waiting up to 30 minutes for them. When they cannot pass because of
+what the release fixes (prod's runner, broken by the release before), run `version` by hand with
+`skip_main_checks`; it still waits for approval.
 
 [semantic-release](https://github.com/semantic-release/semantic-release) and
 [release-please](https://github.com/googleapis/release-please) do this job from
@@ -167,7 +171,7 @@ trust, and the runner itself enforces it:
   defaults to `push,workflow_dispatch`, and `*` trusts every event. The runner logs what it
   trusts when it starts ("trusting refs refs/heads/main,refs/tags/v* and events
   push,workflow_dispatch"). The `prod` GitHub environment holds the release's deploy key, deploys
-  only from `main` and `v*` tags, and waits for the maintainer's approval.
+  only from `main`, and waits for the maintainer's approval.
 - **pre-prod**, where pull requests and the merge queue run, is GitHub's `ubuntu-latest`, on
   purpose: a hosted runner starts cold every time, so every pull request builds and tests the
   project in the worst case, with no caches to hide a slow or broken first build. Nothing there is

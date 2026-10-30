@@ -6,6 +6,10 @@
 # changie, tagged. main is protected; the RELEASE_DEPLOY_KEY deploy key may bypass that, and a tag
 # it pushes starts the release workflow. The key is the prod environment's: the job waits for the
 # maintainer's approval, and only runs from main (README, "Environments").
+# main is tagged only once its own checks have passed on the commit released (ci.yml's and
+# proofs.yml's push runs): the merge queue checked each merge, but not main as it stands after
+# them. A run by hand may skip that wait (skip_main_checks), for a release that fixes what makes
+# them fail (prod's runner, broken by the release before); it still waits for approval.
 # On a schedule, not on the pull request's closing: main takes nothing but merges, and this runs
 # main's own workflow with nothing from any pull request (no pull_request_target).
 name: version
@@ -14,6 +18,11 @@ on:
   schedule:
     - cron: "17 13 * * *" # daily, 13:17 UTC
   workflow_dispatch:
+    inputs:
+      skip_main_checks:
+        description: "Tag without waiting for main's own checks (a fix for what fails them); still needs prod's approval"
+        type: boolean
+        default: false
 
 # Nothing by default; the job asks for what it needs.
 permissions: {}
@@ -63,11 +72,13 @@ jobs:
     needs: check
     if: needs.check.outputs.tag != ''
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The wait for main's checks (WAIT_MINUTES), and the rest.
+    timeout-minutes: 45
     environment: prod
     permissions:
       contents: read # to check out main and its tags
       pull-requests: read # to read the merged pull requests' branches and labels
+      checks: read # to wait for main's checks
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -80,6 +91,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: echo "tag=$(.github/scripts/next-version.sh)" >> "$GITHUB_OUTPUT"
+
+      # On the commit checked out, which the release commit goes on top of: what ci.yml and
+      # proofs.yml run on a push to main (not "Branch name" or "Release builds", pull requests'
+      # only). Usually long done; a merge just before may still be running them.
+      - name: Wait for main's checks
+        if: steps.next.outputs.tag && !inputs.skip_main_checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.next.outputs.tag }}
+          WAIT_MINUTES: "30"
+          REQUIRED_CHECKS: |-
+            Format, build and test
+            Database tests
+            Workflows
+            Proofs
+        run: |
+          .github/scripts/wait-for-checks.sh "$(git rev-parse HEAD)" \
+            "$TAG is not released; once they pass, run version again (README, \"Versioning\")"
 
       - name: Install changie
         if: steps.next.outputs.tag
