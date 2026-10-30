@@ -777,8 +777,8 @@ fn replayRecorded(sh: *Shared, step: u32, stdout: []const u8, stderr: []const u8
     }
 }
 
-/// The note a replayed step's log ends with. The runner counts it per job (see `loop.zig`), so a
-/// step cached by the engine is visible in the runner's own log, not only in the step's.
+/// The note a replayed step's log ends with. The runner counts it per job (see `loop/job.zig`), so
+/// a step cached by the engine is visible in the runner's own log, not only in the step's.
 pub const reused_note = "Reused from Dagger's cache: this step's inputs were unchanged since " ++
     "an earlier run, so the output above was recorded then.";
 
