@@ -166,6 +166,9 @@ pub const Resolved = union(enum) {
         /// `Options.enforce_volatile`). Set for a step that is *not* always-run, where a real value
         /// would be one it could read without the runner knowing and be replayed with.
         withhold_volatile: bool = false,
+        /// The script holds a secret, so its file (`scripts.scriptPath`) is a mounted Dagger
+        /// secret instead of being written by the command, which the engine keeps (#101).
+        script_mounted: bool = false,
     },
     checkout: Fetched,
 };
@@ -3575,4 +3578,50 @@ test "a secret variable set again through GITHUB_ENV as a plain value loses its 
     const use = try execOf(&auto, "./use-token");
     try std.testing.expect(std.mem.indexOf(u8, use, "withoutSecretVariable(name:\"TOKEN\") " ++
         "{ withEnvVariable(name:\"TOKEN\",value:\"anonymous\")") != null);
+}
+
+test "a script with a secret written in reaches its file as a mounted Dagger secret" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const secret = "inline_s3cr3t-value";
+    // As `${{ secrets.T }}` renders: the value in the script's text.
+    const steps = [_]job_mod.Step{
+        testStep("curl -H 'Authorization: Bearer " ++ secret ++ "' https://deploy.example"),
+        testStep("./after.sh"),
+    };
+    var job = testJob(&steps);
+    job.secrets = &.{secret};
+    for ([_]config.StepUser{ .root, .runner }) |user| {
+        var auto: AutoSession = .{ .arena = arena };
+        _ = try roundTrips(arena, &auto, .{
+            .step_cache = true,
+            .step_user = user,
+            .test_ran_marker = "j1",
+        }, job);
+        try expectSecretOnlyInSetSecret(&auto, secret);
+        // The script is nowhere but in its own `setSecret`.
+        try expectSecretOnlyInSetSecret(&auto, "curl -H 'Authorization: Bearer ");
+        const deploy = try execOf(&auto, "begin 1");
+        // Where the command would have written it, readable by the step's user, and gone again
+        // with the step's secrets; the shell runs that file as before.
+        try std.testing.expect(std.mem.indexOf(u8, deploy, "withMountedSecret(path:\"/tmp/" ++
+            "zig-runner-step-1.sh\",source:\"ID") != null);
+        const owner = std.mem.indexOf(u8, deploy, ",owner:\"runner\",mode:292)") != null;
+        try std.testing.expectEqual(user == .runner, owner);
+        try std.testing.expect(std.mem.indexOf(u8, deploy, "mode:292)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, deploy, "\\\"$zig_shell\\\" '-e' " ++
+            "'/tmp/zig-runner-step-1.sh'") != null);
+        try std.testing.expect(std.mem.indexOf(u8, deploy, "> /tmp/zig-runner-step-1.sh") == null);
+        try std.testing.expect(std.mem.indexOf(u8, deploy, "rm -f /tmp/zig-runner-step-1.sh") ==
+            null);
+        try std.testing.expect(std.mem.indexOf(u8, deploy, "withoutMount(path:\"/tmp/" ++
+            "zig-runner-step-1.sh\") { id }") != null);
+        try std.testing.expect(std.mem.indexOf(u8, deploy, "runs this step every time: it uses " ++
+            "secrets (run ") != null);
+        // A script without one is written by the command, as before.
+        const after = try execOf(&auto, "./after.sh");
+        try std.testing.expect(std.mem.indexOf(u8, after, "withMountedSecret") == null);
+        try std.testing.expect(std.mem.indexOf(u8, after, "> /tmp/zig-runner-step-2.sh") != null);
+    }
 }
