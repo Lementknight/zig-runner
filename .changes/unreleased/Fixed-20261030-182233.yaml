@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'Cancelling a job no longer stops a running step whose `if:` still holds once the job is cancelled, such as `if: always()` or `if: cancelled()`: as on GitHub, it runs on until the cancel''s grace period ends (#103).'
+time: 2026-10-30T18:22:33.000000-04:00

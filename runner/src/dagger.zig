@@ -337,10 +337,10 @@ pub const Cancel = struct {
     }
 };
 
-/// Stops a step that runs past its `timeout-minutes`, or that is running when the job is cancelled,
-/// by aborting the step's query (the engine then cancels the exec). A task of its own checks every
-/// 200 ms; `begin` and `end` bracket each step, so an interrupt meant for one step never reaches
-/// the next.
+/// Stops a step that runs past its `timeout-minutes`, or that is running when the job is cancelled
+/// and whose condition no longer holds (`survivesCancel`), by aborting the step's query (the
+/// engine then cancels the exec). A task of its own checks every 200 ms; `begin` and `end` bracket
+/// each step, so an interrupt meant for one step never reaches the next.
 const Watch = struct {
     io: std.Io,
     transport: Transport,
@@ -348,6 +348,9 @@ const Watch = struct {
     mu: std.Io.Mutex = .init,
     in_step: bool = false,
     deadline_ms: i64 = 0,
+    /// The running step keeps running through a cancel, until the grace period ends
+    /// (`survivesCancel`).
+    survives_cancel: bool = false,
     /// A cancel arrived while this step ran and its query is still to be aborted.
     cancel_pending: bool = false,
     cancel_seen: bool = false,
@@ -356,11 +359,12 @@ const Watch = struct {
 
     const Interrupt = enum { none, timed_out, cancelled };
 
-    fn begin(w: *Watch, deadline_ms: i64) void {
+    fn begin(w: *Watch, deadline_ms: i64, survives_cancel: bool) void {
         w.mu.lockUncancelable(w.io);
         defer w.mu.unlock(w.io);
         w.in_step = true;
         w.deadline_ms = deadline_ms;
+        w.survives_cancel = survives_cancel;
         w.interrupt = .none;
         w.cancel_pending = false;
     }
@@ -371,6 +375,7 @@ const Watch = struct {
         defer w.mu.unlock(w.io);
         w.in_step = false;
         w.deadline_ms = 0;
+        w.survives_cancel = false;
         w.cancel_pending = false;
         defer w.interrupt = .none;
         return w.interrupt;
@@ -389,7 +394,7 @@ const Watch = struct {
         if (w.cancel) |c| {
             if (!w.cancel_seen and c.requested.load(.acquire)) {
                 w.cancel_seen = true;
-                w.cancel_pending = w.in_step;
+                w.cancel_pending = w.in_step and !w.survives_cancel;
             }
             const hard = c.hard_deadline_ms.load(.acquire);
             // Past the grace period nothing runs on: whatever is in flight is ended.
@@ -1280,7 +1285,13 @@ fn runStep(
         return null;
     };
 
-    const how: StepRun = .{ .coe = coe, .timeout = limit, .timeout_ms = timeout_ms, .scope = sc1 };
+    const how: StepRun = .{
+        .coe = coe,
+        .timeout = limit,
+        .timeout_ms = timeout_ms,
+        .scope = sc1,
+        .survives_cancel = try survivesCancel(ev, step.condition, step_env),
+    };
     var resolved: Resolved = undefined;
     var mount_buf: [1]Mount = undefined;
     var mounts: []const Mount = &.{};
@@ -1316,7 +1327,23 @@ const StepRun = struct {
     timeout: ?[]const u8,
     timeout_ms: i64,
     scope: expr.Scope,
+    /// The step's condition still holds once the job is cancelled (`survivesCancel`).
+    survives_cancel: bool,
 };
+
+/// Whether a step keeps running when the job is cancelled while it runs. GitHub's runner then
+/// evaluates the step's condition again, with the job cancelled, and stops the step only when it
+/// no longer holds or cannot be evaluated (`StepsRunner.cs` ~141-183): an `if: always()` or
+/// `if: cancelled()` step runs on. Nothing the condition reads changes while the step runs but the
+/// job's status, so it is evaluated here, before the step, with the job taken as cancelled.
+fn survivesCancel(ev: *Evaluator, condition: []const u8, step_env: []const job_mod.EnvVar) !bool {
+    const was = ev.cancelled;
+    defer ev.cancelled = was;
+    ev.cancelled = true;
+    const diag = ev.diag;
+    defer ev.diag = diag;
+    return expr.evalCondition(ev.arena, condition, try ev.scope(step_env)) catch false;
+}
 
 /// `timeout-minutes` as written, in milliseconds; 0 when absent, unparsable or not positive. At
 /// most a year: a larger number (`1e300`, `inf`) would not fit, and converting it panics.
@@ -1377,7 +1404,8 @@ fn runActionStep(
 ) !?Result {
     res.started_ms = std.Io.Clock.real.now(x.io).toMilliseconds();
     if (x.observer) |o| o.started(num, res.name, res.started_ms);
-    watch.begin(if (how.timeout_ms > 0) res.started_ms + how.timeout_ms else 0);
+    const deadline_ms = if (how.timeout_ms > 0) res.started_ms + how.timeout_ms else 0;
+    watch.begin(deadline_ms, how.survives_cancel);
     const ran = switch (step.action) {
         .uses => |u| x.runAction(num, u, how.scope, plain, secret, false),
         .docker => |d| x.runImageStep(num, d, how.scope, plain, secret),
@@ -1430,7 +1458,8 @@ fn runResolvedStep(
 ) !?Result {
     res.started_ms = std.Io.Clock.real.now(x.io).toMilliseconds();
     if (x.observer) |o| o.started(num, res.name, res.started_ms);
-    watch.begin(if (how.timeout_ms > 0) res.started_ms + how.timeout_ms else 0);
+    const deadline_ms = if (how.timeout_ms > 0) res.started_ms + how.timeout_ms else 0;
+    watch.begin(deadline_ms, how.survives_cancel);
     const name = if (step.context_name.len > 0) step.context_name else step.id;
     const ran = x.execScript(num, num, resolved, name, secret, mounts);
     const intr = watch.end();
@@ -2000,7 +2029,7 @@ const FakeAbort = struct {
 test "a step past its timeout is stopped, and only that step" {
     var f: FakeAbort = .{};
     var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = null };
-    w.begin(1_000);
+    w.begin(1_000, false);
     f.in_flight = true;
     w.tick(999);
     try std.testing.expectEqual(@as(u32, 0), f.aborted);
@@ -2008,7 +2037,7 @@ test "a step past its timeout is stopped, and only that step" {
     try std.testing.expectEqual(@as(u32, 1), f.aborted);
     try std.testing.expectEqual(Watch.Interrupt.timed_out, w.end());
     // The next step has no timeout: nothing reaches it.
-    w.begin(0);
+    w.begin(0, false);
     f.in_flight = true;
     w.tick(5_000);
     try std.testing.expectEqual(@as(u32, 1), f.aborted);
@@ -2018,7 +2047,7 @@ test "a step past its timeout is stopped, and only that step" {
 test "a deadline passed between a step's queries stops its next query" {
     var f: FakeAbort = .{};
     var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = null };
-    w.begin(1_000);
+    w.begin(1_000, false);
     w.tick(2_000); // no query in flight
     f.in_flight = true;
     w.tick(2_200);
@@ -2029,24 +2058,59 @@ test "a cancel stops the running step, not the always() steps after it, until th
     var f: FakeAbort = .{};
     var c: Cancel = .{};
     var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = &c };
-    w.begin(0);
+    w.begin(0, false);
     f.in_flight = true;
     c.hard_deadline_ms.store(10_000, .release);
     c.requested.store(true, .release);
     w.tick(1_000);
     try std.testing.expectEqual(Watch.Interrupt.cancelled, w.end());
     // An `if: always()` step after it runs.
-    w.begin(0);
+    w.begin(0, false);
     f.in_flight = true;
     w.tick(2_000);
     try std.testing.expectEqual(@as(u32, 1), f.aborted);
     try std.testing.expectEqual(Watch.Interrupt.none, w.end());
     // Past the grace period, whatever runs is stopped.
-    w.begin(0);
+    w.begin(0, false);
     f.in_flight = true;
     w.tick(10_001);
     try std.testing.expectEqual(@as(u32, 2), f.aborted);
     try std.testing.expectEqual(Watch.Interrupt.cancelled, w.end());
+}
+
+test "an if: always() step runs on through a cancel, until the grace period ends" {
+    var f: FakeAbort = .{};
+    var c: Cancel = .{};
+    var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = &c };
+    w.begin(0, true);
+    f.in_flight = true;
+    c.hard_deadline_ms.store(10_000, .release);
+    c.requested.store(true, .release);
+    w.tick(1_000);
+    try std.testing.expectEqual(@as(u32, 0), f.aborted);
+    w.tick(10_001);
+    try std.testing.expectEqual(@as(u32, 1), f.aborted);
+    try std.testing.expectEqual(Watch.Interrupt.cancelled, w.end());
+}
+
+test "survivesCancel: the step's condition, evaluated with the job cancelled" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var job = testJob(&.{});
+    var ev = try Evaluator.init(arena, &job);
+    const go: []const job_mod.EnvVar = &.{.{ .name = "GO", .value = "yes" }};
+    for ([_]struct { []const u8, bool }{
+        .{ "always()", true },
+        .{ "cancelled()", true },
+        .{ "success()", false },
+        .{ "failure()", false },
+        .{ "!cancelled()", false },
+        .{ "always() && env.GO == 'yes'", true },
+        .{ "fromJSON('{')", false },
+    }) |case| try std.testing.expectEqual(case[1], try survivesCancel(&ev, case[0], go));
+    // The job itself is not cancelled by asking.
+    try std.testing.expect(!ev.cancelled);
 }
 
 test "a second cancel can shorten the grace period, never lengthen it" {
@@ -2066,7 +2130,7 @@ test "a cancel between steps does not stop the next step" {
     var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = &c };
     c.requested.store(true, .release);
     w.tick(1_000);
-    w.begin(0);
+    w.begin(0, false);
     f.in_flight = true;
     w.tick(1_200);
     try std.testing.expectEqual(@as(u32, 0), f.aborted);
