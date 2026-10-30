@@ -166,3 +166,36 @@ jobs:
           else
             zig build test --summary all
           fi
+
+  # The release's own builds, both targets in ReleaseSafe (build-binaries.sh), which nothing else
+  # compiles before the tag: the tests build x86_64 in Debug, and release.yml's checks run only for
+  # a change to the packaging. Code that compiles there and not for aarch64, or not in ReleaseSafe,
+  # would otherwise fail first at the release, after the tag, which cannot be cut again. About a
+  # minute, beside the Database tests' two. Skipped, still reporting, on a change that cannot
+  # affect them (ci-scope.sh binaries); not on main, whose commits the merge queue built, and whose
+  # tag's release builds them anyway.
+  binaries:
+    name: Release builds
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Whether this change can affect the release's builds
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh binaries
+
+      - name: Install Zig
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/install-zig.sh
+
+      - name: Build for x86_64 and aarch64
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/build-binaries.sh v0.0.0-ci "$RUNNER_TEMP/dist"

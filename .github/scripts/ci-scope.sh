@@ -2,6 +2,7 @@
 # Whether a pull request or a merge group can change what a group of CI's checks checks:
 #
 #   ci-scope.sh tests        Format, build and test; Database tests (ci.yml)
+#   ci-scope.sh binaries     Release builds (ci.yml)
 #   ci-scope.sh proofs       Proofs (proofs.yml)
 #   ci-scope.sh packaging    Binaries (check), Binaries (same as zig build), Image (release.yml)
 #
@@ -52,6 +53,17 @@ needed() {
 		*) return 0 ;;
 		esac
 		;;
+	binaries)
+		# The release's binaries as build-binaries.sh compiles them: runner/src through the module
+		# graph zig-modules.sh gives the compiler, from the packages build.zig.zon pins (build.zig
+		# is listed too, so a change to the graph there builds them as well).
+		case $1 in
+		runner/src/* | runner/build.zig | runner/build.zig.zon | .github/workflows/ci.yml | \
+			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
+			.github/scripts/build-binaries.sh | .github/scripts/zig-modules.sh) return 0 ;;
+		*) return 1 ;;
+		esac
+		;;
 	proofs)
 		# `lake build` reads proofs/ alone (its lakefile, manifest and toolchain included); the
 		# hashFiles model's comparison (glob-lean-diff.sh) builds proofs/Oracle.lean and runs it
@@ -72,8 +84,8 @@ needed() {
 		# reads build.zig.zon too. The image is the Dockerfile's, from a context .dockerignore trims,
 		# scanned with .trivyignore.yaml's exceptions. deploy/, which runs the image (compose.yaml)
 		# and installs the binaries (zig-runner-deploy), is read by none of them, and listed as
-		# release.yml's path filter listed it. runner/src is ci.yml's to build and test, for x86_64:
-		# code that compiles there and not for aarch64 fails at the release, not here.
+		# release.yml's path filter listed it. runner/src is ci.yml's: its tests, and the release's
+		# builds for both targets (Release builds, `binaries`).
 		case $1 in
 		runner/build.zig | runner/build.zig.zon | runner/Dockerfile | runner/.dockerignore | \
 			deploy/* | .trivyignore.yaml | .github/workflows/release.yml | \
@@ -87,9 +99,9 @@ needed() {
 }
 
 case $scope in
-tests | proofs | packaging) ;;
+tests | binaries | proofs | packaging) ;;
 *)
-	echo "usage: ci-scope.sh tests|proofs|packaging" >&2
+	echo "usage: ci-scope.sh tests|binaries|proofs|packaging" >&2
 	exit 2
 	;;
 esac
