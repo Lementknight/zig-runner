@@ -13,7 +13,7 @@
 # the release does, without compiling them a second time.
 
 # Pinned by digest, which a moved tag cannot change; Renovate moves the pin.
-FROM --platform=$BUILDPLATFORM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 AS certs
+FROM --platform=$BUILDPLATFORM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS certs
 RUN apk add --no-cache ca-certificates
 # An empty /tmp for the image, which has none: each job's log is spooled there
 # (`RUNNER_LOG_SPOOL_DIR`). Without it every job kept its log in memory instead, up to 64 MB of
@@ -29,7 +29,7 @@ STOPSIGNAL SIGTERM
 ENTRYPOINT ["/runner"]
 
 # From source, the default.
-FROM --platform=$BUILDPLATFORM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 AS build
+FROM --platform=$BUILDPLATFORM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS build
 # The checksums ziglang.org publishes for this version (.github/scripts/install-zig.sh has the same).
 ARG ZIG_VERSION=0.17.0
 ARG ZIG_SHA256_X86_64=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
