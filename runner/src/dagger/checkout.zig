@@ -35,10 +35,10 @@ pub fn isSha(s: []const u8) bool {
 /// The query that resolves a checkout to a Directory id, or null with a reason. `auth`: a Dagger
 /// secret holding the job's GITHUB_TOKEN, sent as GitHub expects a token over HTTPS (user
 /// `x-access-token`), so private repositories can be checked out, as actions/checkout does. The
-/// time checked-out files get: 2000-01-01 00:00 UTC (see `checkoutQuery`).
-const checkout_mtime: i64 = 946684800;
+/// time checked-out files get: 2000-01-01 00:00 UTC (see `query`).
+const mtime: i64 = 946684800;
 
-pub fn checkoutQuery(
+pub fn query(
     arena: Allocator,
     job: job_mod.Job,
     co: job_mod.Checkout,
@@ -74,10 +74,10 @@ pub fn checkoutQuery(
     // are zips, which cannot hold times before 1980: "ZIP does not support timestamps before
     // 1980"); a fixed later time keeps the tree the same from run to run, so cached steps still
     // match. Without `submodules`, the root's entries say whether there are any to empty (see
-    // `fetchCheckout`).
+    // `fetch`).
     const include_tags: ?bool = if (co.fetch_tags) true else null;
     try q.call("tree", .{ .depth = co.fetch_depth, .includeTags = include_tags });
-    try q.call("withTimestamps", .{ .timestamp = checkout_mtime });
+    try q.call("withTimestamps", .{ .timestamp = mtime });
     try q.leaf("id");
     if (!co.submodules) try q.leaf("entries");
     return .{ .doc = try q.finish() };
@@ -105,7 +105,7 @@ fn withoutSubmodules(
         try q.call("withNewDirectory", .{ .path = p });
     }
     // The new directories get the checkout's fixed time, as every other file has.
-    try q.call("withTimestamps", .{ .timestamp = checkout_mtime });
+    try q.call("withTimestamps", .{ .timestamp = mtime });
     try q.leaf("id");
     const out = gql(arena, t, try q.finish(), msg) catch return null;
     return jsonFindString(out, "id") orelse {
@@ -132,7 +132,7 @@ fn gitmodulePaths(arena: Allocator, text: []const u8) ![]const []const u8 {
 /// The checkout step's log up to the commit: actions/checkout's folds ("Fetching the repository",
 /// "Checking out the ref"), filled with what the built-in checkout did instead of git commands it
 /// did not run. The script closes the last fold after setting up the refs.
-pub fn checkoutLog(arena: Allocator, f: Fetched) ![]const []const u8 {
+pub fn log(arena: Allocator, f: Fetched) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     try out.append(arena, try std.fmt.allocPrint(arena, "Syncing repository: {s}", .{f.repo}));
     try out.append(arena, "##[group]Fetching the repository");
@@ -197,7 +197,7 @@ pub fn checkoutLog(arena: Allocator, f: Fetched) ![]const []const u8 {
 /// refs/tags/T (detached) other refs/...      -> the same ref (detached) a bare name         ->
 /// refs/remotes/origin/<name> (detached) Failures are ignored (an image without git, say): the
 /// checkout itself is already done.
-pub fn checkoutRefCommands(arena: Allocator, mount: []const u8, ref: []const u8) ![]const u8 {
+pub fn refCommands(arena: Allocator, mount: []const u8, ref: []const u8) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.writeAll("if command -v git >/dev/null 2>&1; then ( cd ");
@@ -251,7 +251,7 @@ pub fn looksLikeAuthFailure(text: []const u8) bool {
     return false;
 }
 
-pub fn fetchCheckout(
+pub fn fetch(
     arena: Allocator,
     t: Transport,
     job: job_mod.Job,
@@ -266,7 +266,7 @@ pub fn fetchCheckout(
         ws;
     const want = co.ref orelse (if (co.repository == null) job.github.sha else "HEAD");
     const label = if (isSha(want)) want[0..7] else want;
-    const git_ref = checkoutGitRef(co, job);
+    const git_ref = gitRef(co, job);
     var f: Fetched = .{
         .result = .{ .failed = "" },
         .repo = repo,
@@ -283,7 +283,7 @@ pub fn fetchCheckout(
         .tags = co.fetch_tags,
     };
 
-    const doc = switch (try checkoutQuery(arena, job, co, auth)) {
+    const doc = switch (try query(arena, job, co, auth)) {
         .err => |msg| {
             f.result = .{ .failed = msg };
             return f;
@@ -308,7 +308,7 @@ pub fn fetchCheckout(
 
 /// The ref the checkout is named by (`git_ref`): the one asked for unless it is a commit, else for
 /// the workflow's own repository the ref that triggered the run, as actions/checkout does.
-fn checkoutGitRef(co: job_mod.Checkout, job: job_mod.Job) ?[]const u8 {
+fn gitRef(co: job_mod.Checkout, job: job_mod.Job) ?[]const u8 {
     if (co.ref) |r| return if (isSha(r)) null else r;
     if (co.repository == null and job.github.ref.len > 0) return job.github.ref;
     return null;
@@ -361,7 +361,7 @@ test "the checkout log names the ref as the checkout leaves it" {
     for (cases) |c| {
         var f = base;
         f.git_ref = c.ref;
-        const lines = try checkoutLog(arena, f);
+        const lines = try log(arena, f);
         try std.testing.expectEqualStrings(c.want, lines[lines.len - 1]);
         try std.testing.expectEqualStrings("Depth: full history", lines[4]);
         try std.testing.expectEqualStrings("Ref: refs/pull/7/merge", lines[3]);
@@ -387,23 +387,23 @@ test "the submodules to leave empty come from .gitmodules" {
     try std.testing.expectEqualStrings("public", paths[1]);
 }
 
-test "checkoutQuery picks commit, ref or head and honours fetch-depth" {
+test "query picks commit, ref or head and honours fetch-depth" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const job = testJob(&.{});
-    const own = (try checkoutQuery(a.allocator(), job, .{}, null)).doc;
+    const own = (try query(a.allocator(), job, .{}, null)).doc;
     try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { commit(id:\"0123456789012345678901234567890123456789\") { tree(depth:1) { withTimestamps(timestamp:946684800) { id entries } } } } }", own);
-    const by_ref = (try checkoutQuery(a.allocator(), job, .{ .ref = "refs/pull/7/merge", .fetch_depth = 0 }, null)).doc;
+    const by_ref = (try query(a.allocator(), job, .{ .ref = "refs/pull/7/merge", .fetch_depth = 0 }, null)).doc;
     try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { ref(name:\"refs/pull/7/merge\") { tree(depth:0) { withTimestamps(timestamp:946684800) { id entries } } } } }", by_ref);
-    const tags = (try checkoutQuery(a.allocator(), job, .{ .fetch_tags = true }, "SEC")).doc;
+    const tags = (try query(a.allocator(), job, .{ .fetch_tags = true }, "SEC")).doc;
     try std.testing.expect(std.mem.indexOf(u8, tags, "tree(depth:1,includeTags:true) { withTimestamps(timestamp:946684800) { id entries }") != null);
     // With the job's GITHUB_TOKEN (a secret), as GitHub expects a token over HTTPS.
     try std.testing.expect(std.mem.indexOf(u8, tags, "git(url:\"https://github.com/o/r.git\",httpAuthUsername:\"x-access-token\",httpAuthToken:\"SEC\",keepGitDir:true)") != null);
-    const other = (try checkoutQuery(a.allocator(), job, .{ .repository = "x/y", .fetch_depth = 3 }, null)).doc;
+    const other = (try query(a.allocator(), job, .{ .repository = "x/y", .fetch_depth = 3 }, null)).doc;
     try std.testing.expect(std.mem.indexOf(u8, other, "x/y.git") != null and std.mem.indexOf(u8, other, "{ head { tree(depth:3)") != null);
     var empty = job;
     empty.github.repository = "";
-    try std.testing.expect((try checkoutQuery(a.allocator(), empty, .{}, null)) == .err);
+    try std.testing.expect((try query(a.allocator(), empty, .{}, null)) == .err);
 }
 
 test "run mounts a fetched checkout, and a failed fetch fails only that step" {
@@ -426,8 +426,8 @@ test "run mounts a fetched checkout, and a failed fetch fails only that step" {
     var fake: FakeSession = .{ .answers = &answers, .arena = arena };
     var buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-    _ = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    var job_log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    _ = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &job_log);
     for (fake.seen.items) |d| try std.testing.expect(braceBalanced(d));
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withDirectory(path:\"/home/runner/work/r/r\",source:\"TREE1\")") != null);
     // actions/checkout's folds, with what the built-in checkout did, and the commit last (from git).
@@ -469,11 +469,11 @@ test "a checkout gets the refs actions/checkout leaves" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const ar = a.allocator();
-    const branch = try checkoutRefCommands(ar, "/github/workspace", "refs/heads/main");
+    const branch = try refCommands(ar, "/github/workspace", "refs/heads/main");
     try std.testing.expect(std.mem.indexOf(u8, branch, "g update-ref 'refs/remotes/origin/main' HEAD && g update-ref 'refs/heads/main' HEAD && g symbolic-ref HEAD 'refs/heads/main' && g config 'branch.main.remote' origin && g config 'branch.main.merge' 'refs/heads/main'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, try checkoutRefCommands(ar, "/w", "refs/pull/36/merge"), "g update-ref 'refs/remotes/pull/36/merge' HEAD )") != null);
-    try std.testing.expect(std.mem.indexOf(u8, try checkoutRefCommands(ar, "/w", "refs/tags/v1"), "g update-ref 'refs/tags/v1' HEAD )") != null);
-    try std.testing.expect(std.mem.indexOf(u8, try checkoutRefCommands(ar, "/w", "release"), "g update-ref 'refs/remotes/origin/release' HEAD )") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try refCommands(ar, "/w", "refs/pull/36/merge"), "g update-ref 'refs/remotes/pull/36/merge' HEAD )") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try refCommands(ar, "/w", "refs/tags/v1"), "g update-ref 'refs/tags/v1' HEAD )") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try refCommands(ar, "/w", "release"), "g update-ref 'refs/remotes/origin/release' HEAD )") != null);
     // Never fails the step, and only runs where git exists.
     try std.testing.expect(std.mem.startsWith(u8, branch, "if command -v git >/dev/null 2>&1; then ( cd '/github/workspace' && "));
     try std.testing.expect(std.mem.endsWith(u8, branch, ") >/dev/null 2>&1 || true; fi\n"));
