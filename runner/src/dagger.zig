@@ -3384,3 +3384,70 @@ test "round trips: the job setup's query is sent again without the secrets when 
     try std.testing.expect(std.mem.indexOf(u8, seen[3], "withSecretVariable(name:\"JOB_SECRET\",secret:\"SEC_JOB\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[3], "withMountedCache(path:") != null);
 }
+
+/// Every document `auto` saw carries `secret` only as a `setSecret` value: not in an exec's
+/// args, its key or anything else the engine keeps (#101).
+fn expectSecretOnlyInSetSecret(auto: *const AutoSession, secret: []const u8) !void {
+    for (auto.seen.items) |d| {
+        var rest = d;
+        while (std.mem.indexOf(u8, rest, secret)) |at| : (rest = rest[at + secret.len ..]) {
+            const before = rest[0..at];
+            const call = std.mem.lastIndexOf(u8, before, "setSecret(name:") orelse
+                return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOfScalar(u8, before[call..], ')') == null);
+        }
+    }
+}
+
+/// The document that runs the step whose script is `script`.
+fn execOf(auto: *const AutoSession, script: []const u8) ![]const u8 {
+    for (auto.seen.items) |d| {
+        if (std.mem.indexOf(u8, d, "withExec") != null and std.mem.indexOf(u8, d, script) != null)
+            return d;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "a secret in a container job's env reaches steps as a Dagger secret, and they always run" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const secret = "npm_s3cr3t-value";
+    const steps = [_]job_mod.Step{testStep("npm publish")};
+    var job = testJob(&steps);
+    job.secrets = &.{secret};
+    job.container = .{ .name = "", .image = .{ .lit = "node:20" }, .env = &.{
+        .{ .name = "NPM_TOKEN", .value = .{ .lit = secret } },
+        .{ .name = "NODE_ENV", .value = .{ .lit = "production" } },
+    } };
+    var auto: AutoSession = .{ .arena = arena };
+    _ = try roundTrips(arena, &auto, .{ .step_cache = true, .test_ran_marker = "j1" }, job);
+    try expectSecretOnlyInSetSecret(&auto, secret);
+    try std.testing.expectEqual(@as(usize, 1), auto.count("withSecretVariable(name:\"NPM_TOKEN\""));
+    try std.testing.expectEqual(@as(usize, 1), auto.count("withEnvVariable(name:\"NODE_ENV\""));
+    // The step names no secret, but its environment has one: it runs in every job.
+    const publish = try execOf(&auto, "npm publish");
+    try std.testing.expect(std.mem.indexOf(u8, publish, "runs this step every time: it uses " ++
+        "secrets (run ") != null);
+}
+
+test "a container job's env gives way to the job's env of the same name" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const secret = "npm_s3cr3t-value";
+    const steps = [_]job_mod.Step{testStep("npm publish")};
+    var job = testJob(&steps);
+    job.secrets = &.{secret};
+    job.env = &.{.{ .name = "NPM_TOKEN", .value = .{ .lit = "from-the-job" } }};
+    job.container = .{ .name = "", .image = .{ .lit = "node:20" }, .env = &.{
+        .{ .name = "NPM_TOKEN", .value = .{ .lit = secret } },
+    } };
+    var auto: AutoSession = .{ .arena = arena };
+    _ = try roundTrips(arena, &auto, .{}, job);
+    // Only the job's value is set: a secret variable beside it would leave the winner to the
+    // engine.
+    try std.testing.expectEqual(@as(usize, 0), auto.count(secret));
+    try std.testing.expectEqual(@as(usize, 1), auto.count("withEnvVariable(name:\"NPM_TOKEN\"," ++
+        "value:\"from-the-job\")"));
+}
