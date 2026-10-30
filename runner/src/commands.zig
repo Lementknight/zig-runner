@@ -180,7 +180,7 @@ test "paths and the blocked name" {
         try std.testing.expect(isRunnerEnvName(name));
 }
 
-// --- workflow commands printed by a step: `::name key=value,...::data` ---
+// --- workflow commands printed by a step: `::name key=value,...::data`, or `##[name ...]data` ---
 
 pub const Workflow = union(enum) {
     /// Not a command, an unknown one, or commands are stopped: log the line as it is.
@@ -205,8 +205,9 @@ pub const Workflow = union(enum) {
     /// when the command has none.
     set_env: struct { name: ?[]const u8, value: []const u8 },
     add_path: []const u8,
-    /// `::echo::on|off` only changes whether commands are echoed; this runner never echoes them.
-    echo,
+    /// `::echo::on` or `::echo::off`: whether later commands' lines are logged too. Any other
+    /// value fails the step (the log checks it).
+    echo: []const u8,
     /// `::add-matcher::<path>`: register the problem matchers in that file (see matcher.zig). The
     /// path is relative to the workspace, or to an action's own directory inside one.
     add_matcher: []const u8,
@@ -227,65 +228,114 @@ pub const Annotation = struct {
     end_column: ?[]const u8 = null,
 };
 
+/// The commands GitHub's runner registers (`_registeredCommands` in ActionCommandManager.cs): a
+/// line naming any other is output.
+const registered = [_][]const u8{
+    "stop-commands", "add-mask",   "add-matcher", "remove-matcher", "debug",
+    "echo",          "error",      "warning",     "notice",         "group",
+    "endgroup",      "set-output", "save-state",  "set-env",        "add-path",
+};
+
+/// How a command is written: `::name k=v,k2=v2::data`, or the legacy `##[name k=v;k2=v2]data`
+/// anywhere in the line, which GitHub's runner still reads when a line is not the first kind
+/// (`ActionCommand.TryParseV2`, then `TryParse`). They differ in the property separator and the
+/// escapes.
+const Syntax = enum { v2, legacy };
+
+/// A command line taken apart: its name, its properties as written, and its data.
+const Parts = struct { name: []const u8, props: []const u8, data: []const u8 };
+
 /// Parses one line of a step's output. `stopped_token` is the token of an active `stop-commands`.
-/// Leading and trailing whitespace is ignored, as in GitHub's runner; command names are
-/// case-insensitive.
+/// Command names are case-insensitive. In the `::` form, leading and trailing whitespace is
+/// ignored.
 pub fn parseWorkflow(
     arena: Allocator,
     line: []const u8,
     stopped_token: ?[]const u8,
 ) Allocator.Error!Workflow {
-    const t = std.mem.trim(u8, line, " \t\r");
-    if (!std.mem.startsWith(u8, t, "::")) return .none;
-    const rest = t[2..];
-    const end = std.mem.indexOf(u8, rest, "::") orelse return .none;
-    const section = rest[0..end];
-    const data = rest[end + 2 ..];
-
-    const space = std.mem.indexOfScalar(u8, section, ' ');
-    const name = section[0 .. space orelse section.len];
-    const props = if (space) |s| section[s + 1 ..] else "";
     const eql = std.ascii.eqlIgnoreCase;
+    inline for ([_]Syntax{ .v2, .legacy }) |syntax| if (split(line, syntax)) |parts| {
+        const is_token = if (stopped_token) |token| eql(parts.name, token) else false;
+        const known = for (registered) |r| {
+            if (eql(parts.name, r)) break true;
+        } else false;
+        if (is_token or known) {
+            // The token is a command's name while commands are stopped, matched as one is: in
+            // any case, with whatever properties and data (`TryProcessCommand`).
+            if (stopped_token != null) return if (is_token) .resume_commands else .none;
+            return command(arena, parts, syntax);
+        }
+    };
+    return .none;
+}
 
-    // The token is a command's name while commands are stopped, matched as one is: in any case,
-    // with whatever properties and data (`TryProcessCommand` in ActionCommandManager.cs).
-    if (stopped_token) |token| return if (eql(name, token)) .resume_commands else .none;
-
-    if (eql(name, "add-mask")) return .{ .add_mask = try unescape(arena, data, false) };
-    if (eql(name, "add-matcher")) {
-        const path = try unescape(arena, data, false);
-        return if (path.len > 0) .{ .add_matcher = path } else .none;
+/// `line` taken apart as `syntax` writes a command; null when it is not written so.
+fn split(line: []const u8, syntax: Syntax) ?Parts {
+    var section: []const u8 = undefined;
+    var data: []const u8 = undefined;
+    switch (syntax) {
+        .v2 => {
+            const t = std.mem.trim(u8, line, " \t\r");
+            if (!std.mem.startsWith(u8, t, "::")) return null;
+            const end = std.mem.indexOfPos(u8, t, 2, "::") orelse return null;
+            section = t[2..end];
+            data = t[end + 2 ..];
+        },
+        .legacy => {
+            const t = std.mem.trimEnd(u8, line, "\r");
+            const start = std.mem.indexOf(u8, t, "##[") orelse return null;
+            const end = std.mem.indexOfScalarPos(u8, t, start + 3, ']') orelse return null;
+            section = t[start + 3 .. end];
+            data = t[end + 1 ..];
+        },
     }
+    const space = std.mem.indexOfScalar(u8, section, ' ');
+    return .{
+        .name = section[0 .. space orelse section.len],
+        .props = if (space) |s| section[s + 1 ..] else "",
+        .data = data,
+    };
+}
+
+/// The command a registered name stands for, its properties and data read as `syntax` escapes
+/// them.
+fn command(arena: Allocator, parts: Parts, syntax: Syntax) Allocator.Error!Workflow {
+    const eql = std.ascii.eqlIgnoreCase;
+    const name = parts.name;
+    const props = parts.props;
+    const data = try unescape(arena, parts.data, if (syntax == .v2) .data else .legacy);
+    if (eql(name, "add-mask")) return .{ .add_mask = data };
+    if (eql(name, "add-matcher")) return if (data.len > 0) .{ .add_matcher = data } else .none;
     if (eql(name, "remove-matcher")) {
         // The owner is a property, not the data: `::remove-matcher owner=eslint-stylish::`.
-        const owner = try property(arena, props, "owner");
+        const owner = try property(arena, props, "owner", syntax);
         return if (owner) |o| (if (o.len > 0) .{ .remove_matcher = o } else .none) else .none;
     }
-    if (eql(name, "group")) return .{ .group = try unescape(arena, data, false) };
+    if (eql(name, "group")) return .{ .group = data };
     if (eql(name, "endgroup")) return .endgroup;
-    if (eql(name, "debug")) return .{ .debug = try unescape(arena, data, false) };
-    if (eql(name, "echo")) return .echo;
+    if (eql(name, "debug")) return .{ .debug = data };
+    if (eql(name, "echo")) return .{ .echo = data };
     // Even with no token: the log refuses it (`stopTokenRefused`).
-    if (eql(name, "stop-commands")) return .{ .stop = try unescape(arena, data, false) };
+    if (eql(name, "stop-commands")) return .{ .stop = data };
     if (eql(name, "set-env")) return .{ .set_env = .{
-        .name = try property(arena, props, "name"),
-        .value = try unescape(arena, data, false),
+        .name = try property(arena, props, "name", syntax),
+        .value = data,
     } };
-    if (eql(name, "add-path")) return .{ .add_path = try unescape(arena, data, false) };
+    if (eql(name, "add-path")) return .{ .add_path = data };
     for ([_][]const u8{ "error", "warning", "notice" }) |level| if (eql(name, level))
         return .{ .annotation = .{
             .level = level,
-            .message = try unescape(arena, data, false),
-            .title = try property(arena, props, "title"),
-            .file = try property(arena, props, "file"),
-            .line = try property(arena, props, "line"),
-            .end_line = try property(arena, props, "endLine"),
-            .col = try property(arena, props, "col"),
-            .end_column = try property(arena, props, "endColumn"),
+            .message = data,
+            .title = try property(arena, props, "title", syntax),
+            .file = try property(arena, props, "file", syntax),
+            .line = try property(arena, props, "line", syntax),
+            .end_line = try property(arena, props, "endLine", syntax),
+            .col = try property(arena, props, "col", syntax),
+            .end_column = try property(arena, props, "endColumn", syntax),
         } };
     if (eql(name, "set-output") or eql(name, "save-state")) {
-        const key = (try property(arena, props, "name")) orelse return .none;
-        const kv: job_mod.EnvVar = .{ .name = key, .value = try unescape(arena, data, false) };
+        const key = (try property(arena, props, "name", syntax)) orelse return .none;
+        const kv: job_mod.EnvVar = .{ .name = key, .value = data };
         return if (eql(name, "set-output")) .{ .set_output = kv } else .{ .save_state = kv };
     }
     return .none;
@@ -295,48 +345,55 @@ pub fn parseWorkflow(
 /// name of a command, which would end the pause or be taken for one (`ValidateStopToken` in
 /// ActionCommandManager.cs, against its registered commands), in any case.
 pub fn stopTokenRefused(token: []const u8) bool {
-    const registered = [_][]const u8{
-        "stop-commands", "add-mask",   "add-matcher", "remove-matcher", "debug",
-        "echo",          "error",      "warning",     "notice",         "group",
-        "endgroup",      "set-output", "save-state",  "set-env",        "add-path",
-        "pause-logging",
-    };
-    if (token.len == 0) return true;
+    if (token.len == 0 or std.ascii.eqlIgnoreCase(token, "pause-logging")) return true;
     for (registered) |r| if (std.ascii.eqlIgnoreCase(token, r)) return true;
     return false;
 }
 
-/// The value of property `key` in `k=v,k2=v2`.
-fn property(arena: Allocator, props: []const u8, key: []const u8) Allocator.Error!?[]const u8 {
-    var it = std.mem.splitScalar(u8, props, ',');
+/// The value of property `key` in `k=v,k2=v2` (`k=v;k2=v2` in the legacy syntax).
+fn property(
+    arena: Allocator,
+    props: []const u8,
+    key: []const u8,
+    syntax: Syntax,
+) Allocator.Error!?[]const u8 {
+    const separator: u8 = if (syntax == .v2) ',' else ';';
+    var it = std.mem.splitScalar(u8, props, separator);
     while (it.next()) |p| {
         const eq = std.mem.indexOfScalar(u8, p, '=') orelse continue;
         if (std.mem.eql(u8, std.mem.trim(u8, p[0..eq], " "), key))
-            return try unescape(arena, p[eq + 1 ..], true);
+            return try unescape(arena, p[eq + 1 ..], if (syntax == .v2) .property else .legacy);
     }
     return null;
 }
 
+/// Which of GitHub's escape tables applies (`ActionCommand`'s `_escapeDataMappings`,
+/// `_escapePropertyMappings` and, for the legacy syntax, `_escapeMappings`).
+const Escapes = enum { data, property, legacy };
+
 /// The byte an escape `%<code>` stands for, or null when it is not one GitHub defines.
-fn unescapedByte(code: []const u8, is_property: bool) ?u8 {
+fn unescapedByte(code: []const u8, escapes: Escapes) ?u8 {
     const eql = std.ascii.eqlIgnoreCase;
     if (eql(code, "25")) return '%';
     if (eql(code, "0D")) return '\r';
     if (eql(code, "0A")) return '\n';
-    if (is_property and eql(code, "3A")) return ':';
-    if (is_property and eql(code, "2C")) return ',';
+    if (escapes == .property and eql(code, "3A")) return ':';
+    if (escapes == .property and eql(code, "2C")) return ',';
+    if (escapes == .legacy and eql(code, "3B")) return ';';
+    if (escapes == .legacy and eql(code, "5D")) return ']';
     return null;
 }
 
-/// GitHub's escapes: `%25` `%0D` `%0A` in data, plus `%3A` `%2C` in property values.
-fn unescape(arena: Allocator, s: []const u8, is_property: bool) Allocator.Error![]const u8 {
+/// GitHub's escapes: `%25` `%0D` `%0A` in data, plus `%3A` `%2C` in property values; in the
+/// legacy syntax, those three plus `%3B` and `%5D` in both.
+fn unescape(arena: Allocator, s: []const u8, escapes: Escapes) Allocator.Error![]const u8 {
     if (std.mem.indexOfScalar(u8, s, '%') == null) return s;
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
     while (i < s.len) {
         if (s[i] == '%' and i + 3 <= s.len) {
             const code = s[i + 1 .. i + 3];
-            const c = unescapedByte(code, is_property);
+            const c = unescapedByte(code, escapes);
             if (c) |ch| {
                 try out.append(arena, ch);
                 i += 3;
@@ -379,7 +436,7 @@ test "workflow commands" {
     try std.testing.expectEqualStrings("1\n2", set_env.value);
     try std.testing.expect((try parseWorkflow(ar, "::set-env::1", null)).set_env.name == null);
     try std.testing.expectEqualStrings("/opt/bin", (try parseWorkflow(ar, "::ADD-PATH::/opt/bin", null)).add_path);
-    try std.testing.expect(try parseWorkflow(ar, "::echo::on", null) == .echo);
+    try std.testing.expectEqualStrings("on", (try parseWorkflow(ar, "::echo::on", null)).echo);
     // stop-commands: everything is plain text until the token comes back
     try std.testing.expectEqualStrings("tok123", (try parseWorkflow(ar, "::stop-commands::tok123", null)).stop);
     try std.testing.expectEqualStrings("", (try parseWorkflow(ar, "::stop-commands::", null)).stop);
@@ -388,6 +445,28 @@ test "workflow commands" {
     // The token is matched as a command name: any case, any properties or data.
     try std.testing.expect(try parseWorkflow(ar, "::TOK123 x=1::y", "tok123") == .resume_commands);
     try std.testing.expect(try parseWorkflow(ar, "::tok1234::", "tok123") == .none);
+}
+
+test "the legacy ##[command] syntax, anywhere in a line, with its own separator and escapes" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const err = (try parseWorkflow(ar, "build: ##[error file=a.c;line=3]bad%5D%3B 100%25", null)).annotation;
+    try std.testing.expectEqualStrings("error", err.level);
+    try std.testing.expectEqualStrings("bad]; 100%", err.message);
+    try std.testing.expectEqualStrings("a.c", err.file.?);
+    try std.testing.expectEqualStrings("3", err.line.?);
+    try std.testing.expectEqualStrings("Build", (try parseWorkflow(ar, "##[GROUP]Build", null)).group);
+    try std.testing.expectEqualStrings("s3cret", (try parseWorkflow(ar, "##[add-mask]s3cret", null)).add_mask);
+    try std.testing.expectEqualStrings("k", (try parseWorkflow(ar, "##[set-output name=k]v", null)).set_output.name);
+    // Not a registered command, or not closed: output.
+    try std.testing.expect(try parseWorkflow(ar, "##[section]Starting", null) == .none);
+    try std.testing.expect(try parseWorkflow(ar, "##[error unclosed", null) == .none);
+    // The `::` form comes first; a line that is not one is read for the legacy form.
+    try std.testing.expectEqualStrings("w", (try parseWorkflow(ar, "::nope::##[warning]w", null)).annotation.message);
+    // While stopped, the token resumes in either form, and commands are output.
+    try std.testing.expect(try parseWorkflow(ar, "##[tok123]", "tok123") == .resume_commands);
+    try std.testing.expect(try parseWorkflow(ar, "##[error]x", "tok123") == .none);
 }
 
 test "stop-commands tokens GitHub refuses" {
