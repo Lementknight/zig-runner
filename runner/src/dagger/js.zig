@@ -170,7 +170,7 @@ pub fn runJs(
         inputs,
         step_env,
         step_secret,
-        x.pre_state[num - 1],
+        try x.preState(num),
     )) orelse
         return .{ .failed = true, .exit_code = 1 };
     // Its `post` runs after the job's steps, with the inputs and the state saved so far.
@@ -187,7 +187,7 @@ pub fn runJs(
         .state = try std.mem.concat(
             x.arena,
             job_mod.EnvVar,
-            &.{ x.pre_state[num - 1], out.state },
+            &.{ try x.preState(num), out.state },
         ),
     });
     return .{ .failed = out.code != 0, .exit_code = out.code, .outputs = out.outputs };

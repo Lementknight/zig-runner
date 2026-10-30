@@ -41,6 +41,7 @@ const treeAnswer = @import("testing.zig").treeAnswer;
 const fileAnswer = @import("testing.zig").fileAnswer;
 const usesStep = @import("testing.zig").usesStep;
 const braceBalanced = @import("testing.zig").braceBalanced;
+const expectSecretOnlyInSetSecret = @import("testing.zig").expectSecretOnlyInSetSecret;
 
 const Allocator = std.mem.Allocator;
 
@@ -382,6 +383,10 @@ pub fn runNestedUses(
     var plain: std.ArrayList(job_mod.EnvVar) = .empty;
     var secret: std.ArrayList(SecretRef) = .empty;
     try x.nestedEnv(comp, step.nested_env, &plain, &secret);
+    // Which nested action this is, for the state its `pre` saved (`runNestedPres`).
+    const saved_path = x.nested_path;
+    defer x.nested_path = saved_path;
+    x.nested_path = try joinPath(arena, saved_path, step.ctx_id);
     const out = try x.runNested(
         num,
         step.ctx_id,
@@ -482,8 +487,8 @@ pub fn logNestedRunHeader(
 
 /// A composite action's `uses:` step, run as part of step `num` like a step of the job: the
 /// built-in checkout for actions/checkout, a `docker://` image, or a local or remote action
-/// (which may be composite again). Nested actions' `pre` scripts do not run; their `post`
-/// scripts do, at the end.
+/// (which may be composite again). Nested actions' `pre` scripts ran before the job's steps
+/// (`runCompositePre`); their `post` scripts run at the end.
 pub fn runNested(
     x: *Exec,
     num: u32,
@@ -657,7 +662,7 @@ pub fn runPre(x: *Exec, num: u32, step: job_mod.Step) !void {
     const pre: []const u8, const pre_if: ?[]const u8 = switch (act.meta.runs) {
         .node => |nd| .{ nd.pre orelse return, nd.pre_if },
         .docker => |dk| .{ dk.pre_entrypoint orelse return, dk.pre_if },
-        .composite => return,
+        .composite => return runCompositePre(x, num, step, u, act),
     };
     const ev = x.ev;
     ev.diag = "";
@@ -708,6 +713,213 @@ pub fn runPre(x: *Exec, num: u32, step: job_mod.Step) !void {
         ev.job_failed = true;
         x.hook_failed = true;
     } else ok = true;
+}
+
+/// The `pre` scripts of the actions inside a composite action, as one step "Pre <step>" before
+/// the job's steps. GitHub collects every nested remote action with a `pre` into its composite
+/// action's pre steps, each under its own `pre-if` (`ActionManager.cs` ~369-402), and runs them
+/// as the composite action's Pre stage, with the action's `inputs` (`CompositeActionHandler.cs`
+/// ~41-45, ~95-160). Like a JavaScript action's `pre`, it runs whatever the step's `if:` says:
+/// GitHub gives the pre step the action's own condition, `always()` for a composite action
+/// (`ActionManager.cs` ~386-388).
+fn runCompositePre(x: *Exec, num: u32, step: job_mod.Step, u: job_mod.Uses, act: Loaded) !void {
+    if (!try hasNestedPre(x, act, 0)) return;
+    const ev = x.ev;
+    ev.diag = "";
+    const sc0 = try ev.scope(&.{});
+    const step_env = ev.renderEnv(step.env, sc0) catch return;
+    const sc1 = try ev.scope(step_env);
+    const inputs = switch (try x.resolveInputs(num, act, u, sc1, false)) {
+        .failed => return,
+        .ok => |in| in,
+    };
+    var plain: std.ArrayList(job_mod.EnvVar) = .empty;
+    var secret: std.ArrayList(SecretRef) = .empty;
+    x.splitStepEnv(step_env, &plain, &secret) catch return error.EngineFailed;
+    // A step of its own, "Pre <step>", logged under the next log step.
+    const ls = x.next_log_step;
+    x.next_log_step += 1;
+    const started = std.Io.Clock.real.now(x.io).toMilliseconds();
+    const pre_name = x.extraName("Pre", num, act) catch "Pre";
+    x.startExtra(.pre, ls, pre_name, started);
+    const comp: CompositeRun = .{
+        .act = act,
+        .step_env = plain.items,
+        .step_secret = secret.items,
+    };
+    const ok = try runNestedPres(x, num, ls, comp, inputs);
+    if (!ok) {
+        ev.job_failed = true;
+        x.hook_failed = true;
+    }
+    try x.addExtra(.{
+        .kind = .pre,
+        .name = pre_name,
+        .log_step = ls,
+        .outcome = if (ok) .success else .failure,
+        .started_ms = started,
+        .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds(),
+    });
+}
+
+/// Whether a composite action has a remote action with a `pre` among its steps, at any depth.
+/// A local action is read when its step runs, so GitHub runs no `pre` for it (as for the job's
+/// steps); actions/checkout is the built-in checkout.
+fn hasNestedPre(x: *Exec, act: Loaded, depth: usize) anyerror!bool {
+    const steps = switch (act.meta.runs) {
+        .composite => |st| st,
+        else => return false,
+    };
+    if (depth >= max_composite_depth) return false;
+    for (steps) |st| {
+        const r = nestedRemote(st) orelse continue;
+        const inner = switch (try x.loadAction(r)) {
+            .failed, .unresolved => continue,
+            .ok => |a| a,
+        };
+        if (try runsPre(x, inner, depth + 1)) return true;
+    }
+    return false;
+}
+
+/// Whether an action inside a composite action has a `pre` to run: its own, or, for a
+/// composite action, one of its actions'.
+fn runsPre(x: *Exec, act: Loaded, depth: usize) anyerror!bool {
+    return switch (act.meta.runs) {
+        .node => |nd| nd.pre != null,
+        .docker => |dk| dk.pre_entrypoint != null,
+        .composite => try hasNestedPre(x, act, depth),
+    };
+}
+
+/// A composite step's `uses:` when it names a remote action other than actions/checkout.
+fn nestedRemote(st: action.Step) ?job_mod.Uses {
+    const r = switch (action.parseUses(st.uses orelse return null) orelse return null) {
+        .repo => |r| r,
+        .docker, .local => return null,
+    };
+    const is_checkout = std.ascii.eqlIgnoreCase(r.owner, "actions") and
+        std.ascii.eqlIgnoreCase(r.name, "checkout") and r.path.len == 0;
+    if (is_checkout) return null;
+    return .{ .owner = r.owner, .name = r.name, .path = r.path, .ref = r.ref };
+}
+
+/// The nested actions' `pre` scripts of the composite action `comp`, in its steps' order,
+/// logged as log step `ls`; recursive through composite actions. Each saves its state for its
+/// own action's main and post (`Exec.preState`). False when one failed. An action that cannot
+/// be loaded or evaluated here is left to its step, which reports why.
+fn runNestedPres(
+    x: *Exec,
+    num: u32,
+    ls: u32,
+    comp: CompositeRun,
+    inputs: []const expr.Value.Entry,
+) anyerror!bool {
+    const arena = x.arena;
+    const ev = x.ev;
+    if (x.depth >= max_composite_depth) return true;
+    x.depth += 1;
+    defer x.depth -= 1;
+    const saved_steps = ev.steps;
+    const saved_inputs = ev.inputs;
+    const saved_github = ev.github;
+    const saved_failed = ev.job_failed;
+    const saved_status = ev.status_failed;
+    const saved_path = x.nested_path;
+    defer {
+        ev.steps = saved_steps;
+        ev.inputs = saved_inputs;
+        ev.github = saved_github;
+        ev.job_failed = saved_failed;
+        ev.status_failed = saved_status;
+        x.nested_path = saved_path;
+    }
+    try x.enterAction(comp.act, inputs);
+
+    var ok = true;
+    for (comp.act.meta.runs.composite, 1..) |st, i| {
+        const r = nestedRemote(st) orelse continue;
+        const act = switch (try x.loadAction(r)) {
+            .failed, .unresolved => continue,
+            .ok => |a| a,
+        };
+        if (!try runsPre(x, act, 0)) continue;
+        // The key its main finds it by: the same ids as `runCompositeStep`'s.
+        const ctx_id = st.id orelse try std.fmt.allocPrint(arena, "__{d}", .{i});
+        x.nested_path = try joinPath(arena, saved_path, ctx_id);
+        // The step's env and `with:` as its main will have them (`runCompositeStep`,
+        // `runNestedUses`), in the action's scope.
+        ev.diag = "";
+        const sc_env = try ev.scope(comp.step_env);
+        var nested_env: std.ArrayList(job_mod.EnvVar) = .empty;
+        const env_ok = for (st.env) |e| {
+            const v = expr.interpolate(arena, e.value, sc_env) catch break false;
+            try nested_env.append(arena, .{ .name = e.name, .value = v });
+        } else true;
+        if (!env_ok) continue;
+        const sc = try ev.scope(try std.mem.concat(arena, job_mod.EnvVar, &.{
+            comp.step_env,
+            nested_env.items,
+        }));
+        var with: std.ArrayList(job_mod.Input) = .empty;
+        const with_ok = for (st.with) |kv| {
+            const v = expr.interpolate(arena, kv.value, sc) catch break false;
+            try with.append(arena, .{ .name = kv.name, .value = .{ .lit = v } });
+        } else true;
+        if (!with_ok) continue;
+        var u = r;
+        u.inputs = with.items;
+        const pre_if: ?[]const u8 = switch (act.meta.runs) {
+            .node => |nd| nd.pre_if,
+            .docker => |dk| dk.pre_if,
+            .composite => null,
+        };
+        if (!(expr.evalCondition(arena, pre_if orelse "always()", sc) catch false)) continue;
+        const nested_inputs = switch (try x.resolveInputs(ls, act, u, sc, false)) {
+            .failed => continue,
+            .ok => |in| in,
+        };
+        // Env that carries a secret or a mask goes in as a Dagger secret, as for the main.
+        var plain: std.ArrayList(job_mod.EnvVar) = .empty;
+        var secret: std.ArrayList(SecretRef) = .empty;
+        try x.nestedEnv(comp, nested_env.items, &plain, &secret);
+        const env = plain.items;
+        const sec = secret.items;
+        const ran = switch (act.meta.runs) {
+            .composite => {
+                const inner: CompositeRun = .{ .act = act, .step_env = env, .step_secret = sec };
+                if (!try runNestedPres(x, num, ls, inner, nested_inputs)) ok = false;
+                continue;
+            },
+            .docker => |dk| blk: {
+                const pre = dk.pre_entrypoint.?;
+                const dr = try x.dockerRunFor(ls, act, u, dk, nested_inputs, env, sec, pre) orelse
+                    break :blk null;
+                break :blk try x.runContainer(ls, .pre, dr, &.{});
+            },
+            .node => |nd| try x.runJsScript(
+                ls,
+                .pre,
+                act,
+                u,
+                nd.pre.?,
+                nested_inputs,
+                env,
+                sec,
+                &.{},
+            ),
+        };
+        const out = ran orelse {
+            ok = false;
+            continue;
+        };
+        try x.nested_pre_state.put(arena, try x.nestedKey(num), out.state);
+        if (out.code != 0) {
+            logExitCode(x.sh, ls, out.code);
+            ok = false;
+        }
+    }
+    return ok;
 }
 
 /// Runs the registered `post` scripts, last first, each when its `post-if` (default `always()`)
@@ -1335,4 +1547,160 @@ test "JavaScript pre and post: pre runs first and hands its state on, post-if is
             try std.testing.expectEqual(Outcome.success, res.extra[0].outcome);
         }
     }
+}
+
+test "a nested action's pre runs before the job's steps, whatever the step's if:, and hands its state on" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const secret = "pre_s3cr3t-value";
+    const comp_yml =
+        \\runs:
+        \\  using: composite
+        \\  steps:
+        \\    - uses: o/js@v1
+        \\      env:
+        \\        NESTED: ${{ env.TOKEN }}
+    ;
+    const js_yml =
+        \\runs:
+        \\  using: node24
+        \\  pre: dist/pre.js
+        \\  main: dist/main.js
+    ;
+    const pre_with_state = "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"id\":\"C1\"," ++
+        "\"exitCode\":0,\"stdout\":\"\",\"stderr\":\"\",\"fc_state\":{\"contents\":" ++
+        "\"fromPre=1\\n\"}}}}}";
+    // GitHub gives a composite action's pre step the action's own condition, not the step's
+    // `if:` (`ActionManager.cs` ~386-388): the pre runs even when the step is skipped.
+    for ([_][]const u8{ "success()", "false" }) |cond| {
+        var step = usesStep("comp", "o", "comp", "v1", &.{});
+        step.condition = cond;
+        step.env = &.{.{ .name = "TOKEN", .value = .{ .lit = secret } }};
+        const steps = [_]job_mod.Step{step};
+        var job = testJob(&steps);
+        job.secrets = &.{secret};
+        var answers: std.ArrayList([]const u8) = .empty;
+        try answers.appendSlice(arena, &.{
+            base_answer,
+            try treeAnswer(arena, "D1", &.{"action.yml"}),
+            try fileAnswer(arena, comp_yml),
+            // the nested action, loaded for its pre
+            try treeAnswer(arena, "D2", &.{ "action.yml", "dist" }),
+            try fileAnswer(arena, js_yml),
+            "{\"data\":{\"zsec0\":{\"id\":\"S1\"}}}",
+            "{\"data\":{\"container\":{\"from\":{\"bin\":{\"id\":\"BUN\"}}}}}",
+            pre_with_state,
+        });
+        const runs_main = std.mem.eql(u8, cond, "success()");
+        if (runs_main) try answers.append(arena, try exec(arena, "C2", 0, ""));
+        var fake: FakeSession = .{ .answers = answers.items, .arena = arena };
+        var buf: [8192]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+        const seen = fake.seen.items;
+        try std.testing.expect(res.succeeded);
+        for (seen) |d| try std.testing.expect(braceBalanced(d));
+        try std.testing.expectEqual(answers.items.len, seen.len);
+        // The pre: a step of its own, "Pre <step>", before the job's step.
+        try std.testing.expect(std.mem.indexOf(u8, seen[7], "/github/_actions/o/js/v1/dist/pre.js") != null);
+        try std.testing.expectEqual(@as(usize, 1), res.extra.len);
+        try std.testing.expect(std.mem.startsWith(u8, res.extra[0].name, "Pre "));
+        try std.testing.expectEqual(Outcome.success, res.extra[0].outcome);
+        // The nested env holding the secret went in as a Dagger secret, before and after.
+        try std.testing.expect(std.mem.indexOf(u8, seen[7], "secret:\"S1\"") != null);
+        try expectSecretOnlyInSetSecret(seen, secret);
+        if (runs_main) {
+            // The nested main gets the state its own pre saved.
+            try std.testing.expect(std.mem.indexOf(u8, seen[8], "dist/main.js") != null);
+            try std.testing.expect(std.mem.indexOf(u8, seen[8], "'STATE_fromPre=1'") != null);
+            try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
+        } else {
+            try std.testing.expectEqual(Outcome.skipped, res.steps[0].outcome);
+        }
+    }
+}
+
+test "nested pres: pre-if, no pre for local actions, composites in composites, a failing one fails the job" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const comp_yml =
+        \\runs:
+        \\  using: composite
+        \\  steps:
+        \\    - uses: ./local
+        \\    - uses: o/skip@v1
+        \\    - id: deep
+        \\      uses: o/mid@v1
+        \\      with:
+        \\        level: ${{ inputs.level }}
+        \\inputs:
+        \\  level:
+        \\    default: two
+    ;
+    const skip_yml =
+        \\runs:
+        \\  using: node24
+        \\  pre: dist/pre.js
+        \\  pre-if: false
+        \\  main: dist/main.js
+    ;
+    const mid_yml =
+        \\inputs:
+        \\  level:
+        \\    required: true
+        \\runs:
+        \\  using: composite
+        \\  steps:
+        \\    - uses: o/js@v1
+        \\      with:
+        \\        level: ${{ inputs.level }}
+    ;
+    const js_yml =
+        \\inputs:
+        \\  level:
+        \\    required: true
+        \\runs:
+        \\  using: node24
+        \\  pre: dist/pre.js
+        \\  main: dist/main.js
+    ;
+    const steps = [_]job_mod.Step{usesStep("comp", "o", "comp", "v1", &.{})};
+    const answers = [_][]const u8{
+        base_answer,
+        try treeAnswer(arena, "D1", &.{"action.yml"}),
+        try fileAnswer(arena, comp_yml),
+        try treeAnswer(arena, "D2", &.{ "action.yml", "dist" }),
+        try fileAnswer(arena, skip_yml),
+        try treeAnswer(arena, "D3", &.{"action.yml"}),
+        try fileAnswer(arena, mid_yml),
+        try treeAnswer(arena, "D4", &.{ "action.yml", "dist" }),
+        try fileAnswer(arena, js_yml),
+        "{\"data\":{\"container\":{\"from\":{\"bin\":{\"id\":\"BUN\"}}}}}",
+        try exec(arena, "C1", 1, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    const seen = fake.seen.items;
+    for (seen) |d| try std.testing.expect(braceBalanced(d));
+    try std.testing.expectEqual(answers.len, seen.len);
+    // The local action is never read up front; o/skip's pre-if is false; o/js's pre, two levels
+    // down, runs with the inputs passed down to it.
+    for (seen) |d| try std.testing.expect(std.mem.indexOf(u8, d, "r/r/local") == null);
+    for (seen) |d| try std.testing.expect(std.mem.indexOf(u8, d, "o/skip/v1/dist/pre.js") == null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[10], "/github/_actions/o/js/v1/dist/pre.js") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[10], "'INPUT_LEVEL=two'") != null);
+    // It failed: the pre step and the job fail, and the step is skipped.
+    try std.testing.expect(!res.succeeded);
+    try std.testing.expectEqual(@as(usize, 1), res.extra.len);
+    try std.testing.expectEqual(Outcome.failure, res.extra[0].outcome);
+    try std.testing.expectEqual(Outcome.skipped, res.steps[0].outcome);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]Process completed with exit code 1.") != null);
 }

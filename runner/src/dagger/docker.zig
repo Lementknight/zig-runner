@@ -229,7 +229,7 @@ pub fn runDocker(
         step_secret,
         dk.entrypoint,
     )) orelse return failed;
-    const out = (try x.runContainer(num, .main, dr, x.pre_state[num - 1])) orelse return failed;
+    const out = (try x.runContainer(num, .main, dr, try x.preState(num))) orelse return failed;
     if (dk.post_entrypoint) |post| {
         var p = dr;
         p.entrypoint = post;
@@ -246,7 +246,7 @@ pub fn runDocker(
             .state = try std.mem.concat(
                 x.arena,
                 job_mod.EnvVar,
-                &.{ x.pre_state[num - 1], out.state },
+                &.{ try x.preState(num), out.state },
             ),
             .docker = p,
         });

@@ -67,6 +67,7 @@ const fileAnswer = @import("dagger/testing.zig").fileAnswer;
 const treeAnswer = @import("dagger/testing.zig").treeAnswer;
 const usesStep = @import("dagger/testing.zig").usesStep;
 const braceBalanced = @import("dagger/testing.zig").braceBalanced;
+const expectSecretOnlyInSetSecret = @import("dagger/testing.zig").expectSecretOnlyInSetSecret;
 
 const Allocator = std.mem.Allocator;
 
@@ -3999,20 +4000,6 @@ test "round trips: the job setup's query is sent again without the secrets when 
     try std.testing.expect(std.mem.indexOf(u8, seen[3], "withMountedCache(path:") != null);
 }
 
-/// Every document `auto` saw carries `secret` only as a `setSecret` value: not in an exec's
-/// args, its key or anything else the engine keeps (#101).
-fn expectSecretOnlyInSetSecret(auto: *const AutoSession, secret: []const u8) !void {
-    for (auto.seen.items) |d| {
-        var rest = d;
-        while (std.mem.indexOf(u8, rest, secret)) |at| : (rest = rest[at + secret.len ..]) {
-            const before = rest[0..at];
-            const call = std.mem.lastIndexOf(u8, before, "setSecret(name:") orelse
-                return error.TestUnexpectedResult;
-            try std.testing.expect(std.mem.indexOfScalar(u8, before[call..], ')') == null);
-        }
-    }
-}
-
 /// The document that runs the step whose script is `script`.
 fn execOf(auto: *const AutoSession, script: []const u8) ![]const u8 {
     for (auto.seen.items) |d| {
@@ -4036,7 +4023,7 @@ test "a secret in a container job's env reaches steps as a Dagger secret, and th
     } };
     var auto: AutoSession = .{ .arena = arena };
     _ = try roundTrips(arena, &auto, .{ .step_cache = true, .test_ran_marker = "j1" }, job);
-    try expectSecretOnlyInSetSecret(&auto, secret);
+    try expectSecretOnlyInSetSecret(auto.seen.items, secret);
     try std.testing.expectEqual(@as(usize, 1), auto.count("withSecretVariable(name:\"NPM_TOKEN\""));
     try std.testing.expectEqual(@as(usize, 1), auto.count("withEnvVariable(name:\"NODE_ENV\""));
     // The step names no secret, but its environment has one: it runs in every job.
@@ -4087,7 +4074,7 @@ test "a secret passed on through GITHUB_ENV reaches later steps as a Dagger secr
     }) |opts| {
         var auto: AutoSession = .{ .arena = arena, .files = &files };
         _ = try roundTrips(arena, &auto, opts, job);
-        try expectSecretOnlyInSetSecret(&auto, secret);
+        try expectSecretOnlyInSetSecret(auto.seen.items, secret);
         const deploy = try execOf(&auto, "./deploy.sh");
         try std.testing.expect(std.mem.indexOf(u8, deploy, "withoutEnvVariable(name:\"TOKEN\") " ++
             "{ withSecretVariable(name:\"TOKEN\",secret:\"ID") != null);
@@ -4118,7 +4105,7 @@ test "a value masked before it is passed on through GITHUB_ENV is a secret to th
         .stdout = &.{.{ "./mint-token", "::add-mask::" ++ minted ++ "\n" }},
     };
     _ = try roundTrips(arena, &auto, .{ .step_cache = true, .test_ran_marker = "j1" }, testJob(&steps));
-    try expectSecretOnlyInSetSecret(&auto, minted);
+    try expectSecretOnlyInSetSecret(auto.seen.items, minted);
     const deploy = try execOf(&auto, "./deploy.sh");
     try std.testing.expect(std.mem.indexOf(u8, deploy, "withSecretVariable(name:\"TOKEN\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, deploy, "runs this step every time: it uses " ++
@@ -4171,7 +4158,7 @@ test "a secret variable set again through GITHUB_ENV as a plain value loses its 
     }};
     var auto: AutoSession = .{ .arena = arena, .files = &files };
     _ = try roundTrips(arena, &auto, .{}, job);
-    try expectSecretOnlyInSetSecret(&auto, secret);
+    try expectSecretOnlyInSetSecret(auto.seen.items, secret);
     const use = try execOf(&auto, "./use-token");
     try std.testing.expect(std.mem.indexOf(u8, use, "withoutSecretVariable(name:\"TOKEN\") " ++
         "{ withEnvVariable(name:\"TOKEN\",value:\"anonymous\")") != null);
@@ -4196,9 +4183,9 @@ test "a script with a secret written in reaches its file as a mounted Dagger sec
             .step_user = user,
             .test_ran_marker = "j1",
         }, job);
-        try expectSecretOnlyInSetSecret(&auto, secret);
+        try expectSecretOnlyInSetSecret(auto.seen.items, secret);
         // The script is nowhere but in its own `setSecret`.
-        try expectSecretOnlyInSetSecret(&auto, "curl -H 'Authorization: Bearer ");
+        try expectSecretOnlyInSetSecret(auto.seen.items, "curl -H 'Authorization: Bearer ");
         const deploy = try execOf(&auto, "begin 1");
         // Where the command would have written it, readable by the step's user, and gone again
         // with the step's secrets; the shell runs that file as before.
@@ -4242,7 +4229,7 @@ test "a secret in a service's env reaches the service as a Dagger secret" {
     }};
     var auto: AutoSession = .{ .arena = arena };
     _ = try roundTrips(arena, &auto, .{}, job);
-    try expectSecretOnlyInSetSecret(&auto, secret);
+    try expectSecretOnlyInSetSecret(auto.seen.items, secret);
     // In the query that starts the service.
     try std.testing.expectEqual(@as(usize, 1), auto.count("withSecretVariable(name:" ++
         "\"POSTGRES_PASSWORD\",secret:\"ID"));
@@ -4267,7 +4254,7 @@ test "a Docker action's argument holding a secret reaches its command as a Dagge
     job.secrets = &.{secret};
     var auto: AutoSession = .{ .arena = arena };
     _ = try roundTrips(arena, &auto, .{ .step_cache = true, .test_ran_marker = "j1" }, job);
-    try expectSecretOnlyInSetSecret(&auto, secret);
+    try expectSecretOnlyInSetSecret(auto.seen.items, secret);
     const run_doc = try execOf(&auto, "/github/_runtime/busybox");
     // The argument is expanded from an alias as the one word it was, between the others; the
     // alias is attached, after the env's own secrets, and hidden from the command.
