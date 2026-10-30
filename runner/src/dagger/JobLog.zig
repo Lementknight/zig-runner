@@ -1,6 +1,6 @@
 //! Shared between the main task (which runs queries) and the reader task (which streams logs).
 
-const Shared = @This();
+const JobLog = @This();
 
 const std = @import("std");
 const job_mod = @import("../job.zig");
@@ -8,7 +8,7 @@ const sink = @import("../sink.zig");
 const redact = @import("../redact.zig");
 const engine = @import("../engine.zig");
 const matcher = @import("../matcher.zig");
-/// commands.zig; not `commands`, which is a field of `Shared`.
+/// commands.zig; not `commands`, which is a field of `JobLog`.
 const commands_mod = @import("../commands.zig");
 const Annotation = @import("../dagger.zig").Annotation;
 const marker = @import("../dagger.zig").marker;
@@ -85,20 +85,20 @@ pub const StepCommands = struct {
 };
 
 /// A line from the runner itself; never read as a workflow command.
-pub fn append(sh: *Shared, step: u32, text: []const u8) void {
+pub fn append(sh: *JobLog, step: u32, text: []const u8) void {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     sh.appendLocked(step, text);
 }
 
-fn appendLocked(sh: *Shared, step: u32, text: []const u8) void {
+fn appendLocked(sh: *JobLog, step: u32, text: []const u8) void {
     sh.log.append(sh.sink_job_id, step, .stdout, text) catch {};
     if (step < sh.line_counts.len) sh.line_counts[step] += 1;
 }
 
 /// A line of a step's output: workflow commands (`::add-mask::`, `::group::`, ...) are carried
 /// out and logged the way GitHub shows them; anything else is logged as it is.
-fn stepOutput(sh: *Shared, step: u32, text: []const u8) void {
+fn stepOutput(sh: *JobLog, step: u32, text: []const u8) void {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     if (step == 0 or step > sh.commands.len) return sh.appendLocked(step, text);
@@ -161,14 +161,14 @@ fn stepOutput(sh: *Shared, step: u32, text: []const u8) void {
 
 /// An error of the runner's own (a failed exit code, a timeout): logged as `##[error]<msg>` and
 /// annotated, as GitHub's runner does.
-pub fn errorLine(sh: *Shared, step: u32, msg: []const u8) void {
+pub fn errorLine(sh: *JobLog, step: u32, msg: []const u8) void {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     defer sh.resetScratch();
     sh.errorLineLocked(step, msg);
 }
 
-fn errorLineLocked(sh: *Shared, step: u32, msg: []const u8) void {
+fn errorLineLocked(sh: *JobLog, step: u32, msg: []const u8) void {
     sh.appendScratch(step, "##[error]{s}", .{msg});
     sh.annotateLocked(step, .{ .level = "error", .message = msg });
 }
@@ -177,24 +177,24 @@ fn errorLineLocked(sh: *Shared, step: u32, msg: []const u8) void {
 /// `resetScratch` before letting go of `mu`. Built on the job's arena, which it returns memory
 /// to only when a line needs more than any line before it, so it settles at the largest line's
 /// needs.
-fn scratchAllocator(sh: *Shared) Allocator {
+fn scratchAllocator(sh: *JobLog) Allocator {
     if (sh.scratch == null) sh.scratch = .init(sh.arena);
     return sh.scratch.?.allocator();
 }
 
-fn resetScratch(sh: *Shared) void {
+fn resetScratch(sh: *JobLog) void {
     if (sh.scratch) |*s| _ = s.reset(.retain_capacity);
 }
 
 /// `appendFmt`, formatted in the scratch arena: for the log path, where `appendFmt` would keep
 /// every formatted line in the job's arena.
-fn appendScratch(sh: *Shared, step: u32, comptime fmt: []const u8, args: anytype) void {
+fn appendScratch(sh: *JobLog, step: u32, comptime fmt: []const u8, args: anytype) void {
     const text = std.fmt.allocPrint(sh.scratchAllocator(), fmt, args) catch return;
     sh.appendLocked(step, text);
 }
 
 /// An output or state value parsed from a line, copied into the job's arena.
-fn keepVar(sh: *Shared, kv: job_mod.EnvVar) ?job_mod.EnvVar {
+fn keepVar(sh: *JobLog, kv: job_mod.EnvVar) ?job_mod.EnvVar {
     return .{
         .name = sh.arena.dupe(u8, kv.name) catch return null,
         .value = sh.arena.dupe(u8, kv.value) catch return null,
@@ -202,7 +202,7 @@ fn keepVar(sh: *Shared, kv: job_mod.EnvVar) ?job_mod.EnvVar {
 }
 
 /// The matcher files steps have asked for, emptied. Called off the log path.
-pub fn takePendingMatchers(sh: *Shared) []const []const u8 {
+pub fn takePendingMatchers(sh: *JobLog) []const []const u8 {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     const out = sh.pending_matchers.items;
@@ -210,7 +210,7 @@ pub fn takePendingMatchers(sh: *Shared) []const []const u8 {
     return out;
 }
 
-pub fn addMatchers(sh: *Shared, matchers: []const matcher.Matcher) void {
+pub fn addMatchers(sh: *JobLog, matchers: []const matcher.Matcher) void {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     sh.matchers.add(sh.arena, matchers) catch {};
@@ -224,7 +224,7 @@ pub fn addMatchers(sh: *Shared, matchers: []const matcher.Matcher) void {
 /// line in `matchLocked` is, and that one has evidence. This was found while looking for the
 /// crash and fixed on its own merits. The distinction is kept because the alternative is a
 /// reader concluding the crash is accounted for by a lock they can see.
-pub fn warnUnlocked(sh: *Shared, step: u32, text: []const u8) void {
+pub fn warnUnlocked(sh: *JobLog, step: u32, text: []const u8) void {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     sh.appendLocked(step, text);
@@ -233,7 +233,7 @@ pub fn warnUnlocked(sh: *Shared, step: u32, text: []const u8) void {
 /// Offers a line to the problem matchers and annotates whatever they complete. Called with `mu`
 /// held, straight after the line was logged, so `annotateLocked` can point an annotation
 /// without a file at the line it came from.
-fn matchLocked(sh: *Shared, step: u32, text: []const u8) void {
+fn matchLocked(sh: *JobLog, step: u32, text: []const u8) void {
     if (sh.matchers.count() == 0) return;
     // **The line must be duplicated first.** Everything a match captures is a slice of it, and
     // a direct session's line lives only as long as its log record — the same reason the
@@ -263,7 +263,7 @@ fn matchLocked(sh: *Shared, step: u32, text: []const u8) void {
 /// Keeps an annotation for completejob. Like GitHub's runner, at most `max_annotations` of each
 /// level per step (the rest are only logged), and a file in the workspace is named from its
 /// root.
-fn annotateLocked(sh: *Shared, step: u32, an: commands_mod.Annotation) void {
+fn annotateLocked(sh: *JobLog, step: u32, an: commands_mod.Annotation) void {
     var same: usize = 0;
     for (sh.annotations.items) |a| {
         if (a.step == step and std.mem.eql(u8, a.an.level, an.level)) same += 1;
@@ -297,7 +297,7 @@ fn annotateLocked(sh: *Shared, step: u32, an: commands_mod.Annotation) void {
     sh.annotations.append(sh.arena, .{ .step = step, .an = copy }) catch {};
 }
 
-pub fn appendFmt(sh: *Shared, step: u32, comptime fmt: []const u8, args: anytype) void {
+pub fn appendFmt(sh: *JobLog, step: u32, comptime fmt: []const u8, args: anytype) void {
     const text = std.fmt.allocPrint(sh.arena, fmt, args) catch return;
     sh.appendLocked(step, text);
 }
@@ -307,7 +307,7 @@ pub fn appendFmt(sh: *Shared, step: u32, comptime fmt: []const u8, args: anytype
 /// The set keeps them longest first, so a secret that begins with another is masked whole. It
 /// starts from the log's secrets (the job's), copied once; before it, each mask copied and
 /// sorted the whole list again, which made 20000 masks cost 5.8 GB.
-fn addMask(sh: *Shared, value: []const u8) void {
+fn addMask(sh: *JobLog, value: []const u8) void {
     const set = sh.masks orelse set: {
         const set = sh.arena.create(redact.Set) catch return;
         set.* = .{};
@@ -328,14 +328,14 @@ fn dupeOpt(a: Allocator, s: ?[]const u8) Allocator.Error!?[]const u8 {
 
 /// `text` with the job's secrets and masks so far replaced, for what leaves the runner other
 /// than through the log (a step's evaluated name, a job output).
-pub fn redacted(sh: *Shared, arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
+pub fn redacted(sh: *JobLog, arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     return redact.alloc(arena, text, sh.log.currentSecrets());
 }
 
 /// Whether `text` holds one of the job's secrets or masks.
-pub fn holdsSecret(sh: *Shared, text: []const u8) bool {
+pub fn holdsSecret(sh: *JobLog, text: []const u8) bool {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     for (sh.log.currentSecrets()) |s| {
@@ -345,7 +345,7 @@ pub fn holdsSecret(sh: *Shared, text: []const u8) bool {
 }
 
 /// State a step saved with the deprecated `::save-state`, since the last call.
-pub fn takeState(sh: *Shared, step: u32) []const job_mod.EnvVar {
+pub fn takeState(sh: *JobLog, step: u32) []const job_mod.EnvVar {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     if (step == 0 or step > sh.commands.len) return &.{};
@@ -356,7 +356,7 @@ pub fn takeState(sh: *Shared, step: u32) []const job_mod.EnvVar {
 }
 
 /// Outputs a step set with the deprecated `::set-output`, since the last call.
-pub fn takeOutputs(sh: *Shared, step: u32) []const job_mod.EnvVar {
+pub fn takeOutputs(sh: *JobLog, step: u32) []const job_mod.EnvVar {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     if (step == 0 or step > sh.commands.len) return &.{};
@@ -366,7 +366,7 @@ pub fn takeOutputs(sh: *Shared, step: u32) []const job_mod.EnvVar {
     return out;
 }
 
-pub fn flush(sh: *Shared) void {
+pub fn flush(sh: *JobLog) void {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     sh.log.flush() catch {};
@@ -382,14 +382,14 @@ pub fn flush(sh: *Shared) void {
 /// once made the log sink grow an array to that many entries, about 32 GB (#59). A service's
 /// marker carries no secret (a service is not a step and is not given one); it counts only
 /// before any step's marker in its span, which is where a service prints it.
-fn isOwn(sh: *Shared, sc: Scan, in_step: ?u32) bool {
+fn isOwn(sh: *JobLog, sc: Scan, in_step: ?u32) bool {
     return switch (sc.marker) {
         .begin, .end => |n| n >= 1 and n <= sh.ended.len and std.mem.eql(u8, sc.mark, sh.mark),
         .service => |n| in_step == null and n < sh.service_logs.len,
     };
 }
 
-fn emitLive(sh: *Shared, step: u32, text: []const u8) void {
+fn emitLive(sh: *JobLog, step: u32, text: []const u8) void {
     if (step >= 1 and step <= sh.live_lines.len)
         _ = sh.live_lines[step - 1].fetchAdd(1, .monotonic);
     for (bun_load_errors) |e| if (std.mem.indexOf(u8, text, e) != null)
@@ -399,7 +399,7 @@ fn emitLive(sh: *Shared, step: u32, text: []const u8) void {
 }
 
 /// True if this live line was already logged by a replay (the stream was just late).
-fn swallowIfReplayed(sh: *Shared, step: u32, text: []const u8) bool {
+fn swallowIfReplayed(sh: *JobLog, step: u32, text: []const u8) bool {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     if (sh.replayed.count() == 0) return false;
@@ -411,7 +411,7 @@ fn swallowIfReplayed(sh: *Shared, step: u32, text: []const u8) bool {
 }
 
 /// Logs a line taken from a query result and remembers it so a late live copy is dropped.
-fn replay(sh: *Shared, step: u32, text: []const u8) void {
+fn replay(sh: *JobLog, step: u32, text: []const u8) void {
     {
         sh.mu.lockUncancelable(sh.io);
         defer sh.mu.unlock(sh.io);
@@ -427,7 +427,7 @@ fn replay(sh: *Shared, step: u32, text: []const u8) void {
 }
 
 /// Service `n`'s output so far, and a note when lines were left out.
-pub fn takeServiceLog(sh: *Shared, n: usize) []const []const u8 {
+pub fn takeServiceLog(sh: *JobLog, n: usize) []const []const u8 {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     if (n >= sh.service_logs.len) return &.{};
@@ -442,7 +442,7 @@ pub fn takeServiceLog(sh: *Shared, n: usize) []const []const u8 {
     return sh.service_logs[n].items;
 }
 
-fn serviceLine(sh: *Shared, n: u32, line: []const u8) void {
+fn serviceLine(sh: *JobLog, n: u32, line: []const u8) void {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     if (n >= sh.service_logs.len) return;
@@ -453,7 +453,7 @@ fn serviceLine(sh: *Shared, n: u32, line: []const u8) void {
     sh.service_logs[n].append(sh.arena, sh.arena.dupe(u8, line) catch return) catch {};
 }
 
-fn noise(sh: *Shared, line: []const u8) void {
+fn noise(sh: *JobLog, line: []const u8) void {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     if (sh.tail_len == sh.tail.len) {
@@ -495,7 +495,7 @@ pub const Scan = struct {
 
 /// Finds a marker at the end of `line` (`<marker><kind> <n>[ <mark>]`). Returns null for ordinary
 /// output. Whether it is the runner's own, and not text a step printed, is for the caller to say
-/// (`Shared.isOwn`, `replayRecorded`): any step can print this text.
+/// (`JobLog.isOwn`, `replayRecorded`): any step can print this text.
 ///
 /// The last occurrence counts: the runner's markers are echoed on a line of their own, so one that
 /// shares a line follows a step's output without a trailing newline — output that may itself
@@ -535,7 +535,7 @@ fn headerStep(line: []const u8) ?u32 {
 
 /// Splits Dagger's log stream into per-step output.
 const Demux = struct {
-    sh: *Shared,
+    sh: *JobLog,
     span_step: ?u32 = null,
 
     fn feed(d: *Demux, line: []const u8) void {
@@ -568,7 +568,7 @@ const Demux = struct {
     }
 };
 
-pub fn readLogs(io: std.Io, sh: *Shared, file: std.Io.File) void {
+pub fn readLogs(io: std.Io, sh: *JobLog, file: std.Io.File) void {
     var demux: Demux = .{ .sh = sh };
     var rbuf: [64 * 1024]u8 = undefined;
     var fr = file.readerStreaming(io, &rbuf);
@@ -591,7 +591,7 @@ pub fn readLogs(io: std.Io, sh: *Shared, file: std.Io.File) void {
 /// already logged, such as a `stdout` field's value) are skipped, as in Dagger's own progress
 /// output.
 pub const SpanDemux = struct {
-    sh: *Shared,
+    sh: *JobLog,
     gpa: Allocator,
     mu: std.Io.Mutex = .init,
     spans: std.StringHashMapUnmanaged(Span) = .empty,
@@ -697,7 +697,7 @@ const live_grace_ms = 60;
 /// counts as cached if neither its lines nor its end marker arrived in time.
 pub fn awaitLiveOrReplay(
     io: std.Io,
-    sh: *Shared,
+    sh: *JobLog,
     step: u32,
     stdout: []const u8,
     stderr: []const u8,
@@ -708,7 +708,7 @@ pub fn awaitLiveOrReplay(
 }
 
 /// Whether any of the step's lines arrived live, given a moment to.
-pub fn awaitLive(io: std.Io, sh: *Shared, step: u32) bool {
+pub fn awaitLive(io: std.Io, sh: *JobLog, step: u32) bool {
     const idx = step - 1;
     var waited: u32 = 0;
     while (waited < live_grace_ms and !sh.ended[idx].load(.acquire)) : (waited += 10) {
@@ -719,12 +719,12 @@ pub fn awaitLive(io: std.Io, sh: *Shared, step: u32) bool {
 
 /// Whether a step none of whose lines arrived live was served from the cache: its marker says it
 /// did not run in this job, or, without one, its end marker never arrived either.
-pub fn servedFromCache(sh: *Shared, step: u32, ran: ?bool) bool {
+pub fn servedFromCache(sh: *JobLog, step: u32, ran: ?bool) bool {
     return if (ran) |r| !r else !sh.ended[step - 1].load(.acquire);
 }
 
 /// The rest of `awaitLiveOrReplay`, once none of the step's lines arrived live.
-pub fn replayNotLive(sh: *Shared, step: u32, stdout: []const u8, stderr: []const u8, ran: ?bool) bool {
+pub fn replayNotLive(sh: *JobLog, step: u32, stdout: []const u8, stderr: []const u8, ran: ?bool) bool {
     const idx = step - 1;
     // The step ran (its end marker arrived) but none of its lines did. Before a step's stderr went
     // to its stdout (`stream_prologue`), a program's stderr could arrive after the marker when it
@@ -743,7 +743,7 @@ pub fn replayNotLive(sh: *Shared, step: u32, stdout: []const u8, stderr: []const
 
 /// Logs an exec's recorded output as step `step`'s, as the live log showed it when it ran: every
 /// line in order, blank ones included, each through the same workflow-command processing
-/// (`Shared.stepOutput`), so masks, stopped commands, `::set-output` and problem matchers come out
+/// (`JobLog.stepOutput`), so masks, stopped commands, `::set-output` and problem matchers come out
 /// as they did (issue #71).
 ///
 /// The recorded stdout is the script's whole output, stderr included (`stream_prologue`), so its
@@ -753,8 +753,8 @@ pub fn replayNotLive(sh: *Shared, step: u32, stdout: []const u8, stderr: []const
 /// carries the secret of the job that ran the exec, which for a replayed exec is an earlier job's
 /// (`mark_env`). That one is learnt from the `begin` marker on the first line, printed before any
 /// of the step's output. Any other marker text is the step's output, as it was live
-/// (`Shared.isOwn`); recorded output without a `begin` marker first is all output.
-fn replayRecorded(sh: *Shared, step: u32, stdout: []const u8, stderr: []const u8) void {
+/// (`JobLog.isOwn`); recorded output without a `begin` marker first is all output.
+fn replayRecorded(sh: *JobLog, step: u32, stdout: []const u8, stderr: []const u8) void {
     var mark: ?[]const u8 = null;
     var first = true;
     for ([_][]const u8{ stdout, stderr }) |text| {
@@ -787,7 +787,7 @@ pub const reused_note = "Reused from Dagger's cache: this step's inputs were unc
 /// did run, and its lines then arrive (and are dropped as duplicates) after the replay. Only a step
 /// none of whose live lines ever arrived was reused. The note goes to that step's own log, after
 /// its output.
-pub fn noteReusedSteps(sh: *Shared) void {
+pub fn noteReusedSteps(sh: *JobLog) void {
     for (sh.replayed_steps, 0..) |replayed, idx| {
         if (!replayed or sh.live_lines[idx].load(.monotonic) > 0 or sh.ended[idx].load(.acquire))
             continue;
@@ -795,17 +795,17 @@ pub fn noteReusedSteps(sh: *Shared) void {
     }
 }
 
-/// A one-step job's `Shared` for the log path's memory tests, logging to a sink that discards.
+/// A one-step job's `JobLog` for the log path's memory tests, logging to a sink that discards.
 const LogPathFixture = struct {
     disc: std.Io.Writer.Discarding,
     log: sink.LogSink,
     live: [1]std.atomic.Value(u32) = .{.init(0)},
     ended: [1]std.atomic.Value(bool) = .{.init(false)},
     replayed: [1]bool = .{false},
-    cmds: [1]Shared.StepCommands = .{.{}},
+    cmds: [1]JobLog.StepCommands = .{.{}},
     line_counts: [2]u32 = .{ 0, 0 },
     buf: [256]u8 = undefined,
-    sh: Shared,
+    sh: JobLog,
 
     /// In place: the log and `sh` point into the fixture.
     fn init(f: *LogPathFixture, arena: Allocator) void {
@@ -864,7 +864,7 @@ test "a live line that arrives after its step was replayed is dropped, not logge
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
     const live = [_]std.atomic.Value(u32){.init(0)};
     const ended = [_]std.atomic.Value(bool){.init(false)};
-    var sh: Shared = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = @constCast(&live), .ended = @constCast(&ended) };
+    var sh: JobLog = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = @constCast(&live), .ended = @constCast(&ended) };
     sh.replay(1, "hello"); // the step looked cached
     sh.emitLive(1, "hello"); // ...but its live copy arrives late
     sh.emitLive(1, "hello"); // a genuine second line with the same text is kept
@@ -881,7 +881,7 @@ test "a marker a step prints itself, naming no step of the job, is output, not a
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
     const live = [_]std.atomic.Value(u32){.init(0)};
     const ended = [_]std.atomic.Value(bool){.init(false)};
-    var sh: Shared = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = @constCast(&live), .ended = @constCast(&ended) };
+    var sh: JobLog = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = @constCast(&live), .ended = @constCast(&ended) };
     var d: Demux = .{ .sh = &sh };
     d.feed(marker ++ "begin 1");
     d.feed(marker ++ "begin 4000000000"); // printed by the step
@@ -901,7 +901,7 @@ test "output with no newline is cut into lines of max_line_bytes, not held whole
     // No step is open, so the lines are noise: kept in `tail`, not logged.
     var live = [_]std.atomic.Value(u32){.init(0)};
     var ended = [_]std.atomic.Value(bool){.init(false)};
-    var sh: Shared = .{
+    var sh: JobLog = .{
         .io = std.testing.io,
         .arena = a.allocator(),
         .log = &log,
@@ -932,8 +932,8 @@ test "a marker a step prints for another step of the job is output, not a marker
     var live = [_]std.atomic.Value(u32){ .init(0), .init(0), .init(0) };
     var ended = [_]std.atomic.Value(bool){ .init(false), .init(false), .init(false) };
     var replayed = [_]bool{ false, false, false };
-    var cmds = [_]Shared.StepCommands{ .{}, .{}, .{} };
-    var sh: Shared = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = &live, .ended = &ended, .replayed_steps = &replayed, .commands = &cmds, .mark = "s3cr3t" };
+    var cmds = [_]JobLog.StepCommands{ .{}, .{}, .{} };
+    var sh: JobLog = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = &live, .ended = &ended, .replayed_steps = &replayed, .commands = &cmds, .mark = "s3cr3t" };
     for ([_]bool{ false, true }) |direct| {
         // Step 1 prints step 3's markers, in the old form and with a guessed secret.
         const lines = [_][]const u8{
@@ -981,7 +981,7 @@ test "a step is noted as reused only if none of its live lines ever arrived" {
     var live = [_]std.atomic.Value(u32){ .init(0), .init(1), .init(0) };
     var ended = [_]std.atomic.Value(bool){ .init(false), .init(false), .init(false) };
     var replayed = [_]bool{ true, true, false };
-    var sh: Shared = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = &live, .ended = &ended, .replayed_steps = &replayed };
+    var sh: JobLog = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = &live, .ended = &ended, .replayed_steps = &replayed };
     // Step 1 was replayed and no live line came: cached. Step 2 was replayed but its (late) live
     // lines arrived: it ran. Step 3 streamed live.
     noteReusedSteps(&sh);
@@ -999,7 +999,7 @@ test "Bun refusing a program is seen in the step's live lines" {
     defer a.deinit();
     var live = [_]std.atomic.Value(u32){ .init(0), .init(0) };
     var ended = [_]std.atomic.Value(bool){ .init(false), .init(false) };
-    var sh: Shared = .{
+    var sh: JobLog = .{
         .io = std.testing.io,
         .arena = a.allocator(),
         .log = &log,
@@ -1023,7 +1023,7 @@ test "a step that ran but streamed no lines shows its result's output, not as re
     // Step 1 ended live (its end marker arrived); step 2 did not: it was cached.
     var ended = [_]std.atomic.Value(bool){ .init(true), .init(false) };
     var replayed = [_]bool{ false, false };
-    var sh: Shared = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = &live, .ended = &ended, .replayed_steps = &replayed };
+    var sh: JobLog = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = &live, .ended = &ended, .replayed_steps = &replayed };
     try std.testing.expect(!awaitLiveOrReplay(std.testing.io, &sh, 1, "", "error: Cannot use import statement\n", null));
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "[job 0 step 1 stdout] error: Cannot use import statement") != null);
     try std.testing.expect(!replayed[0]);

@@ -40,15 +40,15 @@ const baseContainerId = @import("dagger/set_up.zig").baseContainerId;
 const execFor = @import("dagger/set_up.zig").execFor;
 const setUpJob = @import("dagger/set_up.zig").setUpJob;
 const package_cache_dirs = @import("dagger/set_up.zig").package_cache_dirs;
-const Shared = @import("dagger/Shared.zig");
-pub const Marker = @import("dagger/Shared.zig").Marker;
-pub const Scan = @import("dagger/Shared.zig").Scan;
-pub const scan = @import("dagger/Shared.zig").scan;
-const readLogs = @import("dagger/Shared.zig").readLogs;
-const SpanDemux = @import("dagger/Shared.zig").SpanDemux;
-const awaitLiveOrReplay = @import("dagger/Shared.zig").awaitLiveOrReplay;
-pub const reused_note = @import("dagger/Shared.zig").reused_note;
-const noteReusedSteps = @import("dagger/Shared.zig").noteReusedSteps;
+const JobLog = @import("dagger/JobLog.zig");
+pub const Marker = @import("dagger/JobLog.zig").Marker;
+pub const Scan = @import("dagger/JobLog.zig").Scan;
+pub const scan = @import("dagger/JobLog.zig").scan;
+const readLogs = @import("dagger/JobLog.zig").readLogs;
+const SpanDemux = @import("dagger/JobLog.zig").SpanDemux;
+const awaitLiveOrReplay = @import("dagger/JobLog.zig").awaitLiveOrReplay;
+pub const reused_note = @import("dagger/JobLog.zig").reused_note;
+const noteReusedSteps = @import("dagger/JobLog.zig").noteReusedSteps;
 const Evaluator = @import("dagger/Evaluator.zig");
 const StepCtx = @import("dagger/Evaluator.zig").StepCtx;
 pub const checkoutQuery = @import("dagger/checkout.zig").checkoutQuery;
@@ -713,7 +713,7 @@ pub fn run(
 
     const results = try arena.alloc(StepResult, job.steps.len);
     @memset(results, .{});
-    var sh = try sharedFor(arena, io, opts, job, log);
+    var sh = try jobLogFor(arena, io, opts, job, log);
 
     if (opts.engine) |ep|
         if (opts.test_transport == null) return runDirect(arena, io, opts, job, &sh, results, ep);
@@ -758,13 +758,13 @@ pub fn run(
 /// What every task of a job shares: the log, and one slot per log step — the job's steps, then
 /// their `pre` and `post` scripts (see `ExtraStep`) — for live lines, endings, commands, replays
 /// and counts, plus a buffer per service for its output.
-fn sharedFor(
+fn jobLogFor(
     arena: Allocator,
     io: std.Io,
     opts: Options,
     job: job_mod.Job,
     log: *sink.LogSink,
-) !Shared {
+) !JobLog {
     const n = logSteps(job.steps.len);
     const live = try arena.alloc(std.atomic.Value(u32), n);
     const ended = try arena.alloc(std.atomic.Value(bool), n);
@@ -774,7 +774,7 @@ fn sharedFor(
     }
     const replayed_steps = try arena.alloc(bool, n);
     @memset(replayed_steps, false);
-    const step_commands = try arena.alloc(Shared.StepCommands, n);
+    const step_commands = try arena.alloc(JobLog.StepCommands, n);
     @memset(step_commands, .{});
     const line_counts = try arena.alloc(u32, n);
     @memset(line_counts, 0);
@@ -814,7 +814,7 @@ fn sessionTransport(
     arena: Allocator,
     io: std.Io,
     child: *std.process.Child,
-    sh: *Shared,
+    sh: *JobLog,
     results: []StepResult,
 ) !SessionStart {
     var first: [512]u8 = undefined;
@@ -843,7 +843,7 @@ fn runDirect(
     io: std.Io,
     opts: Options,
     job: job_mod.Job,
-    sh: *Shared,
+    sh: *JobLog,
     results: []StepResult,
     ep: engine.Endpoint,
 ) !Result {
@@ -1008,7 +1008,7 @@ const checkout_defaults = [_][2][]const u8{
 /// log).
 fn logRunHeader(
     arena: Allocator,
-    sh: *Shared,
+    sh: *JobLog,
     num: u32,
     script: []const u8,
     shell: ?[]const u8,
@@ -1029,7 +1029,7 @@ fn logRunHeader(
 }
 
 /// What GitHub's runner logs when a script exits non-zero.
-pub fn logExitCode(sh: *Shared, num: u32, code: i32) void {
+pub fn logExitCode(sh: *JobLog, num: u32, code: i32) void {
     sh.errorLine(
         num,
         std.fmt.allocPrint(sh.arena, "Process completed with exit code {d}.", .{code}) catch return,
@@ -1495,7 +1495,7 @@ fn runSteps(
     io: std.Io,
     opts: Options,
     job: job_mod.Job,
-    sh: *Shared,
+    sh: *JobLog,
     results: []StepResult,
     transport: Transport,
 ) !Result {
@@ -1554,7 +1554,7 @@ fn runSteps(
 }
 
 /// The job, failed at "Initialize containers": every step not run, the service steps shown.
-fn servicesFailed(x: *Exec, arena: Allocator, sh: *Shared, results: []StepResult) !Result {
+fn servicesFailed(x: *Exec, arena: Allocator, sh: *JobLog, results: []StepResult) !Result {
     var failed = try finish(arena, sh, results, "");
     failed.succeeded = false;
     failed.engine_error = null;
@@ -1568,7 +1568,7 @@ fn servicesFailed(x: *Exec, arena: Allocator, sh: *Shared, results: []StepResult
 fn runPres(
     x: *Exec,
     arena: Allocator,
-    sh: *Shared,
+    sh: *JobLog,
     results: []StepResult,
     job: job_mod.Job,
 ) !?Result {
@@ -1620,7 +1620,7 @@ fn finishJob(x: *Exec, opts: Options, results: []StepResult) !Result {
 /// contexts (the steps' outputs and outcomes), each output a string. One that would carry a secret
 /// is dropped with GitHub's warning (later jobs could read it); one that cannot be evaluated is
 /// dropped with the reason.
-fn jobOutputs(arena: Allocator, ev: *Evaluator, sh: *Shared, job: job_mod.Job, result: *Result) !void {
+fn jobOutputs(arena: Allocator, ev: *Evaluator, sh: *JobLog, job: job_mod.Job, result: *Result) !void {
     if (job.outputs.len == 0) return;
     var outs: std.ArrayList(job_mod.EnvVar) = .empty;
     var lines: std.ArrayList([]const u8) = .empty;
@@ -1805,7 +1805,7 @@ pub fn firstLine(s: []const u8) []const u8 {
 /// out step failed (continue-on-error applies); a cancelled one is `cancelled`, and so is the job.
 fn stepInterrupted(
     ev: *Evaluator,
-    sh: *Shared,
+    sh: *JobLog,
     observer: ?Observer,
     step: job_mod.Step,
     res: *StepResult,
@@ -1860,7 +1860,7 @@ fn engineFailed(
 /// Logs why a step could not run and marks it failed (the job too, unless continue-on-error).
 fn failStep(
     ev: *Evaluator,
-    sh: *Shared,
+    sh: *JobLog,
     observer: ?Observer,
     step: job_mod.Step,
     res: *StepResult,
@@ -1876,12 +1876,12 @@ fn failStep(
     if (observer) |o| o.finished(num, res.*);
 }
 
-fn fail(sh: *Shared, results: []StepResult, msg: []const u8) !Result {
+fn fail(sh: *JobLog, results: []StepResult, msg: []const u8) !Result {
     sh.flush();
     return .{ .steps = results, .engine_error = msg, .succeeded = false };
 }
 
-pub fn finish(arena: Allocator, sh: *Shared, results: []StepResult, engine_msg: []const u8) !Result {
+pub fn finish(arena: Allocator, sh: *JobLog, results: []StepResult, engine_msg: []const u8) !Result {
     sh.flush();
     var any_failed = false;
     var any_not_run = false;
@@ -2406,9 +2406,9 @@ test "a replay logs what the live run logged: one stream, in order, blank lines 
             var live = [_]std.atomic.Value(u32){ .init(0), .init(0) };
             var ended = [_]std.atomic.Value(bool){ .init(false), .init(false) };
             var replayed = [_]bool{ false, false };
-            var cmds = [_]Shared.StepCommands{ .{}, .{} };
+            var cmds = [_]JobLog.StepCommands{ .{}, .{} };
             var line_counts = [_]u32{ 0, 0, 0 };
-            var sh: Shared = .{ .io = std.testing.io, .arena = arena, .log = &log, .sink_job_id = 0, .live_lines = &live, .ended = &ended, .replayed_steps = &replayed, .commands = &cmds, .line_counts = &line_counts, .mark = "this-job" };
+            var sh: JobLog = .{ .io = std.testing.io, .arena = arena, .log = &log, .sink_job_id = 0, .live_lines = &live, .ended = &ended, .replayed_steps = &replayed, .commands = &cmds, .line_counts = &line_counts, .mark = "this-job" };
             const begin = try std.fmt.allocPrint(arena, marker ++ "begin 1 {s}", .{mark});
             const end = try std.fmt.allocPrint(arena, "{s}" ++ marker ++ "end 1 {s}", .{ tail, mark });
             if (replay) {

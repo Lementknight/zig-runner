@@ -214,7 +214,7 @@ pub const Set = struct {
     };
 
     /// The allocator is a parameter rather than a field so that a `Set` has a safe default: it
-    /// lives inside the job's `Shared`, which several call sites build field by field, and an
+    /// lives inside the job's `JobLog`, which several call sites build field by field, and an
     /// `undefined` allocator there would be a landmine for whichever of them never adds a matcher.
     ///
     /// Adds every matcher in a file. An owner already present is replaced, as GitHub does, so an

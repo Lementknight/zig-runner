@@ -103,7 +103,7 @@ pub fn stepScriptFc(
 ///
 /// What it costs: a step's programs see one pipe for both, where GitHub's runner gives two and
 /// merges them as it reads them. Nothing in this runner tells the streams apart for a step: its
-/// lines are all logged alike (`Shared.appendLocked`), GitHub's log has no stream either, and
+/// lines are all logged alike (`JobLog.appendLocked`), GitHub's log has no stream either, and
 /// workflow commands and problem matchers are read on both. The one place that read `stderr` alone
 /// (`bun_load_errors`) reads both. A program can still tell, by comparing its file descriptors,
 /// but none a workflow runs is known to care. Recording a second, ordered copy of the output (a
