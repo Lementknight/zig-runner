@@ -123,7 +123,7 @@ pub const Config = struct {
     /// cancels one: its step stopped, `if: always()` steps and post scripts still run, the job
     /// reported cancelled. The deploy agent restarts the runner on every release and expects jobs
     /// to finish, but a stop must not wait on a stuck one (#127). 0 cancels at once. The service's
-    /// `TimeoutStopSec` leaves room for this and the cancel (`loop.stop_cancel_ms`).
+    /// `TimeoutStopSec` leaves room for this and the cancel (`stop_cancel_ms` in loop/job.zig).
     stop_grace_secs: u32 = 600,
     /// Connect to the configured database, report what is there, and exit (no GitHub credentials
     /// needed).

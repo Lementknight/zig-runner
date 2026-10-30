@@ -95,7 +95,7 @@ pub fn complete(
     plan_id: []const u8,
     job_id: []const u8,
     conclusion: Conclusion,
-    /// JSON array of step results (see `loop.zig`).
+    /// JSON array of step results (see `upload.stepResultsJson`).
     step_results: []const u8,
     /// The job's outputs, read by later jobs as `needs.<job>.outputs.<name>`.
     outputs: []const EnvVar,
