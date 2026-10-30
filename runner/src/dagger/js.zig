@@ -41,9 +41,9 @@ const Allocator = std.mem.Allocator;
 /// JavaScript actions run with this binary, named `node` so that Bun behaves as Node. The shim on
 /// PATH answers `node --version`, which Bun named `node` does not handle, and runs the binary
 /// otherwise, so actions that start `node` themselves get the same runtime.
-const js_runtime_path = "/github/_runtime/node/node";
-const js_bin_dir = "/github/_runtime/bin";
-const js_shim_path = js_bin_dir ++ "/node";
+const runtime_path = "/github/_runtime/node/node";
+const bin_dir = "/github/_runtime/bin";
+const shim_path = bin_dir ++ "/node";
 const node_shim =
     \\#!/bin/sh
     \\case "$1" in -v|--version) exec /github/_runtime/node/node -p process.version ;; esac
@@ -54,7 +54,7 @@ const node_shim =
 /// `npx` for actions that run a package's binary (FirebaseExtended/action-hosting-deploy runs
 /// `npx firebase-tools@<version> ...`). With Bun it is `bun x`, whose progress goes to stderr, so a
 /// tool's stdout (often JSON the action parses) stays clean. Bun has no `npm`.
-const js_bun_path = "/github/_runtime/node/bun";
+const bun_path = "/github/_runtime/node/bun";
 const npx_bun_shim =
     \\#!/bin/sh
     \\case "$1" in -y|--yes) shift ;; esac
@@ -62,7 +62,7 @@ const npx_bun_shim =
     \\
 ;
 /// With Node, npm's own package (from the same image) provides `npx` and `npm`.
-const js_npm_dir = "/github/_runtime/npm";
+const npm_dir = "/github/_runtime/npm";
 const npx_node_shim =
     \\#!/bin/sh
     \\exec /github/_runtime/node/node /github/_runtime/npm/bin/npx-cli.js "$@"
@@ -76,7 +76,7 @@ const npm_node_shim =
 
 /// The ids of a JavaScript runtime's files in its image: the binary (`bin`), npm when the runtime
 /// ships it (`npm`), and on musl the C++ runtime it needs (`libs`).
-fn jsRuntimeQuery(arena: Allocator, rt: JsRuntimeSource, musl: bool) ![]const u8 {
+fn runtimeQuery(arena: Allocator, rt: RuntimeSource, musl: bool) ![]const u8 {
     var q: Query = .init(arena);
     try q.open("container");
     try q.call("from", .{ .address = rt.image });
@@ -98,8 +98,8 @@ fn jsRuntimeQuery(arena: Allocator, rt: JsRuntimeSource, musl: bool) ![]const u8
 }
 
 /// Runs the musl Node with its own C++ runtime first on the library path.
-const node_fallback_wrapper = "#!/bin/sh\nLD_LIBRARY_PATH=" ++ js_fallback_dir ++
-    "/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} exec " ++ js_fallback_dir ++ "/node-musl \"$@\"\n";
+const node_fallback_wrapper = "#!/bin/sh\nLD_LIBRARY_PATH=" ++ fallback_dir ++
+    "/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} exec " ++ fallback_dir ++ "/node-musl \"$@\"\n";
 
 fn fileMount(path: []const u8, id: []const u8) Mount {
     return .{ .file = .{ .path = path, .id = id, .permissions = 0o755 } };
@@ -109,13 +109,13 @@ fn newFileMount(path: []const u8, contents: []const u8) Mount {
     return .{ .new_file = .{ .path = path, .contents = contents, .permissions = 0o755 } };
 }
 
-const JsRuntimeSource = struct {
+const RuntimeSource = struct {
     image: []const u8,
     binary: []const u8,
     npm_dir: ?[]const u8 = null,
 };
 /// Bun is pinned to the version the repository's images use (see api/Dockerfile).
-const js_runtimes: std.EnumArray(config.JsRuntime, JsRuntimeSource) = .init(.{
+const runtimes: std.EnumArray(config.JsRuntime, RuntimeSource) = .init(.{
     .bun = .{ .image = "oven/bun:1.4.3", .binary = "/usr/local/bin/bun" },
     .node = .{
         .image = "node:24-bookworm-slim",
@@ -124,8 +124,8 @@ const js_runtimes: std.EnumArray(config.JsRuntime, JsRuntimeSource) = .init(.{
     },
 });
 /// For a musl job image (`container: alpine`): the runtimes' Alpine builds, which also need the
-/// C++ runtime from their image (mounted at `js_lib_dir`).
-const js_runtimes_musl: std.EnumArray(config.JsRuntime, JsRuntimeSource) = .init(.{
+/// C++ runtime from their image (mounted at `lib_dir`).
+const runtimes_musl: std.EnumArray(config.JsRuntime, RuntimeSource) = .init(.{
     .bun = .{ .image = "oven/bun:1.4.3-alpine", .binary = "/usr/local/bin/bun" },
     .node = .{
         .image = "node:24-alpine",
@@ -133,20 +133,20 @@ const js_runtimes_musl: std.EnumArray(config.JsRuntime, JsRuntimeSource) = .init
         .npm_dir = "/usr/local/lib/node_modules/npm",
     },
 });
-const js_lib_dir = "/github/_runtime/lib";
-const js_musl_dir = "/github/_runtime/musl";
+const lib_dir = "/github/_runtime/lib";
+const musl_dir = "/github/_runtime/musl";
 
 /// Node, for JavaScript actions Bun refuses to load when Bun is the runtime (see
 /// `bun_load_errors`).
-const js_fallback_dir = "/github/_runtime/fallback";
-const js_fallback_path = js_fallback_dir ++ "/node";
+const fallback_dir = "/github/_runtime/fallback";
+const fallback_path = fallback_dir ++ "/node";
 
-/// On musl, `js_runtime_path` (and `js_bun_path`) start the binary with its C++ runtime found.
+/// On musl, `runtime_path` (and `bun_path`) start the binary with its C++ runtime found.
 fn muslWrapper(arena: Allocator, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(
         arena,
-        "#!/bin/sh\nLD_LIBRARY_PATH=" ++ js_lib_dir ++ "${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}} " ++
-            "exec " ++ js_musl_dir ++ "/{s} \"$@\"\n",
+        "#!/bin/sh\nLD_LIBRARY_PATH=" ++ lib_dir ++ "${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}} " ++
+            "exec " ++ musl_dir ++ "/{s} \"$@\"\n",
         .{name},
     );
 }
@@ -227,7 +227,7 @@ pub fn runJsScript(
     if (phase == .main)
         try x.logGroup(num, phase, act.ref_label, shown, step_env, step_secret, &.{});
 
-    const script = try jsCommand(arena, js_runtime_path, act, script_rel);
+    const script = try command(arena, runtime_path, act, script_rel);
     const fc = x.next_fc;
     x.next_fc += 1;
     // What the first try starts from and uses up, should Node have to run it again.
@@ -252,25 +252,25 @@ pub fn runJsScript(
     try x.ev.pending_env.appendSlice(arena, pending_env);
     x.ev.pending_path.clearRetainingCapacity();
     try x.ev.pending_path.appendSlice(arena, pending_path);
-    const again = scriptRun(try jsCommand(arena, js_fallback_path, act, script_rel), env.plain);
+    const again = scriptRun(try command(arena, fallback_path, act, script_rel), env.plain);
     const fc_again = x.next_fc;
     x.next_fc += 1;
     const all_mounts = try std.mem.concat(arena, Mount, &.{ mounts.items, node_mounts });
     return try x.execScript(num, fc_again, again, name, env.secret, all_mounts);
 }
 
-/// The command that runs one of the action's scripts: the runtime at `runtime_path`, with the
+/// The command that runs one of the action's scripts: the runtime at `runtime`, with the
 /// shims on PATH, through bash where there is one — dash drops variables whose names are not
 /// identifiers (INPUT_GITHUB-TOKEN) when it starts a program; bash, and busybox's sh (Alpine
 /// images, which have no bash), pass them on.
-fn jsCommand(
+fn command(
     arena: Allocator,
-    runtime_path: []const u8,
+    runtime: []const u8,
     act: Loaded,
     script_rel: []const u8,
 ) ![]const u8 {
     var script: std.Io.Writer.Allocating = .init(arena);
-    try script.writer.print("PATH=\"" ++ js_bin_dir ++ ":$PATH\" exec {s} ", .{runtime_path});
+    try script.writer.print("PATH=\"" ++ bin_dir ++ ":$PATH\" exec {s} ", .{runtime});
     try shellQuote(
         &script.writer,
         try std.fmt.allocPrint(arena, "{s}/{s}", .{ act.path, script_rel }),
@@ -317,9 +317,9 @@ pub fn jsEnv(
 /// shims. False when the image could not be had: the step has been failed with the reason.
 pub fn appendJsRuntimeMounts(x: *Exec, num: u32, mounts: *std.ArrayList(Mount)) !bool {
     const arena = x.arena;
-    const rt = (if (x.musl) js_runtimes_musl else js_runtimes).get(x.js_runtime);
+    const rt = (if (x.musl) runtimes_musl else runtimes).get(x.js_runtime);
     var msg: []const u8 = "";
-    const data = gql(arena, x.transport, try jsRuntimeQuery(arena, rt, x.musl), &msg) catch {
+    const data = gql(arena, x.transport, try runtimeQuery(arena, rt, x.musl), &msg) catch {
         _ = try x.actionFailed(num, "could not get the JavaScript runtime from {s}: {s}", .{
             rt.image,
             msg,
@@ -337,43 +337,43 @@ pub fn appendJsRuntimeMounts(x: *Exec, num: u32, mounts: *std.ArrayList(Mount)) 
             _ = try x.actionFailed(num, "could not get the C++ runtime from {s}", .{rt.image});
             return false;
         };
-        try mounts.append(arena, .{ .dir = .{ .path = js_lib_dir, .id = libs_id } });
-        try mounts.append(arena, fileMount(js_musl_dir ++ "/node", bin));
-        try mounts.append(arena, newFileMount(js_runtime_path, try muslWrapper(arena, "node")));
-    } else try mounts.append(arena, fileMount(js_runtime_path, bin));
-    try mounts.append(arena, newFileMount(js_shim_path, node_shim));
+        try mounts.append(arena, .{ .dir = .{ .path = lib_dir, .id = libs_id } });
+        try mounts.append(arena, fileMount(musl_dir ++ "/node", bin));
+        try mounts.append(arena, newFileMount(runtime_path, try muslWrapper(arena, "node")));
+    } else try mounts.append(arena, fileMount(runtime_path, bin));
+    try mounts.append(arena, newFileMount(shim_path, node_shim));
     switch (x.js_runtime) {
         // The same binary named `bun` is Bun's own CLI, for `bun x`.
         .bun => {
             if (x.musl) {
-                try mounts.append(arena, fileMount(js_musl_dir ++ "/bun", bin));
+                try mounts.append(arena, fileMount(musl_dir ++ "/bun", bin));
                 const wrapper = try muslWrapper(arena, "bun");
-                try mounts.append(arena, newFileMount(js_bun_path, wrapper));
-            } else try mounts.append(arena, fileMount(js_bun_path, bin));
-            try mounts.append(arena, newFileMount(js_bin_dir ++ "/npx", npx_bun_shim));
+                try mounts.append(arena, newFileMount(bun_path, wrapper));
+            } else try mounts.append(arena, fileMount(bun_path, bin));
+            try mounts.append(arena, newFileMount(bin_dir ++ "/npx", npx_bun_shim));
         },
         .node => {
             const npm = idOf(data, "npm") orelse {
                 _ = try x.actionFailed(num, "could not get npm from {s}", .{rt.image});
                 return false;
             };
-            try mounts.append(arena, .{ .dir = .{ .path = js_npm_dir, .id = npm } });
-            try mounts.append(arena, newFileMount(js_bin_dir ++ "/npx", npx_node_shim));
-            try mounts.append(arena, newFileMount(js_bin_dir ++ "/npm", npm_node_shim));
+            try mounts.append(arena, .{ .dir = .{ .path = npm_dir, .id = npm } });
+            try mounts.append(arena, newFileMount(bin_dir ++ "/npx", npx_node_shim));
+            try mounts.append(arena, newFileMount(bin_dir ++ "/npm", npm_node_shim));
         },
     }
     return true;
 }
 
-/// Node at `js_fallback_path`, for an action Bun cannot load, from the same images as
+/// Node at `fallback_path`, for an action Bun cannot load, from the same images as
 /// `RUNNER_JS_RUNTIME=node` (with its own C++ runtime on musl). The mounts, once per job; null,
 /// with the step failed, when the image could not be had.
 pub fn nodeFallback(x: *Exec, num: u32) !?[]const Mount {
     if (x.node_fallback_mounted) return &.{};
     const arena = x.arena;
-    const rt = (if (x.musl) js_runtimes_musl else js_runtimes).get(.node);
+    const rt = (if (x.musl) runtimes_musl else runtimes).get(.node);
     var msg: []const u8 = "";
-    const data = gql(arena, x.transport, try jsRuntimeQuery(arena, rt, x.musl), &msg) catch {
+    const data = gql(arena, x.transport, try runtimeQuery(arena, rt, x.musl), &msg) catch {
         _ = try x.actionFailed(num, "could not get Node from {s}: {s}", .{ rt.image, msg });
         return null;
     };
@@ -389,16 +389,16 @@ pub fn nodeFallback(x: *Exec, num: u32) !?[]const Mount {
         };
         try mounts.append(
             arena,
-            .{ .dir = .{ .path = js_fallback_dir ++ "/lib", .id = libs_id } },
+            .{ .dir = .{ .path = fallback_dir ++ "/lib", .id = libs_id } },
         );
         try mounts.append(
             arena,
-            fileMount(js_fallback_dir ++ "/node-musl", bin),
+            fileMount(fallback_dir ++ "/node-musl", bin),
         );
-        try mounts.append(arena, newFileMount(js_fallback_path, node_fallback_wrapper));
+        try mounts.append(arena, newFileMount(fallback_path, node_fallback_wrapper));
     } else try mounts.append(
         arena,
-        fileMount(js_fallback_path, bin),
+        fileMount(fallback_path, bin),
     );
     x.node_fallback_mounted = true;
     return mounts.items;
