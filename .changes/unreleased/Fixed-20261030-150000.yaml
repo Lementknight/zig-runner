@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A step that logged more after it finished no longer risks GitHub showing only the lines it had logged by then: the job''s end uploaded its whole log while the shorter upload made as the step finished could still be running and land last (#167).'
+time: 2026-10-30T15:00:00.000000-04:00
