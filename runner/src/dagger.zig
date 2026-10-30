@@ -2335,6 +2335,33 @@ test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH
     try std.testing.expectEqual(Outcome.success, res.steps[3].outcome);
 }
 
+test "an output set twice keeps its last value, case-insensitively; GITHUB_OUTPUT beats set-output" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var first = testStep("x");
+    first.context_name = "p";
+    var after = testStep("");
+    after.action.script.script = .{ .expr = "format('echo v={0} legacy={1} both={2}', " ++
+        "steps.p.outputs.v, steps.p.outputs.LEGACY, steps.p.outputs.both)" };
+    const steps = [_]job_mod.Step{ first, after };
+    const legacy = "::set-output name=Legacy::old\\n::set-output name=legacy::new\\n" ++
+        "::set-output name=both::from-command\\n";
+    const answers = [_][]const u8{
+        base_answer,
+        try execFc(arena, "C1", legacy, "v=1\\nV=2\\nboth=from-file\\n", "", ""),
+        try exec(arena, "C2", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "echo v=2 legacy=new both=from-file") != null);
+}
+
 const Recorder = struct {
     events: std.ArrayList([]const u8) = .empty,
     arena: Allocator,
