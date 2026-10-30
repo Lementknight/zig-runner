@@ -3654,3 +3654,36 @@ test "a secret in a service's env reaches the service as a Dagger secret" {
     try std.testing.expectEqual(@as(usize, 1), auto.count("withEnvVariable(name:\"POSTGRES_DB\"," ++
         "value:\"app\")"));
 }
+
+test "a Docker action's argument holding a secret reaches its command as a Dagger secret" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const secret = "args_s3cr3t-value";
+    var step = testStep("");
+    // Split as GitHub splits it: the quoted word, space and secret included, is one argument.
+    step.action = .{ .docker = .{ .image = "alpine:3.22", .inputs = &.{.{
+        .name = "args",
+        .value = .{ .lit = "--token \"Bearer " ++ secret ++ "\" deploy" },
+    }} } };
+    var job = testJob(&.{step});
+    job.secrets = &.{secret};
+    var auto: AutoSession = .{ .arena = arena };
+    _ = try roundTrips(arena, &auto, .{ .step_cache = true, .test_ran_marker = "j1" }, job);
+    try expectSecretOnlyInSetSecret(&auto, secret);
+    const run_doc = try execOf(&auto, "/github/_runtime/busybox");
+    // The argument is expanded from an alias as the one word it was, between the others; the
+    // alias is attached, after the env's own secrets, and hidden from the command.
+    const before = "'--token' \\\"$";
+    const at = (std.mem.indexOf(u8, run_doc, before) orelse return error.TestUnexpectedResult) +
+        before.len;
+    const len = std.mem.indexOfScalar(u8, run_doc[at..], '\\') orelse
+        return error.TestUnexpectedResult;
+    const alias = run_doc[at..][0..len];
+    try std.testing.expect(std.mem.startsWith(u8, alias, "ZIG_SECRET_"));
+    try std.testing.expect(std.mem.startsWith(u8, run_doc[at + len ..], "\\\" 'deploy'"));
+    const attached = try std.fmt.allocPrint(arena, "withSecretVariable(name:\"{s}\",", .{alias});
+    try std.testing.expect(std.mem.indexOf(u8, run_doc, attached) != null);
+    const hidden = try std.fmt.allocPrint(arena, "env -u {s} ", .{alias});
+    try std.testing.expect(std.mem.indexOf(u8, run_doc, hidden) != null);
+}

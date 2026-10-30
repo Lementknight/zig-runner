@@ -20,6 +20,7 @@ const jsonFind = @import("../dagger.zig").jsonFind;
 const jsonFindString = @import("../dagger.zig").jsonFindString;
 const idOf = @import("../dagger.zig").idOf;
 const newSecret = @import("../dagger.zig").newSecret;
+const holdsSecret = @import("../dagger.zig").holdsSecret;
 const envVarNode = @import("../dagger.zig").envVarNode;
 const splitEnv = @import("../dagger.zig").splitEnv;
 const inputEnv = @import("../dagger.zig").inputEnv;
@@ -60,6 +61,11 @@ const braceBalanced = @import("testing.zig").braceBalanced;
 
 const Allocator = std.mem.Allocator;
 
+/// An argument of a Docker action's command: its text, or the alias of the Dagger secret that
+/// holds it (`secretAlias`), which the script expands as one word whatever it holds, so the
+/// arguments are the same either way.
+pub const Arg = union(enum) { text: []const u8, alias: []const u8 };
+
 /// The busybox `sh -c` script that runs a Docker action's command `argv` as step `n`: as
 /// `stepScriptFc`, with the image's command in place of a shell script, and busybox's own `mkdir`,
 /// `printf` and `env` (the image may have none).
@@ -67,7 +73,7 @@ pub fn containerScript(
     arena: Allocator,
     n: u32,
     fc: u32,
-    argv: []const []const u8,
+    argv: []const Arg,
     env: []const job_mod.EnvVar,
     secret_env: []const []const u8,
     always_run: ?[]const u8,
@@ -90,10 +96,14 @@ pub fn containerScript(
     }
     if (write_event) try w.writeAll("if [ -n \"${" ++ event_env ++ "+x}\" ]; then " ++
         "\"$B\" printf '%s' \"$" ++ event_env ++ "\" > " ++ event_path ++ "; fi\n");
+    // An argument's alias is the shell's, not the action's: the command does not inherit it.
+    var env_cmd: std.Io.Writer.Allocating = .init(arena);
+    try env_cmd.writer.writeAll("\"$B\" env ");
+    for (argv) |a| if (a == .alias) try env_cmd.writer.print("-u {s} ", .{a.alias});
     try writeEnvCommand(
         w,
         arena,
-        "\"$B\" env ",
+        env_cmd.written(),
         env,
         secret_env,
         write_event,
@@ -102,7 +112,10 @@ pub fn containerScript(
         action_name,
     );
     for (argv) |a| {
-        try shellQuote(w, a);
+        switch (a) {
+            .text => |t| try shellQuote(w, t),
+            .alias => |name| try w.print("\"${s}\"", .{name}),
+        }
         try w.writeByte(' ');
     }
     try w.writeAll("\nrc=$?\n: ");
@@ -411,7 +424,7 @@ pub fn containerScriptFor(
     x: *Exec,
     num: u32,
     fc: u32,
-    argv: []const []const u8,
+    argv: []const Arg,
     env: []const job_mod.EnvVar,
     names: []const []const u8,
     dr: DockerRun,
@@ -448,9 +461,26 @@ pub fn runContainer(
     const env = try x.containerEnv(dr, state);
     const names = try arena.alloc([]const u8, env.secret.len);
     for (env.secret, names) |sr, *n| n.* = sr.name;
+    // An argument that holds a secret or a mask (`args: ${{ secrets.X }}`) reaches the
+    // container as a Dagger secret after the env's, by its alias: in the command, it would be
+    // in the engine's cache metadata (#101).
+    var secret: std.ArrayList(SecretRef) = .empty;
+    try secret.appendSlice(arena, env.secret);
+    const args = try arena.alloc(Arg, argv.len);
+    for (argv, args) |text, *arg| {
+        if (!holdsSecret(x.job.*, x.sh, text)) {
+            arg.* = .{ .text = text };
+            continue;
+        }
+        const id = newSecret(arena, x.transport, &x.secrets, text, &x.err_msg) catch
+            return error.EngineFailed;
+        const alias = try secretAlias(arena, secret.items.len);
+        try secret.append(arena, .{ .name = alias, .id = id });
+        arg.* = .{ .alias = alias };
+    }
     const fc = x.next_fc;
     x.next_fc += 1;
-    const script = try x.containerScriptFor(num, fc, argv, env.plain, names, dr);
+    const script = try x.containerScriptFor(num, fc, args, env.plain, names, dr);
 
     var q: Query = .init(arena);
     try q.call("loadContainerFromID", .{ .id = img.id });
@@ -459,7 +489,7 @@ pub fn runContainer(
     try q.call("withFile", .{ .path = busybox_path, .permissions = mode, .source = busybox });
     try x.writeActionDirs(&q, img, ws_in);
     try x.writeActionEnv(&q);
-    try writeActionSecrets(arena, &q, env.secret);
+    try writeActionSecrets(arena, &q, secret.items);
     // A Docker action reaches the job's services by name, as on GitHub's container network.
     try x.writeServiceBindings(&q);
     const nesting: ?bool = if (x.nesting) true else null;
