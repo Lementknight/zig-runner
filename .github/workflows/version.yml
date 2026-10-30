@@ -34,9 +34,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CHANGIE_VERSION: "1.26.0"
-  # changie_1.26.0_linux_amd64.tar.gz in the release's checksums.txt.
-  CHANGIE_SHA256: eab168c8287a6e91912e1c02e5260911232d945bfd3c89d8a0e1ace6bb7b6161
   # GitHub's ed25519 host key (`gh api meta`), not whatever answers for github.com.
   GITHUB_HOST_KEY: github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
 
@@ -110,13 +107,10 @@ jobs:
           .github/scripts/wait-for-checks.sh "$(git rev-parse HEAD)" \
             "$TAG is not released; once they pass, run version again (README, \"Versioning\")"
 
+      # Checked against its pinned checksum, which CI checks on every pull request too.
       - name: Install changie
         if: steps.next.outputs.tag
-        run: |
-          tarball="$RUNNER_TEMP/changie.tar.gz"
-          curl -fsSL -o "$tarball" "https://github.com/miniscruff/changie/releases/download/v${CHANGIE_VERSION}/changie_${CHANGIE_VERSION}_linux_amd64.tar.gz"
-          echo "$CHANGIE_SHA256  $tarball" | sha256sum --check --quiet
-          sudo tar -xzf "$tarball" -C /usr/local/bin changie
+        run: .github/scripts/install-changie.sh
 
       - name: Commit and tag
         if: steps.next.outputs.tag
