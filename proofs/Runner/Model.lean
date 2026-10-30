@@ -24,8 +24,8 @@ named:
 
 * "Always run" is not a flag the engine understands. The runner writes the job's nonce into the
   step's script, and the script is part of the key (`always_run`, threaded through
-  `containerScript` in dagger.zig). `stamped` models that, so the proofs are about the mechanism
-  that exists rather than one we wish existed.
+  `containerScript` in dagger/docker.zig). `stamped` models that, so the proofs are about the
+  mechanism that exists rather than one we wish existed.
 
 * `exec` takes a trial number, so a step need not be a function of its inputs alone. Nothing here
   forces a step to be deterministic; the properties that need determinism have to ask for it, which
