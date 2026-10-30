@@ -114,7 +114,7 @@ outputs_reason: ?[]const u8 = null,
 outputs_ms: i64 = 0,
 /// The event payload is in ZIG_RUNNER_EVENT; each step writes it to GITHUB_EVENT_PATH.
 event_from_env: bool,
-/// Workflow- or job-level env carries a secret, so every step uses secrets.
+/// Workflow-, job- or `container:`-level env carries a secret, so every step uses secrets.
 job_secret_env: bool,
 /// Differs for every job (the run, its attempt, and `ran_marker`): makes steps that use secrets
 /// run every time, in every job.

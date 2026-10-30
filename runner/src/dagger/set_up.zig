@@ -162,6 +162,8 @@ const BasePlan = struct {
     ran_marker: []const u8,
     /// The job's `mark_env` value (`JobLog.mark`).
     mark: []const u8,
+    /// A `container:` job's own `env:` (`containerEnv`); empty for any other job.
+    container_env: []const job_mod.EnvVar = &.{},
 };
 
 /// The container every step starts from, as one query: the job image behind its registry auth and
@@ -233,18 +235,38 @@ fn writeImage(
             .{ .name = package_cache_dirs[i].env, .value = package_cache_dirs[i].path },
         );
     };
-    if (job.container) |jc| {
-        // The container's env, as `docker create -e` sets it: every step sees it.
-        const env = ev.renderEnv(jc.env, try ev.scope(&.{})) catch {
-            err_msg.* = try std.fmt.allocPrint(
-                arena,
-                "could not evaluate the container's env: {s}",
-                .{ev.diag},
-            );
-            return error.BaseContainerFailed;
-        };
-        for (env) |e| try q.call("withEnvVariable", .{ .name = e.name, .value = e.value });
+    // The container's env, as `docker create -e` sets it: every step sees it. What carries a
+    // secret goes in as a Dagger secret, as the job's env does (#101).
+    var plain: std.ArrayList(job_mod.EnvVar) = .empty;
+    var secret: std.ArrayList(SecretRef) = .empty;
+    splitEnv(
+        arena,
+        transport,
+        job,
+        secrets,
+        plan.container_env,
+        &plain,
+        &secret,
+        err_msg,
+    ) catch
+        return error.BaseContainerFailed;
+    try writeEnvNodes(q, plain.items, secret.items);
+}
+
+/// A `container:` job's own `env:`, evaluated, without the names the job's env sets: those win
+/// on GitHub (`docker exec -e` over `docker create -e`), and a secret variable and a plain one of
+/// one name would leave it to the engine which of them a step sees. Null when it cannot be
+/// evaluated (the reason in `ev.diag`).
+fn containerEnv(arena: Allocator, ev: *Evaluator, job: job_mod.Job) !?[]const job_mod.EnvVar {
+    const jc = job.container orelse return &.{};
+    const env = ev.renderEnv(jc.env, try ev.scope(&.{})) catch return null;
+    var out: std.ArrayList(job_mod.EnvVar) = .empty;
+    for (env) |e| {
+        for (ev.job_env.items) |j| {
+            if (std.mem.eql(u8, j.name, e.name)) break;
+        } else try out.append(arena, e);
     }
+    return out.items;
 }
 
 /// Provisioning in the default image, the workspace and RUNNER_TEMP, the step user, and the
@@ -391,6 +413,14 @@ pub fn basePlan(
         err_msg.* = try std.fmt.allocPrint(arena, "container: has no image: {s}", .{ev.diag});
         return error.BaseContainerFailed;
     }
+    const container_env = try containerEnv(arena, ev, job) orelse {
+        err_msg.* = try std.fmt.allocPrint(
+            arena,
+            "could not evaluate the container's env: {s}",
+            .{ev.diag},
+        );
+        return error.BaseContainerFailed;
+    };
     const provision = opts.provision and std.mem.eql(u8, job_image, default_image);
     const as_runner = provision and opts.step_user == .runner;
     const ran_marker = opts.test_ran_marker orelse ran: {
@@ -405,12 +435,14 @@ pub fn basePlan(
         job,
         opts,
         job_image,
+        container_env,
         as_runner,
         step_cache,
         secrets,
         err_msg,
     );
     return .{
+        .container_env = container_env,
         .job_image = job_image,
         .provision = provision,
         .as_runner = as_runner,
@@ -476,13 +508,14 @@ fn cacheVolumeIds(
     job: job_mod.Job,
     opts: Options,
     job_image: []const u8,
+    container_env: []const job_mod.EnvVar,
     as_runner: bool,
     step_cache: bool,
     secrets: *Secrets,
     err_msg: *[]const u8,
 ) !CacheVolumes {
     const caches = opts.package_caches and job.github.repository.len > 0;
-    const needed = try baseSecrets(arena, ev, job);
+    const needed = try baseSecrets(arena, ev, job, container_env);
     if (!caches and (try secrets.missing(arena, needed)).len == 0) return .{};
     const ahead = try std.mem.concat(arena, []const u8, &.{ needed, try stepSecrets(arena, job) });
     const pending = try secrets.missing(arena, ahead);
@@ -626,11 +659,17 @@ fn writeCacheVolumes(
 }
 
 /// The secrets the base container is made with: a private job image's registry password, and
-/// job-level env that carries one.
-fn baseSecrets(arena: Allocator, ev: *Evaluator, job: job_mod.Job) ![]const []const u8 {
+/// job-level and container env that carries one.
+fn baseSecrets(
+    arena: Allocator,
+    ev: *Evaluator,
+    job: job_mod.Job,
+    container_env: []const job_mod.EnvVar,
+) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     if (job.container) |jc| if (try registryCredentials(ev, jc)) |c| try out.append(arena, c.pass);
     for (ev.job_env.items) |e| if (containsSecret(job, e.value)) try out.append(arena, e.value);
+    for (container_env) |e| if (containsSecret(job, e.value)) try out.append(arena, e.value);
     return out.items;
 }
 
@@ -691,7 +730,8 @@ pub fn execFor(
         .outputs_volume = plan.outputs_volume,
         .outputs_days = opts.output_keys_days,
         .event_from_env = step_cache and (try ev.eventJson()).len <= max_event_env,
-        .job_secret_env = jobEnvHasSecret(job.*, ev.job_env.items),
+        .job_secret_env = jobEnvHasSecret(job.*, ev.job_env.items) or
+            jobEnvHasSecret(job.*, plan.container_env),
         // Per job, not per run: a run's matrix jobs share its id and attempt, and a step that must
         // run in each of them would otherwise be replayed from the first one's result.
         .run_nonce = try std.fmt.allocPrint(
