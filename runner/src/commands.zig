@@ -106,6 +106,16 @@ pub fn isBlockedEnvName(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "NODE_OPTIONS");
 }
 
+/// The runner's own variables, which `GITHUB_ENV` must not set either: GitHub has none, so
+/// refusing them costs nothing, and set they would forge the machinery behind them. `ZIG_RUNNER_*`
+/// is the run marker (`ran_env`, which tells a replayed step from one that ran), the step markers'
+/// secret (`mark_env`), the event payload (`event_env`) and the step-cache opt-out;
+/// `ZIG_SECRET_<n>` are the aliases secrets reach a step's command by (`secretAlias`).
+pub fn isRunnerEnvName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "ZIG_RUNNER_") or
+        std.mem.startsWith(u8, name, "ZIG_SECRET_");
+}
+
 test "name=value, blank lines, and = inside values" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -154,7 +164,12 @@ test "paths and the blocked name" {
     try std.testing.expect(isBlockedEnvName("NODE_OPTIONS"));
     try std.testing.expect(isBlockedEnvName("node_options"));
     for ([_][]const u8{ "MY_VAR", "GITHUB_TOKEN", "GITHUB_SHA", "RUNNER_OS", "CI" }) |name|
-        try std.testing.expect(!isBlockedEnvName(name));
+        try std.testing.expect(!isBlockedEnvName(name) and !isRunnerEnvName(name));
+    const runner_names = [_][]const u8{
+        "ZIG_RUNNER_RAN", "ZIG_RUNNER_MARK", "ZIG_RUNNER_EVENT", "ZIG_SECRET_0",
+    };
+    for (runner_names) |name|
+        try std.testing.expect(isRunnerEnvName(name));
 }
 
 // --- workflow commands printed by a step: `::name key=value,...::data` ---

@@ -704,6 +704,12 @@ pub fn collect(x: *Exec, num: u32, data: std.json.Value, recorded: Recorded) !Ou
                         "'$GITHUB_ENV' command.");
                     continue;
                 }
+                // Likewise the runner's own variables (not in GitHub's runner).
+                if (commands.isRunnerEnvName(e.name)) {
+                    x.sh.errorLine(num, try std.fmt.allocPrint(arena, "Can't store {s} using " ++
+                        "'$GITHUB_ENV' command: it is the runner's own.", .{e.name}));
+                    continue;
+                }
                 try Evaluator.putEnv(arena, &ev.job_env, e.name, e.value);
                 try set.append(arena, e);
             }
