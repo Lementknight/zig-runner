@@ -616,7 +616,7 @@ fn writeCacheVolumes(
     job_image: []const u8,
     as_runner: bool,
 ) !void {
-    const scope = try packageCacheScope(arena, ev, job.github.repository);
+    const scope = try packageCacheScope(arena, ev, job.github.repository, opts.trusted);
     // Its own volume, so the engine can collect it (it only grows) without the global cache.
     if (opts.zig_local_cache) {
         const key = try std.fmt.allocPrint(
@@ -859,17 +859,29 @@ pub const package_cache_dirs = [_]struct { name: []const u8, path: []const u8, e
     .{ .name = "go-telemetry", .path = "/root/.config/go/telemetry" },
 };
 
-/// Pull requests from forks get their own volumes, so untrusted code cannot plant content in the
-/// caches the repository's own branches use (GitHub scopes its cache by branch for the same
-/// reason).
-pub fn packageCacheScope(arena: Allocator, ev: *Evaluator, repository: []const u8) ![]const u8 {
+/// Which volumes the job shares: `repo`, the repository's trusted jobs', only for a job the runner
+/// vouches for (`Options.trusted`, `trust.vouches`); every other job gets `untrusted`, so untrusted
+/// code cannot plant content in the caches trusted jobs read (GitHub scopes its cache by branch for
+/// the same reason). Several of them are not checked again on use (Go's module cache, Zig's package
+/// cache, cargo's sources, the tool cache's binaries). It fails closed (#105): it used to give a
+/// separate scope only to a pull request whose head repository was named and was another, so a
+/// same-repository pull request, a `workflow_run` or `issue_comment` a fork triggered, or a fork's
+/// pull request whose repository was deleted all shared `repo`. A fork's pull request stays apart
+/// even on a runner that vouches for pull requests.
+pub fn packageCacheScope(
+    arena: Allocator,
+    ev: *Evaluator,
+    repository: []const u8,
+    trusted: bool,
+) ![]const u8 {
+    if (!trusted) return "untrusted";
     const ctxs = [_]expr.Value.Entry{.{ .key = "github", .value = ev.github }};
     const head = expr.evalString(
         arena,
         "github.event.pull_request.head.repo.full_name",
         .{ .contexts = &ctxs },
     ) catch "";
-    return if (head.len > 0 and !std.ascii.eqlIgnoreCase(head, repository)) "fork-pr" else "repo";
+    return if (head.len > 0 and !std.ascii.eqlIgnoreCase(head, repository)) "untrusted" else "repo";
 }
 
 test "the default image is provisioned with git; a custom image is left alone" {
@@ -980,18 +992,44 @@ test "uv's environment goes in its cache, with a .venv symlink to it" {
     try std.testing.expect(std.mem.indexOf(u8, fake3.seen.items[2], "UV_PROJECT_ENVIRONMENT") == null);
 }
 
-test "package caches: one volume per tool, keyed by repository, separate for fork pull requests" {
+test "package caches: one volume per tool, keyed by repository, shared only by vouched-for jobs" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
     var env: std.process.Environ.Map = .init(arena);
     const steps = [_]job_mod.Step{testStep("npm ci")};
-    const fork_ctx =
-        \\{"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"event","v":{"t":2,"d":[{"k":"pull_request","v":{"t":2,"d":[{"k":"head","v":{"t":2,"d":[{"k":"repo","v":{"t":2,"d":[{"k":"full_name","v":"someone/r"}]}}]}}]}}]}}]}}
+    const pr_head =
+        \\{"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"event","v":{"t":2,"d":[
+    ++
+        \\{"k":"pull_request","v":{"t":2,"d":[{"k":"head","v":
     ;
-    for ([_]bool{ false, true }) |fork| {
+    const pr_tail = "}]}}]}}]}}";
+    const head_repo =
+        \\{"t":2,"d":[{"k":"repo","v":{"t":2,"d":[{"k":"full_name","v":
+    ;
+    const fork_ctx = pr_head ++ head_repo ++ "\"someone/r\"}]}}]}" ++ pr_tail;
+    const same_repo_ctx = pr_head ++ head_repo ++ "\"o/r\"}]}}]}" ++ pr_tail;
+    // A fork's pull request whose repository was deleted: GitHub sends `head.repo: null`.
+    const deleted_ctx = pr_head ++ "{\"t\":2,\"d\":[{\"k\":\"repo\",\"v\":null}]}" ++ pr_tail;
+    const Case = struct { trusted: bool, ctx: ?[]const u8, scope: []const u8 };
+    for ([_]Case{
+        .{ .trusted = true, .ctx = null, .scope = "repo" },
+        // A runner that vouches for pull requests (RUNNER_TRUSTED_EVENTS names them): its own.
+        .{ .trusted = true, .ctx = same_repo_ctx, .scope = "repo" },
+        // ...but not for a fork's, whatever the lists say.
+        .{ .trusted = true, .ctx = fork_ctx, .scope = "untrusted" },
+        // Not vouched for (`trust.vouches`): a same-repository pull request, an event the lists
+        // do not name (`workflow_run`, `issue_comment`), any job on a `*` runner, and a fork's
+        // pull request whose head repository is gone, which the old rule could not tell apart.
+        .{ .trusted = false, .ctx = null, .scope = "untrusted" },
+        .{ .trusted = false, .ctx = same_repo_ctx, .scope = "untrusted" },
+        .{ .trusted = false, .ctx = deleted_ctx, .scope = "untrusted" },
+        .{ .trusted = false, .ctx = fork_ctx, .scope = "untrusted" },
+    }) |case| {
         var job = testJob(&steps);
-        if (fork) job.context_data = try std.json.parseFromSliceLeaky(std.json.Value, arena, fork_ctx, .{});
+        if (case.ctx) |ctx| {
+            job.context_data = try std.json.parseFromSliceLeaky(std.json.Value, arena, ctx, .{});
+        }
         var vols: std.Io.Writer.Allocating = .init(arena);
         try vols.writer.writeAll("{\"data\":{");
         for (package_cache_dirs, 0..) |_, i| try vols.writer.print("{s}\"c{d}\":{{\"id\":\"V{d}\"}}", .{ if (i == 0) "" else ",", i, i });
@@ -1001,9 +1039,9 @@ test "package caches: one volume per tool, keyed by repository, separate for for
         var buf: [1024]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-        const res = try run(arena, std.testing.io, &env, .{ .package_caches = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+        const res = try run(arena, std.testing.io, &env, .{ .package_caches = true, .trusted = case.trusted, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
         try std.testing.expect(res.succeeded);
-        const scope = if (fork) "fork-pr" else "repo";
+        const scope = case.scope;
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "c1: cacheVolume(key:\"zig-runner/o/r/{s}/npm\")", .{scope})) != null);
         // The tool cache is also keyed by the job's image (its binaries are built for it).
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "c0: cacheVolume(key:\"zig-runner/o/r/{s}/toolcache/ubuntu:24.04\")", .{scope})) != null);
@@ -1040,6 +1078,7 @@ test "with zig_local_cache, Zig's local cache gets a volume of its own, outside 
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
     const res = try run(arena, std.testing.io, &env, .{
         .package_caches = true,
+        .trusted = true,
         .zig_local_cache = true,
         .step_user = .runner,
         .test_session_argv = &.{ "sh", "-c", fake_child },
@@ -1071,7 +1110,7 @@ test "steps run as runner in the default image, as on GitHub, with their own pac
     var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-    const res = try run(arena, std.testing.io, &env, .{ .package_caches = true, .step_user = .runner, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    const res = try run(arena, std.testing.io, &env, .{ .package_caches = true, .trusted = true, .step_user = .runner, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
     try std.testing.expect(res.succeeded);
     const keys = fake.seen.items[0];
     const base = fake.seen.items[1];

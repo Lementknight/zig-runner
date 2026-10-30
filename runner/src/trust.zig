@@ -22,24 +22,46 @@ pub fn refusal(
     events: []const u8,
     g: Github,
 ) Allocator.Error!?[]const u8 {
-    if (none(refs)) return no_refs;
-    if (!listed(events, g.event_name)) return try std.fmt.allocPrint(
-        arena,
-        "This runner does not run jobs from '{s}' events (RUNNER_TRUSTED_EVENTS: {s}).",
-        .{ g.event_name, events },
-    );
-    if (!listed(refs, g.ref)) return try std.fmt.allocPrint(
-        arena,
-        "This runner does not run jobs for '{s}' (RUNNER_TRUSTED_REFS: {s}).",
-        .{ g.ref, refs },
-    );
-    const workflow = workflowRef(g.workflow_ref);
-    if (!listed(refs, workflow)) return try std.fmt.allocPrint(
-        arena,
-        "This runner does not run workflows read from '{s}' (RUNNER_TRUSTED_REFS: {s}).",
-        .{ workflow, refs },
-    );
-    return null;
+    return switch (verdict(refs, events, g)) {
+        .trusted => null,
+        .no_refs => no_refs,
+        .event => try std.fmt.allocPrint(
+            arena,
+            "This runner does not run jobs from '{s}' events (RUNNER_TRUSTED_EVENTS: {s}).",
+            .{ g.event_name, events },
+        ),
+        .ref => try std.fmt.allocPrint(
+            arena,
+            "This runner does not run jobs for '{s}' (RUNNER_TRUSTED_REFS: {s}).",
+            .{ g.ref, refs },
+        ),
+        .workflow => try std.fmt.allocPrint(
+            arena,
+            "This runner does not run workflows read from '{s}' (RUNNER_TRUSTED_REFS: {s}).",
+            .{ workflowRef(g.workflow_ref), refs },
+        ),
+    };
+}
+
+/// Whether the runner vouches for the job: it passes the gate (`refusal`) on lists that name what
+/// they trust. For what a job may share with the repository's trusted jobs, the package caches'
+/// `repo` scope (#105). A `*` in either list lets every job through without vouching for any: such
+/// a runner is where untrusted code runs (pre-prod), and none of its jobs may write what prod
+/// reads, even on an engine the two share.
+pub fn vouches(refs: []const u8, events: []const u8, g: Github) bool {
+    return verdict(refs, events, g) == .trusted and !everything(refs) and !everything(events);
+}
+
+/// The gate's decision, before it is put into words: the one rule both `refusal` and `vouches`
+/// apply.
+const Verdict = enum { trusted, no_refs, event, ref, workflow };
+
+fn verdict(refs: []const u8, events: []const u8, g: Github) Verdict {
+    if (none(refs)) return .no_refs;
+    if (!listed(events, g.event_name)) return .event;
+    if (!listed(refs, g.ref)) return .ref;
+    if (!listed(refs, workflowRef(g.workflow_ref))) return .workflow;
+    return .trusted;
 }
 
 /// A job's refusal on a runner with no trusted refs: what to set, since nothing is wrong with the
@@ -217,4 +239,33 @@ test "pull requests, other branches and workflows from elsewhere are refused" {
     for (refused) |g| try testing.expect(try refusal(a, prod_refs, prod_events, g) != null);
     const why = (try refusal(a, prod_refs, prod_events, refused[0])).?;
     try testing.expect(std.mem.indexOf(u8, why, "'pull_request' events") != null);
+}
+
+test "vouched for (the caches' repo scope): what the gate trusts by name, never by *" {
+    const wf = "o/r/.github/workflows/ci.yml@";
+    const main = ctx("push", "refs/heads/main", wf ++ "refs/heads/main");
+    const tag = ctx("push", "refs/tags/v1.2.3", wf ++ "refs/tags/v1.2.3");
+    const same_repo_pr = ctx("pull_request", "refs/pull/7/merge", wf ++ "refs/pull/7/merge");
+    // Both run on the default branch's ref and workflow, but a fork can set them off.
+    const workflow_run = ctx("workflow_run", "refs/heads/main", wf ++ "refs/heads/main");
+    const issue_comment = ctx("issue_comment", "refs/heads/main", wf ++ "refs/heads/main");
+    // A fork's pull request whose head repository was deleted looks like any pull request.
+    const orphan_pr = ctx("pull_request", "refs/pull/8/merge", wf ++ "refs/pull/8/merge");
+    try testing.expect(vouches(prod_refs, prod_events, main));
+    try testing.expect(vouches(prod_refs, prod_events, tag));
+    for ([_]Github{ same_repo_pr, workflow_run, issue_comment, orphan_pr }) |g| {
+        try testing.expect(!vouches(prod_refs, prod_events, g));
+    }
+    // A `*` in either list lets jobs through the gate but vouches for none, not even main's push.
+    for ([_]Github{ main, same_repo_pr, workflow_run, orphan_pr }) |g| {
+        try testing.expectEqual(null, try refusal(testing.allocator, "*", "*", g));
+        try testing.expect(!vouches("*", "*", g));
+        try testing.expect(!vouches("refs/heads/main,*", prod_events, g));
+        try testing.expect(!vouches(prod_refs, "push, *", g));
+    }
+    // No refs: nothing passes, so nothing is vouched for.
+    try testing.expect(!vouches("", prod_events, main));
+    // Lists that name pull requests vouch for them; the caches still keep forks apart
+    // (`packageCacheScope`).
+    try testing.expect(vouches("refs/heads/main,refs/pull/*", "push,pull_request", same_repo_pr));
 }
