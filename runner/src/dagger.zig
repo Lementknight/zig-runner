@@ -474,7 +474,7 @@ pub const Options = struct {
     /// Steps may use the job's Dagger engine (`dagger call` inside a step):
     /// `experimentalPrivilegedNesting`. Only in a job the runner vouches for (`trusted`, and not
     /// a fork's pull request): a step's own client could open any cache volume by its key (#228).
-    nesting: bool = true,
+    nesting: bool = false,
     /// Mount `package_cache_dirs` from persistent cache volumes, scoped to the repository. The
     /// runner turns this on (`RUNNER_PACKAGE_CACHES`, on by default).
     package_caches: bool = false,

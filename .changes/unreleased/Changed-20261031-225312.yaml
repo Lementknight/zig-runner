@@ -1,0 +1,3 @@
+kind: Changed
+body: 'Steps no longer get the job''s Dagger engine by default (`RUNNER_DAGGER_NESTING` is now off). A step with it could open any cache volume by its key and run privileged containers, which is control of the machine, so it also defeated the check that a tool tree in a cache volume is the runner''s own. To turn it back on for a pool whose trusted jobs run `dagger call` inside a step, set `RUNNER_DAGGER_NESTING=true` (or `--dagger-nesting=true`); it is still given only in jobs the runner vouches for (#230). The runner logs `Dagger in steps: on` or `off` at startup, next to what it trusts.'
+time: 2026-10-31T22:53:12.000000-04:00

@@ -131,6 +131,11 @@ pub fn pool(c: Runner, n: u32) !Exit {
         "WARNING: this runner carries the prod label and trusts every ref " ++
             "(RUNNER_TRUSTED_REFS=*): a pull request that names prod in runs-on runs here",
     );
+    // Nesting is control of the host, so whether it is on is said beside the trust it rides on.
+    try c.log.say(if (c.cfg.dagger_nesting)
+        "Dagger in steps: on, in jobs this runner vouches for (RUNNER_DAGGER_NESTING=true)"
+    else
+        "Dagger in steps: off (RUNNER_DAGGER_NESTING=true turns it on)");
     // When a silent engine fails a step, so it is no surprise (#100).
     if (c.cfg.engineEndpoint() != null) {
         const t = c.cfg.engine_silence_timeout_secs;
@@ -1450,6 +1455,13 @@ test "the pool logs what it trusts once at startup, and warns when prod trusts e
         "trusting refs refs/heads/main,refs/tags/v* and events push,workflow_dispatch",
     ));
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "WARNING") == null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Dagger in steps: off") != null);
+
+    w.end = 0;
+    cfg.dagger_nesting = true;
+    _ = try pool(c, 0);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Dagger in steps: on") != null);
+    cfg.dagger_nesting = false;
 
     w.end = 0;
     cfg.trusted_refs = "";
