@@ -104,6 +104,11 @@ pub const Config = struct {
     /// repository had the same source. Off by default: Zig never removes anything from that cache,
     /// so it grows by about 50 MB for every source version built, until the engine collects it.
     zig_local_cache: bool = false,
+    /// With `zig_local_cache`, the size in MB past which Zig's local cache starts over, whole, in a
+    /// new generation of its volume (`set_up.zig`, `zig_local_roll_script`): Zig grows it by about
+    /// 111 MB for every commit built, and a Zig cache must never lose part of itself. 0 lets it
+    /// grow, in the volume's root as before.
+    zig_local_cache_max_mb: u32 = 4096,
     /// Seed Zig jobs' global cache with what every `zig build` compiles before it reads any
     /// project: the build runner, 104 s on one core and about 1 GB on the laptop (`set_up.zig`,
     /// "The Zig cache seed"). Off when unset: the runner cannot know which Zig its jobs use, and a
@@ -257,6 +262,8 @@ pub const Config = struct {
         if (environ.get("RUNNER_LOG_SPOOL_DIR")) |v| c.log_spool_dir = v;
         if (environ.get("RUNNER_UV_ENV_IN_CACHE")) |v| c.uv_env_in_cache = try boolean(v);
         if (environ.get("RUNNER_ZIG_LOCAL_CACHE")) |v| c.zig_local_cache = try boolean(v);
+        if (environ.get("RUNNER_ZIG_LOCAL_CACHE_MAX_MB")) |v|
+            c.zig_local_cache_max_mb = try num(u32, v);
         if (environ.get("RUNNER_ZIG_SEED")) |v| c.zig_seed = try zigSeed(v);
         if (environ.get("RUNNER_PREWARM")) |v| c.prewarm = try boolean(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_MAX_MS")) |v| c.output_keys_max_ms = try millis(v);
@@ -316,6 +323,7 @@ pub const Config = struct {
         else if (eq(key, "step-user")) c.step_user = try stepUser(val) //
         else if (eq(key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache")) c.zig_local_cache = try boolean(val) //
+        else if (eq(key, "zig-local-cache-max-mb")) c.zig_local_cache_max_mb = try num(u32, val) //
         else if (eq(key, "zig-seed")) c.zig_seed = try zigSeed(val) //
         else if (eq(key, "prewarm")) c.prewarm = try boolean(val) //
         else if (eq(key, "output-keys-max-ms")) c.output_keys_max_ms = try millis(val) //
@@ -652,6 +660,9 @@ test "Zig's local cache is kept only when asked for, and uv's setting is read" {
     try std.testing.expect((try Config.load(&env, &.{ "runner", "--zig-local-cache=true" })).zig_local_cache);
     try env.put("RUNNER_ZIG_LOCAL_CACHE", "1");
     try std.testing.expect((try Config.load(&env, &.{"runner"})).zig_local_cache);
+    try std.testing.expectEqual(@as(u32, 4096), (try Config.load(&env, &.{"runner"})).zig_local_cache_max_mb);
+    try env.put("RUNNER_ZIG_LOCAL_CACHE_MAX_MB", "0");
+    try std.testing.expectEqual(@as(u32, 0), (try Config.load(&env, &.{"runner"})).zig_local_cache_max_mb);
     try env.put("RUNNER_UV_ENV_IN_CACHE", "false");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).uv_env_in_cache);
 }

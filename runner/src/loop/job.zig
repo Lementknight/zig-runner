@@ -582,6 +582,7 @@ fn runJobSteps(
         .trusted = trust.vouches(cfg.trusted_refs, cfg.trusted_events, job.github),
         .uv_env_in_cache = c.cfg.uv_env_in_cache,
         .zig_local_cache = c.cfg.zig_local_cache,
+        .zig_local_cache_max_mb = c.cfg.zig_local_cache_max_mb,
         .zig_seed = c.cfg.zig_seed,
         .step_cache = c.cfg.step_cache,
         .step_user = c.cfg.step_user,
