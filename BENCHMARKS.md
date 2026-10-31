@@ -147,27 +147,39 @@ hour-long soak, and flat after the first 20 minutes.
 
 ## Against GitHub's hosted runner
 
-*2026-10-30, zig-runner at main (between v0.18.0 and the next release).* The same job, this
-repository's CI test steps (checkout, Install Zig, format check, the tests), run alternately on
-GitHub's `ubuntu-latest` (4 vCPUs) and on zig-runner on a laptop (Ryzen 5 PRO 4650U, 6 cores and 12
-threads, 30 GB, on the balanced power profile), five times each per scenario. Times come from
-GitHub's API; the job and its driver are in the private bench repository.
+*2026-10-31, zig-runner at main (after v0.19.0).* The same job, this repository's CI test steps
+(checkout, Install Zig, format check, the tests), run alternately on GitHub's `ubuntu-latest` (4
+vCPUs) and on zig-runner on a laptop (Ryzen 5 PRO 4650U, 6 cores and 12 threads, 30 GB, on the
+balanced power profile), five times each per scenario, one job at a time. The laptop's runners keep
+Zig's local cache between jobs (`RUNNER_ZIG_LOCAL_CACHE=true`). Times come from GitHub's API; the
+job and its driver are in the private bench repository.
 
 | Scenario (medians) | Hosted job | Hosted tests | zig-runner job | zig-runner tests |
 | --- | --- | --- | --- | --- |
-| Cold: `zig build test`, Zig's cache empty on both | 136 s | 123 s | 137 s | 132 s |
-| A new commit, each as its CI runs it | 40 s | 28 s | 30 s | 26 s |
-| The same commit again | 45 s | 31 s | 2 s | 0 s |
+| Cold, each at its fastest: the compiler called directly (`zig-test.sh`), Zig's cache empty | 49 s | 36 s | 35 s | 31 s |
+| Cold, `zig build test` on both, Zig's cache empty | 148 s | 134 s | 131 s | 128 s |
+| A new commit, each as its CI runs it | 46 s | 36 s | 31 s | 27 s |
+| The same commit again | 54 s | 41 s | 1 s | 0 s |
 
-- **Cold, it is a tie.** Both spend most of the job compiling Zig's build runner on one core, where
-  GitHub's server is about 9 s faster; zig-runner makes that up around the steps (Install Zig took
-  1-2 s against 8 s, as Zig stays in its tool cache).
-- **On a new commit, zig-runner is 25% faster.** The hosted job calls the compiler directly, as CI
-  does there (`zig-test.sh`), and the tests take about as long on each; the rest of the job is what
-  zig-runner keeps between jobs.
-- **On the same commit again, it is 20 times faster:** every step replays from the step cache, and
-  the job takes 2 s. GitHub's runner does all of it again.
+- **zig-runner is faster in every scenario**: 29% cold, 11% when both take `zig build`'s slow path,
+  33% on a new commit, and about 50 times on the same commit again, where every step replays from
+  the step cache.
+- **"Set up job" takes about 1 s on both.** The first job after a new runner image took 27 s, while
+  the engine built the job's base container again; that run is left out.
+- **Install Zig takes 1-2 s against 7-10 s,** as Zig stays in zig-runner's tool cache.
+- **`zig build test` cold** spends most of its time compiling Zig's build runner on one core: GitHub
+  calls the compiler directly on its own runners for that reason (`zig-test.sh`). On a new commit,
+  with the caches warm, the direct path is no faster on zig-runner (28 s against 27 s for the tests),
+  so zig-runner keeps `zig build test`.
+- **GitHub's times vary more:** its cold `zig build test` took 110-158 s across five runs, the
+  laptop's 131-132 s.
 - **Waiting for a runner** took 1 s against 2 s.
+
+This is one job at a time on a quiet machine. GitHub runs as many jobs at once as a plan allows; a
+laptop runs as many as its cores and memory do, and its lead shrinks as they fill.
+
+On 2026-10-30, before the fair cold scenario existed and with Zig's local cache off, the cold
+`zig build test` case was a tie (136 s against 137 s).
 
 A step whose script names a run-specific variable (`GITHUB_RUN_ID`, `GITHUB_SHA` and the rest of
 `volatile_env` in `runner/src/dagger.zig`) is never replayed, and the check reads the script's text,
