@@ -54,6 +54,11 @@ pub const Config = struct {
     /// The engine's own listener (`tcp://host:port`, `unix:///path`) for `direct` sessions, reached
     /// without the Docker API; empty to go through `engine_container`.
     engine_host: []const u8 = "",
+    /// Seconds a step's query may go on with nothing at all heard from the engine (no health
+    /// check, no answer, no log line) before its session is aborted and the step failed
+    /// (`engine.Session.watch`, #100). 0 turns it off. Ten minutes: a swapping engine answers
+    /// late, not that late.
+    engine_silence_timeout_secs: u32 = 600,
     /// The Docker API socket (from DOCKER_HOST when it is `unix://`).
     docker_socket: []const u8 = "/var/run/docker.sock",
     /// Give each step's commands access to the job's Dagger engine
@@ -218,6 +223,8 @@ pub const Config = struct {
         if (environ.get("RUNNER_ENGINE")) |v| c.engine = try engineMode(v);
         if (environ.get("RUNNER_ENGINE_CONTAINER")) |v| c.engine_container = v;
         if (environ.get("RUNNER_ENGINE_HOST")) |v| c.engine_host = v;
+        if (environ.get("RUNNER_ENGINE_SILENCE_TIMEOUT")) |v|
+            c.engine_silence_timeout_secs = try secs(v);
         if (environ.get("DOCKER_HOST")) |v| if (std.mem.startsWith(u8, v, "unix://")) {
             c.docker_socket = v["unix://".len..];
         };
@@ -280,6 +287,7 @@ pub const Config = struct {
         else if (eq(key, "js-runtime")) c.js_runtime = try jsRuntime(val) //
         else if (eq(key, "engine")) c.engine = try engineMode(val) //
         else if (eq(key, "engine-host")) c.engine_host = val //
+        else if (eq(key, "engine-silence-timeout")) c.engine_silence_timeout_secs = try secs(val) //
         else if (eq(key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
         else if (eq(key, "package-caches")) c.package_caches = try boolean(val) //
         else if (eq(key, "step-cache")) c.step_cache = try boolean(val) //
@@ -350,6 +358,10 @@ pub const Config = struct {
                 .host = c.engine_host,
                 .docker_socket = c.docker_socket,
                 .container = c.engine_container,
+                .silence_timeout = if (c.engine_silence_timeout_secs == 0)
+                    null
+                else
+                    .fromSeconds(c.engine_silence_timeout_secs),
             },
             .cli => null,
         };
@@ -505,6 +517,24 @@ test "the stop grace: ten minutes by default, in seconds, 0 for none, at most a 
     try std.testing.expectEqual(@as(u32, 0), (try Config.load(&env, &.{"runner"})).stop_grace_secs);
     try std.testing.expectEqual(@as(u32, 90), (try Config.load(&env, &.{ "runner", "--stop-grace-secs=90" })).stop_grace_secs);
     try env.put("RUNNER_STOP_GRACE_SECS", "86401");
+    try std.testing.expectError(error.InvalidNumber, Config.load(&env, &.{"runner"}));
+}
+
+test "the engine silence timeout: ten minutes by default, in seconds, 0 turns it off" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    var c = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqual(@as(u32, 600), c.engine_silence_timeout_secs);
+    const limit = c.engineEndpoint().?.silence_timeout.?;
+    try std.testing.expectEqual(@as(i64, 600_000), limit.toMilliseconds());
+    try env.put("RUNNER_ENGINE_SILENCE_TIMEOUT", "0");
+    c = try Config.load(&env, &.{"runner"});
+    try std.testing.expect(c.engineEndpoint().?.silence_timeout == null);
+    c = try Config.load(&env, &.{ "runner", "--engine-silence-timeout=1200" });
+    try std.testing.expectEqual(@as(u32, 1200), c.engine_silence_timeout_secs);
+    try env.put("RUNNER_ENGINE_SILENCE_TIMEOUT", "86401");
     try std.testing.expectError(error.InvalidNumber, Config.load(&env, &.{"runner"}));
 }
 

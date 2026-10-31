@@ -562,6 +562,14 @@ pub fn gqlAtMost(
 ) !std.json.Value {
     const body = t.send(arena, doc, limit) catch |e| {
         if (e == error.ResponseTooLarge) return e;
+        // Said in full: the runner gave up on the engine, and how to change that (#100).
+        if (e == error.EngineSilent) {
+            err_msg.* = "the Dagger engine went silent while this step ran (no health check, " ++
+                "no answer and no log line for RUNNER_ENGINE_SILENCE_TIMEOUT), so the runner " ++
+                "aborted its session; raise RUNNER_ENGINE_SILENCE_TIMEOUT, or set it to 0 to " ++
+                "turn this off";
+            return error.DaggerQueryFailed;
+        }
         err_msg.* = try std.fmt.allocPrint(
             arena,
             "could not reach the Dagger session: {s}",

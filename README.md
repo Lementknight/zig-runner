@@ -314,6 +314,14 @@ the machine thrashed for hours (#126). Two things keep that from happening again
   that the process killed is the engine itself, whose unclean restart wipes its cache: check which
   process the kernel picks before relying on it. razorbill does not use it today.
 
+An engine that stops answering altogether (frozen, deadlocked) would hold a step for good, so a
+step's query with nothing at all heard from the engine for `RUNNER_ENGINE_SILENCE_TIMEOUT` seconds
+(600 by default) is aborted and the step failed, saying why (#100). Nothing heard means no health
+check (the engine sends one every 5 s), no byte of an answer and no log line; a swapping engine
+answers late but not that late, and keeps logging. It applies only while a step runs, and the
+runner logs the timeout when it starts. Raise it for an engine that is often that slow; `0` turns
+it off.
+
 ## Benchmarks
 
 [BENCHMARKS.md](BENCHMARKS.md) has what was measured on the reference machine, a Raspberry Pi 5:

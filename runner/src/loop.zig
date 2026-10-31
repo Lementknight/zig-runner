@@ -124,6 +124,14 @@ pub fn pool(c: Runner, n: u32) !Exit {
         "WARNING: this runner carries the prod label and trusts every ref " ++
             "(RUNNER_TRUSTED_REFS=*): a pull request that names prod in runs-on runs here",
     );
+    // When a silent engine fails a step, so it is no surprise (#100).
+    if (c.cfg.engineEndpoint() != null) {
+        const t = c.cfg.engine_silence_timeout_secs;
+        if (t == 0) {
+            try c.log.say("engine silence timeout: off (RUNNER_ENGINE_SILENCE_TIMEOUT=0)");
+        } else try say(c, "engine silence timeout: {d} s (RUNNER_ENGINE_SILENCE_TIMEOUT): a " ++
+            "step's query with nothing heard from the engine for that long is aborted", .{t});
+    }
     const slots = try c.arena.alloc(Slot, n);
     // One per process, so what one runner learns about a repository the others use too.
     const slow = try c.arena.create(SlowOutputs);
