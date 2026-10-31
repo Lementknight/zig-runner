@@ -406,6 +406,14 @@ pub const Warmer = struct {
     pub const job_name = "zig-runner pre-warm";
     /// How often the engine is looked at for a start: a stat, or the gate's count.
     const look_ms = 5 * std.time.ms_per_s;
+    /// A warm shorter than this found everything in the engine's cache and is not learned from,
+    /// as a job that replayed steps is not (`Gate.replayed`): on razorbill a warm after the other
+    /// instance's took 0.4 s and was learned at 0 GB, against 1.3 GB cold, so the warm after the
+    /// next wipe would have reserved nothing. A cold warm pulls an image and builds a container,
+    /// far longer than this. Judged by time, not by a near-zero peak: a real run beside a job that
+    /// frees memory can measure 0 too (`Learned.min_mb`), and a warm misjudged as cached only
+    /// reserves the worst case again.
+    const cached_ms = 3 * std.time.ms_per_s;
 
     /// A warmer for the pool, its gate on `memory`'s slot `slot`, or null, said why, when it would
     /// have nothing to do.
@@ -491,6 +499,7 @@ pub const Warmer = struct {
             .cancel = &w.cancel,
         }, .{ .ptr = w, .readyFn = ready }, &msg);
         const ms = std.Io.Clock.awake.now(w.c.io).toMilliseconds() - w.admitted_ms;
+        if (w.admitted and w.memory != null and ms < cached_ms) w.gate.replayed();
         if (w.admitted) if (w.memory != null) if (w.gate.ended()) |learned| sayUnallocated(
             w.c,
             "the pre-warm raised the engine's memory by {f} at most ({s}); reserving {f} for it",
@@ -1461,12 +1470,24 @@ const FakeWarm = struct {
     var opts: dagger.Options = .{};
     var memory: ?*admission.Admission = null;
     var during: ?admission.Admission.Slot = null;
+    /// How long the warm takes, and what it raises the engine's working set by, if measured.
+    var took_ms: i64 = 0;
+    var rose_mb: ?u64 = null;
 
     fn warm(_: Allocator, _: std.Io, o: dagger.Options, ready: dagger.Ready, _: *[]const u8) anyerror!dagger.Warmed {
         calls += 1;
         opts = o;
         if (!ready.readyFn(ready.ptr)) return error.Cancelled;
-        if (memory) |m| during = m.slots[m.slots.len - 1];
+        const w: *Warmer = @ptrCast(@alignCast(ready.ptr));
+        w.admitted_ms -= took_ms;
+        if (memory) |m| {
+            const s = &m.slots[m.slots.len - 1];
+            during = s.*;
+            if (rose_mb) |mb| {
+                s.base_mb = 600;
+                s.peak_mb = 600 + mb;
+            }
+        }
         return .{ .image = "docker.io/library/ubuntu:24.04@sha256:abc", .seeded = o.zig_seed != null };
     }
     fn socket(_: std.Io, _: []const u8) ?engine.SocketIdentity {
@@ -1483,6 +1504,8 @@ fn testWarmer(c: Runner, memory: ?*admission.Admission) !*Warmer {
     FakeWarm.calls = 0;
     FakeWarm.memory = memory;
     FakeWarm.during = null;
+    FakeWarm.took_ms = 0;
+    FakeWarm.rose_mb = null;
     return w;
 }
 
@@ -1544,6 +1567,44 @@ test "the pre-warm builds the job's base container and Zig seed through the memo
     try std.testing.expectEqual(@as(u32, 0), memory.polling);
     try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "pre-warm: base container and Zig seed built in 0.") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "(docker.io/library/ubuntu:24.04@sha256:abc)") != null);
+}
+
+test "a pre-warm that found everything cached is not learned from: the cold warm's estimate stays" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var cfg: Config = .{ .gh_token = "", .scope = undefined, .trusted_refs = "refs/heads/main" };
+    const c = testRunner(arena, &log, &out, &cfg);
+    var slots: [2]admission.Admission.Slot = undefined;
+    var memory: admission.Admission = .init(std.testing.io, .{}, &slots);
+    memory.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    const w = try testWarmer(c, &memory);
+    defer w.arena.deinit();
+
+    // razorbill's cold warm: 40 s, 1.3 GB.
+    FakeWarm.took_ms = 40 * std.time.ms_per_s;
+    FakeWarm.rose_mb = 1340;
+    w.once();
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "reserving 1.3 GB for it") != null);
+    // Then warms that found it all cached, 0.4 s and nothing raised, more of them than a name
+    // keeps runs of: each still reserves the cold estimate, and none is learned.
+    FakeWarm.took_ms = 400;
+    FakeWarm.rose_mb = 0;
+    for (0..admission.Learned.kept + 1) |_| {
+        out.end = 0;
+        w.once();
+        try std.testing.expectEqual(@as(?u32, 1340), FakeWarm.during.?.est_mb);
+        try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "reserving") == null);
+    }
+    // A restart whose first warm is cached, the other instance having warmed the engine: nothing
+    // learned, so the warm after the next wipe reserves the worst case.
+    memory.learned = .{};
+    w.once();
+    w.once();
+    try std.testing.expectEqual(@as(?u32, null), FakeWarm.during.?.est_mb);
 }
 
 test "an engine start asks for a pre-warm: the gate's count where it sees the engine, else its socket appearing or replaced" {
