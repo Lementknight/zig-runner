@@ -190,10 +190,11 @@ same-repository pull request, a `workflow_run` or `issue_comment` a fork set off
 request whose repository was deleted, gets the `untrusted` volumes. A `*` in either list lets every
 job through without vouching for any, so all of a pre-prod runner's jobs share the `untrusted`
 volumes with each other, and none can write what prod reads. With step caching, these volumes are
-the runner's own and outside every step's key: a replayed step does not write into them again, so
-a step that installs a tool into the tool cache itself (not through a setup action, which runs
-every time) and is replayed after the volume was pruned leaves a later step a PATH to a directory
-that is gone (proofs/README.md, "Against today's code"; #102).
+the runner's own, and what they hold is outside every step's key (their identity, repository and
+trust scope included, is in it): a replayed step does not write into them again, so a step that
+installs a tool into the tool cache itself (not through a setup action, which runs every time) and
+is replayed after the volume was pruned leaves a later step a PATH to a directory that is gone
+(proofs/README.md, "Against today's code"; #102).
 
 Steps get the Dagger engine (`RUNNER_DAGGER_NESTING`, privileged nesting, for `dagger call` inside
 a step) only in jobs the runner vouches for, the same jobs that get the `repo` volumes. A step's

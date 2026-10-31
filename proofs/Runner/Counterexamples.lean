@@ -171,9 +171,9 @@ end FlakyFailure
 
 /-! ## 4. A step that reads a cache volume
 
-Mounts are excluded from an exec's key by design, which is what lets the package caches be shared
-without making every step miss (experiment 6). The price is that a step whose result depends on what
-it found in one is not disciplined, and gets replayed when the volume has changed. -/
+A mount's content is excluded from an exec's key by design, which is what lets the package caches be
+shared without making every step miss (experiment 6). The price is that a step whose result depends
+on what it found in one is not disciplined, and gets replayed when the volume has changed. -/
 
 namespace MountedCache
 

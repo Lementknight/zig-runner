@@ -1095,6 +1095,10 @@ test "package caches: one volume per tool, keyed by repository, shared only by v
         // The tool cache is also keyed by the job's image (its binaries are built for it).
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "c0: cacheVolume(key:\"zig-runner/o/r/{s}/toolcache/ubuntu:24.04\")", .{scope})) != null);
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "cacheVolume(key:\"zig-runner/o/r/{s}/zig\")", .{scope})) != null);
+        // Asked for by key alone: a `source:` seed would put a Directory ID into every step's
+        // recipe, so one may only ever be a trusted, pinned input (proofs/README.md, `Key` row).
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "source:") == null);
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "sharing:") == null);
         // Mounted on the base container, so every step has them.
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/opt/hostedtoolcache\",cache:\"V0\")") != null);
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.npm\",cache:\"V1\")") != null);

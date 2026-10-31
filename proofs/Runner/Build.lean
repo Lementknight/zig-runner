@@ -205,9 +205,10 @@ theorem stable_env_matters {s : State} {sc : Script} {e e' : Env} {ev : Content}
     (ne : stable vol e ≠ stable vol e') : K vol ⟨s, sc, e, ev, m⟩ ≠ K vol ⟨s, sc, e', ev, m⟩ :=
   fun k => ne (congrArg Key.kEnv k)
 
-/-- P3, mounted cache volumes. Nothing about a mount reaches the key: this is BuildKit excluding
-mounts from an exec's cache key, and it is the reason the package caches can be shared without
-making every step miss. -/
+/-- P3, mounted cache volumes. Nothing about a mount's content reaches the key: the engine keys an
+exec by its recipe, in which a cache volume is an identity and never what it holds (DagQL's recipe
+digest since Dagger v0.21.0, BuildKit's exec key before), and it is the reason the package caches
+can be shared without making every step miss. -/
 theorem mounts_invisible {s : State} {sc : Script} {e : Env} {ev : Content} {m m' : Mounts} :
     K vol ⟨s, sc, e, ev, m⟩ = K vol ⟨s, sc, e, ev, m'⟩ :=
   rfl
