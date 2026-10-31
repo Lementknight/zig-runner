@@ -425,41 +425,98 @@ fn jobConclusion(result: dagger.Result) runservice.Conclusion {
 }
 
 /// The job's log on disk while it runs, rather than in memory until it ends: it is then bounded by
-/// the spool and survives the process (see `sink.Spool`). Best effort — a directory the runner
-/// cannot write to is said once and the lines stay in memory, because logging must not fail a job.
-/// Null when no spool directory is configured or the file could not be made. It lives on the
+/// the spool and survives the process (see `sink.Spool`). Best effort — a file the runner cannot
+/// make is said once and the lines stay in memory, because logging must not fail a job. Null when
+/// the runner has no spool directory (`SpoolDir`) or the file could not be made. It lives on the
 /// cycle's arena so the collector can be pointed at it here, where it cannot be forgotten: the
 /// first extraction of handleJob dropped that one line, and only an unused-parameter error caught
 /// it.
 const JobSpool = struct {
     spool: sink.Spool,
-    path: []const u8,
+    dir: std.Io.Dir,
+    /// The file's name in `dir`.
+    name: []const u8,
 
     fn close(sp: *JobSpool, io: std.Io) void {
         sp.spool.file.close(io);
-        std.Io.Dir.cwd().deleteFile(io, sp.path) catch {};
+        sp.dir.deleteFile(io, sp.name) catch {};
     }
 };
 
 fn openSpool(c: Runner, job: job_mod.Job, collect: *sink.LogSink) !?*JobSpool {
-    if (c.cfg.log_spool_dir.len == 0) return null;
-    const path = std.fmt.allocPrint(
-        c.arena,
-        "{s}/zig-runner-job-{d}.log",
-        .{ c.cfg.log_spool_dir, job.check_run_id },
-    ) catch return null;
-    const file = std.Io.Dir.cwd().createFile(c.io, path, .{ .read = true }) catch |e| {
+    const sd = c.spool_dir orelse return null;
+    const name = std.fmt.allocPrint(c.arena, "zig-runner-job-{d}.log", .{job.check_run_id}) catch
+        return null;
+    // Created, never opened: whatever is already at the name, a symlink planted there included, is
+    // refused rather than followed or written through (#106). Readable by the runner's user alone,
+    // like the directory it is in.
+    const file = sd.dir.createFile(c.io, name, .{
+        .read = true,
+        .exclusive = true,
+        .permissions = .fromMode(0o600),
+    }) catch |e| {
         try c.err.print(
             "job {d}: no log spool in {s} ({s}); the job's log is kept in memory\n",
-            .{ job.check_run_id, c.cfg.log_spool_dir, @errorName(e) },
+            .{ job.check_run_id, sd.path, @errorName(e) },
         );
         return null;
     };
     const js = try c.arena.create(JobSpool);
-    js.* = .{ .spool = .{ .file = file, .io = c.io }, .path = path };
+    js.* = .{ .spool = .{ .file = file, .io = c.io }, .dir = sd.dir, .name = name };
     collect.collect.spool = &js.spool;
     return js;
 }
+
+/// The runner's own directory for its jobs' logs, `<log_spool_dir>/zig-runner-<uid>`, made once
+/// when the pool starts. A shared /tmp is anyone's to write in: a log file made there by name could
+/// be a link someone else planted, or be read by them (#106). The systemd unit's `PrivateTmp`
+/// gives the runner a /tmp of its own; this makes running it by hand as safe. A directory already
+/// there is used only if it is a directory (not a link to one), owned by the runner's user and
+/// closed to everyone else. It is held open, so the files go in the directory that was checked
+/// whatever later happens to its path.
+pub const SpoolDir = struct {
+    dir: std.Io.Dir,
+    path: []const u8,
+
+    pub fn open(arena: Allocator, io: std.Io, base: []const u8) !SpoolDir {
+        const uid = std.os.linux.geteuid();
+        const path = try std.fmt.allocPrint(arena, "{s}/zig-runner-{d}", .{ base, uid });
+        std.Io.Dir.cwd().createDir(io, path, .fromMode(0o700)) catch |e| switch (e) {
+            error.PathAlreadyExists => {},
+            else => return e,
+        };
+        // A link is not followed: opening one fails here rather than opening its target.
+        const dir = try std.Io.Dir.cwd().openDir(io, path, .{ .follow_symlinks = false });
+        errdefer dir.close(io);
+        try checkPrivate(dir, uid);
+        return .{ .dir = dir, .path = path };
+    }
+
+    pub fn close(sd: SpoolDir, io: std.Io) void {
+        sd.dir.close(io);
+    }
+
+    /// Asked of the open directory, not its path, so what is checked is what the files go in.
+    fn checkPrivate(
+        dir: std.Io.Dir,
+        uid: std.os.linux.uid_t,
+    ) error{ SpoolDirUnchecked, SpoolDirNotOurs, SpoolDirNotPrivate }!void {
+        const linux = std.os.linux;
+        var st: linux.Statx = undefined;
+        const rc = linux.statx(
+            dir.handle,
+            "",
+            linux.AT.EMPTY_PATH,
+            .{ .TYPE = true, .MODE = true, .UID = true },
+            &st,
+        );
+        if (linux.errno(rc) != .SUCCESS) return error.SpoolDirUnchecked;
+        if (!st.mask.TYPE or !st.mask.MODE or !st.mask.UID) return error.SpoolDirUnchecked;
+        if (st.uid != uid) return error.SpoolDirNotOurs;
+        if (st.mode & linux.S.IFMT != linux.S.IFDIR) return error.SpoolDirNotOurs;
+        if (st.mode & 0o777 != 0o700) return error.SpoolDirNotPrivate;
+    }
+};
 
 /// The job's conclusion as the run-state database records it.
 fn reporterConclusion(result: dagger.Result) []const u8 {
@@ -992,6 +1049,34 @@ pub fn timeSpanMs(text: []const u8) ?i64 {
     return ((days * 24 + h) * 60 + m) * 60_000 + @as(i64, @intFromFloat(sec * 1000));
 }
 
+/// A runner whose jobs spool into `sd`, for the spool tests.
+fn spoolTestRunner(
+    arena: Allocator,
+    cfg: *Config,
+    log: *sink.LogSink,
+    err: *std.Io.Writer,
+    sd: ?*const SpoolDir,
+) Runner {
+    var c = testRunner(arena, log, err, cfg);
+    c.spool_dir = sd;
+    return c;
+}
+
+const spool_test_job: job_mod.Job = .{
+    .plan_id = "p",
+    .job_id = "j",
+    .job_token = "t",
+    .check_run_id = 7,
+    .secrets = &.{},
+    .steps = &.{},
+};
+
+/// The permission bits of `sub_path` in `dir`, the link itself if it is one.
+fn modeOf(dir: std.Io.Dir, sub_path: []const u8) !std.posix.mode_t {
+    const st = try dir.statFile(std.testing.io, sub_path, .{ .follow_symlinks = false });
+    return st.permissions.toMode() & 0o777;
+}
+
 test "the job's log is spooled, and the spool file goes when the job ends" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -999,41 +1084,31 @@ test "the job's log is spooled, and the spool file goes when the job ends" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try std.fs.path.join(arena, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const base = try std.fs.path.join(arena, &.{ ".zig-cache", "tmp", &tmp.sub_path });
 
     var out_buf: [1024]u8 = undefined;
     var out: std.Io.Writer = .fixed(&out_buf);
     var inner: sink.LogSink = .{ .stdout = .{ .writer = &out } };
     var err_buf: [1024]u8 = undefined;
     var err: std.Io.Writer = .fixed(&err_buf);
-    var cfg: Config = .{ .gh_token = "", .scope = undefined, .log_spool_dir = dir };
-    const c: Runner = .{
-        .arena = arena,
-        .gpa = std.testing.allocator,
-        .io = io,
-        .environ = undefined,
-        .cfg = &cfg,
-        .log = &inner,
-        .err = &err,
-        .secrets = &.{},
-        .name = "t",
-    };
-    const job: job_mod.Job = .{
-        .plan_id = "p",
-        .job_id = "j",
-        .job_token = "t",
-        .check_run_id = 7,
-        .secrets = &.{},
-        .steps = &.{},
-    };
+    var cfg: Config = .{ .gh_token = "", .scope = undefined };
+
+    // The runner's directory is its own: made under the configured one, closed to everyone else.
+    const sd = try SpoolDir.open(arena, io, base);
+    defer sd.close(io);
+    const own = try std.fmt.allocPrint(arena, "zig-runner-{d}", .{std.os.linux.geteuid()});
+    try std.testing.expect(std.mem.endsWith(u8, sd.path, own));
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), try modeOf(tmp.dir, own));
+    const c = spoolTestRunner(arena, &cfg, &inner, &err, &sd);
 
     // Opening the spool points the collector at it; handleJob has nothing to remember.
     var collect: sink.LogSink = .{ .collect = .{ .arena = arena, .io = io, .inner = &inner } };
-    const spool = try openSpool(c, job, &collect);
+    const spool = try openSpool(c, spool_test_job, &collect);
     try std.testing.expect(spool != null);
     try std.testing.expect(collect.collect.spool == &spool.?.spool);
-    const path = spool.?.path;
-    try std.testing.expect(std.mem.endsWith(u8, path, "/zig-runner-job-7.log"));
+    try std.testing.expectEqualStrings("zig-runner-job-7.log", spool.?.name);
+    // Readable by the runner's user alone.
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(sd.dir, spool.?.name));
 
     // A logged line is on disk, not in memory, and comes back from the file.
     try collect.append(7, 1, .stdout, "spooled");
@@ -1044,18 +1119,79 @@ test "the job's log is spooled, and the spool file goes when the job ends" {
 
     // Closing deletes the file: a finished job leaves nothing in the spool directory.
     spool.?.close(io);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, path, .{}));
+    try std.testing.expectError(
+        error.FileNotFound,
+        sd.dir.statFile(io, "zig-runner-job-7.log", .{ .follow_symlinks = false }),
+    );
 
-    // No spool directory configured: no spool, nothing said.
-    cfg.log_spool_dir = "";
-    try std.testing.expect((try openSpool(c, job, &collect)) == null);
+    // No spool directory: no spool, nothing said.
+    const none = spoolTestRunner(arena, &cfg, &inner, &err, null);
+    try std.testing.expect((try openSpool(none, spool_test_job, &collect)) == null);
     try std.testing.expectEqual(@as(usize, 0), err.buffered().len);
 
-    // A directory the runner cannot write to: said once, and the job carries on without a spool.
-    cfg.log_spool_dir = try std.fs.path.join(arena, &.{ dir, "not-a-directory" });
-    try std.testing.expect((try openSpool(c, job, &collect)) == null);
+    // The same directory again, as the next start finds it: still the runner's, so used.
+    const again = try SpoolDir.open(arena, io, base);
+    again.close(io);
+}
+
+test "a link planted at the spool's name is not written through (#106)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(arena, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+
+    var out_buf: [1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var inner: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var err_buf: [1024]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+    var cfg: Config = .{ .gh_token = "", .scope = undefined };
+    const sd = try SpoolDir.open(arena, io, base);
+    defer sd.close(io);
+    const c = spoolTestRunner(arena, &cfg, &inner, &err, &sd);
+
+    // A file the link points at, and a link where the job's spool will be made.
+    try tmp.dir.writeFile(io, .{ .sub_path = "victim", .data = "keep" });
+    try sd.dir.symLink(io, "../victim", "zig-runner-job-7.log", .{});
+
+    // Refused, said once, and the job carries on with its log in memory.
+    var collect: sink.LogSink = .{ .collect = .{ .arena = arena, .io = io, .inner = &inner } };
+    try std.testing.expect((try openSpool(c, spool_test_job, &collect)) == null);
+    try std.testing.expect(collect.collect.spool == null);
     try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "no log spool in") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "PathAlreadyExists") != null);
     try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "kept in memory") != null);
+    try collect.append(7, 1, .stdout, "in memory");
+    try std.testing.expectEqual(@as(usize, 1), collect.collect.lines.items.len);
+
+    // What the link points at is as it was: not truncated, not written to.
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("keep", try tmp.dir.readFile(io, "victim", &buf));
+}
+
+test "a spool directory that is a link, or open to others, is refused (#106)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(arena, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const own = try std.fmt.allocPrint(arena, "zig-runner-{d}", .{std.os.linux.geteuid()});
+
+    // A link to a directory that would pass every other check: not followed.
+    try tmp.dir.createDir(io, "elsewhere", .fromMode(0o700));
+    try tmp.dir.symLink(io, "elsewhere", own, .{});
+    try std.testing.expectError(error.NotDir, SpoolDir.open(arena, io, base));
+    try tmp.dir.deleteFile(io, own);
+
+    // A directory others can read or write in: not private, so not used.
+    try tmp.dir.createDir(io, own, .fromMode(0o700));
+    try tmp.dir.setFilePermissions(io, own, .fromMode(0o755), .{});
+    try std.testing.expectError(error.SpoolDirNotPrivate, SpoolDir.open(arena, io, base));
 }
 
 test "timeSpanMs reads GitHub's cancel timeout" {

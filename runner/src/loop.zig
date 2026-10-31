@@ -12,6 +12,7 @@ const sink = @import("sink.zig");
 const redact = @import("redact.zig");
 const admission = @import("admission.zig");
 const handleJob = @import("loop/job.zig").handleJob;
+const SpoolDir = @import("loop/job.zig").SpoolDir;
 const trust = @import("trust.zig");
 
 const Allocator = std.mem.Allocator;
@@ -55,6 +56,9 @@ pub const Runner = struct {
     /// This runner's place at the memory gate (`admission.zig`); null takes jobs whatever the
     /// machine's memory, as tests and `RUNNER_ADMISSION=false` do.
     gate: ?*admission.Gate = null,
+    /// Where each job's log is spooled (`SpoolDir`), shared by the pool; null keeps job logs in
+    /// memory, as tests and an empty `Config.log_spool_dir` do.
+    spool_dir: ?*const SpoolDir = null,
 };
 
 /// Output keys cost two walks of the job's filesystem whatever the step changed, so they are cheap
@@ -132,6 +136,18 @@ pub fn pool(c: Runner, n: u32) !Exit {
         } else try say(c, "engine silence timeout: {d} s (RUNNER_ENGINE_SILENCE_TIMEOUT): a " ++
             "step's query with nothing heard from the engine for that long is aborted", .{t});
     }
+    // Made once here and shared: each job's spool file is created in it (`SpoolDir`). One that is
+    // not safe to use is said once and the jobs keep their logs in memory, as with no directory.
+    const base = c.cfg.log_spool_dir;
+    var spool_dir: ?SpoolDir = null;
+    if (base.len > 0) spool_dir = SpoolDir.open(c.arena, c.io, base) catch |e| d: {
+        try c.err.print(
+            "no log spool in {s} ({s}); job logs are kept in memory\n",
+            .{ base, @errorName(e) },
+        );
+        break :d null;
+    };
+    defer if (spool_dir) |sd| sd.close(c.io);
     const slots = try c.arena.alloc(Slot, n);
     // One per process, so what one runner learns about a repository the others use too.
     const slow = try c.arena.create(SlowOutputs);
@@ -159,6 +175,7 @@ pub fn pool(c: Runner, n: u32) !Exit {
     for (slots, 0..) |*s, i| {
         s.* = .{ .c = c };
         s.c.slow_outputs = slow;
+        if (spool_dir) |*sd| s.c.spool_dir = sd;
         if (memory) |m| {
             s.gate = .{ .pool = m, .slot = i };
             s.c.gate = &s.gate;
