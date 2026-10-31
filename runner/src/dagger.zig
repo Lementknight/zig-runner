@@ -499,6 +499,9 @@ pub const Options = struct {
     uv_env_in_cache: bool = true,
     /// `Config.zig_local_cache`: Zig's local cache goes in a cache volume of its own.
     zig_local_cache: bool = false,
+    /// `Config.zig_seed`: the Zig release Zig jobs' global cache is seeded from (see
+    /// `set_up.zigSeedFor`); null for none.
+    zig_seed: ?config.ZigSeed = null,
     /// Stored outputs not produced again for this many days are removed
     /// (`RUNNER_OUTPUT_KEYS_DAYS`).
     output_keys_days: u32 = 7,
@@ -1664,6 +1667,7 @@ fn runSteps(
     };
 
     if (try setUpJob(&x, opts, results)) |failed| return failed;
+    if (plan.zig_seed_note) |note| x.setUpLine(note);
 
     if (job.container != null or !no_services) {
         if (!try x.startServices()) return servicesFailed(&x, arena, sh, results);

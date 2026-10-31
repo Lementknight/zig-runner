@@ -1,0 +1,3 @@
+kind: Added
+body: '`RUNNER_ZIG_SEED=<version>=<sha256>` (off when unset): the runner builds a Zig global-cache seed in the engine, from only the pinned Zig tarball and a `build.zig` it writes, and gives it to the Zig cache volume of every job that runs Zig. A new volume starts from the seed (`withMountedCache(source:)`) and an existing one gets what it lacks (`cp -an`, manifests last). No job compiles Zig 0.17''s build runner itself any more: a cold `zig build test` of zig-runner went from 146 s to 49 s on the laptop. Jobs without Zig send the same documents as before.'
+time: 2026-10-31T13:55:11.000000-04:00

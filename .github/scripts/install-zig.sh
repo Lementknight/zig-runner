@@ -2,7 +2,8 @@
 # Installs Zig for this job and puts it on the job's PATH. The download is checked against the
 # checksum ziglang.org publishes (https://ziglang.org/download/index.json), pinned here, so a
 # changed or replaced tarball fails the job instead of building the release. A new Zig version
-# means new checksums from that index, and the same version in runner/build.zig.zon.
+# means new checksums from that index, the same version in runner/build.zig.zon, and a new
+# RUNNER_ZIG_SEED for runners that seed Zig caches (deploy/runner.env.example).
 #
 # Zig is unpacked into RUNNER_TOOL_CACHE, which a self-hosted runner keeps between jobs, and the
 # unpacked tree is checked against a digest of all its files, pinned here too: a tree that another
