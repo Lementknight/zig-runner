@@ -1,3 +1,0 @@
-kind: Security
-body: 'The busybox the runner puts into job containers, which Docker actions, service containers and output keys run their scripts with, is pinned by digest (`busybox:1.37.0-musl@sha256:f6a95d61...`, the multi-arch index, so one pin serves amd64 and arm64) instead of a tag its owner could move. Renovate moves the pin (a new busybox version in a pull request of its own, a rebuilt image''s digest monthly at most), and CI checks on every pull request that the pin is a pullable index with the applets the runner uses (`.github/scripts/busybox-pin.sh`). Docker actions, service containers and output-keyed steps run once more after upgrading, and after each busybox update, as the busybox file''s key changes.'
-time: 2026-10-31T04:57:18.000000-04:00

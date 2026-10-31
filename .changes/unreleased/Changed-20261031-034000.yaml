@@ -1,3 +1,0 @@
-kind: Changed
-body: 'The proofs'' README and the Lean docstrings no longer credit BuildKit with leaving cache volumes out of a step''s key: since Dagger v0.21.0 an exec is reused by DagQL''s recipe digest, in which a cache volume is its key string, namespace, sharing and owner and never its content. No theorem changed. The `Key` row now spells out that the volume''s identity (repository and trust scope) is in the real key, the one-time miss a change of trust scope costs, that the provisioned base container is today''s one cross-scope seed, and that a seeded volume may only come from a trusted, pinned input.'
-time: 2026-10-31T03:40:00.000000-04:00

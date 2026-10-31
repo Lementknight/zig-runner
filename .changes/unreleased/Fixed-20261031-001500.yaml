@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'With step caching, a cached step inside a composite action is replayed, its log, masks, outputs and state included, even while the previous inner step''s last live lines are still arriving: the runner no longer takes them for the cached step''s own. And a line one inner step replayed no longer swallows the same line printed live by a later one.'
-time: 2026-10-31T00:15:00.000000-04:00

@@ -1,3 +1,0 @@
-kind: Changed
-body: 'The from/ZIG_LOCAL_CACHE_DIR and provisioning nodes of the base container, and the wait for a starting engine, are each written by one function (`writeFrom`, `writeProvision`, `openSessionWaiting`), ahead of the base-container pre-warm that will use them; documents and behaviour unchanged.'
-time: 2026-10-31T04:18:39.000000-04:00

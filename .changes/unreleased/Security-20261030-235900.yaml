@@ -1,3 +1,0 @@
-kind: Security
-body: 'A job''s log spool is no longer made by name in a shared `/tmp` (#106). The runner makes its own directory under `RUNNER_LOG_SPOOL_DIR`, `zig-runner-<uid>`, mode 0700, once at startup, and uses one already there only if it is a directory (not a symlink), owned by the runner''s user and closed to everyone else. Each job''s `zig-runner-job-<id>.log` is created in it exclusively with mode 0600, so a file or symlink planted at that name is refused rather than followed or written through (the job then keeps its log in memory, and says so). This makes running the runner by hand as safe as under the systemd unit''s `PrivateTmp`. The file is still removed when the job ends.'
-time: 2026-10-30T23:59:00.000000-04:00

@@ -1,3 +1,0 @@
-kind: Changed
-body: 'The README and the proofs'' "Against today''s code" table now say that the tool cache and the package download caches are the runner''s own cache volumes, outside every step''s key, with mount-blindness assumed: a step that installs a tool into the tool cache itself and is replayed after the volume was pruned leaves a later step a PATH to a directory that is gone.'
-time: 2026-10-31T00:30:00.000000-04:00
