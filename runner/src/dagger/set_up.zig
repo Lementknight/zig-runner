@@ -114,6 +114,94 @@ fn zigLocalCacheDir(as_runner: bool) []const u8 {
     return if (as_runner) runner_home ++ "/.cache/zig-local" else "/root/.cache/zig-local";
 }
 
+/// ZIG_LOCAL_CACHE_DIR with `zig_local_cache`: the volume's root, or with a limit
+/// (`zig_local_cache_max_mb`) the `current` link into its live generation (`rollZigLocal`). One
+/// value for every job either way, so it never changes a step's cache key.
+fn zigLocalCacheEnv(as_runner: bool, max_mb: u32) []const u8 {
+    if (max_mb == 0) return zigLocalCacheDir(as_runner);
+    return if (as_runner)
+        runner_home ++ "/.cache/zig-local/current"
+    else
+        "/root/.cache/zig-local/current";
+}
+
+/// Keeps Zig's local cache under a limit without ever removing part of one (an `h/` manifest
+/// whose `o/` outputs are gone breaks a Zig cache for good): the cache lives in `gen-<N>` and
+/// `current` links to it. Past the limit the next job starts `gen-<N+1>` and moves the link
+/// (`mv -T`, a rename: atomic). A Zig process resolves the link once, when it opens the cache, so
+/// one that is running keeps its generation; a `mkdir` of the new one decides between two jobs
+/// rolling at once. A generation goes once its successor has been current for 6 hours, GitHub's
+/// default job timeout: nothing started since then can still be using it. The volume's root from
+/// before generations is removed (the runner's restart into this version ended the jobs that used
+/// it); a `current` that Zig made as a directory after a failed roll becomes the newest generation
+/// in place, and a running job keeps its open directory through the rename.
+/// Arguments: $1 the volume, $2 the limit in KB, $3 the owner (or empty), $4 a nonce for the
+/// temporary link (concurrent jobs' containers have the same PIDs).
+const zig_local_roll_script =
+    \\owner=$3 nonce=$4
+    \\cd "$1" || exit 0
+    \\own() { [ -z "$owner" ] || chown -h "$owner" "$@"; }
+    \\gens() { ls -d gen-* 2>/dev/null | sed -n 's/^gen-\([0-9][0-9]*\)$/\1/p' | sort -n; }
+    \\point() {
+    \\  touch "gen-$1/.zig-runner-since" && ln -s "gen-$1" ".current-$nonce" &&
+    \\    own "gen-$1" "gen-$1/.zig-runner-since" ".current-$nonce" &&
+    \\    mv -T ".current-$nonce" current
+    \\}
+    \\if [ -L current ]; then
+    \\  n=$(readlink current); n=${n#gen-}
+    \\else
+    \\  m=$(gens | tail -n 1); n=$((${m:--1} + 1))
+    \\  if [ -d current ]; then mv -T current "gen-$n"; else rm -rf h o z tmp; mkdir "gen-$n"; fi
+    \\  point "$n" || exit 0
+    \\fi
+    \\case $n in '' | *[!0-9]*) exit 0 ;; esac
+    \\if [ "$(du -sk "gen-$n" | cut -f1)" -gt "$2" ] && mkdir "gen-$((n + 1))"; then
+    \\  point "$((n + 1))" && n=$((n + 1))
+    \\fi
+    \\p=
+    \\for k in $(gens); do
+    \\  [ "$k" -le "$n" ] || break
+    \\  [ -n "$p" ] && [ -n "$(find "gen-$k/.zig-runner-since" -mmin +360)" ] && rm -rf "gen-$p"
+    \\  p=$k
+    \\done
+;
+
+/// Runs `zig_local_roll_script` on the job's Zig local-cache volume, in a container of its own
+/// before the job's base container: the base container's nodes, and so every step's key, stay
+/// what they were. A per-job variable keeps the engine from caching the exec. Nothing of it can
+/// fail the job: a cache that did not roll is only bigger.
+fn rollZigLocal(
+    arena: Allocator,
+    transport: Transport,
+    volume: []const u8,
+    max_mb: u32,
+    as_runner: bool,
+    nonce: []const u8,
+) !void {
+    var q: Query = .init(arena);
+    try q.open("container");
+    try q.call("from", .{ .address = default_image });
+    try q.call("withMountedCache", .{ .path = zig_local_roll_dir, .cache = volume });
+    try q.call("withEnvVariable", .{ .name = "ZIG_RUNNER_ROLL", .value = nonce });
+    const limit_kb = try std.fmt.allocPrint(arena, "{d}", .{@as(u64, max_mb) * 1024});
+    try q.call("withExec", .{ .args = &[_][]const u8{
+        "sh",
+        "-c",
+        zig_local_roll_script,
+        "zig-local-roll",
+        zig_local_roll_dir,
+        limit_kb,
+        if (as_runner) "1001:1001" else "",
+        nonce,
+    } });
+    try q.leaf("sync");
+    var err_msg: []const u8 = "";
+    _ = gql(arena, transport, try q.finish(), &err_msg) catch
+        std.log.warn("Zig local cache not rolled: {s}", .{err_msg});
+}
+
+const zig_local_roll_dir = "/zig-local";
+
 /// Where uv's project environment goes with `uv_env_in_cache`: inside its own cache volume, the
 /// only place a hardlink from that cache can reach (every mount is its own device, even two of one
 /// volume). Keyed by the ref, so jobs on different branches do not reconcile one environment to
@@ -159,6 +247,8 @@ const BasePlan = struct {
     cache_ids: []const []const u8,
     /// The volume for Zig's local cache, with `zig_local_cache`.
     zig_local: ?[]const u8 = null,
+    /// ZIG_LOCAL_CACHE_DIR when `zig_local` is set (`zigLocalCacheEnv`).
+    zig_local_env: ?[]const u8 = null,
     /// The Zig cache seed's directory, for a Zig job on a runner with one (`zigSeedFor`).
     zig_seed: ?[]const u8 = null,
     /// What "Set up job" says of the seed: applied, or why not.
@@ -231,7 +321,7 @@ fn writeImage(
             try q.call("withRegistryAuth", auth);
         } else if (err_msg.len > 0) return error.BaseContainerFailed;
     }
-    try writeFrom(q, plan.job_image, plan.zig_local != null, plan.as_runner);
+    try writeFrom(q, plan.job_image, plan.zig_local_env);
     if (job.container != null) for (plan.cache_ids, 0..) |_, i| {
         // Before the container's env, so its own value wins.
         if (package_cache_dirs[i].env.len == 0) continue;
@@ -265,12 +355,12 @@ fn writeImage(
 
 /// `from` the image, and Zig's local cache directory when it has a volume: the first nodes of
 /// every job's base container, which depend on nothing of the job.
-fn writeFrom(q: *Query, image: []const u8, zig_local: bool, as_runner: bool) !void {
+fn writeFrom(q: *Query, image: []const u8, zig_local_env: ?[]const u8) !void {
     try q.call("from", .{ .address = image });
     // Before the container's env too, so its value (or the workflow's) wins.
-    if (zig_local) try q.call(
+    if (zig_local_env) |dir| try q.call(
         "withEnvVariable",
-        .{ .name = "ZIG_LOCAL_CACHE_DIR", .value = zigLocalCacheDir(as_runner) },
+        .{ .name = "ZIG_LOCAL_CACHE_DIR", .value = dir },
     );
 }
 
@@ -481,6 +571,8 @@ pub fn basePlan(
         secrets,
         err_msg,
     );
+    if (volumes.zig_local) |id| if (opts.zig_local_cache_max_mb > 0)
+        try rollZigLocal(arena, transport, id, opts.zig_local_cache_max_mb, as_runner, ran_marker);
     return .{
         .container_env = container_env,
         .job_image = job_image,
@@ -490,6 +582,10 @@ pub fn basePlan(
         .uv_env = try uvEnvFor(arena, opts, job, as_runner, step_cache),
         .cache_ids = volumes.ids,
         .zig_local = volumes.zig_local,
+        .zig_local_env = if (volumes.zig_local != null)
+            zigLocalCacheEnv(as_runner, opts.zig_local_cache_max_mb)
+        else
+            null,
         .zig_seed = zig_seed,
         .zig_seed_note = zig_seed_note,
         .outputs_volume = volumes.outputs,
@@ -1104,7 +1200,14 @@ pub fn warmDocuments(arena: Allocator, opts: Options) !WarmDocuments {
     const as_runner = provision and opts.step_user == .runner;
     var q: Query = .init(arena);
     try q.open("container");
-    try writeFrom(&q, opts.image, opts.package_caches and opts.zig_local_cache, as_runner);
+    try writeFrom(
+        &q,
+        opts.image,
+        if (opts.package_caches and opts.zig_local_cache)
+            zigLocalCacheEnv(as_runner, opts.zig_local_cache_max_mb)
+        else
+            null,
+    );
     if (provision) try writeProvision(&q, as_runner);
     try q.leaf("sync");
     var ref: Query = .init(arena);
@@ -1193,7 +1296,7 @@ test "the from and provisioning nodes are a byte prefix of every job's base docu
                 const as_runner = provision and step_user == .runner;
                 var q: Query = .init(arena);
                 try q.open("container");
-                try writeFrom(&q, image, zig_local, as_runner);
+                try writeFrom(&q, image, if (zig_local) zigLocalCacheEnv(as_runner, 0) else null);
                 if (provision) try writeProvision(&q, as_runner);
                 const prefix = q.fragment().text;
                 try std.testing.expect(std.mem.startsWith(u8, base, prefix));
@@ -1414,6 +1517,67 @@ test "with zig_local_cache, Zig's local cache gets a volume of its own, outside 
     try std.testing.expect(std.mem.indexOf(u8, keys, "czl: cacheVolume(key:\"zig-runner/o/r/repo/zig-local/runner\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, base, "withEnvVariable(name:\"ZIG_LOCAL_CACHE_DIR\",value:\"/home/runner/.cache/zig-local\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, base, "withMountedCache(path:\"/home/runner/.cache/zig-local\",cache:\"VZL\",owner:\"runner\")") != null);
+}
+
+test "with a limit, Zig's local cache rolls before the base container, under one path every job shares" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("zig build test")};
+    var vols: std.Io.Writer.Allocating = .init(arena);
+    try vols.writer.writeAll("{\"data\":{\"czl\":{\"id\":\"VZL\"}");
+    for (package_cache_dirs, 0..) |_, i| try vols.writer.print(",\"c{d}\":{{\"id\":\"V{d}\"}}", .{ i, i });
+    try vols.writer.writeAll("}}");
+    var bases: [2][]const u8 = undefined;
+    for (&bases, [_][]const u8{ "R1", "R2" }) |*base, marker| {
+        // The roll failing does not fail the job.
+        const answers = [_][]const u8{
+            vols.written(),
+            "{\"errors\":[{\"message\":\"no space left\"}]}",
+            base_answer,
+            try exec(arena, "C1", 0, ""),
+        };
+        var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        const opts: Options = .{
+            .package_caches = true,
+            .trusted = true,
+            .zig_local_cache = true,
+            .zig_local_cache_max_mb = 4096,
+            .step_user = .runner,
+            .test_ran_marker = marker,
+            .test_session_argv = &.{ "sh", "-c", fake_child },
+            .test_transport = fake.transport(),
+        };
+        const res = try run(arena, std.testing.io, &env, opts, testJob(&steps), &log);
+        try std.testing.expect(res.succeeded);
+        const roll = fake.seen.items[1];
+        base.* = fake.seen.items[2];
+        try std.testing.expect(braceBalanced(roll));
+        // The volume, the limit in KB and the step user's id; the job's marker keeps the engine
+        // from reusing the exec.
+        try std.testing.expect(std.mem.indexOf(u8, roll, "withMountedCache(path:\"/zig-local\",cache:\"VZL\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, roll, "\"zig-local-roll\",\"/zig-local\",\"4194304\",\"1001:1001\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, roll, marker) != null);
+        try std.testing.expect(std.mem.indexOf(u8, base.*, "zig-local-roll") == null);
+        try std.testing.expect(std.mem.indexOf(u8, base.*, "withEnvVariable(name:\"ZIG_LOCAL_CACHE_DIR\",value:\"/home/runner/.cache/zig-local/current\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, base.*, "withMountedCache(path:\"/home/runner/.cache/zig-local\",cache:\"VZL\",owner:\"runner\")") != null);
+        // The pre-warm's prefix is still the base container's.
+        var q: Query = .init(arena);
+        try q.open("container");
+        try writeFrom(&q, default_image, zigLocalCacheEnv(true, opts.zig_local_cache_max_mb));
+        try writeProvision(&q, true);
+        const prefix = q.fragment().text;
+        try std.testing.expect(std.mem.startsWith(u8, base.*, prefix));
+        try std.testing.expect(std.mem.startsWith(u8, (try warmDocuments(arena, opts)).base, prefix));
+    }
+    // Up to the job's mark, two jobs' base containers are one: the generation is in neither, so it
+    // reaches no step's key.
+    const cut = std.mem.indexOf(u8, bases[0], mark_env).?;
+    try std.testing.expectEqualStrings(bases[0][0..cut], bases[1][0..cut]);
 }
 
 const test_zig_seed: config.ZigSeed = .{

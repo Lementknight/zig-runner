@@ -359,6 +359,7 @@ fn execJobFile(
         .package_caches = cfg.package_caches,
         .uv_env_in_cache = cfg.uv_env_in_cache,
         .zig_local_cache = cfg.zig_local_cache,
+        .zig_local_cache_max_mb = cfg.zig_local_cache_max_mb,
         .zig_seed = cfg.zig_seed,
         .step_cache = cfg.step_cache,
         .step_user = cfg.step_user,

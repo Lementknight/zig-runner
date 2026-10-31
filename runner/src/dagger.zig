@@ -504,6 +504,9 @@ pub const Options = struct {
     uv_env_in_cache: bool = true,
     /// `Config.zig_local_cache`: Zig's local cache goes in a cache volume of its own.
     zig_local_cache: bool = false,
+    /// `Config.zig_local_cache_max_mb`: past it, Zig's local cache starts over in a new generation
+    /// (`set_up.rollZigLocal`). 0, the default here, keeps it in the volume's root, unbounded.
+    zig_local_cache_max_mb: u32 = 0,
     /// `Config.zig_seed`: the Zig release Zig jobs' global cache is seeded from (see
     /// `set_up.zigSeedFor`); null for none.
     zig_seed: ?config.ZigSeed = null,
