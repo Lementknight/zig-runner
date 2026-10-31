@@ -151,8 +151,9 @@ const zig_local_roll_script =
     \\  n=$(readlink current); n=${n#gen-}
     \\else
     \\  m=$(gens | tail -n 1); n=$((${m:--1} + 1))
-    \\  if [ -d current ]; then mv -T current "gen-$n"; else rm -rf h o z tmp; mkdir "gen-$n"; fi
+    \\  if [ -d current ]; then mv -T current "gen-$n"; else mkdir "gen-$n"; fi
     \\  point "$n" || exit 0
+    \\  rm -rf c h o tmp z
     \\fi
     \\case $n in '' | *[!0-9]*) exit 0 ;; esac
     \\if [ "$(du -sk "gen-$n" | cut -f1)" -gt "$2" ] && mkdir "gen-$((n + 1))"; then
@@ -169,7 +170,10 @@ const zig_local_roll_script =
 /// Runs `zig_local_roll_script` on the job's Zig local-cache volume, in a container of its own
 /// before the job's base container: the base container's nodes, and so every step's key, stay
 /// what they were. A per-job variable keeps the engine from caching the exec. Nothing of it can
-/// fail the job: a cache that did not roll is only bigger.
+/// fail the job: a cache that did not roll is only bigger. The volume is mounted exactly as the
+/// steps mount it (`writeZigLocalMount`): the engine gives a cache volume mounted with another
+/// owner a store of its own. The step user's owner needs the provisioned image, which has the user
+/// (and which the engine has cached for the base container anyway).
 fn rollZigLocal(
     arena: Allocator,
     transport: Transport,
@@ -181,7 +185,8 @@ fn rollZigLocal(
     var q: Query = .init(arena);
     try q.open("container");
     try q.call("from", .{ .address = default_image });
-    try q.call("withMountedCache", .{ .path = zig_local_roll_dir, .cache = volume });
+    if (as_runner) try writeProvision(&q, true);
+    try writeZigLocalMount(&q, volume, as_runner);
     try q.call("withEnvVariable", .{ .name = "ZIG_RUNNER_ROLL", .value = nonce });
     const limit_kb = try std.fmt.allocPrint(arena, "{d}", .{@as(u64, max_mb) * 1024});
     try q.call("withExec", .{ .args = &[_][]const u8{
@@ -189,7 +194,7 @@ fn rollZigLocal(
         "-c",
         zig_local_roll_script,
         "zig-local-roll",
-        zig_local_roll_dir,
+        zigLocalCacheDir(as_runner),
         limit_kb,
         if (as_runner) "1001:1001" else "",
         nonce,
@@ -200,7 +205,15 @@ fn rollZigLocal(
         std.log.warn("Zig local cache not rolled: {s}", .{err_msg});
 }
 
-const zig_local_roll_dir = "/zig-local";
+/// The Zig local-cache volume's mount, one writer for the base container and the roll, so both
+/// reach the same store.
+fn writeZigLocalMount(q: *Query, volume: []const u8, as_runner: bool) !void {
+    try q.call("withMountedCache", .{
+        .path = zigLocalCacheDir(as_runner),
+        .cache = volume,
+        .owner = if (as_runner) runner_user else null,
+    });
+}
 
 /// Where uv's project environment goes with `uv_env_in_cache`: inside its own cache volume, the
 /// only place a hardlink from that cache can reach (every mount is its own device, even two of one
@@ -443,11 +456,7 @@ fn writeCacheMounts(q: *Query, arena: Allocator, plan: BasePlan) !void {
             .owner = owner,
         });
     }
-    if (plan.zig_local) |id| try q.call("withMountedCache", .{
-        .path = zigLocalCacheDir(plan.as_runner),
-        .cache = id,
-        .owner = if (plan.as_runner) runner_user else null,
-    });
+    if (plan.zig_local) |id| try writeZigLocalMount(q, id, plan.as_runner);
     if (plan.zig_seed) |seed| if (zig_path) |path| try writeSeedCopy(q, arena, seed, path);
 }
 
@@ -1519,6 +1528,18 @@ test "with zig_local_cache, Zig's local cache gets a volume of its own, outside 
     try std.testing.expect(std.mem.indexOf(u8, base, "withMountedCache(path:\"/home/runner/.cache/zig-local\",cache:\"VZL\",owner:\"runner\")") != null);
 }
 
+/// The `withMountedCache(...)` call of a document that mounts the volume `cache` (quoted).
+fn mountArgs(doc: []const u8, cache: []const u8) ?[]const u8 {
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, doc, at, "withMountedCache(")) |start| {
+        const end = std.mem.indexOfScalarPos(u8, doc, start, ')') orelse return null;
+        const call = doc[start .. end + 1];
+        if (std.mem.indexOf(u8, call, cache) != null) return call;
+        at = end;
+    }
+    return null;
+}
+
 test "with a limit, Zig's local cache rolls before the base container, under one path every job shares" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -1559,8 +1580,14 @@ test "with a limit, Zig's local cache rolls before the base container, under one
         try std.testing.expect(braceBalanced(roll));
         // The volume, the limit in KB and the step user's id; the job's marker keeps the engine
         // from reusing the exec.
-        try std.testing.expect(std.mem.indexOf(u8, roll, "withMountedCache(path:\"/zig-local\",cache:\"VZL\")") != null);
-        try std.testing.expect(std.mem.indexOf(u8, roll, "\"zig-local-roll\",\"/zig-local\",\"4194304\",\"1001:1001\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, roll, "\"zig-local-roll\",\"/home/runner/.cache/zig-local\",\"4194304\",\"1001:1001\"") != null);
+        // The roll mounts the volume byte for byte as the steps do: the engine keeps a store per
+        // owner, and a roll under another one rolls a volume no step reads.
+        const mount = "withMountedCache(path:\"/home/runner/.cache/zig-local\",cache:\"VZL\",owner:\"runner\")";
+        try std.testing.expectEqualStrings(mountArgs(base.*, "\"VZL\"").?, mountArgs(roll, "\"VZL\"").?);
+        try std.testing.expectEqualStrings(mount, mountArgs(roll, "\"VZL\"").?);
+        // As the step user, who exists only in the provisioned image.
+        try std.testing.expect(std.mem.indexOf(u8, roll, "useradd -m -u 1001") != null);
         try std.testing.expect(std.mem.indexOf(u8, roll, marker) != null);
         try std.testing.expect(std.mem.indexOf(u8, base.*, "zig-local-roll") == null);
         try std.testing.expect(std.mem.indexOf(u8, base.*, "withEnvVariable(name:\"ZIG_LOCAL_CACHE_DIR\",value:\"/home/runner/.cache/zig-local/current\")") != null);
