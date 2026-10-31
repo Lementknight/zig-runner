@@ -2136,20 +2136,26 @@ test "an interpolated text is limited as GitHub limits the format() it makes of 
 }
 
 test "interpolation stops at its limit, and what each expression builds on the way does not add up" {
+    // Both cases at once: each is slow in a debug build, and they share nothing.
+    const io = std.testing.io;
     // A hundred values of 300000 characters: 30 MB, refused at the 18th.
-    {
-        var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
-        defer a.deinit();
-        const ar = a.allocator();
-        const big = try ar.alloc(u8, 300000);
-        @memset(big, 'x');
-        const env = [_]Value.Entry{.{ .key = "big", .value = .{ .string = big } }};
-        const s = tctx(&.{.{ .key = "env", .value = .{ .object = &env } }});
-        const text = try repeated(ar, &.{.{ "${{ env.big }}", 100 }});
-        const before = a.queryCapacity();
-        try std.testing.expectError(error.EvalError, interpolate(ar, text, s));
-        try std.testing.expect(a.queryCapacity() - before < 32 << 20);
-    }
+    const Refused = struct {
+        fn run() !void {
+            var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer a.deinit();
+            const ar = a.allocator();
+            const big = try ar.alloc(u8, 300000);
+            @memset(big, 'x');
+            const env = [_]Value.Entry{.{ .key = "big", .value = .{ .string = big } }};
+            const s = tctx(&.{.{ .key = "env", .value = .{ .object = &env } }});
+            const text = try repeated(ar, &.{.{ "${{ env.big }}", 100 }});
+            const before = a.queryCapacity();
+            try std.testing.expectError(error.EvalError, interpolate(ar, text, s));
+            try std.testing.expect(a.queryCapacity() - before < 32 << 20);
+        }
+    };
+    var refused = try io.concurrent(Refused.run, .{});
+    defer refused.cancel(io) catch {};
     // Two hundred expressions, each building 300000 characters to compare with: short results,
     // and each one's scratch memory is the next one's.
     {
@@ -2172,4 +2178,5 @@ test "interpolation stops at its limit, and what each expression builds on the w
         @memset(try ar.alloc(u8, 4096), '!');
         try std.testing.expect(std.mem.indexOf(u8, diag, "too many arguments to join()") != null);
     }
+    try refused.await(io);
 }
