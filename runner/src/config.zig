@@ -30,6 +30,10 @@ pub const JsRuntime = enum { bun, node };
 pub const StepUser = enum { runner, root };
 /// How jobs reach the Dagger engine: directly (`engine.zig`), or through a `dagger run` child.
 pub const EngineMode = enum { direct, cli };
+/// The Zig release a Zig global-cache seed is built with (`RUNNER_ZIG_SEED=<version>=<sha256>`):
+/// its version and the sha256 of its tarball for the engine host's architecture, from
+/// https://ziglang.org/download/index.json.
+pub const ZigSeed = struct { version: []const u8, sha256: []const u8 };
 
 pub const Config = struct {
     gh_token: []const u8,
@@ -100,6 +104,12 @@ pub const Config = struct {
     /// repository had the same source. Off by default: Zig never removes anything from that cache,
     /// so it grows by about 50 MB for every source version built, until the engine collects it.
     zig_local_cache: bool = false,
+    /// Seed Zig jobs' global cache with what every `zig build` compiles before it reads any
+    /// project: the build runner, 104 s on one core and about 1 GB on the laptop (`set_up.zig`,
+    /// "The Zig cache seed"). Off when unset: the runner cannot know which Zig its jobs use, and a
+    /// seed for another version costs a seed build per engine and 60 MB in every Zig volume, for
+    /// nothing.
+    zig_seed: ?ZigSeed = null,
     /// Output keys cost two walks of the job's filesystem, whatever the step changed: 25 s on a
     /// large checkout against 1 s on a small one (STUDY.md §3.6). When a job spends longer than
     /// this on them, later jobs for that repository skip them until the runner restarts. 0 never
@@ -149,6 +159,7 @@ pub const Config = struct {
         InvalidStepUser,
         InvalidEngine,
         InvalidBool,
+        InvalidZigSeed,
         UnknownFlag,
         MissingFlagValue,
         ProdTrustsNoRef,
@@ -161,6 +172,9 @@ pub const Config = struct {
                 "not set, so this runner would fail every job. Set it to the refs prod may run " ++
                 "(RUNNER_TRUSTED_REFS=refs/heads/main,refs/tags/v*), or to * to trust every ref " ++
                 "(README, \"Environments\").",
+            error.InvalidZigSeed => "RUNNER_ZIG_SEED is <version>=<sha256>: a Zig version and " ++
+                "the sha256 of its Linux tarball for this machine's architecture, from " ++
+                "https://ziglang.org/download/index.json.",
             else => null,
         };
     }
@@ -238,6 +252,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_LOG_SPOOL_DIR")) |v| c.log_spool_dir = v;
         if (environ.get("RUNNER_UV_ENV_IN_CACHE")) |v| c.uv_env_in_cache = try boolean(v);
         if (environ.get("RUNNER_ZIG_LOCAL_CACHE")) |v| c.zig_local_cache = try boolean(v);
+        if (environ.get("RUNNER_ZIG_SEED")) |v| c.zig_seed = try zigSeed(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_MAX_MS")) |v| c.output_keys_max_ms = try millis(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_DAYS")) |v| c.output_keys_days = try count(v);
         if (environ.get("RUNNER_ONCE")) |v| c.once = try boolean(v);
@@ -295,6 +310,7 @@ pub const Config = struct {
         else if (eq(key, "step-user")) c.step_user = try stepUser(val) //
         else if (eq(key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache")) c.zig_local_cache = try boolean(val) //
+        else if (eq(key, "zig-seed")) c.zig_seed = try zigSeed(val) //
         else if (eq(key, "output-keys-max-ms")) c.output_keys_max_ms = try millis(val) //
         else if (eq(key, "log-spool-dir")) c.log_spool_dir = val //
         else if (eq(key, "enforce-volatile")) c.enforce_volatile = try boolean(val) //
@@ -342,6 +358,24 @@ pub const Config = struct {
 
     fn stepUser(s: []const u8) error{InvalidStepUser}!StepUser {
         return std.meta.stringToEnum(StepUser, s) orelse error.InvalidStepUser;
+    }
+
+    /// `<version>=<sha256>`, or empty for none. Both go into a URL and a shell script, so only a
+    /// version's characters and 64 lowercase hex digits pass.
+    fn zigSeed(s: []const u8) error{InvalidZigSeed}!?ZigSeed {
+        if (s.len == 0) return null;
+        const at = std.mem.indexOfScalar(u8, s, '=') orelse return error.InvalidZigSeed;
+        const version = s[0..at];
+        const sha256 = s[at + 1 ..];
+        if (version.len == 0 or sha256.len != 64) return error.InvalidZigSeed;
+        for (version) |ch| {
+            if (!std.ascii.isAlphanumeric(ch) and std.mem.indexOfScalar(u8, ".+-", ch) == null)
+                return error.InvalidZigSeed;
+        }
+        for (sha256) |ch| {
+            if (!std.ascii.isDigit(ch) and !(ch >= 'a' and ch <= 'f')) return error.InvalidZigSeed;
+        }
+        return .{ .version = version, .sha256 = sha256 };
     }
 
     fn jsRuntime(s: []const u8) error{InvalidJsRuntime}!JsRuntime {
@@ -561,6 +595,32 @@ test "package caches are on by default and can be turned off" {
     try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--package-caches=false" })).package_caches);
     try env.put("RUNNER_PACKAGE_CACHES", "0");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).package_caches);
+}
+
+test "the Zig cache seed is off unless RUNNER_ZIG_SEED names a version and a sha256" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try std.testing.expect((try Config.load(&env, &.{"runner"})).zig_seed == null);
+    const sum = "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026";
+    try env.put("RUNNER_ZIG_SEED", "0.17.0=" ++ sum);
+    const seed = (try Config.load(&env, &.{"runner"})).zig_seed.?;
+    try std.testing.expectEqualStrings("0.17.0", seed.version);
+    try std.testing.expectEqualStrings(sum, seed.sha256);
+    try std.testing.expect((try Config.load(&env, &.{ "runner", "--zig-seed=" })).zig_seed == null);
+    // Both end up in a shell script and a URL: nothing but a version and hex gets through.
+    for ([_][]const u8{
+        "0.17.0",
+        "=" ++ sum,
+        "0.17.0=" ++ sum[1..],
+        "0.17.0=" ++ sum[1..] ++ "G",
+        "0.17.0;rm=" ++ sum,
+        "0.17.0 =" ++ sum,
+    }) |bad| {
+        try env.put("RUNNER_ZIG_SEED", bad);
+        try std.testing.expectError(error.InvalidZigSeed, Config.load(&env, &.{"runner"}));
+    }
 }
 
 test "Zig's local cache is kept only when asked for, and uv's setting is read" {
