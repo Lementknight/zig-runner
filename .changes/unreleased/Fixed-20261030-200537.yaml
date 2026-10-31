@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'CI compiles the release''s binaries before the tag (#106): a new "Release builds" check builds both targets (x86_64 and aarch64) in ReleaseSafe, as the release does, on every pull request and in the merge queue that changes `runner/src`, `build.zig`, `build.zig.zon` or the build scripts (`ci-scope.sh binaries`). Code that compiled only in Debug or only for x86_64 used to fail first at the release, after its tag was pushed, losing the version.'
-time: 2026-10-30T20:05:37.000000-04:00

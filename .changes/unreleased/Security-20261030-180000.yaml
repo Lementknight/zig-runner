@@ -1,3 +1,0 @@
-kind: Security
-body: 'The trust gate fails closed (#105): an unset or empty `RUNNER_TRUSTED_REFS` now trusts no ref, so every job fails before its first step with a message saying what to set, instead of trusting every job. Trusting every ref takes `RUNNER_TRUSTED_REFS=*`, and every event `RUNNER_TRUSTED_EVENTS=*` (unset is still `push,workflow_dispatch`). A runner whose `RUNNER_LABELS` include `prod` refuses to start without trusted refs, and warns when they are `*`. The runner logs what it trusts at startup. Upgrade: a runner that relied on unset to run every job (a pre-prod) sets `RUNNER_TRUSTED_REFS=*` and `RUNNER_TRUSTED_EVENTS=*`.'
-time: 2026-10-30T18:00:00.000000-04:00

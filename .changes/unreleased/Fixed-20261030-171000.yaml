@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A job''s `environment.url` is evaluated after its steps and reported to GitHub, so the deployment links to it as on GitHub (#103); a url that would carry a secret is left out with GitHub''s warning, and one that cannot be evaluated fails the job.'
-time: 2026-10-30T17:10:00.000000-04:00

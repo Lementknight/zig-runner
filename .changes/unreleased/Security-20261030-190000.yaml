@@ -1,3 +1,0 @@
-kind: Security
-body: 'Package-cache volumes fail closed (#105): a job shares the repository''s `repo` volumes only when the runner vouches for it, by the trust gate''s own rule on lists that name what they trust (no `*`), and it is not a fork''s pull request. Every other job gets the `untrusted` volumes (formerly `fork-pr`, only for pull requests from a named fork): same-repository pull requests, `workflow_run` and `issue_comment` events, fork pull requests whose repository was deleted, and every job on a runner with `RUNNER_TRUSTED_REFS=*` or `RUNNER_TRUSTED_EVENTS=*`. Fork pull requests start once from empty caches under the new name. Run one engine per trust level (README, "Environments").'
-time: 2026-10-30T19:00:00.000000-04:00

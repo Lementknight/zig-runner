@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Opening the live log feed is given up after 30 s (#100): a feed endpoint that accepted the connection and never answered held the start of a job, or its end when the feed was opened again, for good. The log then appears when the job ends, as for any feed that is unavailable.'
-time: 2026-10-30T23:30:00.000000-04:00

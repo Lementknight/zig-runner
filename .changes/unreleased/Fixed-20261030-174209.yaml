@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A Docker action''s `runs.env` no longer overrides a variable the workflow, the job, the step or the action''s inputs already set; as on GitHub, it only fills names left unset (#103).'
-time: 2026-10-30T17:42:09.000000-04:00

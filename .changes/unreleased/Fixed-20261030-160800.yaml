@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A step can set any variable through `$GITHUB_ENV` but `NODE_OPTIONS`, as on GitHub (#103): `CI=false`, `GITHUB_TOKEN` and other `GITHUB_*` or `RUNNER_*` names now reach later steps instead of being ignored, the variables GitHub derives from the run (`GITHUB_SHA`, `RUNNER_TEMP` and the like) keep their real values in the process while `${{ env.NAME }}` reads what was written, and `NODE_OPTIONS` and the runner''s own `ZIG_RUNNER_*` and `ZIG_SECRET_*` variables are refused with an error annotation.'
-time: 2026-10-30T16:08:00.000000-04:00

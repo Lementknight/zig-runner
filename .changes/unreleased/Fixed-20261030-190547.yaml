@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'The `pre` scripts of actions used inside a composite action now run before the job''s steps, as one "Pre" step for the composite action, under their own `pre-if`, and hand their saved state to their action''s main and post, as on GitHub; they used not to run at all (#103).'
-time: 2026-10-30T19:05:47.000000-04:00

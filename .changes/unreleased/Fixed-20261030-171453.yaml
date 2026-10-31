@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Directories added through `$GITHUB_PATH` come first in `PATH` newest first, each once, as on GitHub (two lines `/a` then `/b` give `/b:/a:…`, not `/a:/b:…`), and they also go before a `PATH` set in a step''s `env:` or through `$GITHUB_ENV`, which used to drop them (#103).'
-time: 2026-10-30T17:14:53.000000-04:00

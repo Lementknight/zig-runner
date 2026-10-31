@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A step output written more than once keeps its last value, with names matched regardless of case, as on GitHub; a name written to `GITHUB_OUTPUT` takes its value from there, not from a deprecated `::set-output` line (#103).'
-time: 2026-10-30T16:02:11.000000-04:00

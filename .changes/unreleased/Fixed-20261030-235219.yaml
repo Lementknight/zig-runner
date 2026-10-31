@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'CI''s Workflows job tries zizmor again when a request to GitHub fails (#106). A failed request makes zizmor exit 1, its code for its own failure, which took a pull request (#194) out of the merge queue. That exit is now retried twice, after 15 and 30 s; findings (exits 10 to 14) and every other exit still fail at once, and the online audits still run on pull requests and in the merge queue.'
-time: 2026-10-30T23:52:19.000000-04:00

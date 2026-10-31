@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Several small cases now behave as on GitHub (#103): the entries of `$GITHUB_OUTPUT`, `$GITHUB_ENV` or `$GITHUB_STATE` before a malformed line still apply before the step fails, and a malformed `$GITHUB_STATE` fails the step too; the 1 MiB step summary limit applies to each file, not to a composite action''s steps together; `timeout-minutes` counts whole minutes, so `0.5` means no timeout; and a `shell:` or `working-directory:` expression that cannot be evaluated fails the step instead of being ignored.'
-time: 2026-10-30T17:40:00.000000-04:00
