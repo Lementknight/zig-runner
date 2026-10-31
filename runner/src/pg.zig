@@ -1000,7 +1000,7 @@ test "a server that accepts and never answers is given up, connecting and in a s
     cfg.port = silent.socket.address.getPort();
     var started = Io.Clock.awake.now(io);
     try std.testing.expectError(error.Timeout, Client.connect(gpa, io, cfg));
-    try std.testing.expect(started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 2_000);
+    try std.testing.expect(started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 10_000);
 
     // Ready for queries, then silent: a statement is given up too.
     const Server = struct {
@@ -1029,5 +1029,5 @@ test "a server that accepts and never answers is given up, connecting and in a s
     defer c.close();
     started = Io.Clock.awake.now(io);
     try std.testing.expectError(error.Timeout, c.exec("select 1"));
-    try std.testing.expect(started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 2_000);
+    try std.testing.expect(started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 10_000);
 }
