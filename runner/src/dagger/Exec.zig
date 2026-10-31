@@ -719,14 +719,25 @@ pub const debugApplied = @import("output_keys.zig").debugApplied;
 
 /// Several execs can log as one step (a composite action's steps, a JavaScript action's pre,
 /// main and post): after the first, count each one's live lines afresh, so a cached one is
-/// replayed.
+/// replayed, and forget the lines replayed for the one before, so a line of this exec's that
+/// one also printed is not taken for its late copy and dropped, workflow command and all (#102).
 pub fn beginExec(x: *Exec, num: u32) void {
     if (x.execs[num - 1] > 0) {
         x.sh.live_lines[num - 1].store(0, .monotonic);
         x.sh.ended[num - 1].store(false, .release);
+        x.sh.forgetReplayed();
     }
     x.sh.bun_refused.store(0, .release);
     x.execs[num - 1] += 1;
+}
+
+/// Whether the exec's lines arrived live (`awaitLive`). Not when its marker says it did not run
+/// in this job: a cached exec prints nothing, so lines counted for its step are an earlier
+/// exec's of the same step arriving late (a composite action's previous step), and waiting on
+/// them would skip this one's replay, its log, masks, outputs and state with it (#102).
+fn liveThisExec(io: std.Io, sh: *JobLog, num: u32, ran: ?bool) bool {
+    if (ran == false) return false;
+    return awaitLive(io, sh, num);
 }
 
 /// An exec's result (`exitCode fc_<kind> { contents }`): its output, replayed if it was cached
@@ -739,8 +750,8 @@ pub fn collect(x: *Exec, num: u32, data: std.json.Value, recorded: Recorded) !Ou
     // recorded output. Without step caching nothing is replayed from an earlier job:
     // run-specific values are part of every key.
     var output: Recorded.Output = .{ .stdout = "", .stderr = "" };
-    if (!awaitLive(x.io, x.sh, num)) {
-        const ran = x.ranThisRun(data);
+    const ran = x.ranThisRun(data);
+    if (!liveThisExec(x.io, x.sh, num, ran)) {
         // An answer that has it already (a test's) is not asked again; a step that ran here
         // and printed nothing has nothing to show.
         if (jsonFind(data, "stdout") != null) output = .{
@@ -1400,6 +1411,42 @@ test "a failed answer without a ran marker is an earlier run's unless the step s
     live[0].store(0, .monotonic);
     ended[0].store(true, .release);
     try std.testing.expect(!failedEarlier(std.testing.io, &sh, 1, null));
+}
+
+test "a cached exec is replayed though the exec before it, of the same step, is still arriving" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    // A composite's inner step A ran; its last lines are still arriving when inner step B, which
+    // the cache answered, is collected: the step's count is above zero, and B's end never comes.
+    var live = [_]std.atomic.Value(u32){.init(2)};
+    var ended = [_]std.atomic.Value(bool){.init(false)};
+    var replayed = [_]bool{false};
+    var cmds = [_]JobLog.StepCommands{.{}};
+    var sh: JobLog = .{
+        .io = std.testing.io,
+        .arena = a.allocator(),
+        .log = &log,
+        .sink_job_id = 0,
+        .live_lines = &live,
+        .ended = &ended,
+        .replayed_steps = &replayed,
+        .commands = &cmds,
+    };
+    try std.testing.expect(!liveThisExec(std.testing.io, &sh, 1, false));
+    _ = replayNotLive(&sh, 1, "::set-output name=v::from-b\nb's line\n", "", false);
+    const outs = sh.takeOutputs(1);
+    try std.testing.expectEqual(@as(usize, 1), outs.len);
+    try std.testing.expectEqualStrings("from-b", outs[0].value);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "b's line") != null);
+    // Nor did it wait for an end that never comes, and warn of output that had not arrived.
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "had not arrived") == null);
+    // An exec that ran here, or did not say, still waits for its own lines.
+    ended[0].store(true, .release);
+    try std.testing.expect(liveThisExec(std.testing.io, &sh, 1, true));
+    try std.testing.expect(liveThisExec(std.testing.io, &sh, 1, null));
 }
 
 test "file commands come back from one combined file" {
