@@ -90,11 +90,16 @@ repository:
   release's own jobs can publish: pull requests' and the merge queue's checks hold read access
   alone ("Image" scans and builds; "Image (publish)", on a tag, pushes and attests).
 - **Pinned inputs.** Actions are pinned by commit and images by digest, not by tag, which their
-  owner (or whoever takes their repository) can move, BuildKit and its SBOM scanner included;
-  [Renovate](https://docs.renovatebot.com)
-  proposes updates a week after their release. The exception is the Dagger engine in
+  owner (or whoever takes their repository) can move, BuildKit and its SBOM scanner included, and
+  the busybox the runner itself puts into job containers (`runner/src/dagger.zig`), pinned by its
+  multi-arch index digest so one pin serves amd64 and arm64; the Workflows job checks on every
+  pull request that this pin is a pullable index with the applets the runner uses
+  (`.github/scripts/busybox-pin.sh`). [Renovate](https://docs.renovatebot.com)
+  proposes updates a week after their release. The exceptions are the Dagger engine in
   `deploy/compose.yaml`, pinned by tag and held there on purpose: the runner speaks one engine
-  version's protocol, and a new engine starts with an empty cache. tls.zig and GitHub's expression
+  version's protocol, and a new engine starts with an empty cache; and, still by tag, the
+  JavaScript runtimes for actions (`oven/bun` and `node`, `runner/src/dagger/js.zig`) and the job
+  base image `ubuntu:24.04` (`RUNNER_IMAGE`), tracked in #107. tls.zig and GitHub's expression
   test cases are pinned by commit. Zig and changie are checked against pinned checksums before they
   run, tls.zig against its `.hash` as well; a Renovate pull request for a new Zig, tls.zig or
   changie fails until its checksums are updated (changie's by the Workflows job, which downloads
@@ -119,8 +124,9 @@ repository:
   database fetched once, with retries, from Google's mirror first; accepted findings are in
   `.trivyignore.yaml`, each with why. GitHub's secret scanning blocks pushes carrying credentials.
 - **Checked.** actionlint and zizmor check the workflows, shellcheck every shell script
-  (`.github/scripts/shellcheck.sh`), and CodeQL the workflows, the Go tools and the Python
-  generators; every job has a time limit. The Database tests job runs every test under
+  (`.github/scripts/shellcheck.sh`), `busybox-pin.sh` the runner's busybox pin, and CodeQL the
+  workflows, the Go tools and the Python generators; every job has a time limit. The Database
+  tests job runs every test under
   ThreadSanitizer (`zig build test -Dsanitize-thread` locally). Vulnerabilities are reported privately ([docs/SECURITY.md](docs/SECURITY.md)).
 - **One secret, one step.** The deploy key that may push to `main` is the `prod` environment's,
   which deploys only from `main` and waits for approval; it is loaded only in the step that pushes,

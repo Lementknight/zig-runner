@@ -77,6 +77,25 @@
         "registry.dagger.io/engine"
       ],
       "enabled": false
+    },
+    {
+      "description": "busybox, the helper image the runner puts into job containers (runner/src/dagger.zig): a new version changes the applets every Docker action, service forwarder and output-key store runs on (sh, tcpsvd, nc, mv -T, cp -a, ...), so it gets its own pull request, which busybox-pin.sh gates; and every update re-keys those steps, which run once more after it.",
+      "matchDepNames": [
+        "busybox"
+      ],
+      "groupName": "busybox"
+    },
+    {
+      "description": "The official busybox image is rebuilt, and its tag re-pushed, about monthly, each time a digest update that re-runs the steps above: proposed monthly at most.",
+      "matchDepNames": [
+        "busybox"
+      ],
+      "matchUpdateTypes": [
+        "digest"
+      ],
+      "schedule": [
+        "on the first day of the month"
+      ]
     }
   ],
   "customManagers": [
@@ -139,6 +158,17 @@
       ],
       "matchStrings": [
         "(?<depName>(?:[a-z0-9.-]+/)*[a-z0-9._-]+):(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "description": "busybox, the helper image the runner names in Zig source (runner/src/dagger.zig), pinned by its multi-arch index digest; the literal is split over two lines with ++, and CI's busybox-pin.sh checks the pin, failing on a shape this pattern would miss.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^runner/src/dagger\\.zig$/"
+      ],
+      "matchStrings": [
+        "\"(?<depName>busybox):(?<currentValue>[A-Za-z0-9._-]+)\"\\s*\\+\\+\\s*\"@(?<currentDigest>sha256:[a-f0-9]{64})\""
       ],
       "datasourceTemplate": "docker"
     },
