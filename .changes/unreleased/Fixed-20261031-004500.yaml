@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'With output keys, pruning the output store no longer deletes a stored output in place while another job is copying it into its next step, which could leave that step starting from part of the output: a pruned directory is renamed out of the way first, and the copy fails, falling back to the step''s own container, if its directory went during it.'
+time: 2026-10-31T00:45:00.000000-04:00

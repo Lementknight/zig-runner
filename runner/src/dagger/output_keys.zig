@@ -247,6 +247,12 @@ pub fn outputsVolume(x: *Exec, num: u32) !?[]const u8 {
 /// for a day. Removing one is always safe: a replayed step does not read the store, and when
 /// the copy into a next step has to run and finds nothing, that falls back to the step's own
 /// container. False, with the fallback noted, when the store exec failed.
+///
+/// A directory goes by being renamed out of the way first (`<name>.dead.<tmp>`), then deleted:
+/// another job may have just produced the same digest and be copying from it (`applyScript`),
+/// and `rm -rf` in place would empty it under that copy, which could still end with status 0
+/// and leave a partial output to be cached (#102). The rename takes the whole directory at
+/// once, so a copy either read all of it first or finds it gone (`applyScript` checks).
 pub fn storeOutput(
     x: *Exec,
     num: u32,
@@ -260,11 +266,12 @@ pub fn storeOutput(
     x.io.random(&tmp_raw);
     const tmp_name = std.fmt.bytesToHex(tmp_raw, .lower);
     const store_script = try std.fmt.allocPrint(arena,
-        \\/bin/busybox find /store -mindepth 1 -maxdepth 1 \( -name '*.tmp.*' -mtime +0 -o -mtime +{d} \) -exec /bin/busybox rm -rf {{}} +
+        \\for p in $(/bin/busybox find /store -mindepth 1 -maxdepth 1 ! -name '*.dead.*' \( -name '*.tmp.*' -mtime +0 -o -mtime +{d} \)); do /bin/busybox mv -T "$p" "$p.dead.{s}" 2>/dev/null; done
+        \\/bin/busybox find /store -mindepth 1 -maxdepth 1 -name '*.dead.*' -exec /bin/busybox rm -rf {{}} +
         \\d=/store/{s}; test -d "$d" && {{ /bin/busybox touch "$d"; exit 0; }}
         \\t="$d.tmp.{s}"; /bin/busybox rm -rf "$t"; /bin/busybox cp -a /in/. "$t" || exit 1
         \\/bin/busybox mv -T "$t" "$d" 2>/dev/null || /bin/busybox rm -rf "$t"; test -d "$d" && /bin/busybox touch "$d"
-    , .{ x.outputs_days, digest, &tmp_name });
+    , .{ x.outputs_days, &tmp_name, digest, &tmp_name });
     var msg: []const u8 = "";
     var q: Query = .init(arena);
     try q.open("container");
@@ -290,6 +297,10 @@ pub fn storeOutput(
 /// filesystem with the removed paths deleted (a step's changes), or as the whole contents of
 /// one directory (a Docker action's workspace). The digest and removed paths are the exec's
 /// arguments, so they are what its key depends on.
+///
+/// The stored directory must still be there after the copy: another job's prune renames it
+/// away before deleting it (`storeOutput`), so if it is gone the copy may have read only part
+/// of it, and the script fails, which falls back to the step's own container (#102).
 pub fn applyScript(x: *Exec, digest: []const u8, target: OutputTarget) ![]const u8 {
     const arena = x.arena;
     var apply: std.Io.Writer.Allocating = .init(arena);
@@ -312,6 +323,7 @@ pub fn applyScript(x: *Exec, digest: []const u8, target: OutputTarget) ![]const 
                 outputs_busybox ++ " cp -a " ++ outputs_store ++ "/{s}/. /\n",
                 .{digest},
             );
+            try aw.print("test -d " ++ outputs_store ++ "/{s}\n", .{digest});
         },
         .replace_dir => |dir| {
             try aw.writeAll(outputs_busybox ++ " rm -rf ");
@@ -320,6 +332,7 @@ pub fn applyScript(x: *Exec, digest: []const u8, target: OutputTarget) ![]const 
             try aw.print("/{s} ", .{digest});
             try shellQuote(aw, dir);
             try aw.writeAll("\n");
+            try aw.print("test -d " ++ outputs_store ++ "/{s}\n", .{digest});
             // As the copy back without output keys does (see `runContainer`).
             if (x.dir_owner) |o| {
                 try aw.print(outputs_busybox ++ " chown -R {s}:{s} ", .{ o, o });
@@ -445,7 +458,7 @@ test "output keys: after a Docker action, the next steps start from the workspac
     const apply = seen[9];
     try std.testing.expect(std.mem.startsWith(u8, apply, "{ loadContainerFromID(id:\"C0\") {"));
     try std.testing.expect(std.mem.indexOf(u8, apply, "rm -rf '/home/runner/work/r/r'\\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, apply, "cp -a /zig-runner-outputs/abcd12 '/home/runner/work/r/r'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, apply, "cp -a /zig-runner-outputs/abcd12 '/home/runner/work/r/r'\\ntest -d /zig-runner-outputs/abcd12\\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, apply, "WS1") == null);
 }
 
@@ -497,7 +510,13 @@ test "output keys: the step after one that always runs starts from that step's o
     // A digest a step produced again is marked used; ones not produced for 7 days, and stale
     // temporary copies, go.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[5], "test -d \\\"$d\\\" && { /bin/busybox touch \\\"$d\\\"; exit 0; }") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[5], "-mtime +0 -o -mtime +7 \\\\) -exec /bin/busybox rm -rf {} +") != null);
+    // They go renamed out of the way first, so a copy another job is making from one never reads
+    // it half deleted (#102): nothing but a renamed directory is deleted.
+    const store = fake.seen.items[5];
+    try std.testing.expect(std.mem.indexOf(u8, store, "! -name '*.dead.*' \\\\( -name '*.tmp.*' " ++
+        "-mtime +0 -o -mtime +7 \\\\)); do /bin/busybox mv -T \\\"$p\\\" \\\"$p.dead.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, store, "-name '*.dead.*' -exec /bin/busybox rm -rf {} +") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, store, "-exec /bin/busybox rm -rf"));
     // Matrix jobs share the run's nonce (123.1): the temporary name is the store's own.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[5], ".tmp.123") == null);
     // The next container: the one before the step (with what the runner added for it), the removed
@@ -505,7 +524,8 @@ test "output keys: the step after one that always runs starts from that step's o
     const apply = fake.seen.items[6];
     try std.testing.expect(std.mem.startsWith(u8, apply, "{ loadContainerFromID(id:\"B0\") {"));
     try std.testing.expect(std.mem.indexOf(u8, apply, "rm -rf -- '/tmp/it'\\\\''s gone'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, apply, "cp -a /zig-runner-outputs/0123abcd/. /") != null);
+    try std.testing.expect(std.mem.indexOf(u8, apply, "cp -a /zig-runner-outputs/0123abcd/. /\\n" ++
+        "test -d /zig-runner-outputs/0123abcd\\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, apply, "C1") == null);
     // As root, which can write anywhere and keep owners; then as the image's user again.
     const as_root = std.mem.indexOf(u8, apply, "withUser(name:\"root\") { withExec(").?;
