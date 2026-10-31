@@ -1147,7 +1147,9 @@ pub const Session = struct {
             s.query_mu.lockUncancelable(s.io);
             defer s.query_mu.unlock(s.io);
             if (!s.in_flight or s.aborted) continue;
-            if (nowMs(s.io) - s.heard_ms.load(.monotonic) < limit_ms) continue;
+            // Past the limit, not at it: both times are whole milliseconds, rounded down, so at
+            // it up to a millisecond less may truly have gone by.
+            if (nowMs(s.io) - s.heard_ms.load(.monotonic) <= limit_ms) continue;
             if (s.abortLocked()) s.silenced = true;
         }
     }
@@ -1593,7 +1595,8 @@ test "a session whose engine never answers /shutdown is closed at its deadline" 
     const started = Io.Clock.awake.now(io);
     s.close();
     const took = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
-    try std.testing.expect(took >= 200 and took < 2_000);
+    // It ends, where it waited for good; generously, for a busy CI machine.
+    try std.testing.expect(took >= 200 and took < 10_000);
 }
 
 /// An engine that attaches the session, answers `/init`, takes a query and never answers it, then
@@ -1701,8 +1704,10 @@ test "a query to an engine that has gone silent is aborted at the silence timeou
     const silent = s.query(arena_state.allocator(), "{a}", no_limit);
     try std.testing.expectError(error.EngineSilent, silent);
     const took = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
-    // Where it used to wait for good.
-    try std.testing.expect(took >= 300 and took < 2_000);
+    // Not before the timeout, and it ends, where it used to wait for good (generously, for a busy
+    // CI machine). It once took 299 ms there, when `watch` fired at the limit in whole
+    // milliseconds rather than past it.
+    try std.testing.expect(took >= 300 and took < 10_000);
 }
 
 test "an engine slow to answer but still talking is not aborted, nor one with the timeout off" {
@@ -1713,23 +1718,24 @@ test "an engine slow to answer but still talking is not aborted, nor one with th
         defer engine.finish();
         var buf: [64]u8 = undefined;
         var s: Session = undefined;
-        // Talking: health traffic the whole time, with a timeout of 300 ms. Silent: no timeout.
+        // Talking: a ping every 50 ms the whole time, with a timeout of 1 s, so a busy machine
+        // that delays some pings does not make it look silent. Silent: no timeout.
         try s.open(std.testing.allocator, io, .{
             .host = try engine.host(&buf),
-            .silence_timeout = if (talk) .fromMilliseconds(300) else null,
+            .silence_timeout = if (talk) .fromMilliseconds(1_000) else null,
         }, null);
         defer s.close();
         var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer arena_state.deinit();
 
-        // Many times the timeout goes by; then the job's cancel ends the query, not the watchdog.
-        const cancel_after: Io.Duration = .fromMilliseconds(1_500);
+        // Well past the timeout, the job's cancel ends the query, not the watchdog.
+        const started = Io.Clock.awake.now(io);
+        const cancel_after: Io.Duration = .fromMilliseconds(2_500);
         var cancelling = try io.concurrent(abortLater, .{ &s, cancel_after });
         defer cancelling.cancel(io);
-        const started = Io.Clock.awake.now(io);
         const cancelled = s.query(arena_state.allocator(), "{a}", no_limit);
         try std.testing.expectError(error.QueryAborted, cancelled);
         const took = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
-        try std.testing.expect(took >= 1_500);
+        try std.testing.expect(took >= 2_500);
     }
 }
