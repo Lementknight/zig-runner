@@ -478,6 +478,9 @@ pub const Options = struct {
     /// Mount `package_cache_dirs` from persistent cache volumes, scoped to the repository. The
     /// runner turns this on (`RUNNER_PACKAGE_CACHES`, on by default).
     package_caches: bool = false,
+    /// `Config.tool_trees`: "Set up job" checks the tool cache's trees and hands steps their
+    /// digests (`set_up.verifyToolTrees`). Off here, on in the runner.
+    tool_trees: bool = false,
     /// The runner vouches for the job (`trust.vouches`): its package caches and output-key store
     /// are the repository's shared `repo` volumes. Otherwise they are `untrusted` ones (see
     /// `packageCacheScope`).
@@ -1719,6 +1722,7 @@ fn runSteps(
 
     if (try setUpJob(&x, opts, results)) |failed| return failed;
     if (plan.zig_seed_note) |note| x.setUpLine(note);
+    if (base.tool_trees_note) |note| x.setUpLine(note);
 
     if (job.container != null or !no_services) {
         if (!try x.startServices()) return servicesFailed(&x, arena, sh, results);

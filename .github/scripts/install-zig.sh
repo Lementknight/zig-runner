@@ -13,9 +13,14 @@
 #
 #   find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum
 #
-# run inside the tree unpacked from the checked tarball. zig-tree-check.sh runs the check, and keeps a
-# list of the files' stat lines and hashes beside the tree so a job re-reads only the files whose
-# size, inode, mtime or ctime changed; what that list does and does not protect against is there.
+# run inside the tree unpacked from the checked tarball.
+#
+# zig-runner computes the same digest of every tree in the tool cache in "Set up job", before any
+# step of the job can write there, from lists no step can reach (runner/src/dagger/tool_trees.sh),
+# and passes each tree's path and digest in ZIG_RUNNER_TOOL_TREES. When it names this tree with the
+# pinned digest, the tree is the one checked and this script does not read it again (0.7-1 s on
+# the laptop, 10-19 s on razorbill under load). Anything else, the variable unset on GitHub's runners
+# included, means the check here.
 set -euo pipefail
 
 version=0.17.0
@@ -40,9 +45,13 @@ cache="${RUNNER_TOOL_CACHE:-${RUNNER_TEMP:-/tmp}}/zig/$version"
 tarball="$cache/$dir.tar.xz"
 tree="$cache/$dir"
 verified() { echo "$sum  $tarball" | sha256sum --check --quiet --status; }
-check() { "$(dirname "$0")/zig-tree-check.sh" "$1" "$tree_sum" "$2"; }
+digest() { (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1); }
 
-if [ ! -d "$tree" ] || ! check "$tree" "$tree.stat" 2>/dev/null; then
+checked() { grep -qxF "$tree_sum $tree" <<<"${ZIG_RUNNER_TOOL_TREES:-}"; }
+
+if checked && [ -d "$tree" ]; then
+	echo "Zig $version: $tree is the tree zig-runner checked in Set up job"
+elif [ ! -d "$tree" ] || [ "$(digest "$tree" 2>/dev/null)" != "$tree_sum" ]; then
 	if ! verified 2>/dev/null; then
 		mkdir -p "$cache"
 		curl -fsSL -o "$tarball.part" "https://ziglang.org/download/$version/$dir.tar.xz"
@@ -57,17 +66,13 @@ if [ ! -d "$tree" ] || ! check "$tree" "$tree.stat" 2>/dev/null; then
 	# sees half a tree.
 	part=$(mktemp -d "$cache/.$dir.XXXXXX")
 	tar -xJf "$tarball" -C "$part"
-	if ! check "$part/$dir" "$part/stat"; then
+	if [ "$(digest "$part/$dir")" != "$tree_sum" ]; then
 		echo "Zig $version for $arch unpacked to files that do not match their pinned digest" >&2
 		rm -rf "$part"
 		exit 1
 	fi
-	rm -rf "$tree" "$tree.stat"
-	if mv -T "$part/$dir" "$tree"; then
-		mv -f "$part/stat" "$tree.stat" 2>/dev/null || :
-	else
-		check "$tree" "$tree.stat"
-	fi
+	rm -rf "$tree"
+	mv -T "$part/$dir" "$tree" || [ "$(digest "$tree")" = "$tree_sum" ]
 	rm -rf "$part"
 fi
 

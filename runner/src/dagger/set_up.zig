@@ -165,6 +165,9 @@ const BasePlan = struct {
     zig_seed_note: ?[]const u8 = null,
     /// The output-key store (`Exec.outputs_volume`), when the job setup's query asked for it.
     outputs_volume: ?[]const u8 = null,
+    /// The volume of the tool cache's lists, when the tool cache's trees are checked
+    /// (`verifyToolTrees`).
+    tool_trees: ?[]const u8 = null,
     ran_marker: []const u8,
     /// The job's `mark_env` value (`JobLog.mark`).
     mark: []const u8,
@@ -199,11 +202,135 @@ pub fn baseContainerId(
         err_msg.* = "Dagger returned no container";
         return error.BaseContainerFailed;
     };
-    return .{ .id = id, .runtime_path = jsonFindString(data, "zig_runtime_path") };
+    const runtime_path = jsonFindString(data, "zig_runtime_path");
+    const lists = plan.tool_trees orelse return .{ .id = id, .runtime_path = runtime_path };
+    const checked = try verifyToolTrees(arena, transport, id, lists, plan.ran_marker, err_msg);
+    return .{ .id = checked.id, .runtime_path = runtime_path, .tool_trees_note = checked.note };
 }
 
-/// The base container, and a `container:` job's own PATH (`Exec.container_path`).
-pub const Base = struct { id: []const u8, runtime_path: ?[]const u8 };
+/// The base container, a `container:` job's own PATH (`Exec.container_path`), and what "Set up
+/// job" says of the tool cache's trees (`verifyToolTrees`).
+pub const Base = struct {
+    id: []const u8,
+    runtime_path: ?[]const u8,
+    tool_trees_note: ?[]const u8 = null,
+};
+
+// The tool cache's trees, checked in "Set up job". A script that pins a tree's digest, as
+// install-zig.sh pins Zig's, would otherwise read the whole tree in every job (19,500 files and
+// 309 MB for Zig: 0.7-1 s on the laptop, 10-19 s on razorbill under load), because the tool cache
+// is shared by every job of its scope and any of them could have changed it. tool_trees.sh reads
+// only the files whose stat changed since a list it keeps; that list is only worth trusting if
+// no job can write it, so it lives in a volume of its own that only this exec mounts, on a branch
+// of the base container that no step starts from. A job that could write the list could record a
+// replaced file's new stat line with its old hash.
+//
+// Never in a job with Dagger nesting: its steps can open any cache volume by its key, and run
+// privileged containers that can set the clock, which the stat lines rely on (#228).
+
+/// The lists' volume, mounted only on the check's own branch.
+const tool_trees_dir = "/zig-runner-tool-trees";
+/// What steps are given: one `DIGEST TREE` line per tree checked, TREE an absolute path.
+const tool_trees_env = "ZIG_RUNNER_TOOL_TREES";
+const tool_cache_dir = for (package_cache_dirs) |d| {
+    if (std.mem.eql(u8, d.name, "toolcache")) break d.path;
+} else unreachable;
+/// The check runs with the image's bash and none of the job's environment (a workflow's
+/// `BASH_ENV` or `PATH` must not run in it).
+const tool_trees_argv = [_][]const u8{
+    "/usr/bin/env",  "-i",           "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+    "bash",          "-c",           @embedFile("tool_trees.sh"),
+    "tool_trees.sh", tool_cache_dir, tool_trees_dir,
+};
+
+/// Runs tool_trees.sh on a branch of the base container with the lists' volume mounted, as root,
+/// and returns the base container with `tool_trees_env` set from what it printed. `nonce` (the
+/// job's run marker) makes the exec run in every job: the engine would reuse it by its recipe,
+/// in which a volume's content has no part. The variable is set even when the check failed or
+/// found nothing, empty then, so a workflow's own value never stands in for the runner's.
+///
+/// The variable is part of every step's key, which is what keeps replay sound: its value is the
+/// trees' paths and digests, a function of the tool cache's content, so it is the same in every
+/// job until a tree is added, removed or changed, and then every step's key changes once.
+fn verifyToolTrees(
+    arena: Allocator,
+    transport: Transport,
+    base: []const u8,
+    lists: []const u8,
+    nonce: []const u8,
+    err_msg: *[]const u8,
+) !struct { id: []const u8, note: []const u8 } {
+    var check: Query = .init(arena);
+    try check.call("loadContainerFromID", .{ .id = base });
+    try check.call("withMountedCache", .{ .path = tool_trees_dir, .cache = lists });
+    try check.call("withUser", .{ .name = "root" });
+    try check.call("withEnvVariable", .{ .name = "ZIG_RUNNER_TOOL_TREES_RUN", .value = nonce });
+    try check.call("withExec", .{ .args = &tool_trees_argv });
+    try check.leaf("stdout");
+    var msg: []const u8 = "";
+    const out: ?[]const u8 = if (gql(arena, transport, try check.finish(), &msg)) |data|
+        jsonFindString(data, "stdout")
+    else |_|
+        null;
+    const verdict = try toolTreesVerdict(arena, out orelse "");
+    var set: Query = .init(arena);
+    try set.call("loadContainerFromID", .{ .id = base });
+    try set.call("withEnvVariable", .{ .name = tool_trees_env, .value = verdict.env });
+    try set.leaf("id");
+    const data = gql(arena, transport, try set.finish(), err_msg) catch
+        return error.BaseContainerFailed;
+    const id = jsonFindString(data, "id") orelse {
+        err_msg.* = "Dagger returned no container";
+        return error.BaseContainerFailed;
+    };
+    const note = if (out == null) try std.fmt.allocPrint(
+        arena,
+        "Tool cache: not checked ({s}); steps check what they use themselves",
+        .{msg},
+    ) else verdict.note;
+    return .{ .id = id, .note = note };
+}
+
+/// `tool_trees_env`'s value and "Set up job"'s line, from tool_trees.sh's `DIGEST TREE FILES
+/// REHASHED` lines. A line that does not have that form, or names a tree outside the tool cache
+/// or through a dot-named directory, is left out: a step then checks that tree itself.
+fn toolTreesVerdict(arena: Allocator, out: []const u8) !struct { env: []const u8, note: []const u8 } {
+    var env: std.ArrayList(u8) = .empty;
+    var note: std.ArrayList(u8) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        const digest = fields.next() orelse continue;
+        const tree = fields.next() orelse continue;
+        const files = fields.next() orelse continue;
+        const rehashed = fields.next() orelse continue;
+        if (fields.next() != null) continue;
+        if (digest.len != 64 or std.mem.indexOfNone(u8, digest, "0123456789abcdef") != null)
+            continue;
+        if (!std.mem.startsWith(u8, tree, tool_cache_dir ++ "/") or
+            std.mem.indexOf(u8, tree, "/.") != null or
+            std.mem.indexOfNone(u8, tree, path_chars) != null) continue;
+        if (std.mem.indexOfNone(u8, files, "0123456789") != null or
+            std.mem.indexOfNone(u8, rehashed, "0123456789") != null) continue;
+        try env.print(arena, "{s}{s} {s}", .{ if (env.items.len > 0) "\n" else "", digest, tree });
+        try note.print(arena, "{s}{s} ({s} files, {s} read)", .{
+            if (note.items.len > 0) ", " else "",
+            tree[tool_cache_dir.len + 1 ..],
+            files,
+            rehashed,
+        });
+    }
+    return .{
+        .env = env.items,
+        .note = if (note.items.len == 0)
+            "Tool cache: no trees to check"
+        else
+            try std.fmt.allocPrint(arena, "Tool cache: checked {s}", .{note.items}),
+    };
+}
+
+/// What tool_trees.sh lets into a tree's path: no spaces, quotes or newlines.
+const path_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-/";
 
 /// `from` the job image, behind a private registry's credentials when there are any, with a
 /// container job's cache variables and its own `env:` set on it.
@@ -493,6 +620,7 @@ pub fn basePlan(
         .zig_seed = zig_seed,
         .zig_seed_note = zig_seed_note,
         .outputs_volume = volumes.outputs,
+        .tool_trees = volumes.tool_trees,
         .ran_marker = ran_marker,
         .mark = mark,
     };
@@ -532,6 +660,7 @@ const CacheVolumes = struct {
     ids: []const []const u8 = &.{},
     zig_local: ?[]const u8 = null,
     outputs: ?[]const u8 = null,
+    tool_trees: ?[]const u8 = null,
 };
 
 /// Package managers' caches persist across jobs in Dagger cache volumes (see `package_cache_dirs`):
@@ -569,6 +698,10 @@ fn cacheVolumeIds(
         .as_runner = as_runner,
         .caches = caches,
         .outputs_key = try outputKeysKey(arena, ev, job, opts, step_cache),
+        .tool_trees_key = if (caches)
+            try toolTreesKey(arena, ev, job, opts, job_image, as_runner)
+        else
+            null,
     };
     var msg: []const u8 = "";
     if (try set_up.send(arena, transport, secrets, pending, &msg)) |v| return v;
@@ -591,6 +724,7 @@ const SetUpQuery = struct {
     as_runner: bool,
     caches: bool,
     outputs_key: ?[]const u8,
+    tool_trees_key: ?[]const u8,
 
     /// Sends the query with `pending` registered. Null, with the reason in `err_msg`, when it
     /// failed or lacked an answer.
@@ -609,6 +743,11 @@ const SetUpQuery = struct {
             try q.leaf("id");
             try q.close(1);
         }
+        if (u.tool_trees_key) |key| {
+            try q.callAs("ctt", "cacheVolume", .{ .key = key });
+            try q.leaf("id");
+            try q.close(1);
+        }
         if (u.caches) try writeCacheVolumes(&q, arena, u.ev, u.job, u.opts, u.job_image, u.as_runner);
         const data = gql(arena, transport, try q.finish(), err_msg) catch return null;
         if (!try secrets.read(arena, data, pending)) {
@@ -618,6 +757,8 @@ const SetUpQuery = struct {
         var out: CacheVolumes = .{};
         if (u.outputs_key != null)
             out.outputs = if (jsonFind(data, "cout")) |v| jsonFindString(v, "id") else null;
+        if (u.tool_trees_key != null)
+            out.tool_trees = if (jsonFind(data, "ctt")) |v| jsonFindString(v, "id") else null;
         if (!u.caches) return out;
         const no_volume = "Dagger returned no cache volume";
         const ids = try arena.alloc([]const u8, package_cache_dirs.len);
@@ -645,6 +786,27 @@ const SetUpQuery = struct {
         return out;
     }
 };
+
+/// The key of the volume `verifyToolTrees` keeps its lists in, beside the tool cache's own (the
+/// same scope, image and user), or null when the job's trees are not checked: with
+/// `tool_trees` off, and in a job with Dagger nesting, whose steps could open it by its key.
+fn toolTreesKey(
+    arena: Allocator,
+    ev: *Evaluator,
+    job: job_mod.Job,
+    opts: Options,
+    job_image: []const u8,
+    as_runner: bool,
+) !?[]const u8 {
+    const scope = try packageCacheScope(arena, ev, job.github.repository, opts.trusted);
+    if (!opts.tool_trees or (opts.nesting and std.mem.eql(u8, scope, "repo"))) return null;
+    return try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/tool-trees/{s}{s}", .{
+        job.github.repository,
+        scope,
+        job_image,
+        if (as_runner) "/" ++ runner_user else "",
+    });
+}
 
 /// One `cacheVolume` per package manager (`c<i>`), and Zig's local cache's (`czl`).
 fn writeCacheVolumes(
@@ -1681,4 +1843,116 @@ test "the pre-warm sends a Zig job's own seed and base documents, and fails with
     var msg: []const u8 = "";
     try std.testing.expectError(error.BaseContainerFailed, warm(arena, fake.transport(), .{}, &msg));
     try std.testing.expect(std.mem.indexOf(u8, msg, "pull access denied") != null);
+}
+
+/// A job run with the tool cache's trees checked, `check` the check exec's answer: what each query
+/// asked for, and the job's log.
+fn toolTreesRun(arena: Allocator, opts: Options, check: []const u8) !SeedRun {
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("zig build")};
+    var vols: std.Io.Writer.Allocating = .init(arena);
+    try vols.writer.writeAll("{\"data\":{\"ctt\":{\"id\":\"VT\"}");
+    for (package_cache_dirs, 0..) |_, i| try vols.writer.print(",\"c{d}\":{{\"id\":\"V{d}\"}}", .{ i, i });
+    try vols.writer.writeAll("}}");
+    const set = "{\"data\":{\"loadContainerFromID\":{\"withEnvVariable\":{\"id\":\"C0T\"}}}}";
+    const answers = try arena.dupe([]const u8, &.{ vols.written(), base_answer, check, set, try exec(arena, "C1", 0, "") });
+    const fake = try arena.create(FakeSession);
+    fake.* = .{ .answers = answers, .arena = arena };
+    const w = try arena.create(std.Io.Writer);
+    w.* = .fixed(try arena.alloc(u8, 8192));
+    var log: sink.LogSink = .{ .stdout = .{ .writer = w } };
+    var o = opts;
+    o.package_caches = true;
+    o.tool_trees = true;
+    o.test_session_argv = &.{ "sh", "-c", fake_child };
+    o.test_transport = fake.transport();
+    o.test_ran_marker = "j1";
+    const res = try run(arena, std.testing.io, &env, o, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    return .{ .seen = fake.seen.items, .log = w.buffered() };
+}
+
+const zig_tree = tool_cache_dir ++ "/zig/0.17.0/zig-x86_64-linux-0.17.0";
+const zig_digest = "310d0a4a95f328f94a350c4339226a4796daee589472b23f2a816d18874efaed";
+
+test "the tool cache's trees are checked on a branch of their own, and steps get only the digests" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const check = "{\"data\":{\"loadContainerFromID\":{\"withMountedCache\":{\"withUser\":" ++
+        "{\"withEnvVariable\":{\"withExec\":{\"stdout\":\"" ++ zig_digest ++ " " ++ zig_tree ++
+        " 19500 3\\n\"}}}}}}}";
+    const r = try toolTreesRun(arena, .{ .trusted = true, .nesting = false }, check);
+    try std.testing.expectEqual(5, r.seen.len);
+    // The lists' volume sits beside the tool cache's, keyed like it.
+    try std.testing.expect(std.mem.indexOf(u8, r.seen[0], "ctt: cacheVolume(key:\"zig-runner/o/r/repo/tool-trees/ubuntu:24.04\")") != null);
+    // The check: on the base container, the lists mounted, as root, run in every job (the nonce),
+    // with none of the job's environment, its stdout read.
+    const c = r.seen[2];
+    try std.testing.expect(braceBalanced(c));
+    try std.testing.expect(std.mem.startsWith(u8, c, "{ loadContainerFromID(id:\"C0\") { withMountedCache(path:\"" ++ tool_trees_dir ++ "\",cache:\"VT\") { withUser(name:\"root\") { withEnvVariable(name:\"ZIG_RUNNER_TOOL_TREES_RUN\",value:\"j1\") { withExec(args:[\"/usr/bin/env\",\"-i\","));
+    try std.testing.expect(std.mem.indexOf(u8, c, "\"tool_trees.sh\",\"/opt/hostedtoolcache\",\"" ++ tool_trees_dir ++ "\"]) { stdout ") != null);
+    // Steps start from the base container with the digests set, not from the check's branch.
+    try std.testing.expectEqualStrings("{ loadContainerFromID(id:\"C0\") { withEnvVariable(name:\"" ++ tool_trees_env ++ "\",value:\"" ++ zig_digest ++ " " ++ zig_tree ++ "\") { id } } }", r.seen[3]);
+    try std.testing.expect(std.mem.indexOf(u8, r.seen[4], "loadContainerFromID(id:\"C0T\")") != null);
+    // The lists' volume is in no query but the check's: not the base container's, not a step's.
+    for (r.seen, 0..) |doc, i| if (i != 0 and i != 2) {
+        try std.testing.expect(std.mem.indexOf(u8, doc, "\"VT\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, doc, tool_trees_dir) == null);
+    };
+    try std.testing.expect(std.mem.indexOf(u8, r.log, "Tool cache: checked zig/0.17.0/zig-x86_64-linux-0.17.0 (19500 files, 3 read)") != null);
+}
+
+test "the tool cache's trees: a failed check sets the variable empty, and nesting means no check" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const failed = try toolTreesRun(arena, .{ .nesting = false }, "{\"errors\":[{\"message\":\"bash: not found\"}]}");
+    try std.testing.expect(std.mem.indexOf(u8, failed.seen[0], "zig-runner/o/r/untrusted/tool-trees/") != null);
+    // Empty, so a workflow's own value does not stand in for the runner's: steps check themselves.
+    try std.testing.expect(std.mem.indexOf(u8, failed.seen[3], "withEnvVariable(name:\"" ++ tool_trees_env ++ "\",value:\"\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed.log, "Tool cache: not checked (bash: not found)") != null);
+
+    // A trusted job with Dagger nesting: its steps could open the lists' volume by its key.
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("zig build")};
+    var vols: std.Io.Writer.Allocating = .init(arena);
+    try vols.writer.writeAll("{\"data\":{");
+    for (package_cache_dirs, 0..) |_, i| try vols.writer.print("{s}\"c{d}\":{{\"id\":\"V{d}\"}}", .{ if (i == 0) "" else ",", i, i });
+    try vols.writer.writeAll("}}");
+    const answers = [_][]const u8{ vols.written(), base_answer, try exec(arena, "C1", 0, "") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .package_caches = true, .tool_trees = true, .trusted = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    try std.testing.expectEqual(3, fake.seen.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "tool-trees") == null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Tool cache") == null);
+}
+
+test "toolTreesVerdict keeps only well-formed lines for trees in the tool cache" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const node = tool_cache_dir ++ "/node/22.1.0/x64";
+    const out = zig_digest ++ " " ++ zig_tree ++ " 19500 0\n" ++
+        // Outside the tool cache, through a dot-named directory, an odd path, a short digest,
+        // uppercase hex, a missing or an extra field, a count that is not one: all left out.
+        zig_digest ++ " /etc/x/y/z 1 1\n" ++
+        zig_digest ++ " " ++ tool_cache_dir ++ "/zig/../../etc 1 1\n" ++
+        zig_digest ++ " " ++ tool_cache_dir ++ "/a/b/c\"d 1 1\n" ++
+        zig_digest[1..] ++ " " ++ node ++ " 1 1\n" ++
+        "310D0A4A95F328F94A350C4339226A4796DAEE589472B23F2A816D18874EFAED " ++ node ++ " 1 1\n" ++
+        zig_digest ++ " " ++ node ++ " 1\n" ++
+        zig_digest ++ " " ++ node ++ " 1 1 1\n" ++
+        zig_digest ++ " " ++ node ++ " 7 x\n" ++
+        zig_digest ++ " " ++ node ++ " 7 7\n";
+    const v = try toolTreesVerdict(arena, out);
+    try std.testing.expectEqualStrings(zig_digest ++ " " ++ zig_tree ++ "\n" ++ zig_digest ++ " " ++ node, v.env);
+    try std.testing.expectEqualStrings("Tool cache: checked zig/0.17.0/zig-x86_64-linux-0.17.0 (19500 files, 0 read), node/22.1.0/x64 (7 files, 7 read)", v.note);
+    const none = try toolTreesVerdict(arena, "");
+    try std.testing.expectEqualStrings("", none.env);
+    try std.testing.expectEqualStrings("Tool cache: no trees to check", none.note);
 }

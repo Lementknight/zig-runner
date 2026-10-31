@@ -72,6 +72,12 @@ pub const Config = struct {
     dagger_nesting: bool = true,
     /// Mount persistent Dagger cache volumes at package managers' cache directories in every job.
     package_caches: bool = true,
+    /// Check the tool cache's trees in "Set up job", before any step can write there, from lists
+    /// kept in a volume no step mounts, and hand steps their digests (ZIG_RUNNER_TOOL_TREES), so a
+    /// script that pins a tree's digest (install-zig.sh) need not read the tree again: 10-19 s of
+    /// razorbill's Install Zig under load. Only in jobs without `dagger_nesting`, whose steps
+    /// cannot reach the lists' volume (`set_up.verifyToolTrees`).
+    tool_trees: bool = true,
     /// Reuse a step's result from an earlier run when its inputs are unchanged (steps that use
     /// secrets always run). A workflow can opt out with `ZIG_RUNNER_STEP_CACHE: false` in its env.
     step_cache: bool = true,
@@ -250,6 +256,7 @@ pub const Config = struct {
         };
         if (environ.get("RUNNER_DAGGER_NESTING")) |v| c.dagger_nesting = try boolean(v);
         if (environ.get("RUNNER_PACKAGE_CACHES")) |v| c.package_caches = try boolean(v);
+        if (environ.get("RUNNER_TOOL_TREES")) |v| c.tool_trees = try boolean(v);
         if (environ.get("RUNNER_STEP_CACHE")) |v| c.step_cache = try boolean(v);
         if (environ.get("RUNNER_STEP_USER")) |v| c.step_user = try stepUser(v);
         if (environ.get("RUNNER_OUTPUT_KEYS")) |v| c.output_keys = try boolean(v);
@@ -312,6 +319,7 @@ pub const Config = struct {
         else if (eq(key, "engine-silence-timeout")) c.engine_silence_timeout_secs = try secs(val) //
         else if (eq(key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
         else if (eq(key, "package-caches")) c.package_caches = try boolean(val) //
+        else if (eq(key, "tool-trees")) c.tool_trees = try boolean(val) //
         else if (eq(key, "step-cache")) c.step_cache = try boolean(val) //
         else if (eq(key, "step-user")) c.step_user = try stepUser(val) //
         else if (eq(key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
@@ -654,6 +662,17 @@ test "Zig's local cache is kept only when asked for, and uv's setting is read" {
     try std.testing.expect((try Config.load(&env, &.{"runner"})).zig_local_cache);
     try env.put("RUNNER_UV_ENV_IN_CACHE", "false");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).uv_env_in_cache);
+}
+
+test "the tool cache's trees are checked in Set up job unless turned off" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try std.testing.expect((try Config.load(&env, &.{"runner"})).tool_trees);
+    try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--tool-trees=false" })).tool_trees);
+    try env.put("RUNNER_TOOL_TREES", "0");
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).tool_trees);
 }
 
 test "step caching is on by default and can be turned off" {
