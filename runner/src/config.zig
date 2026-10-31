@@ -83,7 +83,8 @@ pub const Config = struct {
     enforce_volatile: bool = true,
     /// Where a job's log is spooled while it runs, so the copy the upload reads is not held in
     /// memory for the length of the job (see `sink.Spool` and docs/RELATED.md, "Streaming a step's
-    /// output"). Empty keeps the lines in memory, as before. A directory the runner cannot write to
+    /// output"). The files go in the runner's own directory under it, `zig-runner-<uid>`, mode 0700
+    /// (`SpoolDir`). Empty keeps the lines in memory, as before. A directory the runner cannot use
     /// is reported once and then ignored, because logging must never fail a job.
     log_spool_dir: []const u8 = "/tmp",
     /// Put uv's project environment inside its cache volume, so uv can hardlink into it instead of
