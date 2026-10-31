@@ -1416,6 +1416,8 @@ test "a failed answer without a ran marker is an earlier run's unless the step s
         .sink_job_id = 0,
         .live_lines = &live,
         .ended = &ended,
+        // The live line below never gets its end marker: not 5 s of waiting for it.
+        .stall_ms = 50,
     };
     // The marker decides when there is one.
     try std.testing.expect(failedEarlier(std.testing.io, &sh, 1, false));

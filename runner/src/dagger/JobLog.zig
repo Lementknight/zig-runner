@@ -25,6 +25,12 @@ mu: std.Io.Mutex = .init,
 /// seen.
 live_lines: []std.atomic.Value(u32),
 ended: []std.atomic.Value(bool),
+/// The log stream reached its end (`readLogs`): no step's lines can arrive any more, so a step
+/// with none is not waited for (`awaitLive`).
+stream_ended: std.atomic.Value(bool) = .init(false),
+/// Once a step's lines are arriving, how long it may go without one (`live_stall_ms`); tests
+/// shorten it.
+stall_ms: u32 = live_stall_ms,
 /// The step whose live output said Bun refused to load the program (`bun_load_errors`), 0 for
 /// none: an exec's recorded output, where this was looked for, is no longer read back unless
 /// it is replayed (`Exec.Recorded`). Cleared as each exec begins.
@@ -785,6 +791,7 @@ const Demux = struct {
 };
 
 pub fn readLogs(io: std.Io, sh: *JobLog, file: std.Io.File) void {
+    defer sh.stream_ended.store(true, .release);
     var demux: Demux = .{ .sh = sh };
     var rbuf: [64 * 1024]u8 = undefined;
     var fr = file.readerStreaming(io, &rbuf);
@@ -903,9 +910,10 @@ pub const SpanDemux = struct {
 
 /// How long to wait for a step's first live line before assuming it was served from cache. The log
 /// stream delivers a real step's `end` marker within milliseconds, and a real run stops waiting as
-/// soon as it arrives, so only cached steps pay this. If the stream is later than this, lines show
-/// up twice rather than being lost. Once a line has arrived the step ran, and the wait for the rest
-/// is bounded by `live_stall_ms` instead.
+/// soon as it arrives, so only cached steps pay this, and none once the stream has ended
+/// (`stream_ended`). If the stream is later than this, lines show up twice rather than being lost.
+/// Once a line has arrived the step ran, and the wait for the rest is bounded by `live_stall_ms`
+/// instead.
 const live_grace_ms = 60;
 
 /// Gives the reader a moment to deliver this step's lines; if none show up the step was served from
@@ -947,13 +955,15 @@ pub fn awaitLive(io: std.Io, sh: *JobLog, step: u32) bool {
         waited += 10;
         since_line += 10;
     }) {
+        // Read before the count, which then holds every line the stream delivered.
+        const stream_ended = sh.stream_ended.load(.acquire);
         const lines = sh.live_lines[idx].load(.monotonic);
         if (lines != seen) {
             seen = lines;
             since_line = 0;
         }
-        if (lines == 0 and waited >= live_grace_ms) break;
-        if (lines > 0 and (since_line >= live_stall_ms or waited >= live_drain_ms)) {
+        if (lines == 0 and (stream_ended or waited >= live_grace_ms)) break;
+        if (lines > 0 and (since_line >= sh.stall_ms or waited >= live_drain_ms)) {
             sh.append(step, "##[warning]This step's last output had not arrived when it " ++
                 "ended: any that arrives later is logged after this, and its workflow commands " ++
                 "may come too late to apply.");
@@ -1101,6 +1111,31 @@ test "the marker a step's script prints is one `scan` reads, with the secret aft
     try std.testing.expectEqual(@as(u32, 2), e.marker.end);
     try std.testing.expectEqualStrings("out " ++ marker, e.before);
     try std.testing.expect(scan(marker ++ "end 2 m extra") == null);
+}
+
+test "once the log stream has ended, a step with no live lines is not waited for" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var w: std.Io.Writer.Discarding = .init(&.{});
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    var live = [_]std.atomic.Value(u32){.init(0)};
+    var ended = [_]std.atomic.Value(bool){.init(false)};
+    var sh: JobLog = .{
+        .io = std.testing.io,
+        .arena = a.allocator(),
+        .log = &log,
+        .sink_job_id = 0,
+        .live_lines = &live,
+        .ended = &ended,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "log", .data = "" });
+    const file = try tmp.dir.openFile(std.testing.io, "log", .{});
+    defer file.close(std.testing.io);
+    readLogs(std.testing.io, &sh, file);
+    try std.testing.expect(sh.stream_ended.load(.acquire));
+    try std.testing.expect(!awaitLive(std.testing.io, &sh, 1));
 }
 
 test "a live line that arrives after its step was replayed is dropped, not logged twice" {

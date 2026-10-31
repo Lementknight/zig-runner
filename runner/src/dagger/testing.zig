@@ -94,7 +94,9 @@ pub const FakeSession = struct {
     }
 };
 
-pub const fake_child = "printf '0 tok\\n'; cat >/dev/null";
+/// A session child that logs nothing: closing its stderr ends the log stream at once, so no step
+/// waits out `live_grace_ms` for lines that cannot come (`JobLog.stream_ended`).
+pub const fake_child = "printf '0 tok\\n'; exec 2>&-; cat >/dev/null";
 pub const base_answer = "{\"data\":{\"container\":{\"from\":{\"withWorkdir\":{\"id\":\"C0\"}}}}}";
 
 pub fn exec(arena: Allocator, id: []const u8, code: i32, out: []const u8) ![]const u8 {
