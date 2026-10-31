@@ -4241,7 +4241,7 @@ test "round trips: the job setup's query is sent again without the secrets when 
     defer a.deinit();
     const arena = a.allocator();
     var env: std.process.Environ.Map = .init(arena);
-    const steps = [_]job_mod.Step{testStep("a")};
+    const steps = [_]job_mod.Step{testStep("npm ci")};
     var job = testJob(&steps);
     job.secrets = &.{"s3cr3t-value"};
     job.env = &.{.{ .name = "JOB_SECRET", .value = .{ .lit = "s3cr3t-value" } }};
