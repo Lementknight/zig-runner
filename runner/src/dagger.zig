@@ -460,7 +460,8 @@ pub const Options = struct {
     /// What runs JavaScript actions.
     js_runtime: config.JsRuntime = .bun,
     /// Steps may use the job's Dagger engine (`dagger call` inside a step):
-    /// `experimentalPrivilegedNesting`.
+    /// `experimentalPrivilegedNesting`. Only in a job the runner vouches for (`trusted`, and not
+    /// a fork's pull request): a step's own client could open any cache volume by its key (#228).
     nesting: bool = true,
     /// Mount `package_cache_dirs` from persistent cache volumes, scoped to the repository. The
     /// runner turns this on (`RUNNER_PACKAGE_CACHES`, on by default).
@@ -1515,7 +1516,10 @@ fn runResolvedStep(
         } else return try engineFailed(x, x.observer, res, num, how.coe, results),
         else => return e,
     };
-    if (resolved == .run and out.code != 0) logExitCode(x.sh, num, out.code);
+    if (resolved == .run and out.code != 0) {
+        logExitCode(x.sh, num, out.code);
+        x.noteNestingWithheld(num, resolved.run.script);
+    }
     // As actions/checkout, a post step once the checkout ran (see `Post.checkout`).
     if (resolved == .checkout) try appendCheckoutPost(x, num, res.name);
     try recordOutcome(
@@ -3215,11 +3219,68 @@ test "steps get the engine (privileged nesting) unless it is turned off" {
         var buf: [1024]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-        _ = try run(arena, std.testing.io, &env, .{ .nesting = nesting, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+        _ = try run(arena, std.testing.io, &env, .{ .nesting = nesting, .trusted = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
         // The setup query (and its provisioning exec) never gets it; the step does when enabled.
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "experimentalPrivilegedNesting") == null);
         try std.testing.expectEqual(nesting, std.mem.indexOf(u8, fake.seen.items[1], ",expect:ANY,experimentalPrivilegedNesting:true)") != null);
         try std.testing.expect(braceBalanced(fake.seen.items[1]));
+    }
+}
+
+test "steps get the engine only in jobs the runner vouches for, and a step that needs it is told why" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("dagger call ci")};
+    // A fork's pull request, which a runner vouching for pull requests still does not share
+    // its trusted caches with (`packageCacheScope`).
+    const fork_ctx =
+        \\{"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"event","v":{"t":2,"d":[
+    ++
+        \\{"k":"pull_request","v":{"t":2,"d":[{"k":"head","v":{"t":2,"d":[{"k":"repo","v":
+    ++
+        \\{"t":2,"d":[{"k":"full_name","v":"someone/r"}]}}]}}]}}]}}]}}
+    ;
+    const Case = struct { trusted: bool, fork: bool, nesting: bool };
+    for ([_]Case{
+        .{ .trusted = true, .fork = false, .nesting = true },
+        .{ .trusted = false, .fork = false, .nesting = false },
+        .{ .trusted = true, .fork = true, .nesting = false },
+    }) |c| {
+        var job = testJob(&steps);
+        if (c.fork) job.context_data = try std.json.parseFromSliceLeaky(
+            std.json.Value,
+            arena,
+            fork_ctx,
+            .{},
+        );
+        // The step fails, as `dagger` does when it finds no engine.
+        const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 1, "") };
+        var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+        var buf: [8192]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        _ = try run(arena, std.testing.io, &env, .{
+            .nesting = true,
+            .trusted = c.trusted,
+            .test_session_argv = &.{ "sh", "-c", fake_child },
+            .test_transport = fake.transport(),
+        }, job, &log);
+        const step = fake.seen.items[1];
+        try std.testing.expectEqual(c.nesting, std.mem.indexOf(
+            u8,
+            step,
+            "experimentalPrivilegedNesting",
+        ) != null);
+        const out = w.buffered();
+        try std.testing.expectEqual(!c.nesting, std.mem.indexOf(u8, out, "Dagger in steps: off") !=
+            null);
+        try std.testing.expectEqual(!c.nesting, std.mem.indexOf(
+            u8,
+            out,
+            Exec.nesting_withheld_note,
+        ) != null);
     }
 }
 

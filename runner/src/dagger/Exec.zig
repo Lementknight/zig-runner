@@ -104,6 +104,9 @@ posts: std.ArrayList(Post) = .empty,
 hook_failed: bool = false,
 /// Steps may use the job's Dagger engine (see `Options.nesting`).
 nesting: bool,
+/// `Options.nesting` asked for it, but the runner does not vouch for the job, so its steps do not
+/// get the engine (`set_up.execFor`, #228).
+nesting_withheld: bool = false,
 /// Unchanged steps may be reused across runs (see `Options.step_cache`).
 step_cache: bool,
 /// See `Options.enforce_volatile`.
@@ -861,6 +864,18 @@ fn ranThisRun(x: *Exec, data: std.json.Value) ?bool {
     return std.mem.eql(u8, std.mem.trim(u8, m, " \n"), x.ran_marker);
 }
 
+/// After a `run:` step failed: when it names Dagger and its job was not given the engine, why
+/// its `dagger` found none, rather than leaving the step's connection error to explain it.
+pub fn noteNestingWithheld(x: *Exec, num: u32, script: []const u8) void {
+    if (!x.nesting_withheld) return;
+    if (std.ascii.findIgnoreCase(script, "dagger") == null) return;
+    x.sh.errorLine(num, nesting_withheld_note);
+}
+
+pub const nesting_withheld_note = "This step names Dagger, but steps do not get the Dagger " ++
+    "engine in jobs this runner does not vouch for (README, \"Environments\"): a step's own " ++
+    "Dagger client could open the cache volumes of the jobs it does vouch for.";
+
 /// Whether a failed answer is one the cache kept from an earlier run (#69), given its marker
 /// (`ranThisRun`). Without one (its file commands cut short by a full disk, or never written
 /// because the step's own `trap 'kill 0' EXIT` killed the shell first), it is an earlier run's
@@ -1040,6 +1055,8 @@ pub fn logSetUp(x: *Exec, opts: Options) !void {
         )
     else
         "Engine: Dagger, through `dagger run`");
+    if (x.nesting_withheld) x.setUpLine("Dagger in steps: off, as for every job this runner " ++
+        "does not vouch for (README, \"Environments\")");
     x.setUpLine("##[endgroup]");
     if (x.job.token_permissions.len > 0) {
         const perms = std.json.parseFromSliceLeaky(

@@ -456,7 +456,10 @@ pub fn runNestedScript(
     const mounts: []const Mount = if (mounted) &.{} else &m;
     const out = try x.execScript(num, fc, resolved, step.ctx_id, secret.items, mounts);
     try x.mounted_actions.put(arena, act.mount, {});
-    if (out.code != 0) logExitCode(x.sh, num, out.code);
+    if (out.code != 0) {
+        logExitCode(x.sh, num, out.code);
+        x.noteNestingWithheld(num, script);
+    }
     try outcome.record(ev, arena, step.ctx_id, out.code == 0, step.coe, out.outputs, out.code);
 }
 
