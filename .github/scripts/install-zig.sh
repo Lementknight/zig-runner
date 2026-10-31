@@ -13,7 +13,9 @@
 #
 #   find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum
 #
-# run inside the tree unpacked from the checked tarball.
+# run inside the tree unpacked from the checked tarball. zig-tree-check.sh runs the check, and keeps a
+# list of the files' stat lines and hashes beside the tree so a job re-reads only the files whose
+# size, inode, mtime or ctime changed; what that list does and does not protect against is there.
 set -euo pipefail
 
 version=0.17.0
@@ -38,9 +40,9 @@ cache="${RUNNER_TOOL_CACHE:-${RUNNER_TEMP:-/tmp}}/zig/$version"
 tarball="$cache/$dir.tar.xz"
 tree="$cache/$dir"
 verified() { echo "$sum  $tarball" | sha256sum --check --quiet --status; }
-digest() { (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1); }
+check() { "$(dirname "$0")/zig-tree-check.sh" "$1" "$tree_sum" "$2"; }
 
-if [ ! -d "$tree" ] || [ "$(digest "$tree" 2>/dev/null)" != "$tree_sum" ]; then
+if [ ! -d "$tree" ] || ! check "$tree" "$tree.stat" 2>/dev/null; then
 	if ! verified 2>/dev/null; then
 		mkdir -p "$cache"
 		curl -fsSL -o "$tarball.part" "https://ziglang.org/download/$version/$dir.tar.xz"
@@ -55,13 +57,17 @@ if [ ! -d "$tree" ] || [ "$(digest "$tree" 2>/dev/null)" != "$tree_sum" ]; then
 	# sees half a tree.
 	part=$(mktemp -d "$cache/.$dir.XXXXXX")
 	tar -xJf "$tarball" -C "$part"
-	if [ "$(digest "$part/$dir")" != "$tree_sum" ]; then
+	if ! check "$part/$dir" "$part/stat"; then
 		echo "Zig $version for $arch unpacked to files that do not match their pinned digest" >&2
 		rm -rf "$part"
 		exit 1
 	fi
-	rm -rf "$tree"
-	mv -T "$part/$dir" "$tree" || [ "$(digest "$tree")" = "$tree_sum" ]
+	rm -rf "$tree" "$tree.stat"
+	if mv -T "$part/$dir" "$tree"; then
+		mv -f "$part/stat" "$tree.stat" 2>/dev/null || :
+	else
+		check "$tree" "$tree.stat"
+	fi
 	rm -rf "$part"
 fi
 

@@ -61,6 +61,11 @@ jobs:
       - name: shellcheck
         run: .github/scripts/shellcheck.sh
 
+      # install-zig.sh's tree check, on a small fake tree: the list of stat lines lets a job skip
+      # re-reading unchanged files, never a changed, added or deleted one.
+      - name: Zig tree check
+        run: .github/scripts/zig-tree-check-test.sh
+
       # The changie the release installs, against its pinned checksum: a new version (Renovate's)
       # fails here until the checksum is updated, not at the release, after it was approved.
       - name: changie's checksum
