@@ -421,7 +421,7 @@ pub const Warmer = struct {
         }
         const w = try c.arena.create(Warmer);
         w.* = .{ .c = c, .arena = .init(c.gpa), .memory = memory };
-        if (memory) |m| w.gate = .{ .pool = m, .slot = slot };
+        if (memory) |m| w.gate = .{ .pool = m, .slot = slot, .warm = true };
         // What is there now is what the first warm warms.
         w.socket = w.calls.socket(c.io, c.cfg.engine_host);
         if (memory) |m| w.returns = m.engineReturns();

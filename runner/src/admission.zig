@@ -125,11 +125,11 @@ pub const Admission = struct {
     }
 
     /// What may start without showing in the machine's or the engine's memory yet: a worst case
-    /// for each runner polling and for the one asking (`asking`), and each job started less than
+    /// for each of `polling` runners that may be handed a job, and each job started less than
     /// `ramp_ms` ago with its own estimate.
-    fn reserved(a: *const Admission, now_ms: i64, asking: bool) Reservation {
+    fn reserved(a: *const Admission, now_ms: i64, polling: u32) Reservation {
         const unknown_mb = a.unknown();
-        var r: Reservation = .{ .jobs = a.polling + @intFromBool(asking) };
+        var r: Reservation = .{ .jobs = polling };
         r.mb = @as(u64, r.jobs) * unknown_mb;
         for (a.slots) |s| if (s.started_ms > now_ms - ramp_ms) {
             r.jobs += 1;
@@ -208,9 +208,15 @@ pub const Gate = struct {
     holding: bool = false,
     /// The hold was logged, so its end is logged too, once each.
     announced: bool = false,
+    /// The pool's pre-warm (`loop.Warmer`), not a runner: it is never counted as polling, and it
+    /// reserves against the jobs that run, not the runners polling. A pool is sized so that its
+    /// idle pollers' worst cases fill the gate (16 on the laptop: 17 GB of 18), so against them
+    /// it waited for ever, and precisely while the machine was idle. A job a poller is handed
+    /// while the warm runs still counts the warm (`leave`).
+    warm: bool = false,
 
     /// Null when the runner may poll for a job (and it is then counted as polling); otherwise why
-    /// not.
+    /// not. For the pre-warm (`warm`): whether it may start now.
     pub fn check(g: *Gate) ?Hold {
         const a = g.pool;
         a.mu.lockUncancelable(a.io);
@@ -229,14 +235,17 @@ pub const Gate = struct {
             a.engine.swap.update(u, now_ms)
         else
             null;
+        // A runner asks beside every runner polling; the warm asks for itself alone.
+        const asking = if (g.warm) 1 else a.polling + @intFromBool(!g.claimed);
         const hold = decide(a.limits, .{
             .available_mb = sample.available_mb,
             .pressure = sample.pressure,
             .swap_growth_mb = swap_rate,
             .engine = sample.engine,
             .engine_swap_growth_mb = engine_swap_rate,
-        }, a.reserved(now_ms, !g.claimed), g.holding);
+        }, a.reserved(now_ms, asking), g.holding);
         g.holding = hold != null;
+        if (g.warm) return hold;
         if (hold == null and !g.claimed) a.polling += 1;
         if (hold != null and g.claimed) a.polling -= 1;
         g.claimed = hold == null;
@@ -1426,10 +1435,10 @@ test "a job heavier than configured raises what an unknown job reserves" {
     gates[1].assigned(jobKey("o/r", workflow, "lint"));
     try std.testing.expectEqual(@as(?u32, null), slots[1].est_mb);
     const now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
-    try std.testing.expectEqual(Reservation{ .jobs = 2, .mb = 3200 }, pool.reserved(now_ms, true));
+    try std.testing.expectEqual(Reservation{ .jobs = 2, .mb = 3200 }, pool.reserved(now_ms, pool.polling + 1));
     // `per_job_mb` off reserves nothing, whatever was learned.
     pool.limits.per_job_mb = 0;
-    try std.testing.expectEqual(@as(u64, 0), pool.reserved(now_ms, true).mb);
+    try std.testing.expectEqual(@as(u64, 0), pool.reserved(now_ms, pool.polling + 1).mb);
 }
 
 test "a name reserves the most it took in its last five runs; a full table forgets the oldest" {
@@ -1502,9 +1511,47 @@ test "without the engine's cgroup nothing is learned, and every job reserves per
     gate.assigned(jobKey("o/r", "o/r/.github/workflows/ci.yml", "build"));
     pool.samplePeaks();
     const now_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
-    try std.testing.expectEqual(Reservation{ .jobs = 2, .mb = 2048 }, pool.reserved(now_ms, true));
+    try std.testing.expectEqual(Reservation{ .jobs = 2, .mb = 2048 }, pool.reserved(now_ms, pool.polling + 1));
     try std.testing.expectEqual(@as(?Learned.Change, null), gate.ended());
     try std.testing.expectEqual(@as(usize, 0), pool.learned.len);
+}
+
+test "a pre-warm is let through on an idle machine whose pollers fill the gate, and a job after it counts it" {
+    // The laptop's pool: 16 runners, 18 GB available, 1 GB per job, 1.5 GB floor.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 18404352 kB\n" });
+    var path_buf: [256]u8 = undefined;
+    const meminfo = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/meminfo", .{tmp.sub_path});
+    var slots: [17]Admission.Slot = undefined;
+    var pool: Admission = .init(io, .{}, &slots);
+    pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
+    var gates: [16]Gate = undefined;
+    for (&gates, 0..) |*g, i| {
+        g.* = .{ .pool = &pool, .slot = i };
+        try std.testing.expect(g.check() == null);
+    }
+    try std.testing.expectEqual(@as(u32, 16), pool.polling);
+    // One more runner would not fit beside the 16 pollers' worst cases.
+    var extra: Gate = .{ .pool = &pool, .slot = 16 };
+    try std.testing.expect(extra.check() != null);
+    // The warm, in the same slot, asks against what runs: nothing. Not counted as polling.
+    var warm: Gate = .{ .pool = &pool, .slot = 16, .warm = true };
+    try std.testing.expect(warm.check() == null);
+    try std.testing.expectEqual(@as(u32, 16), pool.polling);
+    warm.leave(true);
+    warm.assigned(jobKey("", "", "zig-runner pre-warm"));
+    // A poller handed a job while the warm runs: both reserved, and both marked overlapped.
+    gates[0].leave(true);
+    try std.testing.expect(slots[16].overlapped and slots[0].overlapped);
+    const now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+    try std.testing.expectEqual(Reservation{ .jobs = 17, .mb = 17 * 1024 }, pool.reserved(now_ms, pool.polling));
+    // So a poller that asks again is held, the warm counted: 14 polling, itself, 2 running.
+    gates[1].leave(false);
+    try std.testing.expect(gates[1].check() != null);
+    _ = warm.ended();
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), slots[16].started_ms);
 }
 
 test "a job that replayed steps from the cache is not learned from, and still frees its slot" {
