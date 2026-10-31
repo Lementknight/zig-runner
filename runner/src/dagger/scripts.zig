@@ -81,11 +81,19 @@ pub fn stepScriptFc(
             try w.writeAll(" log -1 --format=%H 2>/dev/null\nrc=0\n");
         },
     }
+    try writeEndMarker(w, n);
+    // The script file goes once it ran: otherwise every later step's filesystem holds it,
+    // and with it whatever the script embeds (a commit from `${{ github.sha }}`). A mounted one
+    // is unmounted by the query instead.
+    switch (r) {
+        .run => |sc| if (!sc.script_mounted)
+            try w.print("rm -f {s}\n", .{try scriptPath(arena, fc, sc.shell)}),
+        .checkout => {},
+    }
     try w.writeAll("mkdir -p " ++ fc_dir ++ " && : ");
     for (fc_kinds) |k| try w.print(">> {s} ", .{try fcPath(arena, k, fc)});
     try w.writeByte('\n');
     try writeCombinedFileCommands(w, arena, "", fc);
-    try writeMarkerEcho(w, "end", n);
     try w.writeAll("exit $rc\n");
     return aw.written();
 }
@@ -118,8 +126,20 @@ pub fn writeMarkerEcho(w: *std.Io.Writer, kind: []const u8, n: u32) !void {
     try w.print("echo '{s}{s} {d}' \"${{" ++ mark_env ++ "-}}\"\n", .{ marker, kind, n });
 }
 
+/// The `end` marker, written straight after the step's `rc=$?`, before the script's own
+/// bookkeeping (the file commands touched and combined, the script file removed). The runner
+/// waits for it after the exec has answered (`JobLog.awaitLive`), and the engine exports a
+/// container's output in batches about 100 ms apart: each process started between the step's
+/// last line and the marker widens the window in which a batch boundary falls between them, and
+/// one that does holds the step's end for the next batch. That bookkeeping (eight processes, about
+/// 20 ms) put the marker a batch late after about a third of the steps. It prints nothing, so the
+/// marker still follows every line of the step.
+pub fn writeEndMarker(w: *std.Io.Writer, n: u32) !void {
+    try writeMarkerEcho(w, "end", n);
+}
+
 /// The `run:` part of a step's script: the event file when asked, the script written to its file,
-/// then run under its shell in a subshell with the step's env, and removed.
+/// then run under its shell in a subshell with the step's env (`stepScriptFc` removes it).
 fn writeRunScript(
     w: *std.Io.Writer,
     arena: Allocator,
@@ -171,11 +191,7 @@ fn writeRunScript(
         action_name,
     );
     try writeShellCommand(w, arena, sc.shell, path);
-    // The script file goes once it ran: otherwise every later step's filesystem holds it,
-    // and with it whatever the script embeds (a commit from `${{ github.sha }}`). A mounted one
-    // is unmounted by the query instead.
     try w.writeAll(")\nrc=$?\n");
-    if (!sc.script_mounted) try w.print("rm -f {s}\n", .{path});
 }
 
 /// After a step: its file commands in one file (`all_<fc>`), each after a
@@ -382,12 +398,31 @@ test "script quotes, applies env, shell and working directory, and propagates th
     try std.testing.expect(std.mem.endsWith(u8, w, "exit $rc\n"));
     // One stream from the first line, and markers with the job's secret by name only (#71).
     try std.testing.expect(std.mem.startsWith(u8, w, "exec 2>&1\necho '" ++ marker ++ "begin 2' \"${ZIG_RUNNER_MARK-}\"\n"));
-    try std.testing.expect(std.mem.indexOf(u8, w, "echo '" ++ marker ++ "end 2' \"${ZIG_RUNNER_MARK-}\"\nexit $rc\n") != null);
+    // The end marker straight after the step, with nothing started in between (`writeEndMarker`).
+    const end_2 = "echo '" ++ marker ++ "end 2' \"${ZIG_RUNNER_MARK-}\"\n";
+    try std.testing.expect(std.mem.indexOf(u8, w, ")\nrc=$?\n" ++ end_2 ++ "rm -f ") != null);
     // A Docker action's script too.
     const c = try containerScript(a.allocator(), 3, 3, &.{.{ .text = "/entry" }}, &.{}, &.{}, null, false, false, "x");
     try std.testing.expect(std.mem.startsWith(u8, c, "exec 2>&1\necho '" ++ marker ++ "begin 3' \"${ZIG_RUNNER_MARK-}\"\n"));
     try std.testing.expect(std.mem.indexOf(u8, c, "-u ZIG_RUNNER_MARK ") != null);
-    try std.testing.expect(std.mem.endsWith(u8, c, "echo '" ++ marker ++ "end 3' \"${ZIG_RUNNER_MARK-}\"\nexit $rc\n"));
+    try std.testing.expect(std.mem.indexOf(u8, c, "\nrc=$?\necho '" ++ marker ++ "end 3' \"${ZIG_RUNNER_MARK-}\"\n: >> ") != null);
+}
+
+test "a step's end marker follows its output and comes before the script's bookkeeping" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const end_4 = "echo '" ++ marker ++ "end 4' \"${ZIG_RUNNER_MARK-}\"\n";
+    // A mounted script is not removed, a checkout has no script: the marker still comes first.
+    const mounted = try stepScript(a.allocator(), 4, .{ .run = .{ .script = "true", .shell = null, .working_directory = null, .env = &.{}, .script_mounted = true } }, "x");
+    try std.testing.expect(std.mem.indexOf(u8, mounted, ")\nrc=$?\n" ++ end_4 ++ "mkdir -p ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mounted, "rm -f") == null);
+    const plain = try stepScript(a.allocator(), 4, .{ .run = .{ .script = "true", .shell = null, .working_directory = null, .env = &.{} } }, "x");
+    const end_at = std.mem.indexOf(u8, plain, end_4).?;
+    // Only the bookkeeping follows it: what it does prints nothing, so no line of the step's can
+    // come after the marker.
+    try std.testing.expect(std.mem.indexOf(u8, plain, "rm -f /tmp/zig-runner-step-4") == end_at + end_4.len);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "> " ++ fc_dir ++ "/all_4\nexit $rc\n").? > end_at);
+    try std.testing.expect(std.mem.lastIndexOf(u8, plain, "echo ").? == end_at);
 }
 
 test "secret variables reach the script through aliases, whatever their names" {

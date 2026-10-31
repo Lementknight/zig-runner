@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'About a third of steps no longer end ~100 ms late. A step''s `end` marker is now echoed straight after the step, before the script''s own bookkeeping (the file commands touched and combined, the script file removed). That bookkeeping started eight processes (~20 ms) between the step''s last line and the marker, so the engine''s log export, in batches about 100 ms apart, often delivered the marker one batch after the step''s output, and the runner waited for it after the exec had already answered. The bookkeeping prints nothing, so the marker still follows every line of the step. The script text is part of every step''s cache key, so the first run after the upgrade replays nothing.'
+time: 2026-10-31T18:34:17.000000-04:00

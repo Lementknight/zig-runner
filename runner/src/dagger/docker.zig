@@ -49,6 +49,7 @@ const fc_kinds = @import("scripts.zig").fc_kinds;
 const fcPath = @import("scripts.zig").fcPath;
 const writeEnvCommand = @import("scripts.zig").writeEnvCommand;
 const writeCombinedFileCommands = @import("scripts.zig").writeCombinedFileCommands;
+const writeEndMarker = @import("scripts.zig").writeEndMarker;
 const secretAlias = @import("scripts.zig").secretAlias;
 const FakeSession = @import("testing.zig").FakeSession;
 const fake_child = @import("testing.zig").fake_child;
@@ -119,11 +120,12 @@ pub fn containerScript(
         }
         try w.writeByte(' ');
     }
-    try w.writeAll("\nrc=$?\n: ");
+    try w.writeAll("\nrc=$?\n");
+    try writeEndMarker(w, n);
+    try w.writeAll(": ");
     for (fc_kinds) |k| try w.print(">> {s} ", .{try fcPath(arena, k, fc)});
     try w.writeByte('\n');
     try writeCombinedFileCommands(w, arena, "\"$B\" ", fc);
-    try writeMarkerEcho(w, "end", n);
     try w.writeAll("exit $rc\n");
     return aw.written();
 }
