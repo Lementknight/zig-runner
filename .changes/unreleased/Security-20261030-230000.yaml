@@ -1,0 +1,3 @@
+kind: Security
+body: 'A `run:` step''s working directory holding a secret, its own `working-directory:` or the one `defaults.run` gives it, now reaches the step as a Dagger secret, instead of in plain text in the command the engine keeps in its cache metadata, and the step runs every time, as one using a secret does.'
+time: 2026-10-30T23:00:00.000000-04:00

@@ -171,6 +171,10 @@ pub const Resolved = union(enum) {
         /// The script holds a secret, so its file (`scripts.scriptPath`) is a mounted Dagger
         /// secret instead of being written by the command, which the engine keeps (#101).
         script_mounted: bool = false,
+        /// The working directory holds a secret, so it is a Dagger secret attached under this
+        /// alias (`secretAlias`) and `working_directory` is null: in the command, its `cd`
+        /// would be in the engine's cache metadata (#102).
+        working_directory_alias: ?[]const u8 = null,
     },
     checkout: Fetched,
 };
@@ -4254,6 +4258,36 @@ test "a script with a secret written in reaches its file as a mounted Dagger sec
         const after = try execOf(&auto, "./after.sh");
         try std.testing.expect(std.mem.indexOf(u8, after, "withMountedSecret") == null);
         try std.testing.expect(std.mem.indexOf(u8, after, "> /tmp/zig-runner-step-2.sh") != null);
+    }
+}
+
+test "a working directory with a secret in it reaches the step as a Dagger secret, and it always runs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const secret = "wd_s3cr3t-value";
+    // The step's own working directory, and `defaults.run`'s for a step without one.
+    var own = testStep("./deploy.sh");
+    own.action.script.working_directory = .{ .lit = "deploy/" ++ secret };
+    const steps = [_]job_mod.Step{ own, testStep("./by-default.sh") };
+    var job = testJob(&steps);
+    job.secrets = &.{secret};
+    job.defaults_run = .{ .working_directory = .{ .lit = "default/" ++ secret } };
+    var auto: AutoSession = .{ .arena = arena };
+    _ = try roundTrips(arena, &auto, .{ .step_cache = true, .test_ran_marker = "j1" }, job);
+    try expectSecretOnlyInSetSecret(auto.seen.items, secret);
+    for ([_][]const u8{ "./deploy.sh", "./by-default.sh" }) |script| {
+        const d = try execOf(&auto, script);
+        // The script changes to it through an alias the step's own env does not get.
+        try std.testing.expect(std.mem.indexOf(u8, d, "withSecretVariable(name:" ++
+            "\"ZIG_SECRET_0\",secret:\"ID") != null);
+        try std.testing.expect(std.mem.indexOf(u8, d, "cd \\\"$ZIG_SECRET_0\\\" && env " ++
+            "-u ZIG_SECRET_0 ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, d, "withoutSecretVariable(name:" ++
+            "\"ZIG_SECRET_0\")") != null);
+        // The directory is the step's input as much as its script: it runs in every job.
+        try std.testing.expect(std.mem.indexOf(u8, d, "runs this step every time: it uses " ++
+            "secrets (run ") != null);
     }
 }
 
