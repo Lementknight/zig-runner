@@ -894,10 +894,11 @@ pub const SpanDemux = struct {
     }
 };
 
-/// How long to wait for a step's live lines before assuming it was served from cache. The log
+/// How long to wait for a step's first live line before assuming it was served from cache. The log
 /// stream delivers a real step's `end` marker within milliseconds, and a real run stops waiting as
 /// soon as it arrives, so only cached steps pay this. If the stream is later than this, lines show
-/// up twice rather than being lost.
+/// up twice rather than being lost. Once a line has arrived the step ran, and the wait for the rest
+/// is bounded by `live_stall_ms` instead.
 const live_grace_ms = 60;
 
 /// Gives the reader a moment to deliver this step's lines; if none show up the step was served from
@@ -916,11 +917,40 @@ pub fn awaitLiveOrReplay(
     return replayNotLive(sh, step, stdout, stderr, ran);
 }
 
-/// Whether any of the step's lines arrived live, given a moment to.
+/// Once a step's lines are arriving, how long it may go without a new one before the runner stops
+/// waiting for its `end` marker, and how long it waits at most. The exec has answered, so what is
+/// left of its output is finite: the stream is behind, by seconds after a step that printed a lot
+/// (#140), and catches up. The bounds are for a stream that stops delivering, or an `end` marker
+/// that never comes (a script killed before it), not for a step that floods.
+const live_stall_ms = 5_000;
+const live_drain_ms = 120_000;
+
+/// Whether any of the step's lines arrived live, given `live_grace_ms` to; once some have, waits
+/// for the rest, up to the step's `end` marker. The reader carries out each line's workflow
+/// commands as it reads it, so a late `::add-matcher::` or `::add-mask::` then applies before the
+/// step's result is collected and the next step starts, and the next step's lines follow this
+/// step's in the job's log (#140).
 pub fn awaitLive(io: std.Io, sh: *JobLog, step: u32) bool {
     const idx = step - 1;
     var waited: u32 = 0;
-    while (waited < live_grace_ms and !sh.ended[idx].load(.acquire)) : (waited += 10) {
+    var since_line: u32 = 0;
+    var seen: u32 = 0;
+    while (!sh.ended[idx].load(.acquire)) : ({
+        waited += 10;
+        since_line += 10;
+    }) {
+        const lines = sh.live_lines[idx].load(.monotonic);
+        if (lines != seen) {
+            seen = lines;
+            since_line = 0;
+        }
+        if (lines == 0 and waited >= live_grace_ms) break;
+        if (lines > 0 and (since_line >= live_stall_ms or waited >= live_drain_ms)) {
+            sh.append(step, "##[warning]This step's last output had not arrived when it " ++
+                "ended: any that arrives later is logged after this, and its workflow commands " ++
+                "may come too late to apply.");
+            break;
+        }
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     return sh.live_lines[idx].load(.monotonic) > 0;
