@@ -189,7 +189,11 @@ the trust gate on `RUNNER_TRUSTED_REFS` and `RUNNER_TRUSTED_EVENTS` lists that n
 same-repository pull request, a `workflow_run` or `issue_comment` a fork set off, and a fork's pull
 request whose repository was deleted, gets the `untrusted` volumes. A `*` in either list lets every
 job through without vouching for any, so all of a pre-prod runner's jobs share the `untrusted`
-volumes with each other, and none can write what prod reads. Still, run **one engine per trust
+volumes with each other, and none can write what prod reads. With step caching, these volumes are
+the runner's own and outside every step's key: a replayed step does not write into them again, so
+a step that installs a tool into the tool cache itself (not through a setup action, which runs
+every time) and is replayed after the volume was pruned leaves a later step a PATH to a directory
+that is gone (proofs/README.md, "Against today's code"; #102). Still, run **one engine per trust
 level**: untrusted jobs on one engine share its `untrusted` volumes, the engine's other state (its
 layer cache, and with `RUNNER_DAGGER_NESTING` the engine itself) is not scoped at all, and
 nesting is control of the host. A second instance on prod's machine (`zig-runner@sandbox.service`)
