@@ -110,6 +110,11 @@ pub const Config = struct {
     /// seed for another version costs a seed build per engine and 60 MB in every Zig volume, for
     /// nothing.
     zig_seed: ?ZigSeed = null,
+    /// Build the default image's provisioned base container, and the Zig cache seed, in the
+    /// background when the runner starts and when the engine comes back after a restart (its
+    /// cache may be wiped then), so the first job does not spend 27-40 s, and the seed's 104 s,
+    /// in "Set up job" (`loop.Warmer`). Direct engines only (not `RUNNER_ENGINE=cli`).
+    prewarm: bool = true,
     /// Output keys cost two walks of the job's filesystem, whatever the step changed: 25 s on a
     /// large checkout against 1 s on a small one (STUDY.md §3.6). When a job spends longer than
     /// this on them, later jobs for that repository skip them until the runner restarts. 0 never
@@ -253,6 +258,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_UV_ENV_IN_CACHE")) |v| c.uv_env_in_cache = try boolean(v);
         if (environ.get("RUNNER_ZIG_LOCAL_CACHE")) |v| c.zig_local_cache = try boolean(v);
         if (environ.get("RUNNER_ZIG_SEED")) |v| c.zig_seed = try zigSeed(v);
+        if (environ.get("RUNNER_PREWARM")) |v| c.prewarm = try boolean(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_MAX_MS")) |v| c.output_keys_max_ms = try millis(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_DAYS")) |v| c.output_keys_days = try count(v);
         if (environ.get("RUNNER_ONCE")) |v| c.once = try boolean(v);
@@ -311,6 +317,7 @@ pub const Config = struct {
         else if (eq(key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache")) c.zig_local_cache = try boolean(val) //
         else if (eq(key, "zig-seed")) c.zig_seed = try zigSeed(val) //
+        else if (eq(key, "prewarm")) c.prewarm = try boolean(val) //
         else if (eq(key, "output-keys-max-ms")) c.output_keys_max_ms = try millis(val) //
         else if (eq(key, "log-spool-dir")) c.log_spool_dir = val //
         else if (eq(key, "enforce-volatile")) c.enforce_volatile = try boolean(val) //
@@ -583,6 +590,19 @@ test "dagger nesting is on by default and can be turned off" {
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).dagger_nesting);
     try std.testing.expect((try Config.load(&env, &.{ "runner", "--dagger-nesting=true" })).dagger_nesting);
     try env.put("RUNNER_DAGGER_NESTING", "maybe");
+    try std.testing.expectError(error.InvalidBool, Config.load(&env, &.{"runner"}));
+}
+
+test "the pre-warm is on by default and can be turned off" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try std.testing.expect((try Config.load(&env, &.{"runner"})).prewarm);
+    try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--prewarm=false" })).prewarm);
+    try env.put("RUNNER_PREWARM", "false");
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).prewarm);
+    try env.put("RUNNER_PREWARM", "maybe");
     try std.testing.expectError(error.InvalidBool, Config.load(&env, &.{"runner"}));
 }
 

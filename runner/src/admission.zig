@@ -109,8 +109,8 @@ pub const Admission = struct {
         overlapped: bool = false,
     };
 
-    /// `slots` must have one entry for each runner in the pool, and each runner's `Gate.slot` a
-    /// different index into it.
+    /// `slots` must have one entry for each runner in the pool, plus one for the pool's pre-warm
+    /// (`loop.Warmer`), which is a job to the gate, and each `Gate.slot` a different index into it.
     pub fn init(io: std.Io, limits: Limits, slots: []Slot) Admission {
         @memset(slots, .{});
         return .{ .io = io, .limits = limits, .slots = slots };
@@ -160,6 +160,15 @@ pub const Admission = struct {
         for (a.slots) |*s| if (s.base_mb != null) {
             s.peak_mb = @max(s.peak_mb, e.used_mb);
         };
+    }
+
+    /// How often the engine started again since the runner did (`Engine.returns`), or null while
+    /// its cgroup has never been found and the gate cannot tell (the runner in a container of its
+    /// own, as in deploy/compose.yaml).
+    pub fn engineReturns(a: *Admission) ?u32 {
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        return if (a.engine.seen) a.engine.returns else null;
     }
 
     /// What the gate has learned about the engine's cgroup since this was last asked (found, or
@@ -665,6 +674,11 @@ pub const Engine = struct {
     /// What `find` last concluded, told once (`Admission.engineNews`).
     outcome: union(enum) { found: u64, missing: anyerror } = .{ .missing = error.NotLookedFor },
     told: bool = true,
+    /// Found at least once: the runner can see the engine's process.
+    seen: bool = false,
+    /// How often it was found after it was looked for and not found, or lost: each is an engine
+    /// that started (`loop.Warmer` pre-warms it again). Its first finding at startup is not one.
+    returns: u32 = 0,
 
     pub const retry_ms = 60 * std.time.ms_per_s;
 
@@ -682,6 +696,8 @@ pub const Engine = struct {
         if (e.source == .off) return;
         if (e.failed_ms) |t| if (now_ms - t < retry_ms) return;
         if (locate(io, paths, e.source, &e.dir_buf)) |dir| {
+            if (e.outcome == .missing and e.outcome.missing != error.NotLookedFor) e.returns += 1;
+            e.seen = true;
             e.dir = dir;
             e.failed_ms = null;
             e.swap = .{};
@@ -1254,7 +1270,7 @@ test "the engine's cgroup is found through its socket's listener, or not, saying
     try std.testing.expectEqual(@as(?[]const u8, null), off.engineNews(&buf));
 }
 
-test "an engine container recreated is looked for again" {
+test "an engine container recreated is looked for again, and counted as an engine that started" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
@@ -1268,8 +1284,12 @@ test "an engine container recreated is looked for again" {
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent", .cgroup_root = root };
     pool.engine.source = .{ .cgroup = dir };
     var gate: Gate = .{ .pool = &pool };
+    // Never found: the gate cannot tell when the engine starts.
+    try std.testing.expectEqual(@as(?u32, null), pool.engineReturns());
     try std.testing.expect(gate.check() == null);
     try std.testing.expect(pool.engine.dir != null);
+    // Found at startup: not an engine that started since.
+    try std.testing.expectEqual(@as(?u32, 0), pool.engineReturns());
     var buf: [512]u8 = undefined;
     try std.testing.expect(std.mem.indexOf(u8, pool.engineNews(&buf).?, "capped at 4.0") != null);
     // Gone: forgotten and said, and looked for again at the next check, not a minute later.
@@ -1286,6 +1306,7 @@ test "an engine container recreated is looked for again" {
     pool.engine.failed_ms = null;
     try std.testing.expect(gate.check() == null);
     try std.testing.expect(pool.engine.dir != null);
+    try std.testing.expectEqual(@as(?u32, 1), pool.engineReturns());
 }
 
 test "reservations add up what each job reserves, not a flat amount for each" {

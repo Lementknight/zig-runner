@@ -789,6 +789,27 @@ pub const Conn = struct {
     }
 };
 
+/// Which socket file a `unix://` engine host is: an engine that starts unlinks its socket and binds
+/// a new one, so a different identity, or a socket where there was none, is an engine that started,
+/// the only moment its cache can be wiped. Null for no socket there, or a host of another kind.
+pub const SocketIdentity = struct {
+    inode: std.Io.File.INode,
+    ctime: std.Io.Timestamp,
+
+    pub fn of(io: Io, host: []const u8) ?SocketIdentity {
+        if (!std.mem.startsWith(u8, host, "unix://")) return null;
+        const st = std.Io.Dir.cwd().statFile(io, host["unix://".len..], .{}) catch return null;
+        return .{ .inode = st.inode, .ctime = st.ctime };
+    }
+
+    /// Whether going from `before` to `now` is an engine that started.
+    pub fn changed(before: ?SocketIdentity, now: ?SocketIdentity) bool {
+        const n = now orelse return false;
+        const b = before orelse return true;
+        return b.inode != n.inode or b.ctime.nanoseconds != n.ctime.nanoseconds;
+    }
+};
+
 /// A new connection to the engine's API: its own listener when `ep.host` names one, else `buildctl
 /// dial-stdio` in the engine container, through the Docker API (create an exec, then start it with
 /// the connection upgraded to a raw stream).
@@ -1738,4 +1759,27 @@ test "an engine slow to answer but still talking is not aborted, nor one with th
         const took = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
         try std.testing.expect(took >= 2_500);
     }
+}
+
+test "an engine socket that appears, or is replaced, is an engine that started; one that stays is not" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+    const host = try std.fmt.bufPrint(&buf, "unix://.zig-cache/tmp/{s}/engine.sock", .{tmp.sub_path});
+    // No socket yet (the engine is down at boot): nothing to compare, nothing started.
+    const absent = SocketIdentity.of(io, host);
+    try std.testing.expect(absent == null);
+    try std.testing.expect(!SocketIdentity.changed(null, absent));
+    try tmp.dir.writeFile(io, .{ .sub_path = "engine.sock", .data = "" });
+    const first = SocketIdentity.of(io, host).?;
+    try std.testing.expect(SocketIdentity.changed(absent, first));
+    try std.testing.expect(!SocketIdentity.changed(first, SocketIdentity.of(io, host)));
+    // Replaced while both exist, so the new one cannot reuse the old one's inode.
+    try tmp.dir.writeFile(io, .{ .sub_path = "next.sock", .data = "" });
+    try tmp.dir.rename("next.sock", tmp.dir, "engine.sock", io);
+    try std.testing.expect(SocketIdentity.changed(first, SocketIdentity.of(io, host)));
+    // Gone (the engine stopping) is not a start; a TCP host is never compared.
+    try std.testing.expect(!SocketIdentity.changed(first, null));
+    try std.testing.expect(SocketIdentity.of(io, "tcp://127.0.0.1:1234") == null);
 }

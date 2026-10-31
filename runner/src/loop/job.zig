@@ -310,6 +310,9 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
     const job_started_ms = std.Io.Clock.real.now(c.io).toMilliseconds();
     var reporter = try startReporter(c, job, job_started_ms);
     const result = try runJobSteps(c, job, log, &cancel, &live, &step_logs, if (reporter) |*r| r else null);
+    // The engine was starting when this job opened its session, so its cache may have been
+    // wiped: warmed again for the next job.
+    if (result.engine_waited) if (c.warmer) |w| w.request();
     // The steps are done: register the next runner, and open its session, while this job is
     // wrapped up.
     if (c.next) |slot| if (slot.* == null and !stopRequested()) {
