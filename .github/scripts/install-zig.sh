@@ -19,8 +19,8 @@
 # step of the job can write there, from lists no step can reach (runner/src/dagger/tool_trees.sh),
 # and passes each tree's path and digest in ZIG_RUNNER_TOOL_TREES. When it names this tree with the
 # pinned digest, the tree is the one checked and this script does not read it again (0.7-1 s on
-# the laptop, 10-19 s on razorbill under load). Anything else, the variable unset on GitHub's runners
-# included, means the check here.
+# the laptop, 10-19 s on razorbill under load). Anything else, the variable unset on GitHub's
+# runners included, means the check here.
 set -euo pipefail
 
 version=0.17.0

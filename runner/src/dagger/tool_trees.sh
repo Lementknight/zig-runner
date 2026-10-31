@@ -42,7 +42,8 @@ tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
 tab=$(printf '\t')
 # TOOL_TREES_RACY_S is for the tests, which would otherwise wait out the 2 s; no step can set it.
-racy=$(awk -v now="$(date +%s.%N)" -v s="${TOOL_TREES_RACY_S:-2}" 'BEGIN { printf "%.9f", now - s }')
+racy=$(awk -v now="$(date +%s.%N)" -v s="${TOOL_TREES_RACY_S:-2}" \
+	'BEGIN { printf "%.9f", now - s }')
 
 # verify TREE LIST: prints TREE's digest, its number of files and how many were re-hashed, and
 # rewrites LIST. Prints nothing when the tree could not be read.

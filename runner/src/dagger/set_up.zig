@@ -294,7 +294,10 @@ fn verifyToolTrees(
 /// `tool_trees_env`'s value and "Set up job"'s line, from tool_trees.sh's `DIGEST TREE FILES
 /// REHASHED` lines. A line that does not have that form, or names a tree outside the tool cache
 /// or through a dot-named directory, is left out: a step then checks that tree itself.
-fn toolTreesVerdict(arena: Allocator, out: []const u8) !struct { env: []const u8, note: []const u8 } {
+fn toolTreesVerdict(
+    arena: Allocator,
+    out: []const u8,
+) !struct { env: []const u8, note: []const u8 } {
     var env: std.ArrayList(u8) = .empty;
     var note: std.ArrayList(u8) = .empty;
     var lines = std.mem.tokenizeScalar(u8, out, '\n');
