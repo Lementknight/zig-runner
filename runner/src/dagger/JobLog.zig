@@ -619,6 +619,13 @@ fn swallowIfReplayed(sh: *JobLog, step: u32, text: []const u8) bool {
     return true;
 }
 
+/// Forgets the lines replayed so far (`replay`), as another exec of the same step begins.
+pub fn forgetReplayed(sh: *JobLog) void {
+    sh.mu.lockUncancelable(sh.io);
+    defer sh.mu.unlock(sh.io);
+    sh.replayed.clearRetainingCapacity();
+}
+
 /// Logs a line taken from a query result and remembers it so a late live copy is dropped.
 fn replay(sh: *JobLog, step: u32, text: []const u8) void {
     {
@@ -913,7 +920,8 @@ pub fn awaitLiveOrReplay(
     stderr: []const u8,
     ran: ?bool,
 ) bool {
-    if (awaitLive(io, sh, step)) return false;
+    // A cached exec prints nothing: lines counted for its step are an earlier exec's (#102).
+    if (ran != false and awaitLive(io, sh, step)) return false;
     return replayNotLive(sh, step, stdout, stderr, ran);
 }
 
@@ -1110,6 +1118,26 @@ test "a live line that arrives after its step was replayed is dropped, not logge
     sh.emitLive(1, "other");
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, w.buffered(), "hello\n"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "other\n"));
+}
+
+test "a line replayed for one exec does not swallow the same line printed live by the next" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const live = [_]std.atomic.Value(u32){.init(0)};
+    const ended = [_]std.atomic.Value(bool){.init(false)};
+    var cmds = [_]JobLog.StepCommands{.{}};
+    var sh: JobLog = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = @constCast(&live), .ended = @constCast(&ended), .commands = &cmds };
+    // A composite's cached inner step is replayed; the next inner step prints the same line.
+    sh.replay(1, "::set-output name=v::same");
+    _ = sh.takeOutputs(1);
+    sh.forgetReplayed();
+    sh.emitLive(1, "::set-output name=v::same");
+    const outs = sh.takeOutputs(1);
+    try std.testing.expectEqual(@as(usize, 1), outs.len);
+    try std.testing.expectEqualStrings("same", outs[0].value);
 }
 
 test "a marker a step prints itself, naming no step of the job, is output, not a marker" {
