@@ -36,7 +36,10 @@ expect() {
 
 fresh
 expect "first check reads every file" 0 '^Zig tree: 4 files, all re-hashed$'
-[ -s "$list" ] && echo "ok: a passing check leaves the list" || { echo "FAIL: no list"; failures=$((failures + 1)); }
+ok() {
+	if "${@:2}"; then echo "ok: $1"; else echo "FAIL: $1"; failures=$((failures + 1)); fi
+}
+ok "a passing check leaves the list" test -s "$list"
 expect "second check re-hashes nothing" 0 '^Zig tree: 4 files, 0 re-hashed$'
 
 touch "$tree/doc/a b.txt"
@@ -48,7 +51,7 @@ mtime=$(stat -c %y "$tree/zig")
 printf 'zig bjnary\n' >"$tree/zig"
 touch -d "$mtime" "$tree/zig"
 expect "same size and mtime, new content: fails" 1 '^$'
-[ ! -e "$list" ] && echo "ok: a failing check removes the list" || { echo "FAIL: list kept"; failures=$((failures + 1)); }
+ok "a failing check removes the list" test ! -e "$list"
 
 fresh
 expect "list written" 0 'all re-hashed'
