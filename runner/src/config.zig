@@ -67,9 +67,10 @@ pub const Config = struct {
     docker_socket: []const u8 = "/var/run/docker.sock",
     /// Give each step's commands access to the job's Dagger engine
     /// (`experimentalPrivilegedNesting`), so `dagger call` inside a job works, as
-    /// dagger/dagger-for-github expects. That access is enough to run privileged containers, so a
-    /// job can control the runner's host: turn it off for untrusted workflows.
-    dagger_nesting: bool = true,
+    /// dagger/dagger-for-github expects, and only in jobs the runner vouches for. That access is
+    /// enough to run privileged containers and open any cache volume by its key, so a job with it
+    /// controls the runner's host: off unless a pool that needs it turns it on.
+    dagger_nesting: bool = false,
     /// Mount persistent Dagger cache volumes at package managers' cache directories in every job.
     package_caches: bool = true,
     /// Reuse a step's result from an earlier run when its inputs are unchanged (steps that use
@@ -580,15 +581,15 @@ test "the engine silence timeout: ten minutes by default, in seconds, 0 turns it
     try std.testing.expectError(error.InvalidNumber, Config.load(&env, &.{"runner"}));
 }
 
-test "dagger nesting is on by default and can be turned off" {
+test "dagger nesting is off by default and can be turned on" {
     var env: std.process.Environ.Map = .init(std.testing.allocator);
     defer env.deinit();
     try env.put("GH_TOKEN", "t");
     try env.put("GH_SCOPE", "o/r");
-    try std.testing.expect((try Config.load(&env, &.{"runner"})).dagger_nesting);
-    try env.put("RUNNER_DAGGER_NESTING", "false");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).dagger_nesting);
-    try std.testing.expect((try Config.load(&env, &.{ "runner", "--dagger-nesting=true" })).dagger_nesting);
+    try env.put("RUNNER_DAGGER_NESTING", "true");
+    try std.testing.expect((try Config.load(&env, &.{"runner"})).dagger_nesting);
+    try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--dagger-nesting=false" })).dagger_nesting);
     try env.put("RUNNER_DAGGER_NESTING", "maybe");
     try std.testing.expectError(error.InvalidBool, Config.load(&env, &.{"runner"}));
 }
