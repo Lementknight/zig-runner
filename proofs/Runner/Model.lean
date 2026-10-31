@@ -19,8 +19,10 @@ named:
 * A step's key keeps the container it starts from, the script text, and the non-volatile
   environment; it forgets the mounts and the volatile variables. That is what dagger.zig builds:
   `withExec` under `loadContainerFromID`, `withVolatileVariable` for the names in `volatile_env`,
-  and `withMountedCache` for the package caches, whose content BuildKit excludes from an exec's
-  cache key.
+  and `withMountedCache` for the package caches, whose content the engine keeps out of an exec's
+  key: since Dagger v0.21.0 an exec is reused by DagQL's recipe digest, in which a `cacheVolume` is
+  its key string, namespace, sharing and owner and never what it holds. The volume's identity is in
+  the real key and not in `Key`; the README's `Key` row counts that as extra misses.
 
 * "Always run" is not a flag the engine understands. The runner writes the job's nonce into the
   step's script, and the script is part of the key (`always_run`, threaded through
@@ -98,7 +100,8 @@ abbrev Binding := Name × Content
 abbrev Env := List Binding
 
 /-- A mount is a path and the content mounted there: a cache volume for a package manager. Mount
-content is in no key, by design. -/
+content is in no key, by design; the mount's identity is in the engine's and not in `Key`, which
+costs only misses (proofs/README.md, `Key` row). -/
 abbrev Mounts := List (Name × Content)
 
 /-! ## Containers

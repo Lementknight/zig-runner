@@ -49,8 +49,9 @@ variable (vol : Volatile)
 def withheld : Env → Env := stable vol
 
 /-- An input with everything outside the key that varies between runs replaced: the variables
-withheld, and the payload replaced by `withheldEvent`. (The mounts are outside the key too, but they
-do not vary between runs by the runner's doing; what is in them is mount-blindness's question.) -/
+withheld, and the payload replaced by `withheldEvent`. (What the mounts hold is outside the key too,
+but does not vary between runs by the runner's doing; what is in them is mount-blindness's
+question.) -/
 def withhold (i : Input) : Input := { i with env := withheld vol i.env, event := withheldEvent }
 
 /-- The input of an unmarked step under enforcement. The marked ones are unchanged: they get the
