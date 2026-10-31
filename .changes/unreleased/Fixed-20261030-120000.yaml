@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A step that prints a lot no longer has its last lines logged after the next step has started, and an `::add-matcher::` or `::add-mask::` near the end of its output now applies to the steps after it instead of being lost (#140): once a step''s live output has started, the runner reads it up to the step''s end before collecting its result, waiting while lines keep coming and warning in the step''s log if they stop for 5 s or take over 2 minutes.'
+time: 2026-10-30T12:00:00.000000-04:00

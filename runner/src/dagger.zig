@@ -2361,6 +2361,56 @@ test "run streams live lines from the session's log and does not replay them" {
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "connecting") == null);
 }
 
+test "a step's last live lines, arriving after its exec answered, are its own and apply first" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{ testStep("flood"), testStep("use") };
+    // Step 1's end comes on the log stream well after its exec answered, as it does after a flood
+    // (#140): a matcher and a mask in those late lines, which step 2 uses.
+    const matcher_json = "{\"problemMatcher\":[{\"owner\":\"late\",\"pattern\":[{\"regexp\":" ++
+        "\"^A:(.+):(\\\\d+): (.+)$\",\"file\":1,\"line\":2,\"message\":3}]}]}";
+    var matcher_answer: std.Io.Writer.Allocating = .init(arena);
+    try matcher_answer.writer.writeAll("{\"data\":{\"loadContainerFromID\":{\"file\":{\"contents\":");
+    try std.json.Stringify.value(matcher_json, .{}, &matcher_answer.writer);
+    try matcher_answer.writer.writeAll("}}}}");
+    const answers = [_][]const u8{
+        base_answer,
+        try exec(arena, "C1", 0, ""),
+        matcher_answer.written(),
+        try exec(arena, "C2", 0, "A:f1:1: matcher hit\\nmask latesecret end\\n"),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    const child =
+        \\{ echo "::zig-step::begin 1 m-job"; echo "early"; } >&2
+        \\printf '0 tok\n'
+        \\sleep 0.3
+        \\{ echo "late"; echo "::add-matcher::/m.json"; echo "::add-mask::latesecret"
+        \\  echo "::zig-step::end 1 m-job"; } >&2
+        \\cat >/dev/null
+    ;
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_step_mark = "m-job", .test_session_argv = &.{ "sh", "-c", child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    const got = w.buffered();
+    // The late line is step 1's, logged before anything of step 2's.
+    const late = std.mem.indexOf(u8, got, "[job 0 step 1 stdout] late\n") orelse
+        return error.TestUnexpectedResult;
+    const step2 = std.mem.indexOf(u8, got, "[job 0 step 2 ") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(late < step2);
+    // The matcher was read after step 1, and step 2's line matched it; the mask held for step 2.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "file(path:\"/m.json\")") != null);
+    try std.testing.expectEqual(@as(usize, 1), res.annotations.len);
+    try std.testing.expectEqual(@as(u32, 2), res.annotations[0].step);
+    try std.testing.expectEqualStrings("matcher hit", res.annotations[0].an.message);
+    try std.testing.expect(std.mem.indexOf(u8, got, "latesecret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "mask *** end") != null);
+}
+
 test "run reports an engine error when the session cannot start" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
