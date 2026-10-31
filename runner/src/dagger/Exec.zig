@@ -404,8 +404,14 @@ fn resolveRunStep(
     else
         null;
     resolved.run.script_mounted = script_secret != null;
+    // Its working directory too, the step's own or `defaults.run`'s (#102); registered below,
+    // once its alias, after every secret variable's, is known.
+    const wd_secret = if (resolved.run.working_directory) |wd|
+        holdsSecret(x.job.*, x.sh, wd)
+    else
+        false;
     const uses_secrets = secret_env.len > 0 or x.job_secret_env or x.envHoldsSecret() or
-        script_secret != null;
+        script_secret != null or wd_secret;
     const oidc = try x.idToken();
     if (oidc) |t| {
         resolved.run.env = try std.mem.concat(
@@ -418,6 +424,22 @@ fn resolveRunStep(
     const names = try arena.alloc([]const u8, secret_env.len);
     for (secret_env, names) |s, *n| n.* = s.name;
     resolved.run.secret_env = names;
+    if (wd_secret) {
+        const id = newSecret(
+            arena,
+            x.transport,
+            &x.secrets,
+            resolved.run.working_directory.?,
+            &x.err_msg,
+        ) catch return error.EngineFailed;
+        const alias = try secretAlias(arena, secret_env.len);
+        secret_env = try std.mem.concat(arena, SecretRef, &.{ secret_env, &.{.{
+            .name = alias,
+            .id = id,
+        }} });
+        resolved.run.working_directory = null;
+        resolved.run.working_directory_alias = alias;
+    }
     resolved.run.write_event = x.event_from_env;
     // A step that uses secrets (a deploy, a publish) must not be skipped because an earlier run
     // had the same inputs, and one that reads run-specific values must not replay an earlier

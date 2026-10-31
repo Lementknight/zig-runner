@@ -154,10 +154,15 @@ fn writeRunScript(
         try shellQuote(w, wd);
         try w.writeAll(" && ");
     }
+    // The alias is the shell's, for its `cd`, not the step's: the command does not inherit it.
+    if (sc.working_directory_alias) |alias| try w.print("cd \"${s}\" && ", .{alias});
     try writeEnvCommand(
         w,
         arena,
-        "env ",
+        if (sc.working_directory_alias) |alias|
+            try std.fmt.allocPrint(arena, "env -u {s} ", .{alias})
+        else
+            "env ",
         sc.env,
         sc.secret_env,
         sc.write_event,
