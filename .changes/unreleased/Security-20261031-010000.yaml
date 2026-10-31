@@ -1,0 +1,3 @@
+kind: Security
+body: 'Steps get the Dagger engine (`RUNNER_DAGGER_NESTING`) only in jobs the runner vouches for: a step''s own Dagger client could open any cache volume by its key, so a pull request, a job from a ref or event outside the trusted lists, or any job on a `*` runner could write the caches and output-key store trusted jobs read. In those jobs, "Set up job" says Dagger in steps is off, and a failed step that names Dagger is told why.'
+time: 2026-10-31T01:00:00.000000-04:00

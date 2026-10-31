@@ -729,6 +729,8 @@ pub fn execFor(
     for ([_][]const job_mod.EnvVar{ job_env, plan.container_env }) |env| for (env) |e| {
         if (containsSecret(job.*, e.value)) try secret_vars.put(arena, e.name, {});
     };
+    const scope = try packageCacheScope(arena, ev, job.github.repository, opts.trusted);
+    const vouched = std.mem.eql(u8, scope, "repo");
     return .{
         .arena = arena,
         .io = io,
@@ -740,7 +742,12 @@ pub fn execFor(
         .secrets = secrets,
         .next_fc = @intCast(job.steps.len + 1),
         .js_runtime = opts.js_runtime,
-        .nesting = opts.nesting,
+        // Dagger inside steps only for a job whose caches are the trusted jobs' own: a step's
+        // nested client is in the runner's namespace and can open any cache volume by its key,
+        // the `repo` volumes and the output-key store included, and the keys are no secret
+        // (#228).
+        .nesting = opts.nesting and vouched,
+        .nesting_withheld = opts.nesting and !vouched,
         .step_cache = step_cache,
         .enforce_volatile = step_cache and opts.enforce_volatile,
         .output_keys = try outputKeysKey(arena, ev, job.*, opts, step_cache),
