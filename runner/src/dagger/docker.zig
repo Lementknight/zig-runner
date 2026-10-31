@@ -27,6 +27,7 @@ const inputEnv = @import("../dagger.zig").inputEnv;
 const shownInputs = @import("../dagger.zig").shownInputs;
 const shellQuote = @import("../dagger.zig").shellQuote;
 const isVolatile = @import("../dagger.zig").isVolatile;
+const busybox_image = @import("../dagger.zig").busybox_image;
 const busybox_path = @import("../dagger.zig").busybox_path;
 const docker_home = @import("../dagger.zig").docker_home;
 const docker_workspace = @import("../dagger.zig").docker_workspace;
@@ -773,7 +774,8 @@ test "Docker actions: built or pulled, the workspace copied in and back, args, e
     try std.testing.expect(res.succeeded);
     try std.testing.expectEqual(@as(usize, 16), seen.len);
     for (seen) |d| try std.testing.expect(braceBalanced(d));
-    try std.testing.expect(std.mem.indexOf(u8, seen[3], "from(address:\"busybox:1.37.0-musl\") { file(path:\"/bin/busybox\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "from(address:\"" ++ busybox_image ++
+        "\") { file(path:\"/bin/busybox\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[3], "empty: directory { id }") != null);
     // Built with the Dockerfile's directory as the context.
     try std.testing.expect(std.mem.indexOf(u8, seen[4], "loadDirectoryFromID(id:\"D1\") { directory(path:\"sub/docker\") { dockerBuild(dockerfile:\"Dockerfile\")") != null);

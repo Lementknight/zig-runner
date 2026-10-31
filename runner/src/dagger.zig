@@ -179,9 +179,16 @@ pub const Resolved = union(enum) {
     checkout: Fetched,
 };
 
+/// The static busybox that Docker actions, service containers and output keys run their scripts
+/// with (`Exec.busyboxFileFor`). Pinned by the multi-arch index digest, which a moved tag cannot
+/// change (#107): one pin serves amd64 and arm64/v8, the engine picking its platform from the
+/// index. Renovate moves the pin (renovate.json), and CI checks on every pull request that it is
+/// still a pullable index with the applets the runner uses (.github/scripts/busybox-pin.sh). By
+/// hand, `docker buildx imagetools inspect busybox:1.37.0-musl` prints the index digest.
+pub const busybox_image = "busybox:1.37.0-musl" ++
+    "@sha256:f6a95d611e0a8780fabdb2aec43e31275b2720dfefa3e41b16835bfc42454478";
 /// Where a Docker action's container gets its static busybox, and HOME (shared by the job's Docker
 /// actions, as GitHub mounts one /github/home into each).
-pub const busybox_image = "busybox:1.37.0-musl";
 pub const busybox_path = "/github/_runtime/busybox";
 pub const docker_home = "/github/home";
 
@@ -4492,4 +4499,21 @@ test "a Docker action's argument holding a secret reaches its command as a Dagge
     try std.testing.expect(std.mem.indexOf(u8, run_doc, attached) != null);
     const hidden = try std.fmt.allocPrint(arena, "env -u {s} ", .{alias});
     try std.testing.expect(std.mem.indexOf(u8, run_doc, hidden) != null);
+}
+
+test "busybox is pinned by digest" {
+    // A truncated or upper-case paste fails here, before CI's busybox-pin.sh pulls it.
+    const at = std.mem.indexOfScalar(u8, busybox_image, '@') orelse
+        return error.TestUnexpectedResult;
+    const name = busybox_image[0..at];
+    try std.testing.expect(std.mem.startsWith(u8, name, "busybox:"));
+    try std.testing.expect(std.mem.endsWith(u8, name, "-musl"));
+    const digest = busybox_image[at..];
+    try std.testing.expect(std.mem.startsWith(u8, digest, "@sha256:"));
+    const hex = digest["@sha256:".len..];
+    try std.testing.expectEqual(@as(usize, 64), hex.len);
+    for (hex) |c| switch (c) {
+        '0'...'9', 'a'...'f' => {},
+        else => return error.TestUnexpectedResult,
+    };
 }

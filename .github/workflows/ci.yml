@@ -66,6 +66,21 @@ jobs:
       - name: changie's checksum
         run: .github/scripts/install-changie.sh
 
+      # The busybox the runner puts into job containers (runner/src/dagger.zig), pinned by digest:
+      # checked to be a pullable multi-arch index (amd64 and arm64) with the applets Docker actions,
+      # services and output keys use, so a Renovate busybox pull request, or a re-wrapped literal,
+      # fails here, not on a runner. Docker Hub is asked anonymously from GitHub's shared addresses:
+      # only a fetch that fails (exit 75) is tried again, twice, after a pause, as for zizmor.
+      - name: busybox's pin
+        run: |
+          for attempt in 1 2 3; do
+            status=0
+            .github/scripts/busybox-pin.sh || status=$?
+            ((status == 75 && attempt < 3)) || exit "$status"
+            echo "::warning::busybox-pin.sh could not reach Docker Hub (attempt $attempt of 3): trying again"
+            sleep $((attempt * 15))
+          done
+
       # zizmor's online audits ask GitHub (its advisories, the pinned commits). A request that fails
       # makes zizmor exit 1, the code for its own failure, which once took a pull request out of
       # the merge queue (#194). Only that is tried again, twice, after a pause: findings (exit 10
