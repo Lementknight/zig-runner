@@ -29,6 +29,7 @@ const isVolatile = @import("../dagger.zig").isVolatile;
 const logSteps = @import("../dagger.zig").logSteps;
 const finish = @import("../dagger.zig").finish;
 const default_image = @import("../dagger.zig").default_image;
+const jobWorkspace = @import("../dagger.zig").jobWorkspace;
 const work_root = @import("../dagger.zig").work_root;
 const runner_user = @import("../dagger.zig").runner_user;
 const runner_home = @import("../dagger.zig").runner_home;
@@ -225,12 +226,7 @@ fn writeImage(
             try q.call("withRegistryAuth", auth);
         } else if (err_msg.len > 0) return error.BaseContainerFailed;
     }
-    try q.call("from", .{ .address = plan.job_image });
-    // Before the container's env too, so its value (or the workflow's) wins.
-    if (plan.zig_local != null) try q.call(
-        "withEnvVariable",
-        .{ .name = "ZIG_LOCAL_CACHE_DIR", .value = zigLocalCacheDir(plan.as_runner) },
-    );
+    try writeFrom(q, plan.job_image, plan.zig_local != null, plan.as_runner);
     if (job.container != null) for (plan.cache_ids, 0..) |_, i| {
         // Before the container's env, so its own value wins.
         if (package_cache_dirs[i].env.len == 0) continue;
@@ -262,6 +258,17 @@ fn writeImage(
         try q.leafArgs("zig_runtime_path", "envVariable", .{ .name = "PATH" });
 }
 
+/// `from` the image, and Zig's local cache directory when it has a volume: the first nodes of
+/// every job's base container, which depend on nothing of the job.
+fn writeFrom(q: *Query, image: []const u8, zig_local: bool, as_runner: bool) !void {
+    try q.call("from", .{ .address = image });
+    // Before the container's env too, so its value (or the workflow's) wins.
+    if (zig_local) try q.call(
+        "withEnvVariable",
+        .{ .name = "ZIG_LOCAL_CACHE_DIR", .value = zigLocalCacheDir(as_runner) },
+    );
+}
+
 /// A `container:` job's own `env:`, evaluated, without the names the job's env sets: those win
 /// on GitHub (`docker exec -e` over `docker create -e`), and a secret variable and a plain one of
 /// one name would leave it to the engine which of them a step sees. Null when it cannot be
@@ -281,10 +288,7 @@ fn containerEnv(arena: Allocator, ev: *Evaluator, job: job_mod.Job) !?[]const jo
 /// Provisioning in the default image, the workspace and RUNNER_TEMP, the step user, and the
 /// workdir.
 fn writeProvisionAndWorkspace(q: *Query, arena: Allocator, ev: *Evaluator, plan: BasePlan) !void {
-    if (plan.provision) {
-        const script = if (plan.as_runner) provision_runner_script else provision_script;
-        try q.call("withExec", .{ .args = &[_][]const u8{ "sh", "-c", script } });
-    }
+    if (plan.provision) try writeProvision(q, plan.as_runner);
     // The job's workspace and RUNNER_TEMP, the step user's in the default image (cached per
     // repository). A job container's user may be unable to make them; its steps then report
     // that themselves.
@@ -315,6 +319,13 @@ fn writeProvisionAndWorkspace(q: *Query, arena: Allocator, ev: *Evaluator, plan:
         try q.call("withEnvVariable", .{ .name = "HOME", .value = runner_home });
     }
     try q.call("withWorkdir", .{ .path = ev.workspace });
+}
+
+/// The provisioning exec (`provision_script`, or `provision_runner_script` with the step user):
+/// the one expensive node of the base container, and a job-independent one, cached per engine.
+fn writeProvision(q: *Query, as_runner: bool) !void {
+    const script = if (as_runner) provision_runner_script else provision_script;
+    try q.call("withExec", .{ .args = &[_][]const u8{ "sh", "-c", script } });
 }
 
 /// One cache volume mount per package manager, owned by the step user when steps run as it.
@@ -953,6 +964,63 @@ test "the default image is provisioned with git; a custom image is left alone" {
         try std.testing.expect(braceBalanced(base));
         try std.testing.expectEqual(case.expect_provision, std.mem.indexOf(u8, base, "apt-get install") != null);
         try std.testing.expect(std.mem.indexOf(u8, base, case.image) != null);
+    }
+}
+
+test "the from and provisioning nodes are a byte prefix of every job's base document, and carry nothing of a job" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("true")};
+    var vols: std.Io.Writer.Allocating = .init(arena);
+    try vols.writer.writeAll("{\"data\":{\"czl\":{\"id\":\"VZL\"}");
+    for (package_cache_dirs, 0..) |_, i| try vols.writer.print(",\"c{d}\":{{\"id\":\"V{d}\"}}", .{ i, i });
+    try vols.writer.writeAll("}}");
+    for ([_]config.StepUser{ .runner, .root }) |step_user| {
+        for ([_]bool{ true, false }) |zig_local| {
+            for ([_][]const u8{ default_image, "custom/image:1" }) |image| {
+                const answers = [_][]const u8{ vols.written(), base_answer, try exec(arena, "C1", 0, "") };
+                var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+                var buf: [4096]u8 = undefined;
+                var w: std.Io.Writer = .fixed(&buf);
+                var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+                const res = try run(arena, std.testing.io, &env, .{
+                    .image = image,
+                    .package_caches = true,
+                    .trusted = true,
+                    .zig_local_cache = zig_local,
+                    .step_user = step_user,
+                    .test_session_argv = &.{ "sh", "-c", fake_child },
+                    .test_transport = fake.transport(),
+                }, testJob(&steps), &log);
+                try std.testing.expect(res.succeeded);
+                const base = fake.seen.items[1];
+                try std.testing.expect(braceBalanced(base));
+                // The same writers, with what `basePlan` derives from the options, and nothing else.
+                const provision = std.mem.eql(u8, image, default_image);
+                const as_runner = provision and step_user == .runner;
+                var q: Query = .init(arena);
+                try q.open("container");
+                try writeFrom(&q, image, zig_local, as_runner);
+                if (provision) try writeProvision(&q, as_runner);
+                const prefix = q.fragment().text;
+                try std.testing.expect(std.mem.startsWith(u8, base, prefix));
+                try std.testing.expectEqual(provision, std.mem.indexOf(u8, prefix, "apt-get install") != null);
+                try std.testing.expectEqual(zig_local, std.mem.indexOf(u8, prefix, "ZIG_LOCAL_CACHE_DIR") != null);
+                // Nothing of the job: no volume, mount, secret, file, registry credential, nor the
+                // job's workspace (which the rest of the document makes), so the prefix can be
+                // issued with no job at all. The provisioning script's own `mkdir -p` makes fixed
+                // directories.
+                const workspace = try jobWorkspace(arena, testJob(&steps));
+                try std.testing.expect(std.mem.indexOf(u8, base, workspace) != null);
+                for ([_][]const u8{
+                    "experimentalPrivilegedNesting", "withMountedCache", "cacheVolume",
+                    "setSecret",                     "withNewFile",      "withVolatileVariable",
+                    "loadContainerFromID",           "withRegistryAuth", workspace,
+                }) |job_only| try std.testing.expect(std.mem.indexOf(u8, prefix, job_only) == null);
+            }
+        }
     }
 }
 

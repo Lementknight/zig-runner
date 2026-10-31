@@ -899,41 +899,19 @@ fn runDirect(
     var demux: SpanDemux = .{ .sh = sh, .gpa = opts.gpa };
     defer demux.deinit();
     var sess: engine.Session = undefined;
-    // An engine that is starting (just restarted, or updated) refuses connections, or has no socket
-    // yet, for up to a minute or so: wait for it, as GitHub's runner waits for Docker, rather than
-    // fail the job.
     const started = std.Io.Clock.awake.now(io).toMilliseconds();
-    var waiting = false;
-    while (true) {
-        if (openSession(
-            &sess,
-            opts,
-            io,
-            ep,
-            .{ .ptr = &demux, .onRecord = SpanDemux.onRecord },
-        )) |_| {
-            if (waiting) sh.append(0, try engineAcceptedNote(arena, io, started));
-            break;
-        } else |e| {
-            const starting = switch (e) {
-                error.ConnectionRefused, error.FileNotFound => true,
-                error.ConnectionResetByPeer, error.EngineUnreachable => true,
-                else => false,
-            };
-            const cancelled = if (opts.cancel) |c| c.requested.load(.acquire) else false;
-            if (!starting or cancelled or
-                std.Io.Clock.awake.now(io).toMilliseconds() - started > engine_wait_ms)
-                return fail(sh, results, try engineOpenError(arena, e, ep));
-            if (!waiting) sh.append(
-                0,
-                try std.fmt.allocPrint(arena, "Waiting for the Dagger engine to accept " ++
-                    "connections ({s}): it may be starting", .{@errorName(e)}),
-            );
-            waiting = true;
-            io.sleep(.fromSeconds(2), .awake) catch
-                return fail(sh, results, try engineOpenError(arena, e, ep));
-        }
-    }
+    const waited = openSessionWaiting(
+        arena,
+        io,
+        opts,
+        &sess,
+        ep,
+        .{ .ptr = &demux, .onRecord = SpanDemux.onRecord },
+        sh,
+        opts.cancel,
+        started,
+    ) catch |e| return fail(sh, results, try engineOpenError(arena, e, ep));
+    if (waited) sh.append(0, try engineAcceptedNote(arena, io, started));
     // Closing the session ends its log stream; only then has every live line arrived.
     defer {
         sess.close();
@@ -953,6 +931,47 @@ fn runDirect(
     );
 }
 
+/// `openSession`, waiting for an engine that is starting (just restarted, or updated) and refuses
+/// connections, or has no socket yet, for up to a minute or so, as GitHub's runner waits for
+/// Docker, rather than fail. Gives up after `engine_wait_ms` counted from `started`, or when
+/// `cancel` is requested. Returns whether it waited; the first wait is noted in `sh` when there is
+/// one.
+fn openSessionWaiting(
+    arena: Allocator,
+    io: std.Io,
+    opts: Options,
+    sess: *engine.Session,
+    ep: engine.Endpoint,
+    h: ?engine.LogHandler,
+    sh: ?*JobLog,
+    cancel: ?*Cancel,
+    started: i64,
+) !bool {
+    var waiting = false;
+    while (true) {
+        if (openSession(sess, opts, io, ep, h)) |_| {
+            return waiting;
+        } else |e| {
+            const starting = switch (e) {
+                error.ConnectionRefused, error.FileNotFound => true,
+                error.ConnectionResetByPeer, error.EngineUnreachable => true,
+                else => false,
+            };
+            const cancelled = if (cancel) |c| c.requested.load(.acquire) else false;
+            if (!starting or cancelled or
+                std.Io.Clock.awake.now(io).toMilliseconds() - started > engine_wait_ms)
+                return e;
+            if (!waiting) if (sh) |s| s.append(
+                0,
+                try std.fmt.allocPrint(arena, "Waiting for the Dagger engine to accept " ++
+                    "connections ({s}): it may be starting", .{@errorName(e)}),
+            );
+            waiting = true;
+            io.sleep(.fromSeconds(2), .awake) catch return e;
+        }
+    }
+}
+
 /// How long the engine took to accept the session, once it did after a wait.
 fn engineAcceptedNote(arena: Allocator, io: std.Io, started: i64) ![]const u8 {
     const secs = @divTrunc(std.Io.Clock.awake.now(io).toMilliseconds() - started, 1000);
@@ -963,7 +982,7 @@ fn engineAcceptedNote(arena: Allocator, io: std.Io, started: i64) ![]const u8 {
 
 /// Opens a session, starting the engine container first if it exists but is stopped, and having the
 /// `dagger` CLI create it (`dagger core version`) if it does not exist, as `dagger run` would.
-/// How long a job waits for an engine that refuses connections (see `runDirect`).
+/// How long a job waits for an engine that refuses connections (see `openSessionWaiting`).
 const engine_wait_ms = 3 * 60 * 1000;
 
 fn openSession(
@@ -971,7 +990,7 @@ fn openSession(
     opts: Options,
     io: std.Io,
     ep: engine.Endpoint,
-    h: engine.LogHandler,
+    h: ?engine.LogHandler,
 ) !void {
     sess.open(opts.gpa, io, ep, h) catch |e| switch (e) {
         error.EngineContainerNotRunning => {
