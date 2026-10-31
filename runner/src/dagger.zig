@@ -2295,6 +2295,36 @@ test "step caching: a failure the cache kept from an earlier run is not replayed
     }
 }
 
+test "step caching: a failure whose ran marker is missing is not replayed, the step runs again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("npm test")};
+    // The answer has no `fc_ran` (its file commands were cut short, or never written), and
+    // nothing of the step arrived live: an earlier job's failure, so it runs again (#102).
+    const answers = [_][]const u8{
+        base_answer,
+        try exec(arena, "C1", 1, "killed"),
+        try execRan(arena, "C2", 0, "passed", "j1"),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{
+        .step_cache = true,
+        .test_ran_marker = "j1",
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+    }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    const seen = fake.seen.items;
+    try std.testing.expectEqual(@as(usize, 3), seen.len);
+    try std.testing.expect(std.mem.indexOf(u8, seen[2], "its earlier run failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "killed") == null);
+}
+
 test "run threads the container through steps, applies conditions, and replays cached output" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();

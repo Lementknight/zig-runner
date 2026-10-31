@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'With step caching, a failed step whose record lacks the marker saying which job ran it (its file commands cut short by a full disk, or never written because the step killed its own shell) is no longer replayed as this run''s failure: unless the step showed it ran in this job, it runs again, as a failure the cache kept from an earlier run does (#69).'
+time: 2026-10-31T00:00:00.000000-04:00

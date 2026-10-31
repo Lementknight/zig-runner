@@ -59,7 +59,7 @@ dropping it makes the cache hand back an answer that running would not have give
 | `Input.mounts`, absent from the key | `withMountedCache`: BuildKit leaves mounts out of an exec's key |
 | `Output = log · digest · sets · code` | the step's output, `changes(from:).layer.digest`, its file commands, and its exit code |
 | `Input.event`, `Progress.event`, absent from the key | the event payload the runner writes to `$GITHUB_EVENT_PATH` from a variable of its own |
-| `replayable`: a hit counts only if it succeeded | `execScript`: a failure the cache answers with (`ranThisRun == false`) is discarded and the step runs again |
+| `replayable`: a hit counts only if it succeeded | `execScript`: a failure the cache answers with (`failedEarlier`: `ranThisRun == false`, or no marker and nothing of the step in the live log) is discarded and the step runs again |
 | `Enforce.enforced exec`: an unmarked step handed `withhold i` | `RUNNER_ENFORCE_VOLATILE`: `zig-runner-withheld` for the volatile variables, `withheld_event` at `$GITHUB_EVENT_PATH` |
 | `Logs.merged`, `Logs.replay` | `exec 2>&1` at the top of every step's script, and `replayRecorded` |
 | `mark st = .everyRun` | `readsRunSpecific` (a volatile name, `GITHUB_EVENT_PATH` or the event file), plus the secret and OIDC reasons, which are the same case |

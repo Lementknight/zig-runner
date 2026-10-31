@@ -10,6 +10,7 @@ const matcher = @import("../matcher.zig");
 const action = @import("../action.zig");
 const config = @import("../config.zig");
 const engine = @import("../engine.zig");
+const sink = @import("../sink.zig");
 const Query = @import("query.zig").Query;
 const Raw = @import("query.zig").Raw;
 const JobLog = @import("JobLog.zig");
@@ -336,7 +337,9 @@ pub fn execScript(
         // replaying it would fail every re-run the same way until an input changed (#69). So
         // it runs again, marked to run every time, which no earlier run's result can match.
         // Its replayed output is never shown and its file commands never applied.
-        if (rerun == null and exitCode(data) != 0 and x.ranThisRun(data) == false) {
+        if (rerun == null and exitCode(data) != 0 and
+            failedEarlier(x.io, x.sh, num, x.ranThisRun(data)))
+        {
             rerun = "its earlier run failed, and a failure is not replayed";
             continue;
         }
@@ -845,6 +848,16 @@ fn ranThisRun(x: *Exec, data: std.json.Value) ?bool {
     if (!x.step_cache) return true;
     const m = fileCommand(data, "fc_ran") orelse return null;
     return std.mem.eql(u8, std.mem.trim(u8, m, " \n"), x.ran_marker);
+}
+
+/// Whether a failed answer is one the cache kept from an earlier run (#69), given its marker
+/// (`ranThisRun`). Without one (its file commands cut short by a full disk, or never written
+/// because the step's own `trap 'kill 0' EXIT` killed the shell first), it is an earlier run's
+/// unless the step showed it ran in this job, with a live line or its end marker: a cached
+/// exec prints nothing, and a failing step that did run here must not run twice (#102).
+fn failedEarlier(io: std.Io, sh: *JobLog, num: u32, ran: ?bool) bool {
+    if (ran) |r| return !r;
+    return !awaitLive(io, sh, num) and !sh.ended[num - 1].load(.acquire);
 }
 
 /// Text a step added to $GITHUB_STEP_SUMMARY; past the size limit the summary is dropped, in
@@ -1359,6 +1372,34 @@ fn combinedFileCommand(all: []const u8, kind: []const u8) ?[]const u8 {
         start = if (next == all.len) all.len else next + 1;
     }
     return null;
+}
+
+test "a failed answer without a ran marker is an earlier run's unless the step showed it ran here" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var w: std.Io.Writer.Discarding = .init(&.{});
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    var live = [_]std.atomic.Value(u32){.init(0)};
+    var ended = [_]std.atomic.Value(bool){.init(false)};
+    var sh: JobLog = .{
+        .io = std.testing.io,
+        .arena = a.allocator(),
+        .log = &log,
+        .sink_job_id = 0,
+        .live_lines = &live,
+        .ended = &ended,
+    };
+    // The marker decides when there is one.
+    try std.testing.expect(failedEarlier(std.testing.io, &sh, 1, false));
+    try std.testing.expect(!failedEarlier(std.testing.io, &sh, 1, true));
+    // Without one: nothing reached the live log, so the cache answered.
+    try std.testing.expect(failedEarlier(std.testing.io, &sh, 1, null));
+    // A live line, or the end marker alone: it ran in this job.
+    live[0].store(1, .monotonic);
+    try std.testing.expect(!failedEarlier(std.testing.io, &sh, 1, null));
+    live[0].store(0, .monotonic);
+    ended[0].store(true, .release);
+    try std.testing.expect(!failedEarlier(std.testing.io, &sh, 1, null));
 }
 
 test "file commands come back from one combined file" {
