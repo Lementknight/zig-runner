@@ -169,8 +169,8 @@ job and its driver are in the private bench repository.
 - **Install Zig takes 1-2 s against 7-10 s,** as Zig stays in zig-runner's tool cache.
 - **`zig build test` cold** spends most of its time compiling Zig's build runner on one core: GitHub
   calls the compiler directly on its own runners for that reason (`zig-test.sh`). On a new commit,
-  with the caches warm, the direct path is no faster on zig-runner (28 s against 27 s for the tests),
-  so zig-runner keeps `zig build test`.
+  with the caches warm, the direct path is no faster on zig-runner (28 s against 27 s for the
+  tests), so zig-runner keeps `zig build test`.
 - **GitHub's times vary more:** its cold `zig build test` took 110-158 s across five runs, the
   laptop's 131-132 s.
 - **Waiting for a runner** took 1 s against 2 s.

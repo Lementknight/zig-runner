@@ -1,0 +1,3 @@
+kind: Changed
+body: 'BENCHMARKS.md: one line of the hosted-runner comparison rewrapped to the 100-column limit.'
+time: 2026-10-31T03:15:00.000000-04:00
