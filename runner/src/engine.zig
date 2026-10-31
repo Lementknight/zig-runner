@@ -1732,33 +1732,40 @@ test "a query to an engine that has gone silent is aborted at the silence timeou
 }
 
 test "an engine slow to answer but still talking is not aborted, nor one with the timeout off" {
+    // Both at once: each waits out its own cancel, and they share nothing.
     const io = std.testing.io;
-    for ([_]bool{ true, false }) |talk| {
-        var engine: SilentEngine = undefined;
-        try engine.start(talk);
-        defer engine.finish();
-        var buf: [64]u8 = undefined;
-        var s: Session = undefined;
-        // Talking: a ping every 50 ms the whole time, with a timeout of 1 s, so a busy machine
-        // that delays some pings does not make it look silent. Silent: no timeout.
-        try s.open(std.testing.allocator, io, .{
-            .host = try engine.host(&buf),
-            .silence_timeout = if (talk) .fromMilliseconds(1_000) else null,
-        }, null);
-        defer s.close();
-        var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-        defer arena_state.deinit();
+    var talking = try io.concurrent(slowEngineCancelled, .{true});
+    defer talking.cancel(io) catch {};
+    try slowEngineCancelled(false);
+    try talking.await(io);
+}
 
-        // Well past the timeout, the job's cancel ends the query, not the watchdog.
-        const started = Io.Clock.awake.now(io);
-        const cancel_after: Io.Duration = .fromMilliseconds(2_500);
-        var cancelling = try io.concurrent(abortLater, .{ &s, cancel_after });
-        defer cancelling.cancel(io);
-        const cancelled = s.query(arena_state.allocator(), "{a}", no_limit);
-        try std.testing.expectError(error.QueryAborted, cancelled);
-        const took = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
-        try std.testing.expect(took >= 2_500);
-    }
+fn slowEngineCancelled(talk: bool) !void {
+    const io = std.testing.io;
+    var engine: SilentEngine = undefined;
+    try engine.start(talk);
+    defer engine.finish();
+    var buf: [64]u8 = undefined;
+    var s: Session = undefined;
+    // Talking: a ping every 50 ms the whole time, with a timeout of 1 s, so a busy machine that
+    // delays some pings does not make it look silent. Silent: no timeout.
+    try s.open(std.testing.allocator, io, .{
+        .host = try engine.host(&buf),
+        .silence_timeout = if (talk) .fromMilliseconds(1_000) else null,
+    }, null);
+    defer s.close();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    // Well past the timeout, the job's cancel ends the query, not the watchdog.
+    const started = Io.Clock.awake.now(io);
+    const cancel_after: Io.Duration = .fromMilliseconds(2_500);
+    var cancelling = try io.concurrent(abortLater, .{ &s, cancel_after });
+    defer cancelling.cancel(io);
+    const cancelled = s.query(arena_state.allocator(), "{a}", no_limit);
+    try std.testing.expectError(error.QueryAborted, cancelled);
+    const took = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    try std.testing.expect(took >= 2_500);
 }
 
 test "an engine socket that appears, or is replaced, is an engine that started; one that stays is not" {
