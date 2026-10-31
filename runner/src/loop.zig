@@ -7,6 +7,7 @@ const jitconfig = @import("github/jitconfig.zig");
 const auth = @import("github/auth.zig");
 const broker = @import("github/broker.zig");
 const engine = @import("engine.zig");
+const dagger = @import("dagger.zig");
 const db = @import("db.zig");
 const sink = @import("sink.zig");
 const redact = @import("redact.zig");
@@ -59,6 +60,8 @@ pub const Runner = struct {
     /// Where each job's log is spooled (`SpoolDir`), shared by the pool; null keeps job logs in
     /// memory, as tests and an empty `Config.log_spool_dir` do.
     spool_dir: ?*const SpoolDir = null,
+    /// The pool's pre-warm, asked for again after a job that waited for the engine; null for none.
+    warmer: ?*Warmer = null,
 };
 
 /// Output keys cost two walks of the job's filesystem whatever the step changed, so they are cheap
@@ -155,7 +158,9 @@ pub fn pool(c: Runner, n: u32) !Exit {
     // One per process too, so each runner counts the others' jobs before it takes one.
     const memory: ?*admission.Admission = if (c.cfg.admission) m: {
         const m = try c.arena.create(admission.Admission);
-        m.* = .init(c.io, c.cfg.admission_limits, try c.arena.alloc(admission.Admission.Slot, n));
+        // The last slot is the pre-warm's (`Warmer`).
+        const entries = try c.arena.alloc(admission.Admission.Slot, n + 1);
+        m.* = .init(c.io, c.cfg.admission_limits, entries);
         const cgroup = c.cfg.engine_cgroup;
         m.engine.source = if (std.mem.eql(u8, cgroup, "none"))
             .off
@@ -171,9 +176,14 @@ pub fn pool(c: Runner, n: u32) !Exit {
     else
         null;
     defer if (sampling) |*f| f.cancel(c.io);
+    // In the background, so no runner waits for it to listen for jobs.
+    const warmer = if (n > 0) try Warmer.init(c, memory, n) else null;
+    if (warmer) |w| w.start();
+    defer if (warmer) |w| w.stop();
     var group: std.Io.Group = .init;
     for (slots, 0..) |*s, i| {
         s.* = .{ .c = c };
+        s.c.warmer = warmer;
         s.c.slow_outputs = slow;
         if (spool_dir) |*sd| s.c.spool_dir = sd;
         if (memory) |m| {
@@ -353,6 +363,185 @@ fn runnerNameBuf(buf: []u8, c: Runner) ![]const u8 {
     c.io.random(&suffix);
     return std.fmt.bufPrint(buf, "{s}-{x}", .{ c.cfg.name_prefix, suffix });
 }
+
+/// Builds what every job builds before its first step, with no job (`set_up.warm`): the base
+/// container, and the Zig cache seed with `Config.zig_seed`. On the laptop the first job after an
+/// engine wipe spent 169 s in "Set up job" on them, the next 1 s. So it warms the engine when the
+/// pool starts (a new runner, or an engine restarted while it was down), when the engine starts
+/// again (a wipe happens only then), and after a job that had to wait for the engine. A failed
+/// warm is said and nothing else: the first job builds what it needs, as before.
+///
+/// An engine start is the memory gate's to see where it sees the engine's cgroup (it is found
+/// again after it was not, `Admission.engineReturns`); otherwise, as under deploy/compose.yaml,
+/// it is the engine's socket appearing or being replaced (`engine.SocketIdentity`). The warm is a
+/// job to the gate, in the pool's extra slot, taken only once the engine accepted the session, so
+/// a warm waiting for an engine that is down holds no memory.
+pub const Warmer = struct {
+    c: Runner,
+    /// Backs each warm, reset before the next.
+    arena: std.heap.ArenaAllocator,
+    memory: ?*admission.Admission,
+    gate: admission.Gate = undefined,
+    /// Warms asked for since the last began; the pool's start is the first.
+    requests: std.atomic.Value(u32) = .init(1),
+    /// What `engineStarted` saw last.
+    socket: ?engine.SocketIdentity = null,
+    returns: ?u32 = null,
+    /// Requested when the pool stops: a wait ends, and a query is aborted.
+    cancel: dagger.Cancel = .{},
+    /// The current warm went through the gate, and when.
+    admitted: bool = false,
+    admitted_ms: i64 = 0,
+    /// The last warm's error, so a failure that repeats is said once.
+    failed: ?anyerror = null,
+    future: ?std.Io.Future(void) = null,
+    calls: Calls = .{},
+
+    const Calls = struct {
+        warm: *const @TypeOf(dagger.warm) = dagger.warm,
+        socket: *const @TypeOf(engine.SocketIdentity.of) = engine.SocketIdentity.of,
+    };
+
+    /// What the warm is learned under at the gate.
+    pub const job_name = "zig-runner pre-warm";
+    /// How often the engine is looked at for a start: a stat, or the gate's count.
+    const look_ms = 5 * std.time.ms_per_s;
+
+    /// A warmer for the pool, its gate on `memory`'s slot `slot`, or null, said why, when it would
+    /// have nothing to do.
+    pub fn init(c: Runner, memory: ?*admission.Admission, slot: usize) !?*Warmer {
+        if (!c.cfg.prewarm) return null;
+        if (c.cfg.engineEndpoint() == null) {
+            try c.log.say("pre-warm skipped: RUNNER_ENGINE=cli opens no session of its own");
+            return null;
+        }
+        if (trust.none(c.cfg.trusted_refs)) {
+            try c.log.say("pre-warm skipped: this runner trusts no ref, so runs no job");
+            return null;
+        }
+        const w = try c.arena.create(Warmer);
+        w.* = .{ .c = c, .arena = .init(c.gpa), .memory = memory };
+        if (memory) |m| w.gate = .{ .pool = m, .slot = slot, .warm = true };
+        // What is there now is what the first warm warms.
+        w.socket = w.calls.socket(c.io, c.cfg.engine_host);
+        if (memory) |m| w.returns = m.engineReturns();
+        return w;
+    }
+
+    pub fn start(w: *Warmer) void {
+        w.future = w.c.io.concurrent(run, .{w}) catch |e| {
+            sayUnallocated(w.c, "pre-warm not started: {s}", .{@errorName(e)});
+            return;
+        };
+    }
+
+    /// Ends a warm under way, waiting for it, and frees what it used.
+    pub fn stop(w: *Warmer) void {
+        w.cancel.request(std.Io.Clock.real.now(w.c.io).toMilliseconds());
+        if (w.future) |*f| f.cancel(w.c.io);
+        w.arena.deinit();
+    }
+
+    /// Asks for one more warm, after the one under way if there is one.
+    pub fn request(w: *Warmer) void {
+        _ = w.requests.fetchAdd(1, .acq_rel);
+    }
+
+    fn run(w: *Warmer) void {
+        var since_look: i64 = 0;
+        while (!stopRequested() and !w.cancel.requested.load(.acquire)) {
+            if (since_look >= look_ms) {
+                since_look = 0;
+                if (w.engineStarted()) w.request();
+            }
+            if (w.requests.swap(0, .acq_rel) > 0) w.once();
+            w.c.io.sleep(.fromMilliseconds(200), .awake) catch return;
+            since_look += 200;
+        }
+    }
+
+    /// Whether the engine started since this was last asked.
+    fn engineStarted(w: *Warmer) bool {
+        if (w.memory) |m| if (m.engineReturns()) |n| {
+            defer w.returns = n;
+            // First seen now: what the socket said until then covered it.
+            return if (w.returns) |before| n != before else false;
+        };
+        const now = w.calls.socket(w.c.io, w.c.cfg.engine_host);
+        defer w.socket = now;
+        return engine.SocketIdentity.changed(w.socket, now);
+    }
+
+    /// One warm, said in one line.
+    fn once(w: *Warmer) void {
+        _ = w.arena.reset(.retain_capacity);
+        const arena = w.arena.allocator();
+        const cfg = w.c.cfg;
+        w.admitted = false;
+        var msg: []const u8 = "";
+        const result = w.calls.warm(arena, w.c.io, .{
+            .dagger_cmd = cfg.dagger_cmd,
+            .image = cfg.image,
+            .engine = cfg.engineEndpoint(),
+            .gpa = w.c.gpa,
+            .package_caches = cfg.package_caches,
+            .zig_local_cache = cfg.zig_local_cache,
+            .zig_seed = cfg.zig_seed,
+            .step_user = cfg.step_user,
+            .cancel = &w.cancel,
+        }, .{ .ptr = w, .readyFn = ready }, &msg);
+        const ms = std.Io.Clock.awake.now(w.c.io).toMilliseconds() - w.admitted_ms;
+        if (w.admitted) if (w.memory != null) if (w.gate.ended()) |learned| sayUnallocated(
+            w.c,
+            "the pre-warm raised the engine's memory by {f} at most ({s}); reserving {f} for it",
+            .{
+                admission.gb(learned.seen_mb),
+                if (learned.alone) "alone" else "beside jobs",
+                admission.gb(learned.estimate_mb),
+            },
+        );
+        const warmed = result catch |e| {
+            if (e == error.Cancelled or w.cancel.requested.load(.acquire)) return;
+            if (w.failed) |f| if (f == e) return;
+            w.failed = e;
+            sayUnallocated(w.c, "pre-warm failed ({s}): {s}; the first job builds it", .{
+                @errorName(e),
+                if (msg.len > 0) msg else "no message",
+            });
+            return;
+        };
+        w.failed = null;
+        sayUnallocated(w.c, "pre-warm: base container{s} built in {d}.{d} s ({s})", .{
+            if (warmed.seeded) " and Zig seed" else "",
+            @divTrunc(ms, 1000),
+            @divTrunc(@mod(ms, 1000), 100),
+            warmed.image,
+        });
+    }
+
+    /// The engine accepted the session: through the gate, as a job of its own, unless a stop
+    /// comes first.
+    fn ready(ptr: *anyopaque) bool {
+        const w: *Warmer = @ptrCast(@alignCast(ptr));
+        if (w.memory != null) {
+            var said = false;
+            while (w.gate.check()) |hold| {
+                if (!said) sayUnallocated(w.c, "pre-warm holding back: {f}", .{hold});
+                said = true;
+                var left = w.gate.pool.recheck.toMilliseconds();
+                while (left > 0) : (left -= @min(left, 200)) {
+                    if (stopRequested() or w.cancel.requested.load(.acquire)) return false;
+                    w.c.io.sleep(.fromMilliseconds(@min(left, 200)), .awake) catch return false;
+                }
+            }
+            w.gate.leave(true);
+            w.gate.assigned(admission.jobKey("", "", job_name));
+            w.admitted = true;
+        }
+        w.admitted_ms = std.Io.Clock.awake.now(w.c.io).toMilliseconds();
+        return !stopRequested() and !w.cancel.requested.load(.acquire);
+    }
+};
 
 /// The next cycle's JIT registration, made in the background while this cycle's job finishes
 /// (completing it with GitHub, uploading its logs), so the next cycle can listen at once instead
@@ -1264,4 +1453,160 @@ test "the pool logs what it trusts once at startup, and warns when prod trusts e
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "trusting every ref") != null);
     const warning = "WARNING: this runner carries the prod label and trusts every ref";
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), warning) != null);
+}
+
+/// `dagger.warm` for the Warmer's tests: what it was asked, and the gate as the warm found it.
+const FakeWarm = struct {
+    var calls: u32 = 0;
+    var opts: dagger.Options = .{};
+    var memory: ?*admission.Admission = null;
+    var during: ?admission.Admission.Slot = null;
+
+    fn warm(_: Allocator, _: std.Io, o: dagger.Options, ready: dagger.Ready, _: *[]const u8) anyerror!dagger.Warmed {
+        calls += 1;
+        opts = o;
+        if (!ready.readyFn(ready.ptr)) return error.Cancelled;
+        if (memory) |m| during = m.slots[m.slots.len - 1];
+        return .{ .image = "docker.io/library/ubuntu:24.04@sha256:abc", .seeded = o.zig_seed != null };
+    }
+    fn socket(_: std.Io, _: []const u8) ?engine.SocketIdentity {
+        return sockets[@min(looks, sockets.len - 1)];
+    }
+    var sockets: []const ?engine.SocketIdentity = &.{null};
+    var looks: usize = 0;
+    const calls_: Warmer.Calls = .{ .warm = warm, .socket = socket };
+};
+
+fn testWarmer(c: Runner, memory: ?*admission.Admission) !*Warmer {
+    const w = (try Warmer.init(c, memory, 1)).?;
+    w.calls = FakeWarm.calls_;
+    FakeWarm.calls = 0;
+    FakeWarm.memory = memory;
+    FakeWarm.during = null;
+    return w;
+}
+
+test "the pre-warm builds the job's base container and Zig seed through the memory gate, as a job of its own" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fs.path.join(arena, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 8388608 kB\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pressure", .data = "some avg10=50.00 avg60=20.00 avg300=5.00 total=900\n" });
+    // One runner and the pre-warm, as `pool` makes them.
+    var slots: [2]admission.Admission.Slot = undefined;
+    var memory: admission.Admission = .init(io, .{}, &slots);
+    memory.paths = .{
+        .meminfo = try std.fs.path.join(arena, &.{ dir, "meminfo" }),
+        .pressure = try std.fs.path.join(arena, &.{ dir, "pressure" }),
+    };
+    memory.recheck = .fromMilliseconds(10);
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var cfg: Config = .{
+        .gh_token = "",
+        .scope = undefined,
+        .trusted_refs = "refs/heads/main",
+        .zig_seed = .{ .version = "0.17.0", .sha256 = "00" },
+    };
+    const c = testRunner(arena, &log, &out, &cfg);
+    const w = try testWarmer(c, &memory);
+    defer w.arena.deinit();
+
+    // A stop while the gate holds the warm: it gives up there, having taken nothing.
+    w.cancel.request(1);
+    w.once();
+    try std.testing.expectEqual(@as(u32, 1), FakeWarm.calls);
+    try std.testing.expect(FakeWarm.during == null);
+    try std.testing.expectEqual(@as(u32, 0), memory.polling);
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), slots[1].started_ms);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.buffered(), "pre-warm holding back"));
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "pre-warm:") == null);
+
+    // Memory back: the warm takes the pool's extra slot while it runs, under its own name, and
+    // asks for what a job of this runner builds, the seed included.
+    w.cancel = .{};
+    try tmp.dir.writeFile(io, .{ .sub_path = "pressure", .data = "some avg10=0.00 avg60=0.00 avg300=0.00 total=900\n" });
+    w.once();
+    const during = FakeWarm.during.?;
+    try std.testing.expect(during.started_ms != std.math.minInt(i64));
+    try std.testing.expectEqual(admission.jobKey("", "", Warmer.job_name), during.key.?);
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), slots[0].started_ms);
+    try std.testing.expectEqualStrings("0.17.0", FakeWarm.opts.zig_seed.?.version);
+    try std.testing.expect(FakeWarm.opts.cancel == &w.cancel);
+    // Over: it reserves nothing, and said what it built from which image.
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), slots[1].started_ms);
+    try std.testing.expectEqual(@as(u32, 0), memory.polling);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "pre-warm: base container and Zig seed built in 0.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "(docker.io/library/ubuntu:24.04@sha256:abc)") != null);
+}
+
+test "an engine start asks for a pre-warm: the gate's count where it sees the engine, else its socket appearing or replaced" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var out_buf: [1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var cfg: Config = .{ .gh_token = "", .scope = undefined, .trusted_refs = "refs/heads/main" };
+    const c = testRunner(arena, &log, &out, &cfg);
+
+    // No cgroup to see (compose): the socket. Absent at start, then there, then replaced.
+    const one: engine.SocketIdentity = .{ .inode = 1, .ctime = .{ .nanoseconds = 5 } };
+    const two: engine.SocketIdentity = .{ .inode = 2, .ctime = .{ .nanoseconds = 9 } };
+    FakeWarm.sockets = &.{ null, null, one, one, two, null };
+    FakeWarm.looks = 0;
+    const w = try testWarmer(c, null);
+    defer w.arena.deinit();
+    w.socket = null;
+    var started: [5]bool = undefined;
+    for (&started) |*s| {
+        FakeWarm.looks += 1;
+        s.* = w.engineStarted();
+    }
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, true, false }, &started);
+
+    // The gate sees the engine: its count, whatever the socket does.
+    var slots: [2]admission.Admission.Slot = undefined;
+    var memory: admission.Admission = .init(std.testing.io, .{}, &slots);
+    w.memory = &memory;
+    try std.testing.expect(!w.engineStarted());
+    memory.engine.seen = true;
+    try std.testing.expect(!w.engineStarted());
+    try std.testing.expect(!w.engineStarted());
+    memory.engine.returns += 1;
+    try std.testing.expect(w.engineStarted());
+    try std.testing.expect(!w.engineStarted());
+
+    // Asked for by the pool's start, and again by a job that waited for the engine.
+    try std.testing.expectEqual(@as(u32, 1), w.requests.load(.acquire));
+    w.request();
+    try std.testing.expectEqual(@as(u32, 2), w.requests.load(.acquire));
+}
+
+test "no pre-warm when it is off, with RUNNER_ENGINE=cli, or when the runner trusts no ref" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var out_buf: [1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var cfg: Config = .{ .gh_token = "", .scope = undefined, .trusted_refs = "refs/heads/main", .prewarm = false };
+    const c = testRunner(arena, &log, &out, &cfg);
+    // Off: nothing made, so nothing is sent, and a job that waited asks no one.
+    try std.testing.expect(try Warmer.init(c, null, 1) == null);
+    try std.testing.expectEqual(@as(usize, 0), out.buffered().len);
+    cfg.prewarm = true;
+    cfg.engine = .cli;
+    try std.testing.expect(try Warmer.init(c, null, 1) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "pre-warm skipped: RUNNER_ENGINE=cli") != null);
+    cfg.engine = .direct;
+    cfg.trusted_refs = "";
+    try std.testing.expect(try Warmer.init(c, null, 1) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "trusts no ref") != null);
 }

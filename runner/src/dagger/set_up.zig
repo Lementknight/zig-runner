@@ -57,8 +57,8 @@ const Allocator = std.mem.Allocator;
 /// `ubuntu-latest` most often assume without a setup action. `sudo` (steps run as `runner_user`, as
 /// on GitHub, and many call `sudo apt-get`), compilers and `make`, Python with pip and venv (and
 /// `python`), `psql` for a Postgres service, archive and transfer tools, and what composite actions
-/// often use (`jq`, `curl`). Installed once per engine: Dagger caches this exec, so only the first
-/// job pays for it.
+/// often use (`jq`, `curl`). Installed once per engine: Dagger caches this exec, and the pre-warm
+/// (`warm`) builds it before the first job.
 pub const provision_packages = [_][]const u8{
     "git",            "git-lfs",     "ca-certificates", "curl",              "wget",
     "xz-utils",       "bzip2",       "zstd",            "zip",               "unzip",
@@ -1000,22 +1000,9 @@ fn zigSeedFor(
 ) !?[]const u8 {
     const seed = opts.zig_seed orelse return null;
     if (!opts.package_caches or job.github.repository.len == 0 or !usesZig(job)) return null;
-    var q: Query = .init(arena);
-    try q.open("container");
-    try q.call("from", .{ .address = default_image });
-    // The base container's own provisioning (curl and xz), which the engine has cached.
-    try writeProvision(&q, opts.step_user == .runner);
-    try q.call("withNewFile", .{
-        .path = zig_seed_project ++ "/build.zig",
-        .contents = zig_seed_build_zig,
-    });
-    const script = try zigSeedScript(arena, seed);
-    try q.call("withExec", .{ .args = &[_][]const u8{ "sh", "-c", script } });
-    try q.call("directory", .{ .path = zig_seed_dir });
-    // Evaluated here, where a failure leaves the job unseeded, not in the base container.
-    try q.leaf("sync");
     var msg: []const u8 = "";
-    const id = if (gql(arena, transport, try q.finish(), &msg)) |data|
+    const doc = try zigSeedDocument(arena, seed, opts.step_user == .runner);
+    const id = if (gql(arena, transport, doc, &msg)) |data|
         jsonFindString(data, "sync")
     else |_|
         null;
@@ -1026,6 +1013,26 @@ fn zigSeedFor(
             if (msg.len > 0) msg else "Dagger returned no directory",
         });
     return id;
+}
+
+/// The seed's query, evaluated (`sync`) where a failure leaves the job unseeded, not in the base
+/// container. One writer for the job (`zigSeedFor`) and the pre-warm (`warmDocuments`), so both
+/// send the same document and the seed the pre-warm built is the one the job finds.
+fn zigSeedDocument(arena: Allocator, seed: config.ZigSeed, as_runner: bool) ![]const u8 {
+    var q: Query = .init(arena);
+    try q.open("container");
+    try q.call("from", .{ .address = default_image });
+    // The base container's own provisioning (curl and xz), which the engine has cached.
+    try writeProvision(&q, as_runner);
+    try q.call("withNewFile", .{
+        .path = zig_seed_project ++ "/build.zig",
+        .contents = zig_seed_build_zig,
+    });
+    const script = try zigSeedScript(arena, seed);
+    try q.call("withExec", .{ .args = &[_][]const u8{ "sh", "-c", script } });
+    try q.call("directory", .{ .path = zig_seed_dir });
+    try q.leaf("sync");
+    return q.finish();
 }
 
 /// The exec that builds the seed: Zig for the engine host's architecture (the runner's own: they
@@ -1077,6 +1084,55 @@ fn writeSeedCopy(q: *Query, arena: Allocator, seed: []const u8, path: []const u8
     );
     try q.call("withExec", .{ .args = &[_][]const u8{ "sh", "-c", script } });
     try q.call("withoutMount", .{ .path = zig_seed_dir });
+}
+
+// The pre-warm (`loop.Warmer`): what every job of this runner builds before its first step and
+// that depends on nothing of a job, built with no job at all, at startup and when the engine comes
+// back after a restart, so the first job finds it in the engine's cache. The engine caches by
+// recipe, so the documents are written by the job's own writers: the base container's from and
+// provisioning nodes (`writeFrom`, `writeProvision`) and the Zig seed (`zigSeedDocument`). Nothing
+// of a job goes in (no volume, mount, secret, registry credential nor workspace), so no scope's
+// data can reach another through it.
+
+/// The pre-warm's documents: the base container's prefix as `basePlan` derives it for a job with
+/// cache volumes, evaluated (`sync`); what its image resolves to; and the Zig seed when a Zig job
+/// would get one.
+pub const WarmDocuments = struct { base: []const u8, image_ref: []const u8, seed: ?[]const u8 };
+
+pub fn warmDocuments(arena: Allocator, opts: Options) !WarmDocuments {
+    const provision = opts.provision and std.mem.eql(u8, opts.image, default_image);
+    const as_runner = provision and opts.step_user == .runner;
+    var q: Query = .init(arena);
+    try q.open("container");
+    try writeFrom(&q, opts.image, opts.package_caches and opts.zig_local_cache, as_runner);
+    if (provision) try writeProvision(&q, as_runner);
+    try q.leaf("sync");
+    var ref: Query = .init(arena);
+    try ref.open("container");
+    try ref.call("from", .{ .address = opts.image });
+    try ref.leaf("imageRef");
+    var seed: ?[]const u8 = null;
+    if (opts.zig_seed) |z| if (opts.package_caches) {
+        seed = try zigSeedDocument(arena, z, opts.step_user == .runner);
+    };
+    return .{ .base = try q.finish(), .image_ref = try ref.finish(), .seed = seed };
+}
+
+/// What the pre-warm built: the image as the engine resolved it (with its digest when the
+/// registry gave one, as services do for a job's images), and whether the seed was built too.
+pub const Warmed = struct { image: []const u8, seeded: bool };
+
+/// Sends the pre-warm's documents, the base container first. On failure the message is in
+/// `err_msg`.
+pub fn warm(arena: Allocator, transport: Transport, opts: Options, err_msg: *[]const u8) !Warmed {
+    const docs = try warmDocuments(arena, opts);
+    _ = gql(arena, transport, docs.base, err_msg) catch return error.BaseContainerFailed;
+    const ref = gql(arena, transport, docs.image_ref, err_msg) catch
+        return error.BaseContainerFailed;
+    const image = jsonFindString(ref, "imageRef") orelse opts.image;
+    const seed = docs.seed orelse return .{ .image = image, .seeded = false };
+    _ = gql(arena, transport, seed, err_msg) catch return error.ZigSeedFailed;
+    return .{ .image = image, .seeded = true };
 }
 
 test "the default image is provisioned with git; a custom image is left alone" {
@@ -1141,6 +1197,16 @@ test "the from and provisioning nodes are a byte prefix of every job's base docu
                 if (provision) try writeProvision(&q, as_runner);
                 const prefix = q.fragment().text;
                 try std.testing.expect(std.mem.startsWith(u8, base, prefix));
+                // The pre-warm sends that prefix and evaluates it, and nothing else.
+                const warm_docs = try warmDocuments(arena, .{
+                    .image = image,
+                    .package_caches = true,
+                    .zig_local_cache = zig_local,
+                    .step_user = step_user,
+                });
+                try std.testing.expect(std.mem.startsWith(u8, warm_docs.base, prefix));
+                try std.testing.expectEqualStrings("sync } } }", warm_docs.base[prefix.len..][0..10]);
+                try std.testing.expect(warm_docs.seed == null);
                 try std.testing.expectEqual(provision, std.mem.indexOf(u8, prefix, "apt-get install") != null);
                 try std.testing.expectEqual(zig_local, std.mem.indexOf(u8, prefix, "ZIG_LOCAL_CACHE_DIR") != null);
                 // Nothing of the job: no volume, mount, secret, file, registry credential, nor the
@@ -1576,4 +1642,43 @@ test "package caches in a container job: variables point the tools at the volume
     const theirs = std.mem.indexOf(u8, base, "withEnvVariable(name:\"GOCACHE\",value:\"/tmp/gocache\")").?;
     try std.testing.expect(ours < theirs);
     try std.testing.expect(braceBalanced(base));
+}
+
+test "the pre-warm sends a Zig job's own seed and base documents, and fails with Dagger's message" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const steps = [_]job_mod.Step{testStep("zig build test")};
+    for ([_]config.StepUser{ .runner, .root }) |user| {
+        const opts: Options = .{ .package_caches = true, .step_user = user, .zig_seed = test_zig_seed };
+        const r = try seedRun(arena, opts, testJob(&steps), seed_answer);
+        const docs = try warmDocuments(arena, opts);
+        // Byte for byte the job's seed query, so the engine answers the job from its cache.
+        try std.testing.expectEqualStrings(r.seen[0], docs.seed.?);
+        const prefix = docs.base[0..std.mem.indexOf(u8, docs.base, "sync ").?];
+        try std.testing.expect(std.mem.startsWith(u8, r.seen[2], prefix));
+        try std.testing.expect(std.mem.indexOf(u8, prefix, "apt-get install") != null);
+        try std.testing.expect(braceBalanced(docs.base) and braceBalanced(docs.image_ref));
+
+        const answers = [_][]const u8{
+            "{\"data\":{\"container\":{\"from\":{\"withExec\":{\"sync\":\"C0\"}}}}}",
+            "{\"data\":{\"container\":{\"from\":{\"imageRef\":\"docker.io/library/ubuntu:24.04@sha256:abc\"}}}}",
+            seed_answer,
+        };
+        var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+        var msg: []const u8 = "";
+        const w = try warm(arena, fake.transport(), opts, &msg);
+        try std.testing.expectEqualStrings("docker.io/library/ubuntu:24.04@sha256:abc", w.image);
+        try std.testing.expect(w.seeded);
+        try std.testing.expectEqualStrings(docs.base, fake.seen.items[0]);
+        try std.testing.expectEqualStrings(docs.seed.?, fake.seen.items[2]);
+    }
+    // No seed without package caches, as a job gets none; a pull that fails says why.
+    const off = try warmDocuments(arena, .{ .zig_seed = test_zig_seed });
+    try std.testing.expect(off.seed == null);
+    const denied = [_][]const u8{"{\"errors\":[{\"message\":\"pull access denied\"}]}"};
+    var fake: FakeSession = .{ .answers = &denied, .arena = arena };
+    var msg: []const u8 = "";
+    try std.testing.expectError(error.BaseContainerFailed, warm(arena, fake.transport(), .{}, &msg));
+    try std.testing.expect(std.mem.indexOf(u8, msg, "pull access denied") != null);
 }

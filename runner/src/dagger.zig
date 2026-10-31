@@ -39,6 +39,8 @@ const baseContainerId = @import("dagger/set_up.zig").baseContainerId;
 const execFor = @import("dagger/set_up.zig").execFor;
 const setUpJob = @import("dagger/set_up.zig").setUpJob;
 const package_cache_dirs = @import("dagger/set_up.zig").package_cache_dirs;
+const warmBase = @import("dagger/set_up.zig").warm;
+pub const Warmed = @import("dagger/set_up.zig").Warmed;
 const JobLog = @import("dagger/JobLog.zig");
 pub const Marker = @import("dagger/JobLog.zig").Marker;
 pub const Scan = @import("dagger/JobLog.zig").Scan;
@@ -249,6 +251,9 @@ pub const Result = struct {
     succeeded: bool,
     /// GitHub cancelled the job while it ran (a cancel in the UI, or the job's `timeout-minutes`).
     cancelled: bool = false,
+    /// The engine refused the job's session at first (`openSessionWaiting`): it was starting, so
+    /// its cache may have been wiped, and the runner pre-warms it again (`loop.Warmer`).
+    engine_waited: bool = false,
     /// Actions' `pre` and `post` scripts that ran, as GitHub shows them: steps of their own.
     extra: []const ExtraStep = &.{},
     /// The first log step number not used (see `ExtraStep.log_step`); 0 means `steps.len + 1`.
@@ -923,7 +928,7 @@ fn runDirect(
         sh.flush();
     }
     var st: SessionTransport = .{ .s = &sess };
-    return runSteps(
+    var res = try runSteps(
         arena,
         io,
         opts,
@@ -932,6 +937,52 @@ fn runDirect(
         results,
         .{ .ptr = &st, .sendFn = SessionTransport.send, .abortFn = SessionTransport.abort },
     );
+    res.engine_waited = waited;
+    return res;
+}
+
+/// Told by `warm` once the engine accepted the session, before any query: false gives up (a
+/// stop came while it waited), so nothing that waits for the engine holds what this hands out.
+pub const Ready = struct {
+    ptr: *anyopaque,
+    readyFn: *const fn (ptr: *anyopaque) bool,
+};
+
+/// The pre-warm (`set_up.warm`) over a session of its own, with no job: waits for an engine
+/// that is starting as a job does, then `ready`, then sends the documents, aborted when
+/// `opts.cancel` is requested. Direct engines only. On failure the message is in `err_msg`.
+pub fn warm(
+    arena: Allocator,
+    io: std.Io,
+    opts: Options,
+    ready: Ready,
+    err_msg: *[]const u8,
+) anyerror!Warmed {
+    if (opts.test_transport) |t| {
+        if (!ready.readyFn(ready.ptr)) return error.Cancelled;
+        return warmBase(arena, t, opts, err_msg);
+    }
+    const ep = opts.engine orelse return error.NeedsDirectEngine;
+    var sess: engine.Session = undefined;
+    const started = std.Io.Clock.awake.now(io).toMilliseconds();
+    _ = try openSessionWaiting(arena, io, opts, &sess, ep, null, null, opts.cancel, started);
+    defer sess.close();
+    if (!ready.readyFn(ready.ptr)) return error.Cancelled;
+    var st: SessionTransport = .{ .s = &sess };
+    const transport: Transport = .{
+        .ptr = &st,
+        .sendFn = SessionTransport.send,
+        .abortFn = SessionTransport.abort,
+    };
+    // A stop aborts the query, and the engine cancels the exec, as for a step.
+    var watch: Watch = .{ .io = io, .transport = transport, .cancel = opts.cancel };
+    watch.begin(0, false);
+    var watching = io.concurrent(Watch.run, .{&watch}) catch null;
+    defer if (watching) |*f| {
+        watch.done.store(true, .release);
+        f.cancel(io);
+    };
+    return warmBase(arena, transport, opts, err_msg);
 }
 
 /// `openSession`, waiting for an engine that is starting (just restarted, or updated) and refuses
