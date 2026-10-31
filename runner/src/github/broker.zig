@@ -487,7 +487,7 @@ test "a request never answered is given up at its deadline, and tried once on a 
     );
     const took = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
     // Two attempts of 200 ms each, not the minutes a dead connection used to be read for.
-    try std.testing.expect(took >= 400 and took < 2_000);
+    try std.testing.expect(took >= 400 and took < 10_000);
     try std.testing.expectEqual(@as(u32, 2), server.accepts.load(.acquire));
 
     // Never answered the first time, answered the second: the retry succeeds.

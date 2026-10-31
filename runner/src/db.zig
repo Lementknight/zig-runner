@@ -479,7 +479,8 @@ test "a database that accepts and never answers holds up neither the job's end n
     const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
-    const connect_ms = 300;
+    // Long enough that the question below is asked well within it, even on a busy machine.
+    const connect_ms = 2_000;
     const cfg: pg.Config = .{
         .host = "127.0.0.1",
         .port = listener.socket.address.getPort(),
@@ -497,7 +498,9 @@ test "a database that accepts and never answers holds up neither the job's end n
     try store.upsertStep(.{ .job_id = 1, .number = 1, .name = "step", .status = "in_progress" });
     io.sleep(.fromMilliseconds(50), .awake) catch {};
     // The writer is dialling, holding `mu`. The job's end asks what failed (`finishReporter`),
-    // before completejob: it is answered at once, not when the connect is given up.
+    // before completejob: it is answered while the connect still goes on, not once it is given
+    // up (which the writer counts in `failed` before it lets `mu` go). Not a time limit: on a
+    // busy CI machine 100 ms was not always enough to see the answer.
     const Ask = struct {
         fn run(st: *Store, done: *std.atomic.Value(bool)) void {
             std.testing.allocator.free(st.lastError(std.testing.allocator));
@@ -506,14 +509,15 @@ test "a database that accepts and never answers holds up neither the job's end n
     };
     var done: std.atomic.Value(bool) = .init(false);
     var asking = try io.concurrent(Ask.run, .{ &store, &done });
-    var waited: u32 = 0;
-    while (!done.load(.acquire) and waited < 100) : (waited += 10)
+    while (!done.load(.acquire) and store.failed.load(.acquire) == 0)
         io.sleep(.fromMilliseconds(10), .awake) catch {};
-    const answered = done.load(.acquire);
+    // In this order: answered, and the connect not yet given up after that.
+    const asked = done.load(.acquire);
+    const answered = asked and store.failed.load(.acquire) == 0;
 
     // The connect is given up at its deadline, where it used to wait for good.
-    waited = 0;
-    while (store.failed.load(.acquire) == 0 and waited < 5_000) : (waited += 10)
+    var waited: u32 = 0;
+    while (store.failed.load(.acquire) == 0 and waited < 10_000) : (waited += 10)
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     asking.await(io);
     try std.testing.expect(answered);

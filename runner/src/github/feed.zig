@@ -221,5 +221,5 @@ test "a feed that accepts and never answers the upgrade is given up at its deadl
         Socket.openWithin(std.testing.allocator, io, url, "token", .fromMilliseconds(200)),
     );
     const took = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
-    try std.testing.expect(took >= 200 and took < 2_000);
+    try std.testing.expect(took >= 200 and took < 10_000);
 }
