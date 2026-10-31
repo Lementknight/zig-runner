@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The memory gate no longer charges the engine for reclaimable slab (`memory.stat slab_reclaimable`, the kernel''s dentry and inode cache: 180-270 MB on razorbill at idle, where the gate charged 1.3 GB for an engine whose own heap was about 650 MB). The kernel drops it as cheaply as the inactive file cache already left out, so a runner was held, and a job''s learned size raised, for memory the engine gives up the moment a job needs it. Active file pages stay counted, since dropping them means reads from the SD card. `docker stats` still shows memory.current less inactive_file, so it reads that much higher than the gate''s log.'
+time: 2026-10-31T04:41:52.000000-04:00

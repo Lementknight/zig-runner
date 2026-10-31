@@ -582,24 +582,35 @@ pub fn read(io: std.Io, paths: Paths, engine_dir: ?[]const u8) Sample {
     return s;
 }
 
-/// The engine's cap, and its working set: `memory.current` less `inactive_file`. The engine's cache
-/// is file-backed and large (image layers, the step and package caches), and the kernel drops
-/// inactive file pages first and cheaply as the cgroup nears its cap, so counting them would hold
-/// runners for memory the engine gives up the moment a job needs it. Active file pages stay
-/// counted: they are being read, and dropping them turns into reads from the SD card. This is the
-/// working set `docker stats` shows, and the one the kubelet evicts on, so the log and
-/// `docker stats` on the Pi agree. Null unless the cap is a number and usage is readable (a cap
-/// removed is no longer a limit).
+/// The engine's cap, and its working set: `memory.current` less what the kernel reclaims first
+/// and cheaply as the cgroup nears its cap, `inactive_file` and `slab_reclaimable`. The engine's
+/// cache is file-backed and large (image layers, the step and package caches), and the reclaimable
+/// slab is the dentries and inodes of the files it hashes and reads: the Zig tool cache's 19,505
+/// files every job (BENCHMARKS.md), 180-270 MB on razorbill at idle, where the gate charged 1.3 GB
+/// for an engine whose own heap was about 650 MB. Counting either would hold runners, and raise a
+/// job's learned size (#144), for memory the engine gives up the moment a job needs it (#126).
+/// Active file pages stay counted: they are being read, dropping them turns into reads from the SD
+/// card, and without them two unknown 1536 MB jobs would poll at idle on razorbill, the shape of
+/// #144. `MemAvailable` leaves both out the same way, so the host's signal and the engine's agree
+/// about the same bytes. Dirty and writeback pages sit inside `inactive_file` and are left out
+/// although the card must take them first: the gate under-charges most during provisioning's
+/// apt-get (622 MB written, and the dentries of every file unpacked), a known under-charge left for
+/// its own change. `docker stats` and the kubelet subtract `inactive_file` only, so on the Pi they
+/// read the reclaimable slab higher than the log. A key missing from memory.stat subtracts nothing,
+/// so the gate can only charge more than meant. Null unless the cap is a number and usage is
+/// readable (a cap removed is no longer a limit).
 fn readEngine(io: std.Io, dir: []const u8) ?EngineMemory {
     const cap = readBytes(io, dir, "memory.max") orelse return null;
     const current = readBytes(io, dir, "memory.current") orelse return null;
-    // memory.stat is about 2.5 KB (cgroup v2 on Linux 7.0); inactive_file is in its first half.
+    // memory.stat is about 1.3 KB (cgroup v2 on Linux 7.0), both keys in its first half. A longer
+    // file is cut at the buffer, and a key past the cut is a missing one.
     var stat_buf: [8192]u8 = undefined;
-    const inactive_file = if (readIn(io, dir, "memory.stat", &stat_buf)) |text|
-        parseStat(text, "inactive_file") orelse 0
+    const reclaimable = if (readIn(io, dir, "memory.stat", &stat_buf)) |text|
+        (parseStat(text, "inactive_file") orelse 0) +|
+            (parseStat(text, "slab_reclaimable") orelse 0)
     else |_|
         0;
-    return .{ .cap_mb = cap >> 20, .used_mb = (current -| inactive_file) >> 20 };
+    return .{ .cap_mb = cap >> 20, .used_mb = (current -| reclaimable) >> 20 };
 }
 
 /// A cgroup file that holds one number of bytes; null for "max", or one that cannot be read.
@@ -990,6 +1001,10 @@ test "a job that is over reserves nothing, however soon it ended" {
     try std.testing.expectEqual(std.math.minInt(i64), slots[3].started_ms);
 }
 
+/// What a test's memory.stat says, in bytes. `slab_reclaimable` null leaves its line out, as a
+/// kernel without the key would.
+const Stat = struct { inactive_file: u64 = 0, slab_reclaimable: ?u64 = 0 };
+
 /// A cgroup directory under `tmp` with memory.max, memory.current, memory.stat and, if given,
 /// memory.swap.current, in bytes.
 fn writeCgroup(
@@ -997,7 +1012,7 @@ fn writeCgroup(
     sub: []const u8,
     max: []const u8,
     current: u64,
-    inactive_file: u64,
+    stat: Stat,
     swap: ?u64,
 ) !void {
     const io = std.testing.io;
@@ -1013,13 +1028,16 @@ fn writeCgroup(
         .sub_path = "memory.current",
         .data = try std.fmt.bufPrint(&buf, "{d}\n", .{current}),
     });
-    // Trimmed from a `docker run --memory 512m` container's memory.stat (Linux 7.0).
-    try dir.writeFile(io, .{
-        .sub_path = "memory.stat",
-        .data = try std.fmt.bufPrint(&buf, "anon 53248\nfile 1216512\nkernel 352256\n" ++
-            "shmem 0\nfile_mapped 847872\ninactive_anon 0\nactive_anon 53248\n" ++
-            "inactive_file {d}\nactive_file 1150976\nslab 258312\n", .{inactive_file}),
-    });
+    // Trimmed from a `docker run --memory 512m` container's memory.stat (Linux 7.0), the keys in
+    // the kernel's order; slab is the sum of its two halves.
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.print("anon 53248\nfile 1216512\nkernel 352256\nshmem 0\nfile_mapped 847872\n" ++
+        "inactive_anon 0\nactive_anon 53248\ninactive_file {d}\nactive_file 1150976\n" ++
+        "unevictable 0\n", .{stat.inactive_file});
+    if (stat.slab_reclaimable) |s| try w.print("slab_reclaimable {d}\n", .{s});
+    const slab = (stat.slab_reclaimable orelse 0) + 81920;
+    try w.print("slab_unreclaimable 81920\nslab {d}\n", .{slab});
+    try dir.writeFile(io, .{ .sub_path = "memory.stat", .data = w.buffered() });
     if (swap) |s| try dir.writeFile(io, .{
         .sub_path = "memory.swap.current",
         .data = try std.fmt.bufPrint(&buf, "{d}\n", .{s}),
@@ -1028,12 +1046,22 @@ fn writeCgroup(
 
 const mib = 1 << 20;
 
-test "the engine's cgroup: its cap, its use less inactive file cache, its swap" {
+test "the engine's cgroup: its cap, its use less inactive file cache and reclaimable slab, swap" {
     const stat = "anon 1\ninactive_file 65536\n";
     try std.testing.expectEqual(@as(?u64, 65536), parseStat(stat, "inactive_file"));
     // A key that only starts with the one asked for is another key.
     try std.testing.expectEqual(@as(?u64, null), parseStat("inactive_filex 3\n", "inactive_file"));
     try std.testing.expectEqual(@as(?u64, null), parseStat("", "inactive_file"));
+    // The three slab keys sit together, in this order, and each is read as itself.
+    const slabs = "slab_reclaimable 258312\nslab_unreclaimable 81920\nslab 340232\n";
+    try std.testing.expectEqual(@as(?u64, 258312), parseStat(slabs, "slab_reclaimable"));
+    try std.testing.expectEqual(@as(?u64, 81920), parseStat(slabs, "slab_unreclaimable"));
+    try std.testing.expectEqual(@as(?u64, 340232), parseStat(slabs, "slab"));
+    try std.testing.expectEqual(@as(?u64, null), parseStat("slab 7\n", "slab_reclaimable"));
+    try std.testing.expectEqual(@as(?u64, null), parseStat("slab_reclaimable 1\n", "slab"));
+    // A garbled value is no value: it subtracts nothing.
+    const garbled = "slab_reclaimable x\n";
+    try std.testing.expectEqual(@as(?u64, null), parseStat(garbled, "slab_reclaimable"));
     try std.testing.expectEqualStrings(
         "/system.slice/docker-ab12.scope",
         parseProcCgroup("0::/system.slice/docker-ab12.scope\n").?,
@@ -1046,15 +1074,53 @@ test "the engine's cgroup: its cap, its use less inactive file cache, its swap" 
     const io = std.testing.io;
     const none: Paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
     // razorbill's engine mid-soak: 3.9 GB charged, 300 MB of it inactive cache, and swapping.
-    try writeCgroup(tmp.dir, "engine", "4294967296", 3900 * mib, 300 * mib, 512 * mib);
+    try writeCgroup(tmp.dir, "engine", "4294967296", 3900 * mib, .{
+        .inactive_file = 300 * mib,
+    }, 512 * mib);
     var path_buf: [256]u8 = undefined;
     const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/engine", .{tmp.sub_path});
     const s = read(io, none, dir);
     try std.testing.expectEqual(EngineMemory{ .cap_mb = 4096, .used_mb = 3600 }, s.engine.?);
     try std.testing.expectEqual(@as(?u64, 512), s.engine_swap_mb);
 
+    // The same, and 200 MB of dentries and inodes: those are not charged either.
+    try writeCgroup(tmp.dir, "reclaim", "4294967296", 3900 * mib, .{
+        .inactive_file = 300 * mib,
+        .slab_reclaimable = 200 * mib,
+    }, null);
+    const reclaim = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/reclaim", .{tmp.sub_path});
+    try std.testing.expectEqual(@as(u64, 3400), read(io, none, reclaim).engine.?.used_mb);
+
+    // A kernel whose memory.stat has no slab_reclaimable line charges as before.
+    try writeCgroup(tmp.dir, "older", "4294967296", 3900 * mib, .{
+        .inactive_file = 300 * mib,
+        .slab_reclaimable = null,
+    }, null);
+    const older = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/older", .{tmp.sub_path});
+    try std.testing.expectEqual(@as(u64, 3600), read(io, none, older).engine.?.used_mb);
+
+    // A memory.stat longer than the 8 KB read is cut there: a key past the cut is missing, and
+    // the engine is charged all of memory.current rather than anything less.
+    try writeCgroup(tmp.dir, "oversize", "4294967296", 3900 * mib, .{}, null);
+    var big: [8192 + 64]u8 = undefined;
+    for (0..8192 / 4) |i| @memcpy(big[i * 4 ..][0..4], "x 0\n");
+    const tail = try std.fmt.bufPrint(big[8192..], "inactive_file {d}\nslab_reclaimable {d}\n", .{
+        300 * mib,
+        200 * mib,
+    });
+    var oversize_dir = try tmp.dir.openDir(io, "oversize", .{});
+    defer oversize_dir.close(io);
+    try oversize_dir.writeFile(io, .{
+        .sub_path = "memory.stat",
+        .data = big[0 .. 8192 + tail.len],
+    });
+    const oversize = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/oversize", .{
+        tmp.sub_path,
+    });
+    try std.testing.expectEqual(@as(u64, 3900), read(io, none, oversize).engine.?.used_mb);
+
     // No cap ("max"): no engine signal.
-    try writeCgroup(tmp.dir, "uncapped", "max", 3900 * mib, 0, null);
+    try writeCgroup(tmp.dir, "uncapped", "max", 3900 * mib, .{}, null);
     const uncapped = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/uncapped", .{
         tmp.sub_path,
     });
@@ -1106,9 +1172,9 @@ test "the engine's cgroup is the nearest capped one at or above its process's" {
     var root_buf: [128]u8 = undefined;
     const root = try std.fmt.bufPrint(&root_buf, ".zig-cache/tmp/{s}/cg", .{tmp.sub_path});
     // The scope Docker made, capped, and a child its entrypoint moved the engine into, not.
-    try writeCgroup(tmp.dir, "cg/system.slice/docker-e.scope", "4294967296", 0, 0, null);
-    try writeCgroup(tmp.dir, "cg/system.slice/docker-e.scope/init", "max", 0, 0, null);
-    try writeCgroup(tmp.dir, "cg/system.slice", "max", 0, 0, null);
+    try writeCgroup(tmp.dir, "cg/system.slice/docker-e.scope", "4294967296", 0, .{}, null);
+    try writeCgroup(tmp.dir, "cg/system.slice/docker-e.scope/init", "max", 0, .{}, null);
+    try writeCgroup(tmp.dir, "cg/system.slice", "max", 0, .{}, null);
     var start_buf: [256]u8 = undefined;
     var buf: [256]u8 = undefined;
     const start = try std.fmt.bufPrint(&start_buf, "{s}/system.slice/docker-e.scope/init", .{root});
@@ -1133,7 +1199,7 @@ test "the engine's cgroup is found through its socket's listener, or not, saying
     if (own.len < 2) return error.SkipZigTest;
     var sub_buf: [512]u8 = undefined;
     const sub = try std.fmt.bufPrint(&sub_buf, "cg{s}", .{own});
-    try writeCgroup(tmp.dir, sub, "536870912", 0, 0, null);
+    try writeCgroup(tmp.dir, sub, "536870912", 0, .{}, null);
     var root_buf: [128]u8 = undefined;
     const root = try std.fmt.bufPrint(&root_buf, ".zig-cache/tmp/{s}/cg", .{tmp.sub_path});
     // Relative: an absolute path into a worktree can pass a socket address's 108 bytes.
@@ -1192,7 +1258,7 @@ test "an engine container recreated is looked for again" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
-    try writeCgroup(tmp.dir, "cg/docker-a.scope", "4294967296", 1024 * mib, 0, null);
+    try writeCgroup(tmp.dir, "cg/docker-a.scope", "4294967296", 1024 * mib, .{}, null);
     var root_buf: [128]u8 = undefined;
     const root = try std.fmt.bufPrint(&root_buf, ".zig-cache/tmp/{s}/cg", .{tmp.sub_path});
     var dir_buf: [160]u8 = undefined;
@@ -1216,7 +1282,7 @@ test "an engine container recreated is looked for again" {
     const news = pool.engineNews(&buf).?;
     try std.testing.expect(std.mem.indexOf(u8, news, "not found (CgroupNotFound)") != null);
     // Back, under the same name (`docker restart` keeps the container's ID).
-    try writeCgroup(tmp.dir, "cg/docker-a.scope", "4294967296", 1024 * mib, 0, null);
+    try writeCgroup(tmp.dir, "cg/docker-a.scope", "4294967296", 1024 * mib, .{}, null);
     pool.engine.failed_ms = null;
     try std.testing.expect(gate.check() == null);
     try std.testing.expect(pool.engine.dir != null);
@@ -1240,7 +1306,7 @@ test "reservations add up what each job reserves, not a flat amount for each" {
 
 /// The engine's cgroup fixture, "engine" under `tmp`: `used` MB in use of a 4 GB cap.
 fn setEngine(tmp: std.Io.Dir, used: u64) !void {
-    try writeCgroup(tmp, "engine", "4294967296", used * mib, 0, null);
+    try writeCgroup(tmp, "engine", "4294967296", used * mib, .{}, null);
 }
 
 test "a job known to be light lets the next runner through where the worst case would hold" {
@@ -1282,6 +1348,33 @@ test "a job known to be light lets the next runner through where the worst case 
     try std.testing.expect(gates[1].check() == null);
     // It took less this time (the 64 MB floor): still 300 MB reserved, so nothing to say.
     try std.testing.expectEqual(@as(?Learned.Change, null), gates[0].ended());
+}
+
+test "a job's dentries and inodes are not learned as its size" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [256]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/engine", .{tmp.sub_path});
+    try setEngine(tmp.dir, 600);
+    var slots: [1]Admission.Slot = undefined;
+    var pool: Admission = .init(io, .{}, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    pool.engine.dir = dir;
+    var gate: Gate = .{ .pool = &pool, .slot = 0 };
+    const zig = jobKey("o/r", "o/r/.github/workflows/ci.yml@refs/heads/main", "test (zig)");
+
+    // Hashing the tool cache grows the reclaimable slab by 200 MB while memory.current grows by
+    // 1.5 GB: the job is learned at 1.3 GB, what the engine's heap took, as if the slab had not
+    // moved.
+    gate.leave(true);
+    gate.assigned(zig);
+    try writeCgroup(tmp.dir, "engine", "4294967296", 2100 * mib, .{
+        .slab_reclaimable = 200 * mib,
+    }, null);
+    pool.samplePeaks();
+    const change: Learned.Change = .{ .seen_mb = 1300, .estimate_mb = 1300, .alone = true };
+    try std.testing.expectEqual(change, gate.ended().?);
 }
 
 test "a job heavier than configured raises what an unknown job reserves" {
