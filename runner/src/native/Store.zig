@@ -43,6 +43,12 @@ pub fn hex(k: Key) [2 * Sha256.digest_length]u8 {
     return std.fmt.bytesToHex(k, .lower);
 }
 
+/// The store's format: what a layer and its record mean (the sandbox that made the tree, the
+/// record's files and how they replay, the key's extras). Part of every base's parent
+/// (`Backend.below`), so every key: bump it with any change to those, and a runner upgraded
+/// finds none of the layers an older one left (they age out under the cap).
+pub const store_format = "zig-runner native store 2";
+
 /// What a key is of (P8's tag, proofs/Runner/Native.lean): a job's base, a step's container (a
 /// `run:` step's exec, or a checkout's fetch), or one keyed on what a step produced.
 pub const Tag = enum(u64) { base = 0, step = 1, output_keyed = 2 };
@@ -174,72 +180,172 @@ pub const Layer = struct {
     lock: std.Io.File,
 };
 
-/// The layer stored under `key`, held (`Layer`) and its last use now; null when there is none.
-pub fn open(s: Store, arena: Allocator, io: std.Io, key: Key) !?Layer {
+/// What made a layer, which says what its record must hold: a step's file commands end with its
+/// ran marker; a base's and a checkout's fetch's are empty.
+pub const Kind = enum { base, step, fetch };
+
+/// A stored layer found: held, with its record.
+pub const Hit = struct { layer: Layer, rec: Record };
+
+/// The layer stored under `key`, held (`Layer`), checked whole (`readEntry`) and its last use now;
+/// null when there is none. An entry that cannot be replayed (a part missing or cut short, a disk
+/// that filled, a hand that changed it) is evicted, and then is a miss too; `error.Invalid` when
+/// another job holds it, so it can be neither replayed nor replaced now.
+pub fn open(s: Store, arena: Allocator, io: std.Io, key: Key) !?Hit {
     const dir = try s.layerDir(arena, key);
-    const lock_path = try std.fmt.allocPrint(arena, "{s}/lock", .{dir});
+    const lock_path = try join(arena, dir, "lock");
     const f = std.Io.Dir.cwd().openFile(io, lock_path, .{}) catch return null;
-    // Waits out an eviction under way, which then leaves the path naming nothing. An entry with
-    // a part missing (a disk that filled, a hand that removed one) is a miss.
-    if (!flock(f, lock_sh) or !sameFile(arena, f, lock_path) or !s.whole(arena, dir)) {
+    // Waits out an eviction under way, which then leaves the path naming nothing.
+    if (!flock(f, lock_sh) or !sameFile(arena, f, lock_path)) {
         f.close(io);
         return null;
     }
+    const rec = readEntry(arena, io, dir) catch {
+        f.close(io);
+        if (s.evict(arena, io, &hex(key))) return null;
+        return error.Invalid;
+    };
+    // Only a whole entry counts as used, so a broken one ages out.
     _ = linux.utimensat(f.handle, null, null, 0);
-    return .{ .fs = try std.fmt.allocPrint(arena, "{s}/fs", .{dir}), .lock = f };
-}
-
-/// Whether every part of the entry in `dir` is there: its tree, its record and its size.
-fn whole(s: Store, arena: Allocator, dir: []const u8) bool {
-    _ = s;
-    for ([_][]const u8{ "fs", "log", "fc", "size" }) |part| {
-        const p = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ dir, part }, 0) catch
-            return false;
-        var st: linux.Statx = undefined;
-        const nofollow = linux.AT.SYMLINK_NOFOLLOW;
-        const rc = linux.statx(linux.AT.FDCWD, p, nofollow, .{ .TYPE = true }, &st);
-        if (linux.errno(rc) != .SUCCESS) return false;
-        const want: u32 = if (part[0] == 'f' and part[1] == 's') linux.S.IFDIR else linux.S.IFREG;
-        if (st.mode & linux.S.IFMT != want) return false;
-    }
-    return true;
+    return .{ .layer = .{ .fs = try join(arena, dir, "fs"), .lock = f }, .rec = rec };
 }
 
 /// What replaying a stored step needs: its output as printed, and its file commands.
 pub const Record = struct { log: []const u8, fc: []const u8 };
 
-pub fn record(s: Store, arena: Allocator, io: std.Io, key: Key) !Record {
-    const dir = try s.layerDir(arena, key);
+/// A step that printed more than this is not published: its replay would hold it all in memory.
+/// Dagger's limit on a recorded output (`dagger.max_recorded_bytes`).
+pub const max_record_bytes = dagger.max_recorded_bytes;
+
+const fc_ran = @import("../dagger/scripts.zig").fc_marker ++ "ran\n";
+
+/// Why a record cannot be stored or replayed as a `kind`'s, or null when it can.
+fn recordFault(kind: Kind, rec: Record) ?anyerror {
+    if (rec.log.len > max_record_bytes or rec.fc.len > max_record_bytes)
+        return error.RecordTooLarge;
+    return switch (kind) {
+        // Its file commands end with its ran marker (`scripts.writeCombinedFileCommands`):
+        // without it, they were cut short.
+        .step => if (std.mem.indexOf(u8, rec.fc, fc_ran) == null) error.ShortRecord else null,
+        .base, .fetch => if (rec.fc.len > 0) error.ShortRecord else null,
+    };
+}
+
+/// An entry's `meta`: the store's format, what made it, its bytes on disk, and its record's
+/// files' lengths and sha256s, so a part cut short or changed is told from a whole one.
+const Meta = struct {
+    kind: Kind,
+    bytes: u64,
+    log_len: u64,
+    fc_len: u64,
+    log_sha: Key,
+    fc_sha: Key,
+
+    fn write(m: Meta, arena: Allocator) ![]const u8 {
+        return std.fmt.allocPrint(arena, "format {s}\nkind {t}\nbytes {d}\nlog {d} {s}\n" ++
+            "fc {d} {s}\n", .{
+            store_format, m.kind,         m.bytes, m.log_len, &hex(m.log_sha),
+            m.fc_len,     &hex(m.fc_sha),
+        });
+    }
+
+    fn parse(text: []const u8) !Meta {
+        var m: Meta = undefined;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        const want = [_][]const u8{ "format", "kind", "bytes", "log", "fc" };
+        for (want) |name| {
+            const line = lines.next() orelse return error.BadMeta;
+            var f = std.mem.splitScalar(u8, line, ' ');
+            if (!std.mem.eql(u8, f.next() orelse "", name)) return error.BadMeta;
+            const v = f.rest();
+            switch (name[0]) {
+                'f' => if (name.len == 2) {
+                    try parseFile(v, &m.fc_len, &m.fc_sha);
+                } else if (!std.mem.eql(u8, v, store_format)) return error.BadMeta,
+                'k' => m.kind = std.meta.stringToEnum(Kind, v) orelse return error.BadMeta,
+                'b' => m.bytes = try std.fmt.parseInt(u64, v, 10),
+                'l' => try parseFile(v, &m.log_len, &m.log_sha),
+                else => unreachable,
+            }
+        }
+        return m;
+    }
+
+    fn parseFile(v: []const u8, len: *u64, sha: *Key) !void {
+        var f = std.mem.splitScalar(u8, v, ' ');
+        len.* = try std.fmt.parseInt(u64, f.next() orelse return error.BadMeta, 10);
+        _ = try std.fmt.hexToBytes(sha, f.next() orelse return error.BadMeta);
+    }
+};
+
+/// The entry in `dir` read and checked whole: its tree there, its `meta` this format's, its
+/// record's files of the lengths and sha256s it says, and the record one its kind may have.
+fn readEntry(arena: Allocator, io: std.Io, dir: []const u8) !Record {
+    const m = try metaOf(arena, io, dir);
+    if (!isDir(arena, try join(arena, dir, "fs"))) return error.NoTree;
     const cwd = std.Io.Dir.cwd();
     const limit: std.Io.Limit = .limited(max_record_bytes + 1);
     const rec: Record = .{
         .log = try cwd.readFileAlloc(io, try join(arena, dir, "log"), arena, limit),
         .fc = try cwd.readFileAlloc(io, try join(arena, dir, "fc"), arena, limit),
     };
-    // A step's file commands end with its ran marker (`scripts.writeCombinedFileCommands`):
-    // without it, the record was cut short. The base's and a fetch's are empty.
-    if (rec.fc.len > 0 and std.mem.indexOf(u8, rec.fc, fc_ran) == null) return error.ShortRecord;
+    if (rec.log.len != m.log_len or rec.fc.len != m.fc_len) return error.ShortRecord;
+    var sha: Key = undefined;
+    Sha256.hash(rec.log, &sha, .{});
+    if (!std.mem.eql(u8, &sha, &m.log_sha)) return error.ChangedRecord;
+    Sha256.hash(rec.fc, &sha, .{});
+    if (!std.mem.eql(u8, &sha, &m.fc_sha)) return error.ChangedRecord;
+    if (recordFault(m.kind, rec)) |e| return e;
     return rec;
 }
 
-const fc_ran = @import("../dagger/scripts.zig").fc_marker ++ "ran\n";
+fn metaOf(arena: Allocator, io: std.Io, dir: []const u8) !Meta {
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, try join(arena, dir, "meta"), arena, .limited(1024));
+    return Meta.parse(text);
+}
 
-/// A step that printed more than this is not published: its replay would hold it all in memory.
-/// Dagger's limit on a recorded output (`dagger.max_recorded_bytes`).
-pub const max_record_bytes = dagger.max_recorded_bytes;
+/// The cheap half of `readEntry`, for `collect`, which looks at every entry after every job: the
+/// meta, the tree, and the record's files' lengths, without reading them.
+fn entryLooksWhole(arena: Allocator, io: std.Io, dir: []const u8) ?Meta {
+    const m = metaOf(arena, io, dir) catch return null;
+    if (!isDir(arena, join(arena, dir, "fs") catch return null)) return null;
+    for ([_]struct { []const u8, u64 }{ .{ "log", m.log_len }, .{ "fc", m.fc_len } }) |part| {
+        const p = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ dir, part[0] }, 0) catch
+            return null;
+        var st: linux.Statx = undefined;
+        const mask: linux.STATX = .{ .TYPE = true, .SIZE = true };
+        if (linux.errno(linux.statx(linux.AT.FDCWD, p, linux.AT.SYMLINK_NOFOLLOW, mask, &st)) !=
+            .SUCCESS) return null;
+        if (st.mode & linux.S.IFMT != linux.S.IFREG or st.size != part[1]) return null;
+    }
+    if (m.log_len > max_record_bytes or m.fc_len > max_record_bytes) return null;
+    if (m.kind == .step and m.fc_len == 0) return null;
+    return m;
+}
 
-/// Moves a step's finished upper (`upper`, in the job's directory) into the store under `key`,
-/// with its record (`Record`), and holds it for the job. Built under a temporary name, held before
-/// it is visible (so an eviction cannot take it at once), and published by one rename. On failure
-/// the upper is back where it was.
+fn isDir(arena: Allocator, p: []const u8) bool {
+    const z = arena.dupeSentinel(u8, p, 0) catch return false;
+    var st: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, z, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &st);
+    return linux.errno(rc) == .SUCCESS and st.mode & linux.S.IFMT == linux.S.IFDIR;
+}
+
+/// Moves a finished upper (`upper`, in the job's directory) into the store under `key`, with its
+/// record (`Record`, which must be one its `kind` may have and within `max_record_bytes`), and
+/// holds it for the job. Built under a temporary name, written to disk (`syncfs`) before it is
+/// visible, held before it is visible (so an eviction cannot take it at once), and published by
+/// one rename that never replaces. On failure the upper is back where it was, or, if it cannot be
+/// put back, left in the temporary entry and logged, never deleted.
 pub fn publish(
     s: Store,
     arena: Allocator,
     io: std.Io,
     key: Key,
+    kind: Kind,
     upper: []const u8,
     rec: Record,
 ) !Layer {
+    if (recordFault(kind, rec)) |e| return e;
     const cwd = std.Io.Dir.cwd();
     var raw: [8]u8 = undefined;
     io.random(&raw);
@@ -248,25 +354,40 @@ pub fn publish(
         &hex(key),
         &std.fmt.bytesToHex(raw, .lower),
     });
+    const fs_tmp = try join(arena, tmp, "fs");
+    var moved = false;
+    var lock: ?std.Io.File = null;
     try cwd.createDirPath(io, tmp);
-    errdefer removeTree(arena, io, tmp);
+    errdefer {
+        if (lock) |l| l.close(io);
+        const back = !moved or if (cwd.rename(fs_tmp, cwd, upper, io)) true else |e| no: {
+            std.log.warn("native: cannot put {s} back from {s}: {s}", .{ upper, fs_tmp, @errorName(e) });
+            break :no false;
+        };
+        if (back) removeTree(arena, io, tmp);
+    }
+    var m: Meta = .{
+        .kind = kind,
+        .bytes = try treeBytes(arena, io, upper),
+        .log_len = rec.log.len,
+        .fc_len = rec.fc.len,
+        .log_sha = undefined,
+        .fc_sha = undefined,
+    };
+    Sha256.hash(rec.log, &m.log_sha, .{});
+    Sha256.hash(rec.fc, &m.fc_sha, .{});
     try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "log"), .data = rec.log });
     try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "fc"), .data = rec.fc });
-    const size = treeBytes(arena, io, upper);
-    try cwd.writeFile(io, .{
-        .sub_path = try join(arena, tmp, "size"),
-        .data = try std.fmt.allocPrint(arena, "{d}\n", .{size}),
-    });
-    const lock = try cwd.createFile(io, try join(arena, tmp, "lock"), .{});
-    errdefer lock.close(io);
-    if (!flock(lock, lock_sh)) return error.Locked;
-    const fs_tmp = try join(arena, tmp, "fs");
+    try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "meta"), .data = try m.write(arena) });
+    lock = try cwd.createFile(io, try join(arena, tmp, "lock"), .{});
+    if (!flock(lock.?, lock_sh)) return error.Locked;
     try cwd.rename(upper, cwd, fs_tmp, io);
-    errdefer cwd.rename(fs_tmp, cwd, upper, io) catch |e|
-        std.log.warn("native: cannot put {s} back: {s}", .{ upper, @errorName(e) });
+    moved = true;
+    // On disk before it is visible: a crash after the rename must not leave a whole-looking
+    // entry whose files are empty or short.
+    if (linux.errno(linux.syncfs(lock.?.handle)) != .SUCCESS) return error.Sync;
     const dir = try s.layerDir(arena, key);
-    // One rename that never replaces: a layer published meanwhile (or a broken one left there)
-    // stays, and this one is not published.
+    // One rename that never replaces: a layer published meanwhile stays, and this one is not.
     const rc = linux.renameat2(
         linux.AT.FDCWD,
         try arena.dupeSentinel(u8, tmp, 0),
@@ -275,7 +396,7 @@ pub fn publish(
         .{ .NOREPLACE = true },
     );
     if (linux.errno(rc) != .SUCCESS) return error.Publish;
-    return .{ .fs = try join(arena, dir, "fs"), .lock = lock };
+    return .{ .fs = try join(arena, dir, "fs"), .lock = lock.? };
 }
 
 fn join(arena: Allocator, dir: []const u8, name: []const u8) ![]const u8 {
@@ -318,13 +439,12 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
             if (flock(kl, lock_ex | lock_nb)) removeTree(arena, io, full);
             continue;
         }
-        if (!s.whole(arena, full)) {
+        // An entry that cannot be replayed would only take room (`open` evicts it too).
+        const meta = entryLooksWhole(arena, io, full) orelse {
             _ = s.evict(arena, io, e.name);
             continue;
-        }
-        const size_path = join(arena, full, "size") catch return;
-        const size_text = cwd.readFileAlloc(io, size_path, arena, .limited(64)) catch "0";
-        const bytes = std.fmt.parseInt(u64, std.mem.trim(u8, size_text, " \n"), 10) catch 0;
+        };
+        const bytes = meta.bytes;
         var st: linux.Statx = undefined;
         const lock_z = arena.dupeSentinel(u8, join(arena, full, "lock") catch return, 0) catch
             return;
@@ -359,10 +479,11 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
 fn evict(s: Store, arena: Allocator, io: std.Io, name: []const u8) bool {
     const cwd = std.Io.Dir.cwd();
     const full = std.fmt.allocPrint(arena, "{s}/layers/{s}", .{ s.root, name }) catch return false;
-    const lock = cwd.openFile(io, join(arena, full, "lock") catch return false, .{}) catch
-        return false;
-    defer lock.close(io);
-    if (!flock(lock, lock_ex | lock_nb)) return false;
+    // An entry without its lock file (a broken one) no job can hold.
+    const lock: ?std.Io.File = cwd.openFile(io, join(arena, full, "lock") catch return false, .{}) catch |e|
+        if (e == error.FileNotFound) null else return false;
+    defer if (lock) |l| l.close(io);
+    if (lock) |l| if (!flock(l, lock_ex | lock_nb)) return false;
     var raw: [8]u8 = undefined;
     io.random(&raw);
     const dead = std.fmt.allocPrint(arena, "{s}/layers/.dead-{s}", .{
@@ -409,24 +530,56 @@ pub fn sameFile(arena: Allocator, f: std.Io.File, p: []const u8) bool {
 pub fn removeTree(arena: Allocator, io: std.Io, p: []const u8) void {
     const cwd = std.Io.Dir.cwd();
     cwd.deleteTree(io, p) catch {
-        chmodDirs(arena, io, p, 0);
+        chmodDirs(arena, io, p);
         cwd.deleteTree(io, p) catch |e|
             std.log.warn("native: cannot remove {s}: {s}", .{ p, @errorName(e) });
     };
 }
 
-fn chmodDirs(arena: Allocator, io: std.Io, p: []const u8, depth: u32) void {
-    if (depth > max_depth) return;
+/// Every directory under `p` given its owner's permissions, top down, with no limit on depth: a
+/// directory is opened only once the ones above it are searchable again.
+fn chmodDirs(arena: Allocator, io: std.Io, p: []const u8) void {
     const z = arena.dupeSentinel(u8, p, 0) catch return;
     _ = linux.chmod(z, 0o700);
-    var dir = std.Io.Dir.cwd().openDir(io, p, .{ .iterate = true, .follow_symlinks = false }) catch
-        return;
-    defer dir.close(io);
-    var it = dir.iterate();
-    while (it.next(io) catch null) |e| {
-        if (e.kind != .directory) continue;
-        chmodDirs(arena, io, join(arena, p, e.name) catch return, depth + 1);
+    const root = openRoot(arena, p) catch return;
+    defer _ = linux.close(root);
+    var stack: std.ArrayList([]const u8) = .empty;
+    stack.append(arena, "") catch return;
+    while (stack.pop()) |rel| {
+        const fd = if (rel.len == 0) root else openRel(arena, root, rel) catch continue;
+        defer if (fd != root) {
+            _ = linux.close(fd);
+        };
+        const nodes = listDir(arena, io, fd) catch continue;
+        for (nodes) |n| {
+            if (n.kind() != linux.S.IFDIR) continue;
+            _ = linux.fchmodat(fd, n.name, 0o700);
+            const sub = if (rel.len == 0)
+                arena.dupe(u8, n.name) catch return
+            else
+                std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, n.name }) catch return;
+            stack.append(arena, sub) catch return;
+        }
     }
+}
+
+/// The directory `rel` under `root`, through no symlink: in one call, or a component at a time when
+/// the path is past the kernel's limit (a step can nest directories deeper than PATH_MAX).
+fn openRel(arena: Allocator, root: linux.fd_t, rel: []const u8) !linux.fd_t {
+    if (rel.len < linux.PATH_MAX) {
+        if (openDirAt(root, try arena.dupeSentinel(u8, rel, 0))) |fd| return fd else |_| {}
+    }
+    var fd = root;
+    var parts = std.mem.splitScalar(u8, rel, '/');
+    while (parts.next()) |part| {
+        const next = openDirAt(fd, try arena.dupeSentinel(u8, part, 0)) catch |e| {
+            if (fd != root) _ = linux.close(fd);
+            return e;
+        };
+        if (fd != root) _ = linux.close(fd);
+        fd = next;
+    }
+    return fd;
 }
 
 const max_depth = 256;
@@ -450,6 +603,7 @@ const stat_mask: linux.STATX = .{
     .GID = true,
     .SIZE = true,
     .MTIME = true,
+    .CTIME = true,
     .INO = true,
     .BLOCKS = true,
     .NLINK = true,
@@ -492,34 +646,32 @@ fn openRoot(arena: Allocator, p: []const u8) !linux.fd_t {
     return openDirAt(linux.AT.FDCWD, try arena.dupeSentinel(u8, p, 0));
 }
 
-/// The bytes a tree takes on disk, each inode counted once.
-pub fn treeBytes(arena: Allocator, io: std.Io, p: []const u8) u64 {
-    const fd = openRoot(arena, p) catch return 0;
-    defer _ = linux.close(fd);
+/// The bytes a tree takes on disk, each inode counted once, with no limit on depth. An error when
+/// any directory of it cannot be read: a count that left part out would let the store pass its
+/// cap, so such a layer is not published.
+pub fn treeBytes(arena: Allocator, io: std.Io, p: []const u8) !u64 {
+    const root = try openRoot(arena, p);
+    defer _ = linux.close(root);
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-    return bytesIn(arena, io, fd, &seen, 0);
-}
-
-fn bytesIn(
-    arena: Allocator,
-    io: std.Io,
-    fd: linux.fd_t,
-    seen: *std.AutoHashMapUnmanaged(u64, void),
-    depth: u32,
-) u64 {
-    if (depth > max_depth) return 0;
+    var stack: std.ArrayList([]const u8) = .empty;
+    try stack.append(arena, "");
     var total: u64 = 0;
-    const nodes = listDir(arena, io, fd) catch return 0;
-    for (nodes) |n| {
-        if (n.st.nlink > 1) {
-            const got = seen.getOrPut(arena, n.st.ino) catch continue;
-            if (got.found_existing) continue;
+    while (stack.pop()) |rel| {
+        const fd = if (rel.len == 0) root else try openRel(arena, root, rel);
+        defer if (fd != root) {
+            _ = linux.close(fd);
+        };
+        for (try listDir(arena, io, fd)) |n| {
+            if (n.st.nlink > 1 and n.kind() != linux.S.IFDIR) {
+                if ((try seen.getOrPut(arena, n.st.ino)).found_existing) continue;
+            }
+            total += n.st.blocks * 512;
+            if (n.kind() != linux.S.IFDIR) continue;
+            try stack.append(arena, if (rel.len == 0)
+                try arena.dupe(u8, n.name)
+            else
+                try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, n.name }));
         }
-        total += n.st.blocks * 512;
-        if (n.kind() != linux.S.IFDIR) continue;
-        const sub = openDirAt(fd, n.name) catch continue;
-        defer _ = linux.close(sub);
-        total += bytesIn(arena, io, sub, seen, depth + 1);
     }
     return total;
 }
@@ -576,6 +728,13 @@ fn digestIn(
         h.int(ids.inside(n.st.uid));
         h.int(ids.inside(n.st.gid));
         try digestXattrs(arena, h, fd, n);
+        // The rootfs's fingerprint: any write, chmod or touch since moves an entry's ctime,
+        // which no tool can set back (a tar restoring mtimes does not restore it).
+        if (depth == .metadata) {
+            h.int(n.st.ino);
+            h.int(@bitCast(n.st.ctime.sec));
+            h.int(n.st.ctime.nsec);
+        }
         switch (n.kind()) {
             linux.S.IFREG => switch (depth) {
                 .metadata => {
@@ -704,26 +863,62 @@ pub fn layerDigest(s: Store, arena: Allocator, io: std.Io, key: Key, ids: Ids) !
     return d;
 }
 
-/// The rootfs's fingerprint (`treeDigest` of its metadata), for the base's key: a rootfs made
-/// again gives the jobs new keys. Found once per process for each rootfs: overlay does not allow
-/// a layer to change while it is mounted, so the rootfs is not changed under a running runner.
+/// The rootfs's fingerprint, for the base's parent (`Backend.below`): a rootfs made again gives
+/// the jobs new keys. It is `treeDigest` of the metadata (ctimes and inodes among it), which a walk
+/// of a whole image costs, so it is kept per process and checked again for every job against
+/// what changes when the rootfs is replaced or touched: the root's inode and ctime, and the
+/// provisioning stamp's (`rootfs_stamp`, which the recipe touches after changing the rootfs in
+/// place). A change the stamp does not show, under a running runner, is found at its restart.
 pub fn rootfsFingerprint(arena: Allocator, io: std.Io, rootfs: []const u8) !Key {
+    const seen = try rootfsSeen(arena, rootfs);
     fp_mu.lockUncancelable(io);
     defer fp_mu.unlock(io);
-    if (fp_len > 0 and std.mem.eql(u8, fp_path[0..fp_len], rootfs)) return fp_key;
-    const k = try treeDigest(arena, io, rootfs, .metadata, .host);
+    if (fp_len > 0 and std.mem.eql(u8, fp_path[0..fp_len], rootfs) and
+        std.mem.eql(u8, &fp_seen, &seen)) return fp_key;
+    var h: KeyHasher = .plain("rootfs");
+    h.field(&try treeDigest(arena, io, rootfs, .metadata, .host));
+    h.field(&seen);
+    const k = h.final();
     if (rootfs.len <= fp_path.len) {
         @memcpy(fp_path[0..rootfs.len], rootfs);
         fp_len = rootfs.len;
         fp_key = k;
+        fp_seen = seen;
     }
     return k;
+}
+
+/// The file, in the rootfs, that says it was provisioned again: touched after changing it in place
+/// (docs/native-backend.md, "The rootfs").
+pub const rootfs_stamp = ".zig-runner-provisioned";
+
+/// What `rootfsFingerprint` checks for every job: the root's and the stamp's identity and ctime.
+fn rootfsSeen(arena: Allocator, rootfs: []const u8) !Key {
+    var h: KeyHasher = .plain("rootfs seen");
+    for ([_][]const u8{ "", rootfs_stamp }) |name| {
+        const p = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ rootfs, name }, 0);
+        var st: linux.Statx = undefined;
+        const mask: linux.STATX = .{ .INO = true, .CTIME = true };
+        const rc = linux.statx(linux.AT.FDCWD, p, linux.AT.SYMLINK_NOFOLLOW, mask, &st);
+        if (linux.errno(rc) != .SUCCESS) {
+            if (name.len == 0) return error.RootfsUnreadable;
+            h.field("none");
+            continue;
+        }
+        h.int(st.dev_major);
+        h.int(st.dev_minor);
+        h.int(st.ino);
+        h.int(@bitCast(st.ctime.sec));
+        h.int(st.ctime.nsec);
+    }
+    return h.final();
 }
 
 var fp_mu: std.Io.Mutex = .init;
 var fp_path: [std.Io.Dir.max_path_bytes]u8 = undefined;
 var fp_len: usize = 0;
 var fp_key: Key = undefined;
+var fp_seen: Key = undefined;
 
 // --- flattening ---
 
@@ -995,19 +1190,20 @@ test "native store: a published layer is found and held; eviction keeps under th
         var never: std.atomic.Value(bool) = .init(false);
         const kl = try s.lockKey(arena, io, k.*, &never);
         defer kl.close(io);
-        const l = try s.publish(arena, io, k.*, upper, .{ .log = "the log\n", .fc = "::zig-file-command::ran\nj1\n" });
+        const l = try s.publish(arena, io, k.*, .step, upper, .{ .log = "the log\n", .fc = "::zig-file-command::ran\nj1\n" });
         // The upper moved in.
         try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, try std.fmt.allocPrint(arena, "up{d}", .{i}), .{}));
         held[i] = l;
-        const rec = try s.record(arena, io, k.*);
-        try std.testing.expectEqualStrings("the log\n", rec.log);
-        try std.testing.expectEqualStrings("::zig-file-command::ran\nj1\n", rec.fc);
+        const hit = (try s.open(arena, io, k.*)).?;
+        hit.layer.lock.close(io);
+        try std.testing.expectEqualStrings("the log\n", hit.rec.log);
+        try std.testing.expectEqualStrings("::zig-file-command::ran\nj1\n", hit.rec.fc);
     }
     // Over the cap (0), but every layer is held: nothing goes.
     s.collect(arena, io);
     for (keys) |k| {
-        const l = (try s.open(arena, io, k)).?;
-        l.lock.close(io);
+        const h = (try s.open(arena, io, k)).?;
+        h.layer.lock.close(io);
     }
     // Let the first two go: they are evicted, the held one stays, and a new open misses.
     for (held[0..2]) |*h| {
@@ -1017,7 +1213,7 @@ test "native store: a published layer is found and held; eviction keeps under th
     s.collect(arena, io);
     try std.testing.expect(try s.open(arena, io, keys[0]) == null);
     try std.testing.expect(try s.open(arena, io, keys[1]) == null);
-    const kept = (try s.open(arena, io, keys[2])).?;
+    const kept = (try s.open(arena, io, keys[2])).?.layer;
     kept.lock.close(io);
     // Its digest, kept once computed, is the tree's.
     const d1 = try s.layerDigest(arena, io, keys[2], .host);
@@ -1083,4 +1279,119 @@ test "native store: a digest sees ids as the job's namespace does, never the hos
     try std.testing.expectEqual(@as(u32, 65534), (Ids{ .base = 1000, .count = 1 }).inside(0));
     try std.testing.expectEqual(@as(u32, 1001), (Ids{ .base = 1_900_000_000, .count = 65536 }).inside(1_900_001_001));
     try std.testing.expectEqual(@as(u32, 65534), (Ids{ .base = 1_900_000_000, .count = 65536 }).inside(1_900_065_536));
+}
+
+test "native store: the rootfs's fingerprint changes when the rootfs is changed in place" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "rootfs/usr/bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "rootfs/usr/bin/tool", .data = "v1" });
+    const rootfs = try tmp.dir.realPathFileAlloc(io, "rootfs", arena);
+    const first = try rootfsFingerprint(arena, io, rootfs);
+    try std.testing.expectEqualSlices(u8, &first, &try rootfsFingerprint(arena, io, rootfs));
+    // Provisioned again in place, as `tar -x` over it does: same size, mtime set back. The ctime
+    // moved, but only a new walk sees it; the stamp, touched after, makes the next job walk.
+    try tmp.dir.writeFile(io, .{ .sub_path = "rootfs/usr/bin/tool", .data = "v2" });
+    const tool = try std.fmt.allocPrintSentinel(arena, "{s}/usr/bin/tool", .{rootfs}, 0);
+    const t = [2]linux.timespec{ .{ .sec = 1, .nsec = 0 }, .{ .sec = 1, .nsec = 0 } };
+    _ = linux.utimensat(linux.AT.FDCWD, tool, &t, 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "rootfs/" ++ rootfs_stamp, .data = "" });
+    const second = try rootfsFingerprint(arena, io, rootfs);
+    try std.testing.expect(!std.mem.eql(u8, &first, &second));
+    // A walk sees an in-place change by its ctime even with the stamp untouched, as at a
+    // restart, when nothing is kept.
+    _ = linux.utimensat(linux.AT.FDCWD, tool, &t, 0);
+    fp_len = 0;
+    const third = try rootfsFingerprint(arena, io, rootfs);
+    try std.testing.expect(!std.mem.eql(u8, &second, &third));
+}
+
+test "native store: a record that cannot be replayed is refused, and a broken entry is evicted" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const s: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}) };
+    try prepare(arena, io, s.root);
+    try tmp.dir.createDirPath(io, "up");
+    const upper = try std.fmt.allocPrint(arena, "{s}/up", .{root});
+    var kh: KeyHasher = .plain("test");
+    const k = kh.final();
+    const ran = "::zig-file-command::ran\nj1\n";
+    // Refused, and the upper left where it was: a step's file commands without their ran marker
+    // or empty, a base's with any, and file commands past the limit.
+    const big = try arena.alloc(u8, max_record_bytes + 1);
+    @memset(big, 'x');
+    const refused = [_]struct { Kind, Record }{
+        .{ .step, .{ .log = "", .fc = "::zig-file-command::env\n" } },
+        .{ .step, .{ .log = "", .fc = "" } },
+        .{ .base, .{ .log = "", .fc = ran } },
+        .{ .step, .{ .log = "", .fc = big } },
+    };
+    for (refused) |r| {
+        try std.testing.expect(std.meta.isError(s.publish(arena, io, k, r[0], upper, r[1])));
+        try tmp.dir.access(io, "up", .{});
+    }
+    // A base's empty record is whole.
+    const base = try s.publish(arena, io, k, .base, upper, .{ .log = "", .fc = "" });
+    base.lock.close(io);
+    (try s.open(arena, io, k)).?.layer.lock.close(io);
+
+    // A step's entry whose log was cut short afterwards: a miss, and evicted, so it can be
+    // published again.
+    var kh2: KeyHasher = .plain("test 2");
+    const k2 = kh2.final();
+    try tmp.dir.createDirPath(io, "up2");
+    const up2 = try std.fmt.allocPrint(arena, "{s}/up2", .{root});
+    const l = try s.publish(arena, io, k2, .step, up2, .{ .log = "a whole log\n", .fc = ran });
+    l.lock.close(io);
+    const log_path = try std.fmt.allocPrint(arena, "store/layers/{s}/log", .{&hex(k2)});
+    try tmp.dir.writeFile(io, .{ .sub_path = log_path, .data = "a who" });
+    try std.testing.expect(try s.open(arena, io, k2) == null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, log_path, .{}));
+    // `collect` removes one too, by its lengths, without reading it.
+    try tmp.dir.createDirPath(io, "up3");
+    const up3 = try std.fmt.allocPrint(arena, "{s}/up3", .{root});
+    (try s.publish(arena, io, k2, .step, up3, .{ .log = "a whole log\n", .fc = ran })).lock.close(io);
+    try tmp.dir.writeFile(io, .{ .sub_path = log_path, .data = "a who" });
+    s.collect(arena, io);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, log_path, .{}));
+}
+
+test "native store: a tree's walk has no depth limit, and fails closed on what it cannot read" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // 300 levels, past the old limit of 256, with a file at the bottom and the deepest
+    // directories taken every permission from.
+    var rel: std.ArrayList(u8) = .empty;
+    try rel.appendSlice(arena, "deep");
+    for (0..300) |_| try rel.appendSlice(arena, "/d");
+    try tmp.dir.createDirPath(io, rel.items);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(arena, "{s}/f", .{rel.items}),
+        .data = &@as([8192]u8, @splat('x')),
+    });
+    const deep = try tmp.dir.realPathFileAlloc(io, "deep", arena);
+    try std.testing.expect(try treeBytes(arena, io, deep) >= 8192);
+    // Rootless, a directory it cannot open fails the count (root reads it anyway).
+    const bottom = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{
+        try tmp.dir.realPathFileAlloc(io, ".", arena),
+        rel.items,
+    }, 0);
+    _ = linux.chmod(bottom, 0);
+    if (linux.geteuid() != 0) try std.testing.expect(std.meta.isError(treeBytes(arena, io, deep)));
+    // Removed whole all the same.
+    removeTree(arena, io, deep);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "deep", .{}));
 }

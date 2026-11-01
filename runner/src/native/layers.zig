@@ -31,9 +31,9 @@ pub const Store = struct {
 
     /// The layer stored under `key`, held for the job, or null.
     pub fn get(s: Store, arena: Allocator, io: std.Io, hex: []const u8) !?[]const u8 {
-        const layer = (try s.store.open(arena, io, try key(hex))) orelse return null;
-        try s.held.append(arena, layer.lock);
-        return layer.fs;
+        const hit = (try s.store.open(arena, io, try key(hex))) orelse return null;
+        try s.held.append(arena, hit.layer.lock);
+        return hit.layer.fs;
     }
 
     /// A new, empty directory in the job's, to build the layer for `key` in.
@@ -53,11 +53,13 @@ pub const Store = struct {
     /// path. When another builder stored the key first, its layer is used and this one removed.
     pub fn publish(s: Store, arena: Allocator, io: std.Io, built: []const u8, hex: []const u8) ![]const u8 {
         const k = try key(hex);
-        const layer = s.store.publish(arena, io, k, built, .{ .log = "", .fc = "" }) catch |e| {
+        // Kind `fetch`: a tree with an empty record, never replayed as a step's (P2 has no
+        // `build` kind yet).
+        const layer = s.store.publish(arena, io, k, .fetch, built, .{ .log = "", .fc = "" }) catch |e| {
             const first = (try s.store.open(arena, io, k)) orelse return e;
             P2Store.removeTree(arena, io, built);
-            try s.held.append(arena, first.lock);
-            return first.fs;
+            try s.held.append(arena, first.layer.lock);
+            return first.layer.fs;
         };
         try s.held.append(arena, layer.lock);
         return layer.fs;

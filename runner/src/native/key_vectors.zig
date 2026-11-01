@@ -12,12 +12,10 @@
 //!   holds of any sound spelling (`Native.native_key_iff`), so it applies to the store's key
 //!   whatever bytes it hashes.
 //!
-//! Keys go through P2's own `Store.KeyHasher` (`init`, `core`, its `bytes` writer) and
-//! `Store.stableEnv`; `keyFor`'s tail, which needs a `Backend`, is written out here as `keyFor`
-//! writes it. The digest below a base is still a reference (`belowPreimage`), following P2's
-//! review fixes (#272 at 28a9dd1: `Store.store_format`, the scope and the repository after the label), which
-//! main does not have yet. **When they merge:** write `Backend.below`'s hashing as a function of
-//! its inputs, call it from `storeBelow`, and drop the reference.
+//! The runner's own key functions are checked too: `Backend.stepKey` (`keyFor`'s hashing) and
+//! `Backend.belowKey` (`below`'s), against both the relation and the model's preimages. `below`
+//! adds P4's seed layers and cache volumes after the model's fields, only when a job has any;
+//! the model does not have them yet.
 
 const std = @import("std");
 const Store = @import("Store.zig");
@@ -160,6 +158,21 @@ pub fn backendKey(gpa: Allocator, in: KeyInput) ![32]u8 {
 
 pub fn referenceBelow(gpa: Allocator, in: BelowInput) ![32]u8 {
     return sha(gpa, try belowPreimage(gpa, in));
+}
+
+/// The digest below a base the runner computes: `Backend.belowKey`, which `Backend.below` calls
+/// (no seed layers, no cache volumes: the model has neither yet).
+pub fn backendBelow(gpa: Allocator, in: BelowInput) ![32]u8 {
+    _ = gpa;
+    return Backend.belowKey(in.format, in.scope, in.repository, in.fingerprint, in.userns, in.id_base, &.{}, in.binds, null);
+}
+
+/// Its preimage, as `Backend.belowKey` writes it.
+pub fn backendBelowPreimage(gpa: Allocator, in: BelowInput) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    _ = Backend.belowKey(in.format, in.scope, in.repository, in.fingerprint, in.userns, in.id_base, &.{}, in.binds, &w.writer);
+    return w.toOwnedSlice();
 }
 
 // --- the vectors ---
@@ -311,8 +324,9 @@ test "the native key's preimage is the model's" {
 
 test "native keys are equal exactly where the model's are" {
     try checkRelation(storeKey, referenceBelow);
-    // P2's own key function, as the runner calls it (`Backend.keyFor` → `Backend.stepKey`).
-    try checkRelation(backendKey, referenceBelow);
+    // P2's own key functions, as the runner calls them (`Backend.keyFor` → `Backend.stepKey`,
+    // `Backend.below` → `Backend.belowKey`).
+    try checkRelation(backendKey, backendBelow);
     // And it hashes exactly the model's preimage: its key is the preimage's digest.
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
@@ -321,7 +335,10 @@ test "native keys are equal exactly where the model's are" {
             try storeKey(std.testing.allocator, k.in),
             try backendKey(std.testing.allocator, k.in),
         ),
-        .below => {},
+        .below => |bl| {
+            const got = try backendBelowPreimage(std.testing.allocator, bl.in);
+            defer std.testing.allocator.free(got);
+            try std.testing.expectEqualSlices(u8, bl.preimage, got);
+        },
     };
-    // When P2's review fixes merge: referenceBelow becomes storeBelow, over `Backend.below`'s hashing.
 }

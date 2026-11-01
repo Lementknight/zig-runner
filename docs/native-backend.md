@@ -217,7 +217,14 @@ use it:
 docker run --name zr-rootfs ubuntu:24.04 sh -c '<set_up.provision_runner_script>'
 mkdir -p /var/lib/zig-runner/rootfs
 docker export zr-rootfs | tar -x -C /var/lib/zig-runner/rootfs
+touch /var/lib/zig-runner/rootfs/.zig-runner-provisioned
 ```
+
+To provision it again, make a new directory and rename it over the old one between jobs, or, if
+it is changed in place, touch `.zig-runner-provisioned` in it afterwards. The step store's layers
+were made over the old rootfs: every job checks the rootfs's root and that stamp before it trusts
+the fingerprint it found once (`Store.rootfsFingerprint`), and a change neither shows (an
+in-place change, the stamp not touched) is found when the runner restarts, by the walk's ctimes.
 
 **What the runner needs.** As root (the supported mode): `CAP_SYS_ADMIN` (namespaces, mounts,
 idmapped mounts, `pivot_root`), `CAP_NET_ADMIN` (the bridge, veths, addresses, routes, NAT),
@@ -327,7 +334,9 @@ per-job helper makes the namespaces and the static mounts once.
 What it covers, as built:
 
 - `runner/src/native/Store.zig` is the store, under `RUNNER_NATIVE_STORE` (mode 0700):
-  `layers/<key>/{fs,log,fc,size,lock,digest}`, `keys/<key>.lock`, and the running jobs' `jobs/`.
+  `layers/<key>/{fs,log,fc,meta,lock,digest}`, `keys/<key>.lock`, and the running jobs' `jobs/`.
+  `meta` holds the store's format, the entry's kind (base, step, fetch), its bytes on disk, and
+  its log's and file commands' lengths and sha256s.
   `Backend.zig` keys each exec (`keyFor`), claims the key (`claimKey`), replays a hit (`replay`)
   and publishes a success (`publishTop`).
 - **Keys** are P8's preimage format (proofs/Runner/Native.lean, `stepPreimage`): a u64 tag (0 a
@@ -338,25 +347,42 @@ What it covers, as built:
   (`Store.stableEnv`). After the core come what P8's model does not have yet: the step's uid,
   gid and working directory, and the files written for it that stay (the event file when it is
   not a variable). A base has no parent; in its place goes a digest of what every layer depends
-  on (`Backend.below`): the rootfs's fingerprint (a metadata walk, once per process), how ids
-  are mapped, on a root runner the slot's first id (a layer's files are owned by its job's
+  on (`Backend.below`): the store's format (`Store.store_format`), the job's cache scope and
+  repository, the rootfs's fingerprint (a walk of its metadata, ctimes and inodes among it, kept
+  per process and checked again for every job against the root's and the provisioning stamp's
+  identity and ctime), how ids are mapped, on a root runner the slot's first id (a layer's files are owned by its job's
   range, so it is reused only by jobs with the same range: only misses come of it), and the binds'
   places (never their content). Under step caching the event payload is a variable each step
   writes to the file, as `set_up.writeRunEnv` gives it, so the base is the same for every run.
+- **The store's format** (`Store.store_format`) is bumped with any change to what a layer or its
+  record means: the sandbox's trees, the record's files and how they replay, the key's extras.
+  A runner upgraded across a bump finds none of the older runner's layers; they age out under
+  the cap.
+- **Forks**: a fork's pull request that `trust.vouches` accepts still runs natively, with caching,
+  in a key space of its own: the scope is `set_up.packageCacheScope`'s (`untrusted` when the
+  pull request's head repository is another), the same test that keeps its package cache volumes
+  apart on Dagger. It never replays or leaves a layer its repository's own jobs use. It does
+  share the store's disk and its cap.
 - **Publish**: only a step that exited 0 with its file commands taken, that does not always run
   (no secret, no OIDC token, no run-specific value) and whose parent is in the store. So a failure
   is never replayed (#69), nothing after an always-run step is kept (its parent is not stored, as
   under Dagger its new parent makes every later key new), and no layer or log holds a secret. A
-  step that printed more than `dagger.max_recorded_bytes` is not kept. A commit's checkout
+  step that printed more than `dagger.max_recorded_bytes` is not kept, nor a record its kind may
+  not have (a step's file commands without their ran marker, a base's or a fetch's not empty),
+  nor a layer whose size cannot be counted whole (a directory it cannot read). A commit's checkout
   (a fetch of a full SHA) is a layer like a step's, keyed on its script and never on the token;
   a branch or tag moves, so its fetch always runs. The upper is moved under `layers/.tmp-<key>-<n>`
-  with its record, held, and published by one `renameat2(RENAME_NOREPLACE)`.
+  with its record, held, written to disk (`syncfs`), and published by one
+  `renameat2(RENAME_NOREPLACE)`. An upper that cannot be put back after a failure is left there
+  and logged, never deleted.
 - **Replay**: the stored raw output (markers and all) and combined file commands go through
   `Exec.collect` as Dagger's answer for a cached exec does, with the earlier job's ran marker, so
   the log is `JobLog.replayNotLive`'s, byte-identical by construction, and outputs, env, PATH,
   summaries and state are applied again. The step's log ends with "Reused from the native step
-  store", which the runner counts as it counts Dagger's note. An entry with a part missing, or
-  file commands without their ran marker, is a miss (and `collect` removes it).
+  store", which the runner counts as it counts Dagger's note. Every hit is checked whole first
+  (`meta`'s lengths and sha256s, and the record its kind may have): one that is not is evicted
+  under its exclusive lock and is a miss, so the step runs and is published again; its last use
+  is touched only once it passed.
 - **Locks**: one flock per key while its exec runs (polled, so a cancel or a timeout ends the
   wait), so two jobs sharing the store do not run one key at once: the second replays the
   first's. On a root runner two jobs at once take two slots, so their keys differ anyway. A job
@@ -364,7 +390,8 @@ What it covers, as built:
 - **GC** (`Store.collect`, after each job): past `RUNNER_NATIVE_STORE_MAX_MB` (default 10240),
   the layers no job holds go, least recently used first (the lock file's mtime is the last use),
   each renamed away under its lock taken exclusively, then deleted. Half-built and half-evicted
-  entries of dead runners, broken entries and idle key locks go too.
+  entries of dead runners, idle key locks, and entries that are not whole (by `meta` and their
+  files' lengths, without reading them) go too.
 - **Flattening**: before a step on a stack of 100 layers (`default_flatten_at`), the stack is
   merged into one (`Store.flatten`): later entries win, whiteouts are kept (they hide the
   rootfs), opaque directories stay opaque, files are hard links and directories are made with
@@ -1222,6 +1249,19 @@ What BuildKit's cache did implicitly, now explicit in `native/Store.zig`:
 - **The store's mode is a security boundary.** Its layers hold job-written files owned by the
   jobs' ids, setuid ones among them: at 0755 a host user could run one as the job's root's host id.
   The store is 0700 (P1's job directories, under it, were exposed the same way).
+- **What the review found (after merge, fixed in a follow-up).** A fingerprint kept per process
+  by path missed a rootfs provisioned again in place: `tar -x` restores mtimes, so size and mtime
+  match; ctimes do not, and every job now checks the root and a stamp. Layers outlived runner
+  upgrades that change their meaning: the store's format is now in every key. A record that
+  could not be replayed was still published and then shadowed its key forever, every lookup
+  keeping it fresh: records are now checked at publish and on every hit, with sha256s in a
+  `meta`, and a broken entry is evicted. Nothing was synced before the rename that publishes,
+  so a crash could leave a whole-looking empty entry: `syncfs` first. A vouched fork's pull
+  request shared the trusted jobs' key space: its cache scope is now in the key. And walks that
+  stopped at depth 256 or skipped unreadable directories undercounted a layer: they now have no
+  depth limit and fail closed. Lesson: an entry in a cache shared between jobs is input the next
+  job trusts, so every way it can be partial, stale or someone else's has to be in its key or
+  checked on read.
 - **Dagger's replay limit is not ours.** Dagger replays a step past 4 MiB of output with a warning
   instead of its log; natively such a step is not published and runs again.
 
