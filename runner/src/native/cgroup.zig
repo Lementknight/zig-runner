@@ -81,13 +81,16 @@ fn memTotal(io: std.Io) ?u64 {
 /// Where this runner's jobs' cgroups go, or why they have none.
 pub const Parent = union(enum) { dir: []const u8, none: []const u8 };
 
-/// `resolve`d once per process for each setting (a `self` moves the runner's processes once),
-/// and kept in buffers of its own, since the arena it came from is a job's.
+/// `resolve`d once per process for each setting when it is found (a `self` moves the runner's
+/// processes once), and kept in buffers of its own, since the arena it came from is a job's. A
+/// parent not found is looked for again at the next job: a cgroup made late, or a controller
+/// given since, is then taken.
 pub fn parent(arena: Allocator, io: std.Io, want: []const u8) Parent {
     mu.lockUncancelable(io);
     defer mu.unlock(io);
     if (cache.found and std.mem.eql(u8, cache.want(), want)) return cache.get();
     const found = resolve(arena, io, want);
+    if (found == .none) return found;
     cache.put(want, found);
     return cache.get();
 }
