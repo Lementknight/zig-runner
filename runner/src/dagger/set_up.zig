@@ -2258,7 +2258,7 @@ test "the tool cache's trees: a failed check sets the variable empty, and nestin
     var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-    const res = try run(arena, std.testing.io, &env, .{ .package_caches = true, .tool_trees = true, .trusted = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    const res = try run(arena, std.testing.io, &env, .{ .package_caches = true, .tool_trees = true, .trusted = true, .nesting = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
     try std.testing.expect(res.succeeded);
     try std.testing.expectEqual(3, fake.seen.items.len);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "tool-trees") == null);
