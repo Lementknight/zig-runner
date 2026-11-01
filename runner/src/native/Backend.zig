@@ -66,8 +66,13 @@ pub const Config = struct {
     store: []const u8 = "",
     /// This binary, which runs each step's sandbox (`sandbox.command`).
     self_exe: []const u8 = "",
-    /// The runner vouches for the job (`trust.vouches`): native steps run only in such jobs.
+    /// The runner vouches for the job (`trust.vouches`). Jobs it does not vouch for run natively
+    /// only once `job_limits` holds, on a root runner (`untrustedRefusal`).
     vouched: bool = false,
+    /// Each job runs in a cgroup of its own with `memory.max` and `pids.max` (phase 4). P4 sets it
+    /// once its limits are in place; until then it stays false and a job the runner does not
+    /// vouch for runs on Dagger, where a fork bomb or a memory hog stays in the engine's limits.
+    job_limits: bool = false,
     /// Rootless native steps (`RUNNER_NATIVE_ROOTLESS`): only root is mapped inside, so apt's
     /// `_apt`, `chown` to other users and `tar` with owners fail, and steps share the host's
     /// network. Off: a rootless runner sends every job to Dagger.
@@ -142,8 +147,7 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
     std.Io.Dir.accessAbsolute(io, cfg.rootfs, .{}) catch
         return "the native rootfs (RUNNER_NATIVE_ROOTFS) cannot be read";
     if (cfg.self_exe.len == 0 or cfg.store.len == 0) return "the native store is not set up";
-    if (!cfg.vouched) return "native steps run only in jobs this runner vouches for " ++
-        "(RUNNER_TRUSTED_REFS)";
+    if (!cfg.vouched) if (untrustedRefusal(cfg)) |why| return why;
     if (std.os.linux.geteuid() != 0 and !cfg.rootless) return "the runner is not root, and " ++
         "rootless native steps have only one id mapped (RUNNER_NATIVE_ROOTLESS=1 runs them " ++
         "anyway; subordinate ids are phase 5's)";
@@ -172,6 +176,18 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
         },
         .script, .unsupported => {},
     };
+    return null;
+}
+
+/// Why a job the runner does not vouch for cannot run natively here, or null when it can: only
+/// with every phase 5 isolation in place (Docker's seccomp allow list, the nftables rules) and
+/// phase 4's per-job resource limits (`Config.job_limits`), and only on a root runner, since a
+/// rootless one has neither the job's own network nor its own range of ids yet.
+pub fn untrustedRefusal(cfg: Config) ?[]const u8 {
+    if (!cfg.job_limits) return "native steps run only in jobs this runner vouches for " ++
+        "(RUNNER_TRUSTED_REFS) until each job has cgroup limits of its own (phase 4)";
+    if (std.os.linux.geteuid() != 0) return "native steps run jobs this runner does not vouch " ++
+        "for only on a root runner (a rootless job's own network and ids are phase 5's)";
     return null;
 }
 
@@ -1289,6 +1305,13 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     var remote = ok;
     remote.vouched = false;
     try expectReason("vouches", unsupported(io, run_only, root, remote));
+    try expectReason("cgroup limits", unsupported(io, run_only, root, remote));
+    // With phase 4's limits, on a root runner only.
+    remote.job_limits = true;
+    if (std.os.linux.geteuid() == 0)
+        try std.testing.expect(unsupported(io, run_only, root, remote) == null)
+    else
+        try expectReason("root runner", unsupported(io, run_only, root, remote));
     if (std.os.linux.geteuid() != 0) {
         var rootless = ok;
         rootless.rootless = false;
