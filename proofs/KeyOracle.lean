@@ -22,12 +22,14 @@ Each line is tab-separated, every byte string in lowercase hex, numbers in decim
 
     key    name equal|differ  A B   with A, B: tag parent script env uid gid workdir files preimage
     below  name equal|differ  A B   with A, B: format scope repository fingerprint userns idBase
-                                         binds preimage
+                                         binds [seeds=…] preimage
     layer  name root|any  entries preimage    (a tree, and `Native.walkPreimage` of it)
 
 An environment is `name=value` pairs joined by `,` in the container's order, volatile names
 included (the preimage has the stable ones); files are `path=contents=mode`, binds
-`host=place=readOnly=optional` (0 or 1); `-` is an empty list.
+`host=place=readOnly=optional` (0 or 1), with `=volume` after each when one of them is a cache
+volume; `seeds=` and the seeds' paths joined by `,` is there only when the job has seeds; `-` is an
+empty list.
 -/
 
 open Runner Runner.Build Runner.Native
@@ -72,6 +74,10 @@ def atomText : Nat → String
   | 34 => "untrusted"
   | 35 => "Open-Blue/zig-runner"
   | 36 => "Open-Blue/other"
+  | 37 => "/var/lib/zig-runner/native/seeds/x86_64-0.17.0-root"
+  | 38 => "/var/lib/zig-runner/native/seeds/x86_64-0.16.0-root"
+  | 39 => "/var/lib/zig-runner/native/volumes/o/r/repo/npm"
+  | 43 => "/root/.npm"
   | 32 => "zig-runner native store 1"
   | 50 => "a.txt"
   | 51 => "bin"
@@ -110,7 +116,7 @@ def scriptText : Script → String
 
 def path : Binding := (0, 10)
 def home : Binding := (2, 14)
-def below0 : Below := ⟨31, 33, 35, 23, 25, 1900000000, [⟨27, 28, true, true⟩]⟩
+def below0 : Below := ⟨31, 33, 35, 23, 25, 1900000000, [⟨27, 28, true, true⟩], [], []⟩
 def asRoot : Extra := ⟨0, 0, 20, []⟩
 def eventFile (c : Nat) : Kept := ⟨22, c, 0o644⟩
 
@@ -157,7 +163,8 @@ def fmt : Format where
 /-- Equality of the model's values, by their fields: the derived `DecidableEq` of a structure with a
 `Bool` field does not compile to code. -/
 def bindT (b : Bind) := (b.host, b.place, b.readOnly, b.optional)
-def belowT (w : Below) := (w.format, w.scope, w.repository, w.fingerprint, w.userns, w.idBase, w.binds.map bindT)
+def belowT (w : Below) :=
+  (w.format, w.scope, w.repository, w.fingerprint, w.userns, w.idBase, w.binds.map bindT, w.seeds, w.volumes)
 def extraT (x : Extra) := (x.uid, x.gid, x.workdir, x.files.map fun k => (k.path, k.contents, k.mode))
 def baseT (b : BaseSpec) := (belowT b.below, b.script, b.env, extraT b.extra)
 
@@ -180,8 +187,11 @@ def filesField : List Kept → String :=
 
 def bit (x : Bool) : String := if x then "1" else "0"
 
-def bindsField : List Bind → String :=
-  list fun b => s!"{hex (fmt.str b.host)}={hex (fmt.str b.place)}={bit b.readOnly}={bit b.optional}"
+/-- The binds, each with whether it is a cache volume when the job has any (`volumes` not empty). -/
+def bindsField (bs : List Bind) (volumes : List Bool) : String :=
+  let bind := fun (b : Bind) => s!"{hex (fmt.str b.host)}={hex (fmt.str b.place)}={bit b.readOnly}={bit b.optional}"
+  if volumes.isEmpty then list bind bs
+  else list (fun (bv : Bind × Bool) => s!"{bind bv.1}={bit bv.2}") (bs.zip volumes)
 
 /-- What the store is given for one key: the tag, the parent's key, the script, the whole env, the
 extras; and its preimage, over the stable env. -/
@@ -245,6 +255,10 @@ def baseVectors : List (String × (Nat × Env) × (Nat × Env)) :=
     ("base-slot", (0, [path, home]), (4, [path, home])),
     ("base-fork", (0, [path, home]), (5, [path, home])) ]
 
+/-- A job's binds with a cache volume (npm's), as P4 binds it, and the same marked a volume. -/
+def twoBinds : List Bind := [⟨27, 28, true, true⟩, ⟨39, 43, false, false⟩]
+def withVolume : Below := { below0 with binds := twoBinds, volumes := [false, true] }
+
 def belowVectors : List (String × Below × Below) :=
   [ ("below-same", below0, below0),
     ("below-store-format", below0, { below0 with format := 32 }),
@@ -254,12 +268,22 @@ def belowVectors : List (String × Below × Below) :=
     ("below-userns", below0, { below0 with userns := 26, idBase := 0 }),
     ("below-slot", below0, { below0 with idBase := 1900065536 }),
     ("below-read-only", below0, { below0 with binds := [⟨27, 28, false, true⟩] }),
-    ("below-no-binds", below0, { below0 with binds := [] }) ]
+    ("below-no-binds", below0, { below0 with binds := [] }),
+    -- P4: the Zig cache seeds' layers and which binds are cache volumes, after the rest and only
+    -- when there are any, so the vectors above are the bytes they were.
+    ("below-seed", below0, { below0 with seeds := [37] }),
+    ("below-same-seed", { below0 with seeds := [37] }, { below0 with seeds := [37] }),
+    ("below-other-seed", { below0 with seeds := [37] }, { below0 with seeds := [38] }),
+    ("below-seeds-order", { below0 with seeds := [37, 38] }, { below0 with seeds := [38, 37] }),
+    ("below-volume", { below0 with binds := twoBinds }, withVolume),
+    ("below-volume-and-seed", withVolume, { withVolume with seeds := [37] }) ]
 
 def belowLine (w : Below) : String :=
-  "\t".intercalate [hex (fmt.str w.format), hex (fmt.str w.scope), hex (fmt.str w.repository),
+  "\t".intercalate ([hex (fmt.str w.format), hex (fmt.str w.scope), hex (fmt.str w.repository),
     hex (fmt.str w.fingerprint), hex (fmt.str w.userns), toString w.idBase,
-    bindsField w.binds, hex (belowPreimage fmt w)]
+    bindsField w.binds w.volumes] ++
+    (if w.seeds.isEmpty then [] else ["seeds=" ++ list (fun s => hex (fmt.str s)) w.seeds]) ++
+    [hex (belowPreimage fmt w)])
 
 /-! Layer vectors: small trees as P2's walk sees them, owned by ids outside the job's range (so
 65534 in the preimage, whoever runs the test), children in byte order of names. -/

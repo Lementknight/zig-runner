@@ -56,6 +56,8 @@ pub const BelowInput = struct {
     userns: []const u8,
     id_base: u64,
     binds: []const Bind,
+    /// P4's Zig cache seeds' layers; which binds are cache volumes is `Bind.volume`.
+    seeds: []const []const u8 = &.{},
 };
 
 pub const KeyFn = fn (Allocator, KeyInput) anyerror![32]u8;
@@ -104,6 +106,7 @@ pub fn belowPreimage(gpa: Allocator, in: BelowInput) ![]u8 {
         .userns = in.userns,
         .id_base = in.id_base,
         .binds = in.binds,
+        .seeds = in.seeds,
     }, &w.writer);
     const bytes = try w.toOwnedSlice();
     var check: [32]u8 = undefined;
@@ -151,6 +154,11 @@ fn num(text: []const u8) !u64 {
 
 /// A `-` or a `,`-joined list of `=`-joined parts.
 fn items(arena: Allocator, text: []const u8, parts: usize) ![]const []const []const u8 {
+    return itemsOf(arena, text, parts, parts);
+}
+
+/// `items` whose items have between `min` and `max` parts.
+fn itemsOf(arena: Allocator, text: []const u8, min: usize, max: usize) ![]const []const []const u8 {
     var out: std.ArrayList([]const []const u8) = .empty;
     if (std.mem.eql(u8, text, "-")) return out.items;
     var it = std.mem.splitScalar(u8, text, ',');
@@ -158,7 +166,7 @@ fn items(arena: Allocator, text: []const u8, parts: usize) ![]const []const []co
         var ps: std.ArrayList([]const u8) = .empty;
         var p = std.mem.splitScalar(u8, item, '=');
         while (p.next()) |part| try ps.append(arena, part);
-        try std.testing.expectEqual(parts, ps.items.len);
+        try std.testing.expect(ps.items.len >= min and ps.items.len <= max);
         try out.append(arena, ps.items);
     }
     return out.items;
@@ -204,15 +212,24 @@ fn belowSide(arena: Allocator, it: *Fields) !Side {
     const userns = try unhex(arena, it.next().?);
     const id_base = try num(it.next().?);
     var binds: std.ArrayList(Bind) = .empty;
-    for (try items(arena, it.next().?, 4)) |p| try binds.append(arena, .{
+    // With P4's volumes, a fifth part: whether the bind is a cache volume.
+    for (try itemsOf(arena, it.next().?, 4, 5)) |p| try binds.append(arena, .{
         .host = try unhex(arena, p[0]),
         .at = try unhex(arena, p[1]),
         .read_only = std.mem.eql(u8, p[2], "1"),
         .optional = std.mem.eql(u8, p[3], "1"),
+        .volume = p.len == 5 and std.mem.eql(u8, p[4], "1"),
     });
+    // P4's seeds, only when the job has them.
+    var seeds: std.ArrayList([]const u8) = .empty;
+    var last = it.next().?;
+    if (std.mem.startsWith(u8, last, "seeds=")) {
+        for (try items(arena, last["seeds=".len..], 1)) |p| try seeds.append(arena, try unhex(arena, p[0]));
+        last = it.next().?;
+    }
     return .{ .below = .{
-        .in = .{ .format = format, .scope = scope, .repository = repository, .fingerprint = fingerprint, .userns = userns, .id_base = id_base, .binds = binds.items },
-        .preimage = try unhex(arena, it.next().?),
+        .in = .{ .format = format, .scope = scope, .repository = repository, .fingerprint = fingerprint, .userns = userns, .id_base = id_base, .binds = binds.items, .seeds = seeds.items },
+        .preimage = try unhex(arena, last),
     } };
 }
 

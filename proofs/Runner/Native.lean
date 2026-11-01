@@ -13,7 +13,8 @@ engine discharged becomes the runner's obligation, and each one is stated and pr
   (`Store.KeyHasher`, `Backend.keyFor`): a tag, the parent's key, the script text, the stable
   environment, then the uid, gid, working directory and kept files, each length-prefixed. A base has
   the digest below it (`Backend.below`: store format, trust scope, repository, rootfs, id mapping,
-  slot, binds) in its parent's place. `fork_keys_apart`: a fork's pull request and the repository's
+  slot, binds, and the Zig cache seeds and which binds are cache volumes when there are any) in its
+  parent's place. `fork_keys_apart`: a fork's pull request and the repository's
   own jobs never share a key. The
   extras are no new input: a base's are part of what the model's base is (`BaseSpec`), and a step's
   are its base's (`Format.stepExtra`), so determined by its key's parent. `encKey_injective` says no
@@ -93,7 +94,9 @@ structure Bind where
 (`set_up.packageCacheScope`: `repo`, or `untrusted` for a fork's pull request or a job the runner
 does not vouch for), the repository, the rootfs's fingerprint (`Store.rootfsFingerprint`), how ids
 are mapped (the userns mode's name), the slot's first id on a root runner (0 otherwise), and the
-binds. -/
+binds; then, from P4, the Zig cache seeds' layers between the rootfs and the job's (by path) and,
+per bind, whether it is a cache volume (`Bind.volume`), empty when none is. A job with neither has
+the bytes it had before P4 (`belowTail`). -/
 structure Below where
   format : Nat
   scope : Nat
@@ -102,6 +105,8 @@ structure Below where
   userns : Nat
   idBase : Nat
   binds : List Bind
+  seeds : List Nat := []
+  volumes : List Bool := []
   deriving DecidableEq, Repr
 
 /-- A job's base as the store keys it (`Backend.base`): what lies below it, the script that makes the
@@ -182,13 +187,21 @@ def encExtra (x : Extra) : Bytes :=
 def encBind (b : Bind) : Bytes :=
   lp f (f.str b.host) ++ (lp f (f.str b.place) ++ (encBool f b.readOnly ++ encBool f b.optional))
 
+/-- What follows the binds below a base: nothing for a job with no seed and no volume, else the
+seeds, counted, and the volume flags, counted. -/
+def belowTail (seeds : List Nat) (volumes : List Bool) : Bytes :=
+  if seeds = [] ∧ volumes = [] then [] else
+    f.word seeds.length ++ (encList (fun s => lp f (f.str s)) seeds ++
+      (f.word volumes.length ++ encList (encBool f) volumes))
+
 /-- **The digest below a base** (`Backend.below`), untagged (`KeyHasher.plain`): the label, the
 store's format, the scope, the repository, the rootfs's fingerprint, the userns mode, the slot's
-first id, and the binds, counted. -/
+first id, the binds, counted, and the tail (`belowTail`). -/
 def belowPreimage (w : Below) : Bytes :=
   lp f f.label ++ (lp f (f.str w.format) ++ (lp f (f.str w.scope) ++ (lp f (f.str w.repository) ++
     (lp f (f.str w.fingerprint) ++ (lp f (f.str w.userns) ++
-    (f.word w.idBase ++ (f.word w.binds.length ++ encList (encBind f) w.binds)))))))
+    (f.word w.idBase ++ (f.word w.binds.length ++ (encList (encBind f) w.binds ++
+      belowTail f w.seeds w.volumes))))))))
 
 /-- **What the store hashes for a key** (`KeyHasher.init(tag)`, `core`, then `keyFor`'s tail): the
 tag, the parent's key, the script's text, the stable environment, then the `Extra`. -/
@@ -314,12 +327,42 @@ theorem encExtra_inj (h : f.Sound) {x x' : Extra} (e : encExtra f x = encExtra f
   obtain ⟨hfs, _⟩ := list_split (kept_split h) hl (r := []) (s := []) (by simpa using e)
   rw [hu, hg, h.str_inj hw, hfs]
 
+theorem seed_split (h : f.Sound) {a a' : Nat} {r s : Bytes}
+    (e : lp f (f.str a) ++ r = lp f (f.str a') ++ s) : a = a' ∧ r = s := by
+  obtain ⟨ha, hr⟩ := lp_split h e
+  exact ⟨h.str_inj ha, hr⟩
+
+theorem Format.Sound.word_ne_nil (h : f.Sound) (n : Nat) : f.word n ≠ [] := by
+  intro e
+  have nil : ∀ k, f.word k = [] := fun k => by
+    rw [← List.length_eq_zero_iff, h.word_width, ← h.word_width n, e, List.length_nil]
+  exact absurd (h.word_inj ((nil 0).trans (nil 1).symm)) (by decide)
+
+/-- The tail is unambiguous: none for a job with neither seeds nor volumes, and else counted. -/
+theorem belowTail_inj (h : f.Sound) {sd sd' : List Nat} {v v' : List Bool}
+    (e : belowTail f sd v = belowTail f sd' v') : sd = sd' ∧ v = v' := by
+  unfold belowTail at e
+  by_cases c : sd = [] ∧ v = []
+  · by_cases c' : sd' = [] ∧ v' = []
+    · exact ⟨c.1.trans c'.1.symm, c.2.trans c'.2.symm⟩
+    · rw [ite_eq_left c, ite_eq_right c'] at e
+      exact absurd e.symm (by simp [h.word_ne_nil])
+  · by_cases c' : sd' = [] ∧ v' = []
+    · rw [ite_eq_right c, ite_eq_left c'] at e
+      exact absurd e (by simp [h.word_ne_nil])
+    rw [ite_eq_right c, ite_eq_right c'] at e
+    obtain ⟨hl, e⟩ := h.word_split e
+    obtain ⟨hsd, e⟩ := list_split (seed_split h) hl e
+    obtain ⟨hvl, e⟩ := h.word_split e
+    obtain ⟨hv, _⟩ := list_split (bool_split h) hvl (r := []) (s := []) (by simpa using e)
+    exact ⟨hsd, hv⟩
+
 /-- **The digest below a base is unambiguous**: equal preimages, the same store format, scope,
-repository, rootfs, mapping, slot and binds. -/
+repository, rootfs, mapping, slot, binds, seeds and volume flags. -/
 theorem belowPreimage_inj (h : f.Sound) {w w' : Below} (e : belowPreimage f w = belowPreimage f w') :
     w = w' := by
-  obtain ⟨fm, sc, rp, fp, u, i, bs⟩ := w
-  obtain ⟨fm', sc', rp', fp', u', i', bs'⟩ := w'
+  obtain ⟨fm, sc, rp, fp, u, i, bs, sd, v⟩ := w
+  obtain ⟨fm', sc', rp', fp', u', i', bs', sd', v'⟩ := w'
   simp only [belowPreimage] at e
   obtain ⟨_, e⟩ := lp_split h e
   obtain ⟨hfm, e⟩ := lp_split h e
@@ -329,8 +372,9 @@ theorem belowPreimage_inj (h : f.Sound) {w w' : Below} (e : belowPreimage f w = 
   obtain ⟨hu, e⟩ := lp_split h e
   obtain ⟨hi, e⟩ := h.word_split e
   obtain ⟨hl, e⟩ := h.word_split e
-  obtain ⟨hbs, _⟩ := list_split (bind_split h) hl (r := []) (s := []) (by simpa using e)
-  rw [h.str_inj hfm, h.str_inj hsc, h.str_inj hrp, h.str_inj hfp, h.str_inj hu, hi, hbs]
+  obtain ⟨hbs, e⟩ := list_split (bind_split h) hl e
+  obtain ⟨hsd, hv⟩ := belowTail_inj h e
+  rw [h.str_inj hfm, h.str_inj hsc, h.str_inj hrp, h.str_inj hfp, h.str_inj hu, hi, hbs, hsd, hv]
 
 theorem tag_ne (h : f.Sound) {n m : Nat} {r s : Bytes} (ne : n ≠ m) : f.word n ++ r ≠ f.word m ++ s :=
   fun e => ne (h.word_split e).1
@@ -463,7 +507,7 @@ def f : Format where
     | .body b _ => [b]
     | .stamped t _ => [t]
   label := []
-  base _ := ⟨⟨0, 0, 0, 0, 0, 0, []⟩, 0, [], ⟨0, 0, 0, []⟩⟩
+  base _ := ⟨⟨0, 0, 0, 0, 0, 0, [], [], []⟩, 0, [], ⟨0, 0, 0, []⟩⟩
   stepExtra _ := ⟨0, 0, 0, []⟩
 
 theorem apart :
