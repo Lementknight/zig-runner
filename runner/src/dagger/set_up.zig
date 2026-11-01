@@ -330,7 +330,12 @@ pub fn baseContainerId(
     const lists = plan.tool_trees orelse return .{ .id = id, .runtime_path = runtime_path };
     const checked = try verifyToolTrees(arena, transport, id, lists, plan.ran_marker, err_msg);
     if (plan.zig_discover) |r| r.discover(tool_cache_dir, checked.env);
-    return .{ .id = checked.id, .runtime_path = runtime_path, .tool_trees_note = checked.note };
+    return .{
+        .id = checked.id,
+        .runtime_path = runtime_path,
+        .tool_trees_note = checked.note,
+        .tool_trees = checked.env,
+    };
 }
 
 /// The base container, a `container:` job's own PATH (`Exec.container_path`), and what "Set up
@@ -339,6 +344,8 @@ pub const Base = struct {
     id: []const u8,
     runtime_path: ?[]const u8,
     tool_trees_note: ?[]const u8 = null,
+    /// `tool_trees_env`'s value, when the trees were checked (`Exec.tool_trees`).
+    tool_trees: ?[]const u8 = null,
 };
 
 // The tool cache's trees, checked in "Set up job". A script that pins a tree's digest, as
@@ -357,9 +364,10 @@ pub const Base = struct {
 const tool_trees_dir = "/zig-runner-tool-trees";
 /// What steps are given: one `DIGEST TREE` line per tree checked, TREE an absolute path.
 const tool_trees_env = "ZIG_RUNNER_TOOL_TREES";
-const tool_cache_dir = for (package_cache_dirs) |d| {
-    if (std.mem.eql(u8, d.name, "toolcache")) break d.path;
+const tool_cache_index = for (package_cache_dirs, 0..) |d, i| {
+    if (std.mem.eql(u8, d.name, "toolcache")) break i;
 } else unreachable;
+const tool_cache_dir = package_cache_dirs[tool_cache_index].path;
 /// The check runs with the image's bash and none of the job's environment (a workflow's
 /// `BASH_ENV` or `PATH` must not run in it).
 const tool_trees_argv = [_][]const u8{
@@ -1103,6 +1111,9 @@ pub fn execFor(
         .nesting = opts.nesting and vouched,
         .nesting_withheld = opts.nesting and !vouched,
         .step_cache = step_cache,
+        // Mounted at the same path for every step user (`runnerCachePath`).
+        .tool_cache = if (plan.cache_ids.len > tool_cache_index and
+            plan.cache_used[tool_cache_index]) tool_cache_dir else null,
         .enforce_volatile = step_cache and opts.enforce_volatile,
         .output_keys = try outputKeysKey(arena, ev, job.*, opts, step_cache),
         .outputs_volume = plan.outputs_volume,
@@ -2538,4 +2549,98 @@ test "toolTreesVerdict keeps only well-formed lines for trees in the tool cache"
     const none = try toolTreesVerdict(arena, "");
     try std.testing.expectEqualStrings("", none.env);
     try std.testing.expectEqualStrings("Tool cache: no trees to check", none.note);
+}
+
+/// A job of one step under step caching whose first answer is an earlier job's, with `path` its
+/// $GITHUB_PATH and `env_line` its $GITHUB_ENV, and the tool cache's trees checked when `check`
+/// is given (#229).
+fn replayedToolPathRun(arena: Allocator, opts: Options, check: ?[]const u8, path: []const u8, env_line: []const u8) !SeedRun {
+    var env: std.process.Environ.Map = .init(arena);
+    // Naming it mounts the tool cache (`cachesUsed`).
+    const steps = [_]job_mod.Step{testStep("./install-protoc.sh \"$RUNNER_TOOL_CACHE\"")};
+    var vols: std.Io.Writer.Allocating = .init(arena);
+    try vols.writer.writeAll(if (check != null) "{\"data\":{\"ctt\":{\"id\":\"VT\"}," else "{\"data\":{");
+    for (package_cache_dirs, 0..) |_, i| try vols.writer.print("{s}\"c{d}\":{{\"id\":\"V{d}\"}}", .{ if (i == 0) "" else ",", i, i });
+    try vols.writer.writeAll("}}");
+    const replayed = try std.fmt.allocPrint(arena, "{{\"data\":{{\"loadContainerFromID\":{{\"withExec\":{{" ++
+        "\"id\":\"C1\",\"exitCode\":0,\"stdout\":\"\",\"stderr\":\"\",\"fc_ran\":{{\"contents\":\"earlier-job\"}}," ++
+        "\"fc_path\":{{\"contents\":\"{s}\\n\"}},\"fc_env\":{{\"contents\":\"{s}\\n\"}}}}}}}}}}", .{ path, env_line });
+    const ran = "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"id\":\"C2\",\"exitCode\":0," ++
+        "\"stdout\":\"\",\"stderr\":\"\",\"fc_ran\":{\"contents\":\"j1\"}}}}}";
+    const set = "{\"data\":{\"loadContainerFromID\":{\"withEnvVariable\":{\"id\":\"C0T\"}}}}";
+    const answers = if (check) |c|
+        try arena.dupe([]const u8, &.{ vols.written(), base_answer, c, set, replayed, ran })
+    else if (opts.package_caches)
+        try arena.dupe([]const u8, &.{ vols.written(), base_answer, replayed, ran })
+    else
+        try arena.dupe([]const u8, &.{ base_answer, replayed, ran });
+    const fake = try arena.create(FakeSession);
+    fake.* = .{ .answers = answers, .arena = arena };
+    const w = try arena.create(std.Io.Writer);
+    w.* = .fixed(try arena.alloc(u8, 8192));
+    var log: sink.LogSink = .{ .stdout = .{ .writer = w } };
+    var o = opts;
+    o.step_cache = true;
+    o.tool_trees = check != null;
+    o.test_session_argv = &.{ "sh", "-c", fake_child };
+    o.test_transport = fake.transport();
+    o.test_ran_marker = "j1";
+    const res = try run(arena, std.testing.io, &env, o, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    return .{ .seen = fake.seen.items, .log = w.buffered() };
+}
+
+test "step caching: a replayed step that put a tool cache directory no checked tree holds on PATH runs again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const protoc = tool_cache_dir ++ "/protoc/27.0/x64";
+    const check_of = struct {
+        fn f(comptime trees: []const u8) []const u8 {
+            return "{\"data\":{\"loadContainerFromID\":{\"withMountedCache\":{\"withUser\":" ++
+                "{\"withEnvVariable\":{\"withExec\":{\"stdout\":\"" ++ trees ++ "\"}}}}}}}";
+        }
+    }.f;
+    const reason = "zig-runner runs this step every time: its record names " ++ protoc ++
+        "/bin in the tool cache, where \\\"Set up job\\\" found no tree holding it";
+    const opts: Options = .{ .package_caches = true, .trusted = true, .nesting = false };
+
+    // The volume was pruned since the recorded run: "Set up job" found no protoc tree, as the
+    // cold run that recorded the install found none, so the key matched. It runs again.
+    const zig_only = check_of(zig_digest ++ " " ++ zig_tree ++ " 19500 0\\n");
+    const gone = try replayedToolPathRun(arena, opts, zig_only, protoc ++ "/bin", "MODE=ci");
+    try std.testing.expectEqual(6, gone.seen.len);
+    try std.testing.expect(std.mem.indexOf(u8, gone.seen[4], "runs this step every time") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gone.seen[5], reason) != null);
+    // The earlier run's PATH entry is never applied: the step that ran here sets its own.
+    try std.testing.expect(std.mem.indexOf(u8, gone.seen[5], protoc ++ "/bin:") == null);
+
+    // A $GITHUB_ENV value naming it, alone or in a list, does the same.
+    const in_env = try replayedToolPathRun(arena, opts, zig_only, "/usr/local/bin", "PROTOC_HOME=/x:" ++ protoc ++ "/bin");
+    try std.testing.expectEqual(6, in_env.seen.len);
+    try std.testing.expect(std.mem.indexOf(u8, in_env.seen[5], reason) != null);
+
+    // The tree is there: the replay stands.
+    const protoc_tree = check_of(zig_digest ++ " " ++ protoc ++ " 12 0\\n");
+    const held = try replayedToolPathRun(arena, opts, protoc_tree, protoc ++ "/bin", "PROTOC_HOME=" ++ protoc);
+    try std.testing.expectEqual(5, held.seen.len);
+
+    // A path that climbs out of a checked tree is not held by it, nor is a sibling's prefix.
+    const climbs = try replayedToolPathRun(arena, opts, protoc_tree, protoc ++ "/../../gone/1/x64/bin", "MODE=ci");
+    try std.testing.expectEqual(6, climbs.seen.len);
+    const sibling = try replayedToolPathRun(arena, opts, protoc_tree, protoc ++ "-old/bin", "MODE=ci");
+    try std.testing.expectEqual(6, sibling.seen.len);
+
+    // Trees not checked: nothing says it is there, so it runs again.
+    const unchecked = try replayedToolPathRun(arena, opts, null, protoc ++ "/bin", "MODE=ci");
+    try std.testing.expectEqual(4, unchecked.seen.len);
+    try std.testing.expect(std.mem.indexOf(u8, unchecked.seen[3], reason) != null);
+
+    // Without package caches the tool cache is no volume: it went with the recorded container.
+    const layer = try replayedToolPathRun(arena, .{}, null, protoc ++ "/bin", "MODE=ci");
+    try std.testing.expectEqual(2, layer.seen.len);
+
+    // Outside the tool cache, or the tool cache itself (the mount): the replay stands.
+    const own = try replayedToolPathRun(arena, opts, check_of(""), "/usr/local/protoc/bin", "TOOLS=" ++ tool_cache_dir);
+    try std.testing.expectEqual(5, own.seen.len);
 }
