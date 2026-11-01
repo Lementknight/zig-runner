@@ -338,7 +338,8 @@ per-job helper makes the namespaces and the static mounts once.
   "Image: from the native store", and "Provisioned natively in N ms (layer <key>)" or "...made
   before".
 - Falls back to Dagger: a job container's `ports:`, `volumes:` and `options:` (phase 6 brings the
-  network that ports and volumes need).
+  network that ports and volumes need), and on a rootless runner without `RUNNER_NATIVE_ROOTFS`
+  the provisioned default image (below).
 
 The store, under `RUNNER_NATIVE_STORE`, each directory only the runner's (mode 0700: a rootfs
 holds the image's set-uid files with the image's owners, the host's root's on a root runner):
@@ -373,9 +374,10 @@ What it does not do yet (debt, with the phase that pays it):
 - **zstd frame checksums are not checked** (std's streaming zstd cannot yet); the blob's digest is
   checked before and the diff id after, which covers it.
 - **Rootless** (tests, the laptop): only root is mapped, so every file is the runner's,
-  directories keep their owner's write bit, apt downloads as root (`APT::Sandbox::User "root"`,
-  written into the rootless provisioning layer), and an image whose `USER` is not root cannot
-  run. Phase 5's subordinate ids pay this.
+  directories keep their owner's write bit, an image whose `USER` is not root cannot run, and the
+  default image cannot be provisioned (dpkg gives files to other ids, `root:adm`, which fails with
+  `EINVAL`): such a job goes to Dagger unless `RUNNER_NATIVE_ROOTFS` is set. Phase 5's
+  subordinate ids pay this.
 - **The image's `WorkingDir` and `Entrypoint`** are not used: steps start in the workspace, as on
   Dagger. Docker actions (phase 7) need the entrypoint.
 
@@ -717,8 +719,11 @@ Surprises:
   those bytes written needed to go through the hasher too"). The digests cover it.
 - **Zig 0.17 removed `**` array repetition**; `@splat` in a container's constant does the same at
   compile time.
-- **Rootless apt.** With only root mapped, apt cannot drop to `_apt` to download and its methods
-  exit 112; it is told to download as root.
+- **Rootless provisioning cannot work with one id.** apt cannot drop to `_apt` to download (its
+  methods exit 112), and once told to download as root, dpkg's `chown root:adm` fails. A rootless
+  runner without the operator's rootfs sends default-image jobs to Dagger, rather than failing
+  them where P1 sent them to Dagger. And apt's own last line ("dpkg returned an error code") says
+  nothing: a failed provisioning now reports its last eight lines.
 - The pull is not where the time goes: cold, about 0.5 s of auth and manifests and 1.6-2 s of
   fetch and unpack for ubuntu, against Dagger's 4.5 s. Provisioning (apt) is the minute, and it
   now runs once per store, as Dagger's cached exec did once per engine.

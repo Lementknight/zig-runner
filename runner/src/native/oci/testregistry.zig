@@ -355,7 +355,7 @@ test "native oci pull of the default image from Docker Hub (ZIG_RUNNER_TEST_PULL
     const osr = try root.readFileAlloc(io, "usr/lib/os-release", arena, .limited(4096));
     try testing.expect(std.mem.indexOf(u8, osr, "Ubuntu") != null);
     const t1 = std.Io.Clock.awake.now(io).toMilliseconds();
-    const warm = try image.pull(arena, testing.allocator, io, &client, store, .{ .image = dagger.default_image, .owners = false }, &why);
+    const warm = try image.pull(arena, testing.allocator, io, &client, store, .{ .image = dagger.default_image, .owners = std.os.linux.geteuid() == 0 }, &why);
     std.debug.print("warm (pinned, in the store): {d} ms\n", .{std.Io.Clock.awake.now(io).toMilliseconds() - t1});
     try testing.expect(warm.pulled == null);
 }

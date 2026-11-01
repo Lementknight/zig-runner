@@ -177,6 +177,14 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
     if (job.services.len > 0) return "`services:` are not native yet (phase 6)";
     if (opts.nesting) return "steps that use the Dagger engine (RUNNER_DAGGER_NESTING) need Dagger";
     if (usesHashFiles(job)) return "`hashFiles()` reads the job's container through Dagger";
+    // dpkg gives files to other users and groups (`root:adm`), which one mapped id cannot hold.
+    if (std.os.linux.geteuid() != 0 and cfg.rootfs.len == 0 and opts.provision and
+        std.mem.eql(u8, dagger.resolveImage(if (job.container) |jc| switch (jc.image) {
+            .lit => |l| l,
+            .expr => "",
+        } else opts.image), dagger.default_image))
+        return "provisioning the default image needs a range of ids, which a rootless runner " ++
+            "does not have (RUNNER_NATIVE_ROOTFS, or a root runner)";
     const as_runner = opts.step_user == .runner;
     if (as_runner and std.os.linux.geteuid() != 0) return "steps run as the runner user need a " ++
         "range of ids, which a rootless runner does not have (RUNNER_STEP_USER=root, or a root " ++
@@ -1056,14 +1064,11 @@ fn prepareRootfs(b: *Backend, ev: *Evaluator, plan: anytype, err_msg: *[]const u
         },
     ) else "Image: from the native store");
     b.rootfs = img.rootfs;
-    if (plan.provision) {
-        const script = if (plan.as_runner) set_up.provision_runner_script else set_up.provision_script;
-        const full = if (b.how.userns == .mapped)
-            script
-        else
-            try std.mem.concat(arena, u8, &.{ rootless_apt, script });
-        b.rootfs = try b.provision(img, full, err_msg);
-    }
+    if (plan.provision) b.rootfs = try b.provision(
+        img,
+        if (plan.as_runner) set_up.provision_runner_script else set_up.provision_script,
+        err_msg,
+    );
     if (!plan.as_runner and img.user.len > 0) {
         const ids = b.imageUser(img.user) catch |e| {
             err_msg.* = try std.fmt.allocPrint(arena, "the image's USER {s}: {s}", .{
@@ -1081,10 +1086,6 @@ fn prepareRootfs(b: *Backend, ev: *Evaluator, plan: anytype, err_msg: *[]const u
         b.image_gid = ids[1];
     }
 }
-
-/// Rootless, only root is mapped, so apt cannot drop to its `_apt` user to download (its methods
-/// fail with code 112): it downloads as root instead, there and in the job's steps after.
-const rootless_apt = "echo 'APT::Sandbox::User \"root\";' > /etc/apt/apt.conf.d/00zig-runner-rootless && ";
 
 /// `image` pulled into the store, or found there (`oci/image.zig`), within `pull_deadline`.
 fn pull(b: *Backend, image: []const u8, creds: ?registry.Credentials, why: *[]const u8) !oci.Image {
@@ -1616,7 +1617,10 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     // be there.
     var no_rootfs = ok;
     no_rootfs.rootfs = "";
-    try std.testing.expect(unsupported(io, run_only, root, no_rootfs) == null);
+    if (std.os.linux.geteuid() == 0)
+        try std.testing.expect(unsupported(io, run_only, root, no_rootfs) == null)
+    else
+        try expectReason("range of ids", unsupported(io, run_only, root, no_rootfs));
     no_rootfs.rootfs = "/nonexistent/rootfs";
     try expectReason("cannot be read", unsupported(io, run_only, root, no_rootfs));
 
@@ -2586,6 +2590,8 @@ test "the default image pulled and provisioned natively, then a job in it (ZIG_R
     const arena = a.allocator();
     const environ = try std.testing.environ.createMap(arena);
     if (!std.mem.eql(u8, environ.get("ZIG_RUNNER_TEST_PULL") orelse "", "1")) return error.SkipZigTest;
+    // Rootless, dpkg's chowns to other ids fail, and such a job goes to Dagger (`unsupported`).
+    if (std.os.linux.geteuid() != 0) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var cfg = try testConfig(arena, &tmp);
