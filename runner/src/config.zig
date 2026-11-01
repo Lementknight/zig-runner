@@ -136,6 +136,9 @@ pub const Config = struct {
     native_subid_base: u32 = NativeBackend.default_subid_base,
     /// The native jobs' network on a root runner (`RUNNER_NATIVE_SUBNET`, `net.Subnet.parse`).
     native_subnet: []const u8 = native_net.Subnet.default_text,
+    /// Where native services' images are until the native image pull (`RUNNER_NATIVE_IMAGES`,
+    /// `native/images.zig`): "" for none, which sends jobs with `services:` to Dagger.
+    native_images: []const u8 = "",
     /// Experimental: key the steps after one that always runs on what it produced rather than on
     /// the step itself (see `dagger.Options.output_keys`).
     output_keys: bool = false,
@@ -245,6 +248,7 @@ pub const Config = struct {
         InvalidStepUser,
         InvalidBackend,
         InvalidNativeRootfs,
+        InvalidNativeImages,
         InvalidNativeSubnet,
         InvalidNativeSubidBase,
         InvalidEngine,
@@ -264,6 +268,8 @@ pub const Config = struct {
                 "(README, \"Environments\").",
             error.InvalidNativeRootfs => "RUNNER_NATIVE_ROOTFS is a directory's absolute path: " ++
                 "overlay takes it as a layer from the job's directory.",
+            error.InvalidNativeImages => "RUNNER_NATIVE_IMAGES is a directory's absolute path " ++
+                "(docs/native-backend.md, P6).",
             error.InvalidNativeSubnet => "RUNNER_NATIVE_SUBNET is an IPv4 network a.b.c.d/p " ++
                 "with no host bits set and a prefix of 8 to 23 bits (room for every job's " ++
                 "address), by default " ++ native_net.Subnet.default_text ++ ".",
@@ -317,6 +323,8 @@ pub const Config = struct {
         }
         if (c.native_rootfs.len > 0 and !std.fs.path.isAbsolutePosix(c.native_rootfs))
             return error.InvalidNativeRootfs;
+        if (c.native_images.len > 0 and !std.fs.path.isAbsolutePosix(c.native_images))
+            return error.InvalidNativeImages;
         _ = try native_net.Subnet.parse(c.native_subnet);
         if (c.native_subid_base < NativeBackend.min_subid_base) return error.InvalidNativeSubidBase;
 
@@ -396,6 +404,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_ROOTLESS")) |v| c.native_rootless = try boolean(v);
         if (environ.get("RUNNER_NATIVE_SUBID_BASE")) |v| c.native_subid_base = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_SUBNET")) |v| c.native_subnet = v;
+        if (environ.get("RUNNER_NATIVE_IMAGES")) |v| c.native_images = v;
         if (environ.get("RUNNER_OUTPUT_KEYS")) |v| c.output_keys = try boolean(v);
         if (environ.get("RUNNER_ENFORCE_VOLATILE")) |v| c.enforce_volatile = try boolean(v);
         if (environ.get("RUNNER_LOG_SPOOL_DIR")) |v| c.log_spool_dir = v;
@@ -468,6 +477,7 @@ pub const Config = struct {
         else if (eq(key, "native-rootless")) c.native_rootless = try boolean(val) //
         else if (eq(key, "native-subid-base")) c.native_subid_base = try num(u32, val) //
         else if (eq(key, "native-subnet")) c.native_subnet = val //
+        else if (eq(key, "native-images")) c.native_images = val //
         else if (eq(key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache")) c.zig_local_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache-max-mb")) c.zig_local_cache_max_mb = try num(u32, val) //
