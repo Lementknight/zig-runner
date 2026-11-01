@@ -630,7 +630,10 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   fix: a size written beside each volume when its job releases it (`<volume>.size`), a cap of its
   own (`RUNNER_NATIVE_VOLUMES_MAX_MB`; the layers' 10 GiB would be gone in one Zig job), and
   eviction least recently used first under the volume's lock taken exclusively and non-blocking, as
-  `evict` does for a layer. The tool cache's checked trees (`set_up.verifyToolTrees`) and the seed
+  `evict` does for a layer. A step whose processes still hold all of `pids.max` when its script
+  ends fails with exit 2 and loses its file commands: the wrapper's `sh`, the step's PID 1, cannot
+  fork its epilogue (its log says the job reached its process limit). Fixing that needs a PID 1
+  that reaps and kills a step's leftovers before the epilogue. The tool cache's checked trees (`set_up.verifyToolTrees`) and the seed
   registry's discovery from them are off natively: steps check the trees they use themselves, as on
   Dagger without the check. A Dagger job that overlapped only native jobs is still learned as "beside
   others", an upper bound (small; the gate's overlap marks are set before a job is known to be

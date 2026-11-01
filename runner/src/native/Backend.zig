@@ -4128,8 +4128,18 @@ test "root runner: a native job's runaway is OOM-killed in its own cgroup, a for
     // the same time, holds 200 MB under the default limit and must not notice.
     const hog = testStep("python3 -c 'x = []\nwhile True: x.append(b\"x\" * (8 << 20))' || " ++
         "echo exit=$?");
-    // `sleep` may itself be refused a process while the bomb holds them all (bash's `-e`).
-    var bomb = testStep("bomb() { bomb | bomb & }; bomb; sleep 2 || true; echo after-the-bomb");
+    // The bomb in a process group of its own (`set -m`), for 2 s of builtins only (nothing else
+    // can fork while it holds every process), then killed, and waited out until no process of
+    // the group is left, so the step's own end (`scripts.stepScriptFc`'s epilogue, whose `sh`
+    // must fork) finds its processes free again. Left running, the bomb still held them there:
+    // the wrapper's `sh` could not fork, and the step failed with exit 2 (#265's CI, once).
+    var bomb = testStep("set -m\n" ++
+        "( set +m; bomb() { bomb | bomb & }; bomb; while :; do :; done ) &\n" ++
+        "pg=$!\nset +m\n" ++
+        "end=$((SECONDS + 2)); while [ $SECONDS -lt $end ]; do :; done\n" ++
+        "kill -9 -- -$pg\n" ++
+        "while kill -0 -- -$pg 2>/dev/null; do :; done\n" ++
+        "echo after-the-bomb");
     bomb.condition = "always()";
     var near = testStep("python3 -c 'import time; x = b\"x\" * (200 << 20); time.sleep(6); " ++
         "print(\"neighbour held\", len(x) >> 20)'");
@@ -4173,6 +4183,8 @@ test "root runner: a native job's runaway is OOM-killed in its own cgroup, a for
     // stopped at the limit and the job went on.
     try std.testing.expect(std.mem.indexOf(u8, texts[0], "exit=137") != null or
         r.steps[0].exit_code == 137);
+    // The bomb's step succeeded: once it ended the bomb, its end could fork again.
+    if (r.steps[1].outcome != .success) std.debug.print("bomb step: exit {d}\n", .{r.steps[1].exit_code});
     try std.testing.expectEqual(dagger.Outcome.success, r.steps[1].outcome);
     // The neighbour ran through, its 200 MB held, nothing of its own killed or refused.
     const n = results[1] orelse return error.TestUnexpectedResult;
