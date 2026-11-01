@@ -462,6 +462,54 @@ remains before native steps may run jobs the runner does not vouch for:
 - `Input.mounts` absent from the key holds by construction.
 - Exit: `proofs/README.md` and the Lean files name native functions where they named Dagger's.
 
+**Status: proved of P2's key format as P2 builds it (#268, with its review fixes in #272 at `28a9dd1`); the
+Zig check runs P2's own code: `Store.KeyHasher` and `Store.stableEnv` for keys, `Backend.belowKey`
+for the digest below a base, and `Store.treeDigestTo` on fixture trees for layer digests.**
+`proofs/Runner/Native.lean` is the native backend's refinement of the model, beside Dagger's rather
+than replacing it, since both backends ship (proofs/README.md, "On the native backend"):
+
+- **The key.** A key is sha256 of `keyPreimage`, as P2's `Store.KeyHasher` and `Backend.keyFor`
+  build it: a u64 tag (1 for a step's exec or a checkout's fetch, 0 for a base, 2 for an
+  output-keyed container), the parent's key, the script's text, the count and bindings of the stable
+  environment in the container's order (`Store.stableEnv`: the volatile names, `ZIG_RUNNER_EVENT`,
+  `ZIG_RUNNER_RAN`, `ZIG_RUNNER_MARK` and `ZIG_SECRET_*` dropped), then the uid, gid, working
+  directory and kept files, each field prefixed with its length as a u64 little-endian. A base has
+  no parent: in its place is the untagged digest below it (`Backend.below`: the store's format
+  `Store.store_format`, the trust scope, the repository, the rootfs's fingerprint, the userns mode,
+  the slot's first id, the binds). `fork_keys_apart`: a fork's pull request (scope `untrusted`) and
+  the repository's own jobs (`repo`) never ask the same key, so neither replays what the other
+  stored.
+  The extras are not new inputs: a step's are its job's, fixed with the base (`Format.stepExtra`), and a base's are part of what the
+  model's base is (`BaseSpec`). `encState_injective`, `belowPreimage_inj`, `encKey_injective` and
+  `native_key_iff`: the format keeps exactly what the model's key keeps, so P2 and P3 hold of it;
+  mounts and the event payload are no argument of it. `Ambiguous` is what plain concatenation would
+  cost.
+- **Replay.** The store records a success of an unmarked step and nothing else. Then every hit is
+  honest, succeeded and unmarked by construction, and `native_replay_eq_run` is P1 under
+  `Disciplined` alone: no `Numbered`, no `Ahead`, whatever other runners publish or evict between
+  steps, and whichever reads fail. `native_eq_dagger`: the two backends give the same answers.
+- **Concurrency.** Whole-entry operations in any order keep the store honest (`ops_keep_honest`);
+  which of two racing writers wins does not matter (`race_irrelevant`), so the flock per key is
+  about cost; an entry is read whole or is a miss (`readWhole_agrees`, `Torn`).
+- **Layer digests.** A sorted walk of what a later step can see, nothing that differs between runs:
+  `digest_deterministic` and `digest_injective`, which are what output keys need. `walk_injective`
+  proves it of P2's walk as written (`Store.treeDigest`: paths, modes, owners, xattrs, a file's
+  sha256, a link's target, a device's numbers, `..` after a directory), given one change P8 made
+  to it: the xattrs are now counted, since without the count the last xattr and the content after
+  it could not be told apart.
+- **Logs.** A store that records the one pipe the step writes to replays the run without
+  `exec 2>&1` (`Logs.native_replay`). The scripts keep it: one script for both backends.
+- **The tie to the code.** `keyoracle` (`proofs/KeyOracle.lean`) writes
+  `runner/src/native/testdata/step_keys.tsv`, `.github/scripts/key-vectors.sh` checks in the proofs
+  workflow that it is the model's, and `runner/src/native/key_vectors.zig` checks the preimages
+  (29 key vectors: steps, bases, the digest below a base; 4 layer vectors: modes, an xattr and a
+  symlink, an opaque directory, a whiteout) and the equal/differ relation against it.
+
+**What is left**: if P2's format changes, change `Native.encState` (and `keyPreimage`,
+`belowPreimage`, `walkPreimage`) and `KeyOracle.lean` to match, keep `Format.Sound` proved, and
+regenerate the vectors (`key-vectors.sh --write`). A format that sorts the environment, or drops a
+length, a count or a tag, fails the vectors on purpose.
+
 ### P9: Pi validation, then the decision
 
 - Run the full pool on the Pi (aarch64) and the laptop on native for a soak period: real workloads,
@@ -741,3 +789,61 @@ Surprises:
   them, which also works rootless.
 
 Measured against Dagger: a replayed step 0.37 ms against ~95 ms, about 250 times faster.
+
+### P8: remapping the proofs
+
+Written against P2's specification while P2 was being built, so what it taught is about the
+specification:
+
+- **What BuildKit discharged is three obligations, not one.** "The key is computed from exactly
+  what the model says" splits into: the preimage is unambiguous (every field length-prefixed, a
+  count before the environment, a tag per kind of container), the environment keeps the order the
+  step sees, and the script text tells apart the scripts the model does. The last was always
+  assumed under Dagger too, and unstated; the first is new, and plain concatenation fails it with a
+  four-byte example (`Ambiguous`: script `x` with `Y=1`, and script `xY=1` with nothing).
+- **Not storing what cannot be replayed removes the model's bookkeeping.** `Build` needs `Numbered`
+  and `Ahead` because the engine records marked steps and failures, and the proof has to show
+  nothing ever finds them. A store that publishes only successes of unmarked steps never holds
+  them, so native P1 needs `Disciplined` and nothing else. It also keeps a marked step's log, which
+  may hold a secret, off the store's disk, which P0 asked for.
+- **The flock is for cost, not correctness.** Two honest entries for one unmarked key are equal
+  under `Disciplined`, so which racing writer wins does not matter. What correctness needs is that
+  the store changes by whole entries (one rename) and that a reader treats a missing or short part
+  as a miss: either one alone closes torn reads, and an eviction part-way is the same case as a
+  write part-way.
+- **Comparing the walk byte for byte found an ambiguity.** P2's layer walk wrote an entry's xattrs
+  with no count before them, so where the last xattr ends and the content begins was not in the
+  bytes: a symlink's target is a field just as an xattr's name is. The proof of `walk_injective`
+  could not go through without it, and two different layers could have shared a digest, which output
+  keys would have taken for early cutoff. The fix was one count. Nothing asked for a layer digest
+  yet, so no stored digest changed meaning; the rootfs's fingerprint, the same walk, changed once,
+  which costs one round of misses.
+- **What P2 hashes beyond the model added no input to it.** P2's key carries the uid, gid, working
+  directory and kept files, and the digest below a base (store format, rootfs, id mapping, slot,
+  binds). Each is
+  either part of what the model's base is or fixed with it for every step of the job, so the proof
+  needed a richer `Format`, not a richer model: the base became a `BaseSpec` and a step's extras its
+  base's (`stepExtra`). One consequence worth knowing: when the event payload is too large for a
+  variable, P2 writes it as a kept file of the base, so the base and every key above it are per run.
+  That costs only misses. The store's format, which P2 put below every base after review, is the
+  format version P8 asked for: it makes every key new when what a layer means changes, and the
+  rootfs's fingerprint is an opaque atom to the model however P2 computes it.
+- **The stable environment is a predicate, and the model never needed it to be `volatile_env`.**
+  P2 also drops the runner's own per-job variables and the secret aliases (`Store.stableEnv`); the
+  model's `vol` is any predicate, so nothing changed but the vectors.
+- **Some entries no one can ask for.** With output keys off for a marked step, every step after it
+  starts from a container whose key names the job, so its entry, though honest, can only ever be
+  found by that job. Publishing it is safe and useless; P2 may skip it.
+- **A miss is always safe, and the proof says why in one line**: every invariant is "every entry
+  that is there is honest", which removing entries or failing a read cannot break. LRU eviction and
+  a read cut short need no argument of their own.
+- **The layer digest must hash namespace ids, not host ids.** P1 gives each slot its own range of
+  host ids, so the same layer written in two slots has different owners on the host. Hashing those
+  would make the digest, which is part of a step's output, differ between runs: no early cutoff,
+  and `Disciplined` false in letter. The same holds of times and inodes, and of the order readdir
+  returns. Whiteouts must be in the walk, or a layer that deletes a file has the digest of one that
+  does not.
+- **`exec 2>&1` is now Dagger's need only.** The native helper already gives the step one pipe for
+  both streams (`dup2(1, 2)` before `execve` in `sandbox.zig`), so a store that records that pipe
+  replays the run without merging. The script keeps the line because both backends run the same
+  script, and its text is in the key.
