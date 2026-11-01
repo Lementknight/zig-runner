@@ -107,6 +107,16 @@ pub const Admission = struct {
         /// Another runner's job ran at some point during this one: its peak is the engine's for
         /// both, an upper bound on its own (`Learned`).
         overlapped: bool = false,
+        /// The job runs on the native backend (`Gate.native`): measured in its own cgroup, whose
+        /// path is in `cgroup_buf` while it is there, from nothing, so never beside another job;
+        /// and it takes nothing of the engine's cap.
+        native: bool = false,
+        cgroup_buf: [256]u8 = @splat(0),
+        cgroup_len: usize = 0,
+
+        fn cgroup(s: *const Slot) ?[]const u8 {
+            return if (s.cgroup_len > 0) s.cgroup_buf[0..s.cgroup_len] else null;
+        }
     };
 
     /// `slots` must have one entry for each runner in the pool, plus one for the pool's pre-warm
@@ -134,6 +144,7 @@ pub const Admission = struct {
         for (a.slots) |s| if (s.started_ms > now_ms - ramp_ms) {
             r.jobs += 1;
             r.mb += s.est_mb orelse unknown_mb;
+            if (s.native) r.native_mb += s.est_mb orelse unknown_mb;
         };
         return r;
     }
@@ -147,19 +158,29 @@ pub const Admission = struct {
         }
     }
 
-    /// A job's peak is the engine's, not its own: the engine is one cgroup for every job, so a
-    /// job that overlaps another is charged for both (`Slot.overlapped`).
+    /// A Dagger job's peak is the engine's, not its own: the engine is one cgroup for every job,
+    /// so a job that overlaps another is charged for both (`Slot.overlapped`). A native job's is
+    /// its own cgroup's (`Gate.native`). The engine is read once, and only for a job measured
+    /// there.
     fn samplePeaks(a: *Admission) void {
         a.mu.lockUncancelable(a.io);
         defer a.mu.unlock(a.io);
-        const dir = a.engine.dir orelse return;
-        for (a.slots) |s| {
-            if (s.base_mb != null) break;
-        } else return;
-        const e = readEngine(a.io, dir) orelse return;
-        for (a.slots) |*s| if (s.base_mb != null) {
-            s.peak_mb = @max(s.peak_mb, e.used_mb);
-        };
+        var engine: ?EngineMemory = null;
+        var engine_read = false;
+        for (a.slots) |*s| {
+            if (s.base_mb == null) continue;
+            if (s.native) {
+                if (s.cgroup()) |dir| if (workingSetMb(a.io, dir)) |mb| {
+                    s.peak_mb = @max(s.peak_mb, mb);
+                };
+                continue;
+            }
+            if (!engine_read) {
+                engine_read = true;
+                if (a.engine.dir) |dir| engine = readEngine(a.io, dir);
+            }
+            if (engine) |e| s.peak_mb = @max(s.peak_mb, e.used_mb);
+        }
     }
 
     /// How often the engine started again since the runner did (`Engine.returns`), or null while
@@ -228,7 +249,9 @@ pub const Gate = struct {
         // running are not measured further: the new engine's working set is not theirs.
         if (a.engine.dir != null and sample.engine == null) {
             a.engine.lost();
-            for (a.slots) |*s| s.base_mb = null;
+            for (a.slots) |*s| if (!s.native) {
+                s.base_mb = null;
+            };
         }
         const swap_rate = if (sample.swap_used_mb) |u| a.swap.update(u, now_ms) else null;
         const engine_swap_rate = if (sample.engine_swap_mb) |u|
@@ -293,6 +316,54 @@ pub const Gate = struct {
         s.peak_mb = e.used_mb;
     }
 
+    /// The runner's job runs on the native backend, in the cgroup `dir` (`native/cgroup.zig`), or
+    /// in none (null). It is measured in its cgroup, from nothing (the cgroup is new), instead of
+    /// from the engine's working set, where it takes nothing; so it is never measured beside
+    /// another job, and it does not count against the engine's cap. Without a cgroup it is not
+    /// measured, as a job without an engine signal is not. A job the gate was not told of
+    /// (`leave`) is left alone.
+    pub fn native(g: *Gate, dir: ?[]const u8) void {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        const s = &a.slots[g.slot];
+        if (s.started_ms == std.math.minInt(i64)) return;
+        s.native = true;
+        s.cgroup_len = 0;
+        s.base_mb = null;
+        const d = dir orelse return;
+        if (d.len > s.cgroup_buf.len) return;
+        @memcpy(s.cgroup_buf[0..d.len], d);
+        s.cgroup_len = d.len;
+        s.base_mb = 0;
+        s.peak_mb = workingSetMb(a.io, d) orelse 0;
+    }
+
+    /// The runner's native job's cgroup is about to be removed: read a last time, then no more.
+    /// The job went to the Dagger engine after `native` (a native set-up that found it cannot
+    /// run there): it takes the engine's cap again, and with no engine baseline nothing is learned
+    /// from it, rather than its native cgroup's few MB.
+    pub fn backToEngine(g: *Gate) void {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        const s = &a.slots[g.slot];
+        s.native = false;
+        s.cgroup_len = 0;
+        s.base_mb = null;
+    }
+
+    pub fn nativeDone(g: *Gate) void {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        const s = &a.slots[g.slot];
+        if (s.cgroup()) |dir| if (workingSetMb(a.io, dir)) |mb| {
+            s.peak_mb = @max(s.peak_mb, mb);
+        };
+        s.cgroup_len = 0;
+    }
+
     /// The runner's job replayed a step from the step cache: what it took is not learned.
     pub fn replayed(g: *Gate) void {
         const a = g.pool;
@@ -318,9 +389,10 @@ pub const Gate = struct {
         // At most 1 TB, so that it fits the table's u32 and sums of them cannot overflow.
         const seen_mb: u32 = @intCast(@min(@max(s.peak_mb -| base, Learned.min_mb), 1 << 20));
         const before = a.learned.estimate(key);
-        const after = a.learned.record(key, seen_mb, !s.overlapped);
+        const alone = !s.overlapped or s.native;
+        const after = a.learned.record(key, seen_mb, alone);
         if (before == after) return null;
-        return .{ .seen_mb = seen_mb, .estimate_mb = after, .alone = !s.overlapped };
+        return .{ .seen_mb = seen_mb, .estimate_mb = after, .alone = alone };
     }
 };
 
@@ -437,8 +509,9 @@ pub fn jobKey(repository: []const u8, workflow_ref: []const u8, name: []const u8
     return h.final();
 }
 
-/// What may start without showing in memory yet: how many jobs, and what they reserve together.
-pub const Reservation = struct { jobs: u32, mb: u64 = 0 };
+/// What may start without showing in memory yet: how many jobs, and what they reserve together;
+/// `native_mb` of it for native jobs, which do not run in the engine (`Gate.native`).
+pub const Reservation = struct { jobs: u32, mb: u64 = 0, native_mb: u64 = 0 };
 
 /// Why a runner may not take a job, for the log.
 pub const Hold = union(enum) {
@@ -514,10 +587,11 @@ pub fn decide(limits: Limits, s: Signals, reserved: Reservation, holding: bool) 
             .floor_mb = limits.min_available_mb,
         } };
     }
-    // The same reservations against the engine's cap: every job taken runs in the engine.
+    // The same reservations against the engine's cap, but native jobs': every other job taken
+    // runs in the engine.
     if (s.engine) |e| {
         const margin: u64 = if (holding) resume_margin_mb else 0;
-        const needed = limits.min_engine_headroom_mb + reserved.mb;
+        const needed = limits.min_engine_headroom_mb + (reserved.mb -| reserved.native_mb);
         if (needed > 0 and e.cap_mb -| e.used_mb < needed + margin) return .{ .engine = .{
             .used_mb = e.used_mb,
             .cap_mb = e.cap_mb,
@@ -619,6 +693,13 @@ pub fn read(io: std.Io, paths: Paths, engine_dir: ?[]const u8) Sample {
 /// readable (a cap removed is no longer a limit).
 fn readEngine(io: std.Io, dir: []const u8) ?EngineMemory {
     const cap = readBytes(io, dir, "memory.max") orelse return null;
+    return .{ .cap_mb = cap >> 20, .used_mb = workingSetMb(io, dir) orelse return null };
+}
+
+/// A cgroup's working set in MB, as `readEngine` counts the engine's: `memory.current` less
+/// `inactive_file` and `slab_reclaimable`. A native job's own cgroup is read so too
+/// (`Gate.native`), so what the gate learns of a job means the same on either backend.
+pub fn workingSetMb(io: std.Io, dir: []const u8) ?u64 {
     const current = readBytes(io, dir, "memory.current") orelse return null;
     // memory.stat is about 1.3 KB (cgroup v2 on Linux 7.0), both keys in its first half. A longer
     // file is cut at the buffer, and a key past the cut is a missing one.
@@ -628,8 +709,10 @@ fn readEngine(io: std.Io, dir: []const u8) ?EngineMemory {
             (parseStat(text, "slab_reclaimable") orelse 0)
     else |_|
         0;
-    return .{ .cap_mb = cap >> 20, .used_mb = (current -| reclaimable) >> 20 };
+    return (current -| reclaimable) >> 20;
 }
+
+pub const readCgroupBytes = readBytes;
 
 /// A cgroup file that holds one number of bytes; null for "max", or one that cannot be read.
 fn readBytes(io: std.Io, dir: []const u8, name: []const u8) ?u64 {
@@ -1499,6 +1582,65 @@ test "sampling raises the peaks of jobs running only; a job seen to take nothing
     try setEngine(tmp.dir, 400);
     pool.samplePeaks();
     try std.testing.expectEqual(@as(u32, Learned.min_mb), running.ended().?.estimate_mb);
+}
+
+test "a native job is measured in its own cgroup, alone, and not against the engine's cap" {
+    // Two jobs at once, as on razorbill (#144): a Dagger job and a native one. The engine sees
+    // only the Dagger job's growth; the native job's cgroup only its own.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [256]u8 = undefined;
+    const engine = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/engine", .{tmp.sub_path});
+    var job_buf: [256]u8 = undefined;
+    const job = try std.fmt.bufPrint(&job_buf, ".zig-cache/tmp/{s}/job", .{tmp.sub_path});
+    try setEngine(tmp.dir, 1000);
+    try writeCgroup(tmp.dir, "job", "max", 0, .{}, null);
+    var slots: [2]Admission.Slot = undefined;
+    var pool: Admission = .init(io, .{}, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    pool.engine.dir = engine;
+    var on_dagger: Gate = .{ .pool = &pool, .slot = 0 };
+    var on_native: Gate = .{ .pool = &pool, .slot = 1 };
+    on_dagger.leave(true);
+    on_dagger.assigned(jobKey("o/r", "o/r/.github/workflows/ci.yml", "dagger"));
+    on_native.leave(true);
+    on_native.assigned(jobKey("o/r", "o/r/.github/workflows/ci.yml", "native"));
+    on_native.native(job);
+    try std.testing.expect(slots[0].overlapped and slots[1].overlapped);
+    try setEngine(tmp.dir, 1700);
+    try writeCgroup(tmp.dir, "job", "max", 900 * mib, .{}, null);
+    pool.samplePeaks();
+    try writeCgroup(tmp.dir, "job", "max", 300 * mib, .{}, null);
+    pool.samplePeaks();
+    // The engine's reservation leaves the native job out: with the engine at 1700 of 4096 MB,
+    // two unknown jobs (2048 MB) and its headroom (256 MB) fit, the native one's 1024 MB beside.
+    const now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+    const r = pool.reserved(now_ms, 0);
+    try std.testing.expectEqual(@as(u64, 2048), r.mb);
+    try std.testing.expectEqual(@as(u64, 1024), r.native_mb);
+    try std.testing.expect(decide(.{}, .{ .engine = .{ .cap_mb = 4096, .used_mb = 2700 } }, r, false) == null);
+    try std.testing.expect(decide(.{}, .{ .engine = .{ .cap_mb = 4096, .used_mb = 2900 } }, r, false) != null);
+    // Its cgroup goes before the job ends: read a last time, then left alone.
+    try writeCgroup(tmp.dir, "job", "max", 950 * mib, .{}, null);
+    on_native.nativeDone();
+    try writeCgroup(tmp.dir, "job", "max", 4000 * mib, .{}, null);
+    pool.samplePeaks();
+    const native_learned = on_native.ended().?;
+    try std.testing.expectEqual(@as(u32, 950), native_learned.seen_mb);
+    try std.testing.expect(native_learned.alone);
+    // The Dagger job overlapped it, and is still taken as beside another: its own reading is the
+    // engine's, which is all its own here, but the gate does not know that yet.
+    const dagger_learned = on_dagger.ended().?;
+    try std.testing.expectEqual(@as(u32, 700), dagger_learned.seen_mb);
+    try std.testing.expect(!dagger_learned.alone);
+
+    // A native job without a cgroup is not measured: nothing is learned from it.
+    on_native.leave(true);
+    on_native.assigned(jobKey("o/r", "o/r/.github/workflows/ci.yml", "uncounted"));
+    on_native.native(null);
+    pool.samplePeaks();
+    try std.testing.expectEqual(@as(?Learned.Change, null), on_native.ended());
 }
 
 test "without the engine's cgroup nothing is learned, and every job reserves per_job_mb" {

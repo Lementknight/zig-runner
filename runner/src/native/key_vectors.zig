@@ -124,6 +124,21 @@ pub fn storeKey(gpa: Allocator, in: KeyInput) ![32]u8 {
     return sha(gpa, try keyPreimage(gpa, in));
 }
 
+/// The key the runner computes: `Backend.stepKey`, which `Backend.keyFor` calls (the
+/// integration's wiring of `checkRelation` to P2's key function).
+pub fn backendKey(gpa: Allocator, in: KeyInput) ![32]u8 {
+    const files = try gpa.alloc(@import("sandbox.zig").Spec.File, in.files.len);
+    defer gpa.free(files);
+    for (in.files, files) |f, *o| o.* = .{
+        .path = f.path,
+        .contents = f.contents,
+        .mode = @intCast(f.mode),
+        .keep = true,
+    };
+    return Backend.stepKey(@fromBackingInt(@intCast(in.tag)), in.parent, in.script, in.env, in.uid, in.gid, in.workdir, files) orelse
+        error.Unkeyed;
+}
+
 /// The digest below a base P2 gives, through `Backend.belowKey`.
 pub fn storeBelow(gpa: Allocator, in: BelowInput) ![32]u8 {
     return sha(gpa, try belowPreimage(gpa, in));
@@ -279,6 +294,18 @@ test "the native key's preimage is the model's" {
 
 test "native keys are equal exactly where the model's are" {
     try checkRelation(storeKey, storeBelow);
+    // The runner's own key function (`Backend.keyFor` → `Backend.stepKey`), and that it hashes
+    // exactly the model's preimage.
+    try checkRelation(backendKey, storeBelow);
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    for (try parse(arena_state.allocator())) |v| for ([_]Side{ v.a, v.b }) |side| switch (side) {
+        .key => |k| try std.testing.expectEqual(
+            try storeKey(std.testing.allocator, k.in),
+            try backendKey(std.testing.allocator, k.in),
+        ),
+        .below => {},
+    };
 }
 
 const linux = std.os.linux;
