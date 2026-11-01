@@ -992,9 +992,9 @@ fn registrationFailed(
         try redact.write(c.err, message, c.secrets);
     }
     if (@backingInt(status) == 403 or @backingInt(status) == 404)
-        try c.err.writeAll("\n  GH_TOKEN must be able to manage self-hosted runners of " ++
-            "GH_SCOPE: a fine-grained token with \"Administration: read and write\" " ++
-            "on the repository (\"Self-hosted runners: read and write\" for an organization), " ++
+        try c.err.writeAll("\n  GH_TOKEN, or the GitHub App, must be able to manage " ++
+            "self-hosted runners of GH_SCOPE: \"Administration: read and write\" on the " ++
+            "repository (\"Self-hosted runners: read and write\" for an organization), " ++
             "or a classic token with repo (admin:org)");
     try c.err.writeByte('\n');
     const fatal = switch (@backingInt(status)) {

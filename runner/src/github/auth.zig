@@ -77,14 +77,24 @@ const jwt_lifetime_secs = 300;
 
 /// Builds an RS256 client-assertion JWT. `now` is unix seconds.
 pub fn buildJwt(arena: Allocator, creds: Credentials, now: i64, jti: []const u8) Error![]const u8 {
-    const header = "{\"alg\":\"RS256\",\"typ\":\"JWT\"}";
     const claims = try std.fmt.allocPrint(
         arena,
         "{{\"sub\":\"{s}\",\"iss\":\"{s}\",\"aud\":\"{s}\"," ++
             "\"nbf\":{d},\"iat\":{d},\"exp\":{d},\"jti\":\"{s}\"}}",
         .{ creds.client_id, creds.client_id, creds.authorization_url, now, now, now + jwt_lifetime_secs, jti },
     );
+    return signJwt(arena, claims, creds.modulus, creds.private_exponent);
+}
 
+/// `claims` (a JSON object) as an RS256 JWT signed with the RSA key `modulus`, `private_exponent`
+/// (big-endian): the runner's client assertion here, and a GitHub App's JWT (`app.buildJwt`).
+pub fn signJwt(
+    arena: Allocator,
+    claims: []const u8,
+    modulus: []const u8,
+    private_exponent: []const u8,
+) (Allocator.Error || rsa_sign.Error)![]const u8 {
+    const header = "{\"alg\":\"RS256\",\"typ\":\"JWT\"}";
     const h_len = b64url.Encoder.calcSize(header.len);
     const c_len = b64url.Encoder.calcSize(claims.len);
     var signing_input = try arena.alloc(u8, h_len + 1 + c_len);
@@ -93,12 +103,7 @@ pub fn buildJwt(arena: Allocator, creds: Credentials, now: i64, jti: []const u8)
     _ = b64url.Encoder.encode(signing_input[h_len + 1 ..], claims);
 
     var sig_buf: [512]u8 = undefined;
-    const sig = try rsa_sign.signSha256(
-        &sig_buf,
-        creds.modulus,
-        creds.private_exponent,
-        signing_input,
-    );
+    const sig = try rsa_sign.signSha256(&sig_buf, modulus, private_exponent, signing_input);
 
     const sig_len = b64url.Encoder.calcSize(sig.len);
     const out = try arena.alloc(u8, signing_input.len + 1 + sig_len);
