@@ -24,6 +24,7 @@ comptime {
     _ = @import("native/Backend.zig");
     _ = @import("native/sandbox.zig");
     _ = @import("native/net.zig");
+    _ = @import("native/seccomp.zig");
     _ = @import("redact.zig");
     _ = @import("yaml.zig");
     _ = @import("action.zig");
