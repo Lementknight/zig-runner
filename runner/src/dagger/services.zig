@@ -19,6 +19,7 @@ const marker = @import("../dagger.zig").marker;
 const registryHost = @import("docker.zig").registryHost;
 const RegistryAuth = @import("docker.zig").RegistryAuth;
 const registryAuth = @import("docker.zig").registryAuth;
+const native_services = @import("../native/services.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -103,6 +104,7 @@ fn ignoredOptions(arena: Allocator, options: []const u8) ![]const u8 {
 /// their published ports to localhost in every step. False when one could not start: the job
 /// then fails without running its steps, as on GitHub.
 pub fn startServices(x: *Exec) !bool {
+    if (x.native) |b| return native_services.start(b, x);
     const arena = x.arena;
     const ev = x.ev;
     const ls = x.next_log_step;
@@ -165,6 +167,14 @@ pub fn pullJobContainer(x: *Exec, ls: u32, jc: job_mod.Service) !bool {
     const ev = x.ev;
     x.sh.append(ls, "##[group]Starting job container");
     x.sh.append(ls, try std.fmt.allocPrint(arena, "Pulling {s}", .{x.job_image}));
+    // On the native backend the image was pulled for the job's base (`Backend.prepareRootfs`).
+    if (x.native) |b| {
+        if (b.image) |img| x.sh.append(ls, try std.fmt.allocPrint(arena, "Digest: {s}", .{img.digest}));
+        // Whether its JavaScript actions need the musl runtime, as below.
+        x.musl = b.isMusl();
+        x.sh.append(ls, "##[endgroup]");
+        return true;
+    }
     var auth_msg: []const u8 = "";
     const head: ImageHead = .{
         .auth = try registryAuth(
@@ -508,6 +518,7 @@ pub fn writeServiceBindings(x: *Exec, q: *Query) !void {
 
 /// "Stop containers", after the post scripts, as GitHub's runner ends a job with services.
 pub fn stopServices(x: *Exec) !void {
+    if (x.native) |b| return native_services.stop(b, x);
     if (x.services.items.len == 0 and x.job.container == null) return;
     const ls = x.next_log_step;
     x.next_log_step += 1;

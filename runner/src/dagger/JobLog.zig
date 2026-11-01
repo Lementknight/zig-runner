@@ -670,7 +670,9 @@ pub fn takeServiceLog(sh: *JobLog, n: usize) []const []const u8 {
     return sh.service_logs[n].items;
 }
 
-fn serviceLine(sh: *JobLog, n: u32, line: []const u8) void {
+/// Keeps a line of service `n`'s output for "Stop containers" (the native backend's services
+/// hand theirs here directly, `native/services.zig`).
+pub fn serviceLine(sh: *JobLog, n: u32, line: []const u8) void {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     if (n >= sh.service_logs.len) return;
@@ -1071,17 +1073,20 @@ fn replayRecorded(sh: *JobLog, step: u32, stdout: []const u8, stderr: []const u8
 /// a step cached by the engine is visible in the runner's own log, not only in the step's.
 pub const reused_note = "Reused from Dagger's cache: this step's inputs were unchanged since " ++
     "an earlier run, so the output above was recorded then.";
+/// The same note for a step the native backend replayed from its layer store (`native/Store.zig`).
+pub const native_reused_note = "Reused from the native step store: this step's inputs were " ++
+    "unchanged since an earlier run, so the output above was recorded then.";
 
 /// Says which steps Dagger served from cache. Decided once the session has ended and the log stream
 /// is fully read, not when a step's output is replayed: the live stream can lag behind a step that
 /// did run, and its lines then arrive (and are dropped as duplicates) after the replay. Only a step
 /// none of whose live lines ever arrived was reused. The note goes to that step's own log, after
 /// its output.
-pub fn noteReusedSteps(sh: *JobLog) void {
+pub fn noteReusedSteps(sh: *JobLog, note: []const u8) void {
     for (sh.replayed_steps, 0..) |replayed, idx| {
         if (!replayed or sh.live_lines[idx].load(.monotonic) > 0 or sh.ended[idx].load(.acquire))
             continue;
-        sh.append(@intCast(idx + 1), reused_note);
+        sh.append(@intCast(idx + 1), note);
     }
 }
 
@@ -1352,7 +1357,7 @@ test "a step is noted as reused only if none of its live lines ever arrived" {
     var sh: JobLog = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = &live, .ended = &ended, .replayed_steps = &replayed };
     // Step 1 was replayed and no live line came: cached. Step 2 was replayed but its (late) live
     // lines arrived: it ran. Step 3 streamed live.
-    noteReusedSteps(&sh);
+    noteReusedSteps(&sh, reused_note);
     const got = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 1 stdout] Reused from Dagger's cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "step 2") == null);

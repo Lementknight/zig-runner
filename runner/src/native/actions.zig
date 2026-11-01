@@ -57,7 +57,11 @@ fn reasonFor(b: *Backend, job: job_mod.Job, u: job_mod.Uses, depth: u32) anyerro
     if (u.local) return localReason(b, job, u.path, depth);
     const k = try key(arena, u);
     const lr = b.actions.get(k) orelse lr: {
-        const fetched = try fetch(b, job, u);
+        const fetched = fetch(b, job, u) catch |e| switch (e) {
+            error.NoGit => return "the job's image has no git to fetch its actions with " ++
+                "natively (Dagger fetches them with its own)",
+            else => return e,
+        };
         try b.actions.put(arena, k, fetched);
         break :lr fetched;
     };
@@ -88,8 +92,9 @@ fn judge(
     switch (meta.runs) {
         // The runtime from the image store, as Dagger takes it from its image (`js.zig`).
         .node => {
-            const rt = js.runtimes.get(b.js_runtime);
-            return switch (try images.lookup(arena, b.io, b.images, rt.image)) {
+            // The musl build on a musl image (`container: alpine`), as `js.zig` mounts it.
+            const rt = (if (b.isMusl()) js.runtimes_musl else js.runtimes).get(b.js_runtime);
+            return switch (try docker_action.find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, rt.image)) {
                 .image => null,
                 .missing => |why| try std.fmt.allocPrint(arena, "{s} is a JavaScript action, " ++
                     "and its runtime is not here: {s}", .{ label, why }),
@@ -179,7 +184,9 @@ fn readOwn(b: *Backend, job: job_mod.Job, path: []const u8) !?[]const u8 {
     var out: Backend.Captured = .{ .arena = arena };
     const ended = try b.execOn(&.{ "sh", "-c", aw.written() }, try gitEnv(b, job, true), &.{}, 0, 0, out.output(), null);
     const layer = try b.layerPath(b.layers.items.len - 1);
-    defer sandbox.unlinkIn(arena, layer, out_path);
+    // Its layer is a look, nothing the job keeps: dropped, so it leaves no unkeyed layer below
+    // the base, and the job's steps keep their keys (P2).
+    defer b.dropTop();
     if (ended.failure.len > 0 or ended.code != 0) return null;
     return switch (try sandbox.readIn(arena, layer, out_path, Backend.max_read)) {
         .text => |t| t,
@@ -219,7 +226,7 @@ pub fn loadLocal(b: *Backend, x: *Exec, u: job_mod.Uses) !Exec.LoadResult {
 }
 
 fn imageReason(b: *Backend, image: []const u8) !?[]const u8 {
-    return switch (try images.lookup(b.arena, b.io, b.images, image)) {
+    return switch (try docker_action.find(b.arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, image)) {
         .missing => |why| why,
         .image => |img| if (images.runsAsRoot(img.user)) null else try std.fmt.allocPrint(
             b.arena,
@@ -289,12 +296,19 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
     const env = try gitEnv(b, job, std.mem.eql(u8, repository, job.github.repository));
     var out: Backend.Captured = .{ .arena = arena };
     const ended = try b.execOn(&.{ "sh", "-c", aw.written() }, env, &.{}, 0, 0, out.output(), null);
+    // `sh` found no git in the image (any image is native since P3, not only the provisioned
+    // default one): Dagger fetches with git of its own.
+    if (ended.failure.len == 0 and ended.code == 127) return error.NoGit;
     if (ended.failure.len > 0 or ended.code != 0) return .{ .unresolved = try std.fmt.allocPrint(
         arena,
         "Unable to resolve action `{s}`: {s}",
         .{ ref_label, if (ended.failure.len > 0) ended.failure else out.tail() },
     ) };
     const sha = out.tail();
+    // The tree is the commit's, whoever fetched it and when: keyed so, the base and the steps
+    // above it keep their keys from job to job (`Backend.keyFetched`).
+    if (sha.len == 40) try b.keyFetched(try std.fmt.allocPrint(arena, "an action's tree: {s}/{s}.git " ++
+        "at {s} in {s}", .{ server, repository, sha, mount }));
 
     const layer = try b.layerPath(b.layers.items.len - 1);
     const dir = try std.fmt.allocPrint(arena, "{s}{s}", .{ layer, mount });
@@ -492,6 +506,49 @@ test "uses: actions natively: a Dockerfile action built in layers, an image acti
     try std.testing.expectEqual(@as(usize, 2), n);
 }
 
+test "a job with an action keeps its steps cached: the action's tree is keyed by its commit" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testActions(arena, &tmp);
+    try testRepo(arena, &tmp, "comp", &.{.{
+        "action.yml",
+        \\runs:
+        \\  using: composite
+        \\  steps:
+        \\    - shell: bash
+        \\      run: echo composite step
+    }});
+    const steps = [_]job_mod.Step{ usesStep("comp", "o", "comp", "v1", &.{}), testStep("echo after the action") };
+    var job = testJob(&steps);
+    job.github.server_url = "file:///srv/git";
+    var texts: [2][]const u8 = undefined;
+    for (&texts, [_][]const u8{ "ran-1", "ran-2" }) |*text, ran| {
+        var env: std.process.Environ.Map = .init(arena);
+        var w: std.Io.Writer.Allocating = .init(arena);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+        const res = try dagger.run(arena, std.testing.io, &env, .{
+            .native = cfg,
+            .step_user = .root,
+            .step_cache = true,
+            .test_ran_marker = ran,
+            .gpa = std.testing.allocator,
+        }, job, &log);
+        text.* = w.written();
+        errdefer std.debug.print("{s}\n", .{text.*});
+        try std.testing.expect(std.mem.indexOf(u8, text.*, "Engine: native") != null);
+        for (res.steps) |st| try std.testing.expectEqual(dagger.Outcome.success, st.outcome);
+    }
+    // Fetched again by the second job, the same commit: the same key, so the base and the steps
+    // above it are the first job's. Unkeyed, nothing above the fetch was ever replayed.
+    errdefer std.debug.print("first:\n{s}\nsecond:\n{s}\n", .{ texts[0], texts[1] });
+    try std.testing.expect(std.mem.indexOf(u8, texts[0], dagger.native_reused_note) == null);
+    try std.testing.expect(std.mem.count(u8, texts[1], dagger.native_reused_note) >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, texts[1], "after the action") != null);
+}
+
 test "preload: a JavaScript action, a local one, or an image not in the store sends the job to Dagger" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -511,7 +568,7 @@ test "preload: a JavaScript action, a local one, or an image not in the store se
     for ([_]Case{
         .{ .step = usesStep("j", "o", "js", "v1", &.{}), .why = "o/js@v1 is a JavaScript action" },
         .{ .step = local, .why = "is not in o/r at" },
-        .{ .step = usesStep("f", "o", "far", "v1", &.{}), .why = "zr-test/other:1 is not in the native image store" },
+        .{ .step = usesStep("f", "o", "far", "v1", &.{}), .why = "zr-test/other:1 is not in the tests' images directory" },
         .{ .step = usesStep("m", "o", "multi", "v1", &.{}), .why = "line 1: multi-stage" },
         // One that cannot be fetched is not a reason: native "Set up job" fails with it.
         .{ .step = usesStep("n", "o", "nope", "v1", &.{}), .why = null },
