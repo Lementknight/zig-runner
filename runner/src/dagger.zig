@@ -73,7 +73,29 @@ const expectSecretOnlyInSetSecret = @import("dagger/testing.zig").expectSecretOn
 
 const Allocator = std.mem.Allocator;
 
-pub const default_image = "ubuntu:24.04";
+/// The image a job runs in without `container:`, and the shared base every job's chain starts
+/// from (set_up.zig provisions it). Pinned by its multi-arch index digest, which a moved tag cannot
+/// change: one pin serves amd64 and arm64/v8, as for `busybox_image`. Renovate moves the pin
+/// (renovate.json), and CI checks on every pull request that it is still an index for both
+/// (.github/scripts/ubuntu-pin.sh), which prints the digest too.
+pub const default_image = "ubuntu:24.04" ++
+    "@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852";
+/// The default image's name, which a workflow's `container:` or the config's image may give:
+/// `resolveImage` makes it the pinned image, so it is provisioned and keyed as the default is.
+pub const default_image_name = default_image[0..std.mem.indexOfScalar(u8, default_image, '@').?];
+
+/// `default_image` for its bare name, any other image as given (a custom tag or digest is the
+/// user's choice, used as is and not provisioned).
+pub fn resolveImage(image: []const u8) []const u8 {
+    return if (std.mem.eql(u8, image, default_image_name)) default_image else image;
+}
+
+/// An image without its digest: what binaries built in it depend on (its release), not which
+/// rebuild of it the pin names.
+pub fn imageName(image: []const u8) []const u8 {
+    const at = std.mem.indexOfScalar(u8, image, '@') orelse return image;
+    return image[0..at];
+}
 /// Where a Docker action sees the job's workspace, as on GitHub.
 pub const docker_workspace = "/github/workspace";
 /// GitHub's runner works under /home/runner/work; a `container:` job sees it as /__w.
@@ -3150,7 +3172,7 @@ test "logs read like GitHub's: Set up job, then each step's header with its shel
         "[job 0 step 0 stdout] Runner name: 'zig-1a2b3c4d'",
         "[job 0 step 0 stdout] Runner group name: 'Default'",
         "[job 0 step 0 stdout] ##[group]Runner Image",
-        "[job 0 step 0 stdout] Image: ubuntu:24.04",
+        "[job 0 step 0 stdout] Image: " ++ default_image,
         "[job 0 step 0 stdout] ##[group]GITHUB_TOKEN Permissions",
         "[job 0 step 0 stdout] Contents: read",
         "[job 0 step 0 stdout] PullRequests: write",
@@ -4632,7 +4654,23 @@ test "busybox is pinned by digest" {
     const name = busybox_image[0..at];
     try std.testing.expect(std.mem.startsWith(u8, name, "busybox:"));
     try std.testing.expect(std.mem.endsWith(u8, name, "-musl"));
-    const digest = busybox_image[at..];
+    try expectDigest(busybox_image[at..]);
+}
+
+test "the default image is pinned by digest, and its bare name resolves to the pin" {
+    // A truncated or upper-case paste fails here, before CI's ubuntu-pin.sh asks Docker Hub.
+    try std.testing.expectEqualStrings("ubuntu:24.04", default_image_name);
+    try expectDigest(default_image[default_image_name.len..]);
+    try std.testing.expectEqualStrings(default_image, resolveImage("ubuntu:24.04"));
+    try std.testing.expectEqualStrings(default_image, resolveImage(default_image));
+    // Another tag, or another digest of the same tag, is the user's image, as given.
+    for ([_][]const u8{ "ubuntu:22.04", "ubuntu:latest", "ubuntu", "ubuntu:24.04@sha256:0000000000000000000000000000000000000000000000000000000000000000" }) |other|
+        try std.testing.expectEqualStrings(other, resolveImage(other));
+    try std.testing.expectEqualStrings("ubuntu:24.04", imageName(default_image));
+    try std.testing.expectEqualStrings("custom/image:1", imageName("custom/image:1"));
+}
+
+fn expectDigest(digest: []const u8) !void {
     try std.testing.expect(std.mem.startsWith(u8, digest, "@sha256:"));
     const hex = digest["@sha256:".len..];
     try std.testing.expectEqual(@as(usize, 64), hex.len);
