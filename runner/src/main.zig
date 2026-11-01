@@ -76,7 +76,8 @@ pub fn main(init: std.process.Init) !u8 {
     // A native step's sandbox (`native/sandbox.zig`): before anything else, so nothing has
     // started a thread when it makes its namespaces.
     if (args.len == 2 and std.mem.eql(u8, args[1], sandbox.command)) return sandbox.main(arena);
-    if (args.len == 4 and std.mem.eql(u8, args[1], net.command)) return net.upMain(arena, args[2], args[3]);
+    if (args.len == 5 and std.mem.eql(u8, args[1], net.command))
+        return net.upMain(arena, args[2], args[3], args[4]);
     if (try printVersionIfAsked(io, args)) return @backingInt(Exit.done);
 
     var cfg = Config.load(init.environ_map, args) catch |e| {

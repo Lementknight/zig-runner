@@ -53,6 +53,8 @@ slot: ?Slot = null,
 netns: ?[]const u8 = null,
 /// `Config.subid_base`: the job's ids start at it plus its slot's offset (`idBase`).
 subid_base: u32 = default_subid_base,
+/// `Config.subnet`: the job's address is its slot's in it.
+subnet: net.Subnet = .default,
 running: sandbox.Running = .{},
 
 /// What the runner configures (`RUNNER_BACKEND=native`).
@@ -73,6 +75,9 @@ pub const Config = struct {
     /// The first host id of the jobs' ranges on a root runner (`RUNNER_NATIVE_SUBID_BASE`): slot
     /// n's 65536 ids start at `subid_base + n * 65536`.
     subid_base: u32 = default_subid_base,
+    /// The jobs' network on a root runner (`RUNNER_NATIVE_SUBNET`). The bridge is the host's, so
+    /// every runner on a host must use the same one.
+    subnet: net.Subnet = .default,
     /// Host paths mounted into every step. Tests bind the host's /usr into a rootfs of a few
     /// directories; phase 4's cache volumes will be these.
     binds: []const sandbox.Spec.Bind = &.{},
@@ -80,7 +85,13 @@ pub const Config = struct {
     test_fail_after_lock: bool = false,
 };
 
-pub const default_subid_base: u32 = 1_000_000_000;
+/// Past systemd's ranges: its containers' (systemd-nspawn's private users and nsresourced's,
+/// 524288 to 1879048191) end below it, and its foreign range (2147352576 onwards) starts above
+/// the last slot's ids (1916383999), which stay below 2^31 for tools that take ids as signed.
+pub const default_subid_base: u32 = 1_900_000_000;
+/// Every id below it may be a host user's or group's (`useradd` gives up to 60000, and LDAP or
+/// SSSD ranges commonly start at 10000 or 100000).
+pub const min_subid_base: u32 = 100_000;
 /// The ids each job has on a root runner: 0 to 65535, as an image expects.
 pub const ids_per_slot: u32 = 65536;
 
@@ -100,6 +111,7 @@ pub fn configFor(
         .vouched = vouched,
         .rootless = cfg.native_rootless,
         .subid_base = cfg.native_subid_base,
+        .subnet = try net.Subnet.parse(cfg.native_subnet),
     };
 }
 
@@ -203,30 +215,61 @@ fn templateText(t: job_mod.Template) []const u8 {
     };
 }
 
-/// Whether this machine can run native steps, found once per process with one sandbox; null when
-/// it can, else why not, and every native job then runs on Dagger. On a root runner, it also
-/// makes the network's NAT rules (`net.natRules`) and checks the ids against /etc/subuid.
+/// Whether this machine can run native steps, found with one sandbox; null when it can, else
+/// why not, and every native job then runs on Dagger. A success holds for the process's life; a
+/// failure is tried again once `probe_backoff_ms` have passed, so a machine that was not ready
+/// (iptables locked, a module not loaded yet) does not keep native off until a restart. On a root
+/// runner, it also makes the network's NAT rules (`net.natRules`) and checks the jobs' ids and
+/// subnet against the host's.
 pub fn usable(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) ?[]const u8 {
     probe_mu.lockUncancelable(io);
     defer probe_mu.unlock(io);
-    if (probed) |p| return p;
+    const now = std.Io.Clock.awake.now(io).toMilliseconds();
+    if (probe_cache.fresh(now)) return probe_cache.why();
     const why = probe(arena, io, gpa, cfg) catch |e| @errorName(e);
-    // Kept for the process's life: the arena is the job's.
-    const result: ?[]const u8 = if (why) |w|
-        (std.heap.page_allocator.dupe(u8, w) catch "it failed")
-    else
-        null;
-    probed = result;
-    return result;
+    return probe_cache.store(now, why);
 }
 
 var probe_mu: std.Io.Mutex = .init;
-var probed: ??[]const u8 = null;
+var probe_cache: ProbeCache = .{};
+pub const probe_backoff_ms = 5 * 60 * 1000;
+
+/// The probe's last answer and when it was found (`usable`), kept in a buffer of its own since
+/// the arena it came from is a job's.
+const ProbeCache = struct {
+    probed: bool = false,
+    failed: bool = false,
+    at_ms: i64 = 0,
+    buf: [1024]u8 = undefined,
+    len: usize = 0,
+
+    /// Whether the last answer stands without probing again: a success always, a failure within
+    /// its back-off.
+    fn fresh(c: *const ProbeCache, now_ms: i64) bool {
+        return c.probed and (!c.failed or now_ms - c.at_ms < probe_backoff_ms);
+    }
+
+    /// Null for "usable", else why not.
+    fn why(c: *const ProbeCache) ?[]const u8 {
+        return if (c.failed) c.buf[0..c.len] else null;
+    }
+
+    fn store(c: *ProbeCache, now_ms: i64, answer: ?[]const u8) ?[]const u8 {
+        c.probed = true;
+        c.failed = answer != null;
+        c.at_ms = now_ms;
+        const text: []const u8 = answer orelse "";
+        c.len = @min(text.len, c.buf.len);
+        @memcpy(c.buf[0..c.len], text[0..c.len]);
+        return c.why();
+    }
+};
 
 fn probe(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !?[]const u8 {
     if (std.os.linux.geteuid() == 0) {
-        if (try overlapsSubuid(arena, io, cfg.subid_base)) |why| return why;
-        if (try net.natRules(arena, io)) |why| return why;
+        if (try idsClash(arena, io, cfg.subid_base, host_id_files)) |why| return why;
+        if (try net.subnetClash(arena, io, cfg.subnet)) |why| return why;
+        if (try natRulesFor(arena, io, cfg.subnet, true)) |why| return why;
     }
     var b = try init(arena, io, gpa, cfg);
     defer b.deinit();
@@ -240,25 +283,90 @@ fn probe(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !?[]const u8
     return null;
 }
 
-/// Why the jobs' ranges of ids cannot be used, when /etc/subuid gives some of them to a user (a
-/// rootless container runtime's): two would then share host ids.
-fn overlapsSubuid(arena: Allocator, io: std.Io, first: u32) !?[]const u8 {
-    const text = std.Io.Dir.cwd().readFileAlloc(io, "/etc/subuid", arena, .limited(1 << 20)) catch
-        return null;
+/// The NAT rules for the host's uplinks now, remembered so a job finds out cheaply whether the
+/// uplinks changed since (a laptop moving from cable to Wi-Fi), and makes the new ones' rules
+/// (`jobNetwork`). With no default route, the probe fails, and a job goes on without the rules:
+/// it has no way out, as the host has none.
+fn natRulesFor(arena: Allocator, io: std.Io, subnet: net.Subnet, probing: bool) !?[]const u8 {
+    const ups = try net.uplinks(arena, io);
+    if (ups.len == 0 and !probing) return null;
+    const joined = try std.mem.join(arena, "\x00", ups);
+    rules_mu.lockUncancelable(io);
+    defer rules_mu.unlock(io);
+    if (ups.len > 0 and std.mem.eql(u8, joined, rules_for[0..rules_len])) return null;
+    if (try net.natRules(arena, io, subnet, ups)) |why| return why;
+    // Too long to keep: the rules are checked again (`iptables -C`) next time.
+    rules_len = if (joined.len <= rules_for.len) joined.len else 0;
+    @memcpy(rules_for[0..rules_len], joined[0..rules_len]);
+    return null;
+}
+
+var rules_mu: std.Io.Mutex = .init;
+/// The uplinks the rules were made for, joined by zero bytes.
+var rules_for: [256]u8 = undefined;
+var rules_len: usize = 0;
+
+/// The host's files that say which ids are taken (`idsClash`).
+pub const IdFiles = struct {
+    subuid: []const u8,
+    subgid: []const u8,
+    passwd: []const u8,
+    group: []const u8,
+};
+
+pub const host_id_files: IdFiles = .{
+    .subuid = "/etc/subuid",
+    .subgid = "/etc/subgid",
+    .passwd = "/etc/passwd",
+    .group = "/etc/group",
+};
+
+/// Why the jobs' ranges of ids (`first` onwards, `ids_per_slot` per slot) cannot be used: below
+/// `min_subid_base`, past 2^32, given to someone in /etc/subuid or /etc/subgid (a rootless
+/// container runtime's range), or holding a user's or a group's id from /etc/passwd or
+/// /etc/group. A job's root would then share host ids with them. Users only a directory service
+/// knows (LDAP, SSSD) are not seen: `min_subid_base` is above their usual ranges. Null when none
+/// of that is so.
+pub fn idsClash(arena: Allocator, io: std.Io, first: u32, files: IdFiles) !?[]const u8 {
+    if (first < min_subid_base) return try std.fmt.allocPrint(
+        arena,
+        "RUNNER_NATIVE_SUBID_BASE ({d}) is below {d}, where the host's own users and groups are",
+        .{ first, min_subid_base },
+    );
     const end = @as(u64, first) + @as(u64, ids_per_slot) * net.max_slots;
     if (end > std.math.maxInt(u32)) return "RUNNER_NATIVE_SUBID_BASE leaves no room for the " ++
         "jobs' ids below 2^32";
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        var f = std.mem.splitScalar(u8, line, ':');
-        const user = f.next() orelse continue;
-        const start = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue;
-        const count = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue;
-        if (start < end and first < start + count) return try std.fmt.allocPrint(arena, "the " ++
-            "jobs' ids ({d} onwards, RUNNER_NATIVE_SUBID_BASE) overlap {s}'s in /etc/subuid", .{
-            first,
-            user,
-        });
+    const cwd = std.Io.Dir.cwd();
+    const ranges = [_][]const u8{ files.subuid, files.subgid };
+    for (ranges) |path| {
+        const text = cwd.readFileAlloc(io, path, arena, .limited(1 << 20)) catch continue;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            var f = std.mem.splitScalar(u8, line, ':');
+            const user = f.next() orelse continue;
+            const start = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue;
+            const count = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue;
+            if (start < end and first < start + count) return try std.fmt.allocPrint(
+                arena,
+                "the jobs' ids ({d}-{d}, RUNNER_NATIVE_SUBID_BASE) overlap {s}'s in {s}",
+                .{ first, end - 1, user, path },
+            );
+        }
+    }
+    const owners = [_][]const u8{ files.passwd, files.group };
+    for (owners) |path| {
+        const text = cwd.readFileAlloc(io, path, arena, .limited(16 << 20)) catch continue;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            var f = std.mem.splitScalar(u8, line, ':');
+            const name = f.next() orelse continue;
+            _ = f.next() orelse continue;
+            const id = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue;
+            if (id >= first and id < end) return try std.fmt.allocPrint(arena, "the jobs' ids " ++
+                "({d}-{d}, RUNNER_NATIVE_SUBID_BASE) hold {s}'s id {d} in {s}", .{
+                first, end - 1, name, id, path,
+            });
+        }
     }
     return null;
 }
@@ -304,7 +412,7 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
     // Until the lock is the Backend's, a failure removes the directory and closes the lock here;
     // from then on `deinit` does both, once.
     errdefer removeTree(arena, io, new);
-    for ([_][]const u8{ "W", "M" }) |d|
+    for ([_][]const u8{ "W", "M", sandbox.secrets_dir }) |d|
         try cwd.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ new, d }));
     const lock = try lockFile(arena, io, try std.fmt.allocPrint(arena, "{s}/lock", .{new}), true);
     const how = launch(arena, io, cfg) catch |e| {
@@ -325,6 +433,7 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
         .lock = lock,
         .how = how,
         .subid_base = cfg.subid_base,
+        .subnet = cfg.subnet,
     };
     errdefer b.deinit();
     if (cfg.test_fail_after_lock) return error.TestFailure;
@@ -347,23 +456,28 @@ fn jobBinds(b: *Backend, cfg: Config) ![]const sandbox.Spec.Bind {
     } });
 }
 
-/// A slot of its own (the first free one, held by its lock), and the job's network namespace on
-/// the runner's bridge (`net.zig`), made by a helper (`net.command`), since a thread of the
-/// runner must not change its namespace.
+/// A slot of its own (the first free one on the host, held by its lock, `net.slots_dir`), and
+/// the job's network namespace on the runner's bridge (`net.zig`), made by a helper
+/// (`net.command`), since a thread of the runner must not change its namespace.
 fn jobNetwork(b: *Backend, cfg: Config) !void {
     const arena = b.arena;
-    const slots = try std.fmt.allocPrint(arena, "{s}/slots", .{cfg.store});
-    try std.Io.Dir.cwd().createDirPath(b.io, slots);
-    for (0..net.max_slots) |n| {
-        const path = try std.fmt.allocPrint(arena, "{s}/{d}.lock", .{ slots, n });
-        const lock = lockFile(arena, b.io, path, false) catch continue;
-        b.slot = .{ .n = @intCast(n), .lock = lock };
-        break;
-    } else return error.NoFreeSlot;
+    b.slot = try lockSlot(arena, b.io, net.slots_dir);
+    const n = b.slot.?.n;
+    // A veth of this slot is a dead job's: its runner let the lock go, by ending or dying. Only
+    // the slot's holder removes it, so a live job's network is never touched.
+    var sock = try net.Socket.open();
+    sock.deleteVeth(n);
+    sock.close();
+    // The host's uplinks may have changed since the probe made their rules.
+    if (try natRulesFor(arena, b.io, cfg.subnet, false)) |why| {
+        std.log.warn("native: the jobs' NAT rules: {s}", .{why});
+        return error.JobNetworkFailed;
+    }
     const path = try std.fmt.allocPrint(arena, "{s}/netns", .{b.dir});
-    const slot = try std.fmt.allocPrint(arena, "{d}", .{b.slot.?.n});
+    const slot = try std.fmt.allocPrint(arena, "{d}", .{n});
+    const subnet = try std.fmt.allocPrint(arena, "{f}", .{cfg.subnet});
     var child = try std.process.spawn(b.io, .{
-        .argv = &.{ cfg.self_exe, net.command, path, slot },
+        .argv = &.{ cfg.self_exe, net.command, path, slot, subnet },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .pipe,
@@ -371,9 +485,9 @@ fn jobNetwork(b: *Backend, cfg: Config) !void {
     var err: std.ArrayList(u8) = .empty;
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = child.stderr.?.readStreaming(b.io, &.{&buf}) catch break;
-        if (n == 0) break;
-        try err.appendSlice(arena, buf[0..n]);
+        const got = child.stderr.?.readStreaming(b.io, &.{&buf}) catch break;
+        if (got == 0) break;
+        try err.appendSlice(arena, buf[0..got]);
     }
     const term = try child.wait(b.io);
     b.netns = path;
@@ -383,13 +497,49 @@ fn jobNetwork(b: *Backend, cfg: Config) !void {
     }
 }
 
+/// The first slot whose lock in `dir` no process holds, locked. The directory is made only
+/// root's, so no other user can take a slot's lock. A lock file removed and made again while it
+/// was being taken is not trusted: the lock is taken only on the file the path names.
+fn lockSlot(arena: Allocator, io: std.Io, dir: []const u8) !Slot {
+    const linux = std.os.linux;
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, std.fs.path.dirname(dir) orelse "/");
+    const d = try arena.dupeSentinel(u8, dir, 0);
+    _ = linux.mkdir(d, 0o700);
+    if (linux.errno(linux.chmod(d, 0o700)) != .SUCCESS) return error.SlotsDirectory;
+    for (0..net.max_slots) |n| {
+        const path = try std.fmt.allocPrint(arena, "{s}/{d}.lock", .{ dir, n });
+        const lock = lockFile(arena, io, path, false) catch continue;
+        if (!sameFile(arena, lock, path)) {
+            lock.close(io);
+            continue;
+        }
+        return .{ .n = @intCast(n), .lock = lock };
+    }
+    return error.NoFreeSlot;
+}
+
+/// Whether `f` is the file `path` names now.
+fn sameFile(arena: Allocator, f: std.Io.File, path: []const u8) bool {
+    const linux = std.os.linux;
+    var held: linux.Statx = undefined;
+    var named: linux.Statx = undefined;
+    const p = arena.dupeSentinel(u8, path, 0) catch return false;
+    const mask: linux.STATX = .{ .INO = true };
+    if (linux.errno(linux.statx(f.handle, "", linux.AT.EMPTY_PATH, mask, &held)) != .SUCCESS)
+        return false;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, p, 0, mask, &named)) != .SUCCESS) return false;
+    return held.ino == named.ino and held.dev_major == named.dev_major and
+        held.dev_minor == named.dev_minor;
+}
+
 /// What "Set up job" says of the job's ids and network: a range of its own and a network of its
 /// own on a root runner; only root, and the host's network, rootless.
 pub fn idsNote(b: *const Backend, arena: Allocator) ![]const u8 {
     if (b.how.userns != .mapped) return "Native steps, rootless: only root is mapped inside " ++
         "(apt's _apt user, chown to other users and tar with owners fail), and steps share the " ++
         "host's network.";
-    const addr = net.jobAddress(b.slot.?.n);
+    const addr = b.subnet.jobAddress(b.slot.?.n);
     return std.fmt.allocPrint(arena, "Native steps: ids 0-65535 are host ids {d}-{d}, and the " ++
         "job's network is its own ({d}.{d}.{d}.{d} on {s}).", .{
         b.idBase(),
@@ -1456,14 +1606,31 @@ test "secrets reach native steps under their aliases, in scripts and in working 
     s1.env = &.{.{ .name = "TOKEN", .value = .{ .lit = "s3cr3t-token" } }};
     var s2 = testStep("pwd");
     s2.action.script.working_directory = .{ .lit = "/tmp/wd-s3cr3t-token" };
-    var job = testJob(&.{ s1, s2 });
+    // A script holding the secret: a file bound from a tmpfs of the step's own, never written
+    // into the layer, which is on the store's disk.
+    const s3 = testStep(": s3cr3t-token; stat -f -c script-fs=%T \"$0\"; " ++
+        "python3 -c 'import sys\n" ++
+        "for line in open(\"/proc/self/mountinfo\"):\n" ++
+        "    f = line.split()\n" ++
+        "    if f[4] == sys.argv[1]: print(\"script-mount\", f[f.index(\"-\") + 1])' \"$0\"");
+    const s4 = testStep("ls /tmp/zig-runner-step-3* 2>/dev/null | wc -l | " ++
+        "sed 's/^/scripts-left=/'");
+    var job = testJob(&.{ s1, s2, s3, s4 });
     job.secrets = &.{"s3cr3t-token"};
     const r = try runNativeJob(arena, cfg, job, .root);
-    try std.testing.expectEqual(dagger.Outcome.success, r.res.steps[0].outcome);
-    try std.testing.expectEqual(dagger.Outcome.success, r.res.steps[1].outcome);
+    for (r.res.steps) |st| if (st.outcome != .success) {
+        std.debug.print("{s}\n", .{r.text});
+        return error.TestUnexpectedResult;
+    };
     // The value arrived (its length), and the working directory holding it was entered through
     // its alias. (Masking is the log sink's, which this test's does not do.)
-    try expectLines(r.text, &.{ "token-length=12", "stdout] /tmp/wd-s3cr3t-token" });
+    try expectLines(r.text, &.{
+        "token-length=12",
+        "stdout] /tmp/wd-s3cr3t-token",
+        "script-fs=tmpfs",
+        "script-mount tmpfs",
+        "scripts-left=0",
+    });
 }
 
 test "a native step is contained: pivot_root, masked /proc, Docker's capabilities, no_new_privs" {
@@ -1496,6 +1663,26 @@ test "a native step is contained: pivot_root, masked /proc, Docker's capabilitie
         \\print("host", os.path.exists("{s}"))
         \\'
         \\test -e {s} && echo marker-visible || echo marker-hidden
+        \\[ "$(wc -c < /proc/interrupts)" = 0 ] && echo interrupts-masked || echo interrupts-visible
+        \\echo zr 2>/dev/null > /proc/sys/kernel/hostname && echo procsys-written ||
+        \\  echo procsys-refused
+        \\python3 -c '
+        \\for line in open("/proc/self/mountinfo"):
+        \\    f = line.split()
+        \\    if f[4] in ("/proc/sys", "/proc/sysrq-trigger", "/proc/irq"):
+        \\        print("ro-mount", f[4], f[5].split(",")[0])
+        \\'
+        \\python3 -c '
+        \\import ctypes
+        \\libc = ctypes.CDLL(None, use_errno=True)
+        \\params = ctypes.create_string_buffer(120)
+        \\r = libc.syscall(425, 1, params); print("io_uring_setup", r, ctypes.get_errno())
+        \\for name, p in (("addr-no-randomize", 0x0040000), ("read-implies-exec", 0x0400000)):
+        \\    ctypes.set_errno(0)
+        \\    r = libc.personality(ctypes.c_ulong(p))
+        \\    print("personality", name, r, ctypes.get_errno())
+        \\print("personality query", libc.personality(ctypes.c_ulong(0xffffffff)))
+        \\'
     , .{ marker, marker });
     const r = try runNativeJob(arena, cfg, testJob(&.{testStep(script)}), .root);
     if (r.res.steps[0].outcome != .success) {
@@ -1511,7 +1698,24 @@ test "a native step is contained: pivot_root, masked /proc, Docker's capabilitie
         "mount -1",
         "host False",
         "marker-hidden",
+        // runc's masks and read-only paths, each applied or the step would not have run: from
+        // the step's own /proc, with every mount under it, wherever the host has binfmt_misc
+        // mounted under its /proc/sys (GitHub's runner does).
+        "interrupts-masked",
+        "procsys-refused",
+        "ro-mount /proc/sys ro",
+        "ro-mount /proc/sysrq-trigger ro",
+        "ro-mount /proc/irq ro",
+        // io_uring is refused, as moby 25 refuses it, and personality takes only Docker's values.
+        "io_uring_setup -1 1",
+        "personality addr-no-randomize -1 1",
+        "personality read-implies-exec -1 1",
+        "personality query 0",
     });
+    const info = "/proc/self/mountinfo";
+    const mounts = try std.Io.Dir.cwd().readFileAlloc(io, info, arena, .limited(1 << 20));
+    if (std.mem.indexOf(u8, mounts, " /proc/sys/fs/binfmt_misc ") != null)
+        std.debug.print("native backend test: the host's /proc/sys has binfmt_misc\n", .{});
 }
 
 test "a native step cannot follow a symlink it planted out to the host's files" {
@@ -1648,7 +1852,7 @@ fn collectWords(arena: Allocator, line: []const u8) ![]const []const u8 {
     return out.items;
 }
 
-test "root runner: each job has its own network, and the host's loopback is out of reach" {
+test "root runner: a job's own network, out of reach of the host's services and other jobs" {
     try requireRoot();
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -1658,35 +1862,47 @@ test "root runner: each job has its own network, and the host's loopback is out 
     defer tmp.cleanup();
     const cfg = try testConfig(arena, &tmp);
 
-    // A listener on the host's 127.0.0.1, which a step must not reach.
-    const linux = std.os.linux;
-    const sock = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
-    try std.testing.expect(linux.errno(sock) == .SUCCESS);
-    defer _ = linux.close(@intCast(sock));
-    var addr: linux.sockaddr.in = .{
-        .port = std.mem.nativeToBig(u16, 47123),
-        .addr = std.mem.nativeToBig(u32, 0x7f000001),
-    };
-    const bound = linux.bind(@intCast(sock), @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
-    try std.testing.expect(linux.errno(bound) == .SUCCESS);
-    try std.testing.expect(linux.errno(linux.listen(@intCast(sock), 4)) == .SUCCESS);
+    // Listeners on the host's 127.0.0.1 and on all its addresses (the bridge's among them), which
+    // a step must not reach.
+    const loopback = try listen(47123, 0x7f000001);
+    defer _ = std.os.linux.close(loopback);
+    const any = try listen(47124, 0);
+    defer _ = std.os.linux.close(any);
 
-    // Two jobs at once, both serving on :5432 and on their own lo, and neither reaching the
-    // host's listener.
-    const script =
+    // Two jobs at once, both serving on :5432 and on their own lo, neither reaching the host's
+    // listeners, and neither reaching the other's :5432 (bridge ports isolated, and the host
+    // routes nothing between jobs).
+    const gw = cfg.subnet.gateway();
+    const first = cfg.subnet.jobAddress(0);
+    const script = try std.fmt.allocPrint(arena,
         \\python3 - <<'EOF'
-        \\import socket, threading
+        \\import socket, time
         \\s = socket.socket(); s.bind(("0.0.0.0", 5432)); s.listen(); print("bound 5432")
         \\c = socket.create_connection(("127.0.0.1", 5432), 2); print("own lo works")
-        \\try:
-        \\    socket.create_connection(("127.0.0.1", 47123), 2); print("host loopback reached")
-        \\except OSError: print("host loopback unreachable")
-        \\import time; time.sleep(1)
+        \\u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.connect(("192.0.2.1", 9))
+        \\me = u.getsockname()[0]
+        \\def reach(host, port):
+        \\    try:
+        \\        socket.create_connection((host, port), 2).close(); return True
+        \\    except OSError: return False
+        \\print("host loopback", "reached" if reach("127.0.0.1", 47123) else "unreachable")
+        \\print("host via bridge", "reached" if reach("{d}.{d}.{d}.{d}", 47124) else "unreachable")
+        \\time.sleep(2)
+        \\base = "{d}.{d}.{d}."
+        \\peers = [base + str(i) for i in range({d}, {d} + 4) if base + str(i) != me]
+        \\print("peers", "reached" if any(reach(p, 5432) for p in peers) else "unreachable")
+        \\time.sleep(8)
         \\EOF
-    ;
+    , .{ gw[0], gw[1], gw[2], gw[3], first[0], first[1], first[2], first[3], first[3] });
     const Run = struct {
-        fn one(arena_: Allocator, cfg_: Config, out: *[]const u8, ok: *bool) void {
-            const r = runNativeJob(arena_, cfg_, testJob(&.{testStep(script)}), .root) catch {
+        fn one(
+            arena_: Allocator,
+            cfg_: Config,
+            script_: []const u8,
+            out: *[]const u8,
+            ok: *bool,
+        ) void {
+            const r = runNativeJob(arena_, cfg_, testJob(&.{testStep(script_)}), .root) catch {
                 ok.* = false;
                 return;
             };
@@ -1701,13 +1917,20 @@ test "root runner: each job has its own network, and the host's loopback is out 
         .init(std.testing.allocator),
     };
     defer for (&arenas) |*x| x.deinit();
-    var first = try io.concurrent(Run.one, .{ arenas[0].allocator(), cfg, &texts[0], &oks[0] });
-    Run.one(arenas[1].allocator(), cfg, &texts[1], &oks[1]);
-    first.await(io);
+    const args = .{ arenas[0].allocator(), cfg, script, &texts[0], &oks[0] };
+    var other = try io.concurrent(Run.one, args);
+    Run.one(arenas[1].allocator(), cfg, script, &texts[1], &oks[1]);
+    other.await(io);
     for (texts, oks) |t, ok| {
         if (!ok) std.debug.print("{s}\n", .{t});
         try std.testing.expect(ok);
-        try expectLines(t, &.{ "bound 5432", "own lo works", "host loopback unreachable" });
+        try expectLines(t, &.{
+            "bound 5432",
+            "own lo works",
+            "host loopback unreachable",
+            "host via bridge unreachable",
+            "peers unreachable",
+        });
     }
 
     // Out to the world, when the host itself gets there: DNS through the job's resolver, HTTP
@@ -1724,6 +1947,126 @@ test "root runner: each job has its own network, and the host's loopback is out 
         "urllib.request.urlopen(\"https://github.com\", timeout=20).status)'");
     const r = try runNativeJob(arena, cfg, testJob(&.{out}), .root);
     try expectLines(r.text, &.{ "dns-ok", "http 200" });
+}
+
+/// A TCP listener of the test's on the host, on `port` at `addr` (host order; 0 for every
+/// address).
+fn listen(port: u16, addr: u32) !std.os.linux.fd_t {
+    const linux = std.os.linux;
+    const sock = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(sock) != .SUCCESS) return error.Socket;
+    const fd: linux.fd_t = @intCast(sock);
+    errdefer _ = linux.close(fd);
+    const one: i32 = 1;
+    const reuse = linux.SO.REUSEADDR;
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, reuse, std.mem.asBytes(&one), @sizeOf(i32));
+    var sa: linux.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, addr),
+    };
+    if (linux.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
+        return error.Bind;
+    if (linux.errno(linux.listen(fd, 4)) != .SUCCESS) return error.Listen;
+    return fd;
+}
+
+test "the jobs' ids: each range the host already uses, or may, is refused" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const Case = struct { file: []const u8, text: []const u8, reason: []const u8 };
+    const first: u32 = 2_000_000;
+    const end = first + ids_per_slot * net.max_slots;
+    const cases = [_]Case{
+        .{
+            .file = "subuid",
+            .text = "lement:100000:65536\npodman:1999000:2000\n",
+            .reason = "podman's in",
+        },
+        .{
+            .file = "subgid",
+            .text = "lement:100000:65536\nbuilder:16000000:1\n",
+            .reason = "builder's in",
+        },
+        .{
+            .file = "passwd",
+            .text = "root:x:0:0::/root:/bin/sh\nldap-user:x:2000000:100::/:/bin/sh\n",
+            .reason = "ldap-user's id 2000000",
+        },
+        .{
+            .file = "group",
+            .text = try std.fmt.allocPrint(arena, "root:x:0:\nlast:x:{d}:\n", .{end - 1}),
+            .reason = "last's id",
+        },
+    };
+    const files: IdFiles = .{
+        .subuid = try std.fmt.allocPrint(arena, "{s}/subuid", .{root}),
+        .subgid = try std.fmt.allocPrint(arena, "{s}/subgid", .{root}),
+        .passwd = try std.fmt.allocPrint(arena, "{s}/passwd", .{root}),
+        .group = try std.fmt.allocPrint(arena, "{s}/group", .{root}),
+    };
+    // Nothing there, and files that name only others' ids: usable.
+    try std.testing.expect(try idsClash(arena, io, first, files) == null);
+    for (cases) |c| try tmp.dir.writeFile(io, .{ .sub_path = c.file, .data = "x:1000:1000\n" });
+    try std.testing.expect(try idsClash(arena, io, first, files) == null);
+    for (cases) |c| {
+        try tmp.dir.writeFile(io, .{ .sub_path = c.file, .data = c.text });
+        try expectReason(c.reason, try idsClash(arena, io, first, files));
+        try tmp.dir.writeFile(io, .{ .sub_path = c.file, .data = "x:1000:1000\n" });
+    }
+    // The id just past the last slot's range is someone else's to have.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "passwd",
+        .data = try std.fmt.allocPrint(arena, "next:x:{d}:1::/:/bin/sh\n", .{end}),
+    });
+    try std.testing.expect(try idsClash(arena, io, first, files) == null);
+    try expectReason("below 100000", try idsClash(arena, io, 99_999, files));
+    try expectReason("2^32", try idsClash(arena, io, std.math.maxInt(u32) - ids_per_slot, files));
+    // The default range clears systemd's container and foreign ranges, below 2^31.
+    try std.testing.expect(default_subid_base > 1_879_048_191);
+    try std.testing.expect(default_subid_base + ids_per_slot * net.max_slots <= 2_147_352_576);
+}
+
+test "a failed probe is tried again after its back-off; a success holds" {
+    var c: ProbeCache = .{};
+    try std.testing.expect(!c.fresh(0));
+    try std.testing.expectEqualStrings("iptables is locked", c.store(1000, "iptables is locked").?);
+    try std.testing.expect(c.fresh(1000 + probe_backoff_ms - 1));
+    try std.testing.expectEqualStrings("iptables is locked", c.why().?);
+    try std.testing.expect(!c.fresh(1000 + probe_backoff_ms));
+    try std.testing.expect(c.store(1000 + probe_backoff_ms, null) == null);
+    try std.testing.expect(c.fresh(std.math.maxInt(i64)));
+}
+
+test "root runner: slots are the host's, so two runners with different stores never share one" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var other = cfg;
+    try tmp.dir.createDirPath(io, "store-2");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    other.store = try std.fmt.allocPrint(arena, "{s}/store-2", .{root});
+    var first = try init(arena, io, std.testing.allocator, cfg);
+    defer first.deinit();
+    var second = try init(arena, io, std.testing.allocator, other);
+    defer second.deinit();
+    try std.testing.expect(first.slot.?.n != second.slot.?.n);
+    try std.testing.expect(first.idBase() != second.idBase());
+    // The second job's set-up left the first's veth alone, and both are on the bridge.
+    var sock = try net.Socket.open();
+    defer sock.close();
+    var buf: [16]u8 = undefined;
+    try std.testing.expect(sock.index(net.hostLink(&buf, first.slot.?.n)) != null);
+    try std.testing.expect(sock.index(net.hostLink(&buf, second.slot.?.n)) != null);
 }
 
 test "a job's directory and lock are let go once, when its set-up fails after the lock is taken" {

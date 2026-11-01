@@ -31,6 +31,11 @@ const Allocator = std.mem.Allocator;
 /// The helper's subcommand (`main.zig` dispatches it before anything else runs).
 pub const command = "native-step";
 
+/// The mount point, in the job's directory, of the tmpfs that holds a step's secret files
+/// (`Spec.File.keep`): mounted in the step's own mount namespace, so it is nowhere on the host's
+/// disk or in its mounts, and gone with the step.
+pub const secrets_dir = "S";
+
 /// What the helper is told to run. Paths of layers are relative to `root` (the job's directory),
 /// which keeps overlay's mount options short however many layers there are.
 pub const Spec = struct {
@@ -76,7 +81,10 @@ pub const Spec = struct {
         path: []const u8,
         contents: []const u8,
         mode: u32 = 0o444,
-        /// Left in the layer, as `withNewFile` leaves a file (the event payload).
+        /// Left in the layer, as `withNewFile` leaves a file (the event payload). Otherwise the
+        /// file holds a secret (a script with one in it) and never reaches the store's disk: it
+        /// is written to a tmpfs of the step's own (`secrets_dir`) and bound at `path` over an
+        /// empty file, which goes once the step ends.
         keep: bool = false,
     };
 };
@@ -420,7 +428,18 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
     const root: linux.fd_t = @intCast(root_rc);
     // As the namespace's root, so what is made here is the job's root's.
     if (spec.userns != .mapped) bindAll(arena, spec);
-    for (spec.files) |f| writeFileIn(arena, root, f);
+    var secrets = false;
+    for (spec.files) |f| secrets = secrets or !f.keep;
+    if (secrets) check("mount the tmpfs for secret files", linux.mount(
+        "tmpfs",
+        secrets_dir,
+        "tmpfs",
+        linux.MS.NOSUID | linux.MS.NODEV,
+        @intFromPtr("mode=0700,size=16m"),
+    ));
+    for (spec.files, 0..) |f, i| {
+        if (f.keep) writeFileIn(arena, root, f) else bindSecretIn(arena, root, f, i);
+    }
 
     // 3. PID 1, told by `alive` whether the helper is still there once it has re-armed its
     // parent-death signal; then until the step ends or the lifeline closes.
@@ -440,7 +459,14 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
     }
     _ = linux.close(alive[0]);
     const st = superviseStep(@intCast(pid));
-    for (spec.files) |f| if (!f.keep) unlinkAt(arena, root, f.path);
+    for (spec.files) |f| if (!f.keep) {
+        // Its bind first: a mount point cannot be removed in the namespace it is mounted in.
+        if (targetIn(arena, root, f.path, false)) |fd| {
+            _ = linux.umount2(procFd(arena, fd), linux.MNT.DETACH);
+            _ = linux.close(fd);
+        }
+        unlinkAt(arena, root, f.path);
+    };
     if (linux.W.IFEXITED(st)) return linux.W.EXITSTATUS(st);
     if (linux.W.IFSIGNALED(st)) return @truncate(128 + @backingInt(linux.W.TERMSIG(st)));
     return 128;
@@ -696,26 +722,52 @@ fn armParentDeath(alive: linux.fd_t) void {
 }
 
 /// runc's masked paths, hidden (files under /dev/null, directories under an empty read-only
-/// tmpfs), and its read-only ones. A path the kernel does not have is skipped.
+/// tmpfs), and its read-only ones, made read-only from the step's own /proc (never the helper's,
+/// which is the host's, with its submounts) with every mount under them. A path the kernel does
+/// not have is skipped; one it has that cannot be hidden or made read-only fails the step, since
+/// the step would otherwise run with it open.
 fn maskPaths(arena: Allocator, root: linux.fd_t) void {
     const files = [_][]const u8{
-        "/proc/kcore",       "/proc/keys",        "/proc/latency_stats", "/proc/timer_list",
-        "/proc/timer_stats", "/proc/sched_debug",
+        "/proc/interrupts", "/proc/kcore",       "/proc/keys",        "/proc/latency_stats",
+        "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug",
     };
-    for (files) |f| _ = bindIn(arena, root, "/dev/null", f, false);
+    for (files) |f| {
+        const fd = existingIn(arena, root, f, false) orelse continue;
+        defer _ = linux.close(fd);
+        const rc = linux.mount("/dev/null", procFd(arena, fd), null, linux.MS.BIND, 0);
+        check(about(arena, "mask", f), rc);
+    }
     const dirs = [_][]const u8{
         "/proc/acpi",    "/proc/asound",                  "/proc/scsi",
         "/sys/firmware", "/sys/devices/virtual/powercap",
     };
     for (dirs) |d| {
-        const fd = targetIn(arena, root, d, true) orelse continue;
+        const fd = existingIn(arena, root, d, true) orelse continue;
         defer _ = linux.close(fd);
-        _ = linux.mount("tmpfs", procFd(arena, fd), "tmpfs", linux.MS.RDONLY, 0);
+        const rc = linux.mount("tmpfs", procFd(arena, fd), "tmpfs", linux.MS.RDONLY, 0);
+        check(about(arena, "mask", d), rc);
     }
     const read_only = [_][]const u8{
         "/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger",
     };
-    for (read_only) |p| if (bindIn(arena, root, p, p, false)) remountReadOnly(arena, root, p);
+    for (read_only) |p| {
+        const fd = existingIn(arena, root, p, false) orelse continue;
+        defer _ = linux.close(fd);
+        const tree = cloneTreeReadOnly(arena, fd, "", p);
+        defer _ = linux.close(tree);
+        moveTree(arena, tree, fd, p);
+    }
+}
+
+/// `at` inside the overlay, resolved inside it, for a mount on it; null when it does not exist,
+/// and any other failure fails the step.
+fn existingIn(arena: Allocator, root: linux.fd_t, at: []const u8, dir: bool) ?linux.fd_t {
+    const rel = z(arena, std.mem.trimStart(u8, at, "/"));
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .PATH = true, .DIRECTORY = dir };
+    return switch (openIn(root, rel, flags, 0, 0)) {
+        .fd => |f| f,
+        .err => |e| if (e == .NOENT) null else fatal(about(arena, "find", at), @backingInt(e)),
+    };
 }
 
 /// Docker's default capabilities: the bounding set cut to them, so a root step has these and no
@@ -746,64 +798,15 @@ pub const docker_caps: u64 = 0xa80425fb;
 
 /// Docker's default seccomp profile, as a deny list: what it refuses a container without
 /// CAP_SYS_ADMIN and friends fails with EPERM (module loading, kexec, keyrings, bpf, perf, mounts,
-/// namespaces, the clock, swap, reboot), `clone` making namespaces too, and `clone3` is ENOSYS so
-/// the C library falls back to `clone`. Anything else is allowed, as Docker's allow list is in
-/// effect for what a default container can do.
+/// namespaces, the clock, swap, reboot, io_uring as moby 25 refuses it), `clone` making namespaces
+/// too, `personality` but for the values Docker allows (Linux, 32-bit Linux, a 2.6 uname, and the
+/// query), and `clone3` is ENOSYS so the C library falls back to `clone`. Anything else is
+/// allowed, as Docker's allow list is in effect for what a default container can do.
 fn installSeccomp() void {
-    const denied = comptime deniedSyscalls();
-    // ld arch; foreign arch: deny. ld nr; [x32: deny]; denied: deny; clone: check; clone3: ENOSYS;
-    // allow. clone: ld flags; namespace flags: deny; allow. deny: EPERM.
-    var prog: [denied.len + 16]SockFilter = undefined;
-    var n: usize = 0;
-    prog[n] = ld(4);
-    n += 1;
-    prog[n] = jeq(native_arch, 1, 0);
-    n += 1;
-    prog[n] = ret(seccomp_errno | @as(u32, @backingInt(linux.E.PERM)));
-    n += 1;
-    prog[n] = ld(0);
-    n += 1;
-    const count = denied.len + 4 + @as(usize, if (builtin.cpu.arch == .x86_64) 1 else 0);
-    // A jump from instruction `from` to `to`, counted from the one after `from`.
-    const rest = struct {
-        fn deny(from: usize, to: usize) u8 {
-            return @intCast(to - from - 1);
-        }
-    };
-    const allow_at = 4 + count - 1;
-    const clone_at = allow_at + 1;
-    const deny_at = clone_at + 3;
-    if (builtin.cpu.arch == .x86_64) {
-        prog[n] = .{ .code = bpf_jset, .jt = rest.deny(n, deny_at), .jf = 0, .k = 0x40000000 };
-        n += 1;
-    }
-    for (denied) |nr| {
-        prog[n] = jeq(nr, rest.deny(n, deny_at), 0);
-        n += 1;
-    }
-    prog[n] = jeq(@backingInt(linux.SYS.clone), rest.deny(n, clone_at), 0);
-    n += 1;
-    prog[n] = jeq(@backingInt(linux.SYS.clone3), 0, 1);
-    n += 1;
-    prog[n] = ret(seccomp_errno | @as(u32, @backingInt(linux.E.NOSYS)));
-    n += 1;
-    std.debug.assert(n == allow_at);
-    prog[n] = ret(seccomp_allow);
-    n += 1;
-    // clone's flags, its first argument's low word on a little-endian machine.
-    prog[n] = ld(16);
-    n += 1;
-    const namespaces = 0x7E020000;
-    prog[n] = .{ .code = bpf_jset, .jt = rest.deny(n, deny_at), .jf = 0, .k = namespaces };
-    n += 1;
-    prog[n] = ret(seccomp_allow);
-    n += 1;
-    std.debug.assert(n == deny_at);
-    prog[n] = ret(seccomp_errno | @as(u32, @backingInt(linux.E.PERM)));
-    n += 1;
+    const prog = comptime seccompProgram();
     const fprog: extern struct { len: u16, filter: [*]const SockFilter } = .{
-        .len = @intCast(n),
-        .filter = &prog,
+        .len = @intCast(prog.len),
+        .filter = prog.ptr,
     };
     check("install the seccomp filter", linux.prctl(
         @backingInt(linux.PR.SET_SECCOMP),
@@ -812,6 +815,68 @@ fn installSeccomp() void {
         0,
         0,
     ));
+}
+
+/// `personality`'s arguments Docker's profile allows: PER_LINUX, PER_LINUX32, UNAME26,
+/// UNAME26 | PER_LINUX32, and 0xffffffff, which asks for the current one.
+pub const allowed_personalities = [_]u32{ 0x0, 0x8, 0x20000, 0x20008, 0xffffffff };
+
+/// The filter, as instructions whose jumps name a block (`Target`) and are resolved once the
+/// blocks' places are known. BPF jumps only forward, so the blocks follow the main sequence.
+fn seccompProgram() []const SockFilter {
+    const Target = enum { next, allow, deny, clone, personality };
+    const Ins = struct { code: u16, k: u32, jt: Target = .next, jf: Target = .next };
+    const denied = deniedSyscalls();
+    var ins: [denied.len + 32]Ins = undefined;
+    var n: usize = 0;
+    var at: std.enums.EnumArray(Target, usize) = .initFill(0);
+    const emit = struct {
+        fn f(list: []Ins, len: *usize, i: Ins) void {
+            list[len.*] = i;
+            len.* += 1;
+        }
+    }.f;
+    // The architecture: a foreign one's numbers mean other calls.
+    emit(&ins, &n, .{ .code = bpf_ld_w_abs, .k = 4 });
+    emit(&ins, &n, .{ .code = bpf_jeq, .k = native_arch, .jf = .deny });
+    emit(&ins, &n, .{ .code = bpf_ld_w_abs, .k = 0 });
+    // x32's calls, numbered from 0x40000000 on x86_64.
+    if (builtin.cpu.arch == .x86_64)
+        emit(&ins, &n, .{ .code = bpf_jset, .k = 0x40000000, .jt = .deny });
+    for (denied) |nr| emit(&ins, &n, .{ .code = bpf_jeq, .k = nr, .jt = .deny });
+    emit(&ins, &n, .{ .code = bpf_jeq, .k = @backingInt(linux.SYS.clone), .jt = .clone });
+    const personality = @backingInt(linux.SYS.personality);
+    emit(&ins, &n, .{ .code = bpf_jeq, .k = personality, .jt = .personality });
+    emit(&ins, &n, .{ .code = bpf_jeq, .k = @backingInt(linux.SYS.clone3), .jf = .allow });
+    emit(&ins, &n, .{ .code = bpf_ret, .k = seccomp_errno | @as(u32, @backingInt(linux.E.NOSYS)) });
+    // clone's flags, its first argument's low word on a little-endian machine.
+    at.set(.clone, n);
+    emit(&ins, &n, .{ .code = bpf_ld_w_abs, .k = 16 });
+    emit(&ins, &n, .{ .code = bpf_jset, .k = 0x7E020000, .jt = .deny, .jf = .allow });
+    // personality's one argument, an `unsigned int` to the kernel.
+    at.set(.personality, n);
+    emit(&ins, &n, .{ .code = bpf_ld_w_abs, .k = 16 });
+    for (allowed_personalities) |p| emit(&ins, &n, .{ .code = bpf_jeq, .k = p, .jt = .allow });
+    at.set(.deny, n);
+    emit(&ins, &n, .{ .code = bpf_ret, .k = seccomp_errno | @as(u32, @backingInt(linux.E.PERM)) });
+    // Last, so every jump to it goes forward.
+    at.set(.allow, n);
+    emit(&ins, &n, .{ .code = bpf_ret, .k = seccomp_allow });
+
+    var out: [n]SockFilter = undefined;
+    for (ins[0..n], &out, 0..) |i, *o, pc| {
+        const jump = struct {
+            fn f(t: Target, from: usize, places: std.enums.EnumArray(Target, usize)) u8 {
+                if (t == .next) return 0;
+                const to = places.get(t);
+                if (to <= from) @compileError("a seccomp jump goes backwards");
+                return @intCast(to - from - 1);
+            }
+        }.f;
+        o.* = .{ .code = i.code, .jt = jump(i.jt, pc, at), .jf = jump(i.jf, pc, at), .k = i.k };
+    }
+    const final = out;
+    return &final;
 }
 
 const SockFilter = extern struct { code: u16, jt: u8, jf: u8, k: u32 };
@@ -828,32 +893,23 @@ const native_arch: u32 = switch (builtin.cpu.arch) {
     else => @compileError("the native backend's seccomp filter knows x86_64 and aarch64"),
 };
 
-fn ld(offset: u32) SockFilter {
-    return .{ .code = bpf_ld_w_abs, .jt = 0, .jf = 0, .k = offset };
-}
-fn jeq(k: u32, jt: u8, jf: u8) SockFilter {
-    return .{ .code = bpf_jeq, .jt = jt, .jf = jf, .k = k };
-}
-fn ret(k: u32) SockFilter {
-    return .{ .code = bpf_ret, .jt = 0, .jf = 0, .k = k };
-}
-
 fn deniedSyscalls() []const u32 {
     const names = [_][]const u8{
-        "acct",              "add_key",         "bpf",               "clock_adjtime",
-        "clock_settime",     "create_module",   "delete_module",     "fanotify_init",
-        "finit_module",      "fsconfig",        "fsmount",           "fsopen",
-        "fspick",            "get_kernel_syms", "get_mempolicy",     "init_module",
-        "ioperm",            "iopl",            "kcmp",              "kexec_file_load",
-        "kexec_load",        "keyctl",          "lookup_dcookie",    "mbind",
-        "mount",             "mount_setattr",   "move_mount",        "move_pages",
-        "name_to_handle_at", "nfsservctl",      "open_by_handle_at", "open_tree",
-        "perf_event_open",   "pivot_root",      "quotactl",          "quotactl_fd",
-        "reboot",            "request_key",     "set_mempolicy",     "setns",
-        "settimeofday",      "stime",           "swapoff",           "swapon",
-        "syslog",            "sysfs",           "_sysctl",           "umount",
-        "umount2",           "unshare",         "uselib",            "userfaultfd",
-        "ustat",             "vm86",            "vm86old",
+        "acct",           "add_key",           "bpf",             "clock_adjtime",
+        "clock_settime",  "create_module",     "delete_module",   "fanotify_init",
+        "finit_module",   "fsconfig",          "fsmount",         "fsopen",
+        "fspick",         "get_kernel_syms",   "get_mempolicy",   "init_module",
+        "io_uring_enter", "io_uring_register", "io_uring_setup",  "ioperm",
+        "iopl",           "kcmp",              "kexec_file_load", "kexec_load",
+        "keyctl",         "lookup_dcookie",    "mbind",           "mount",
+        "mount_setattr",  "move_mount",        "move_pages",      "name_to_handle_at",
+        "nfsservctl",     "open_by_handle_at", "open_tree",       "perf_event_open",
+        "pivot_root",     "quotactl",          "quotactl_fd",     "reboot",
+        "request_key",    "set_mempolicy",     "setns",           "settimeofday",
+        "stime",          "swapoff",           "swapon",          "syslog",
+        "sysfs",          "_sysctl",           "umount",          "umount2",
+        "unshare",        "uselib",            "userfaultfd",     "ustat",
+        "vm86",           "vm86old",
     };
     var out: [names.len]u32 = undefined;
     var n: usize = 0;
@@ -938,18 +994,34 @@ fn bindIn(
 /// `path` alone is refused in a user namespace, since it would uncover what the mounts under it
 /// hide, and a remount covers one mount at a time.
 fn bindTreeReadOnly(arena: Allocator, root: linux.fd_t, path: []const u8) void {
+    const tree = cloneTreeReadOnly(arena, linux.AT.FDCWD, path, path);
+    defer _ = linux.close(tree);
+    const target = targetIn(arena, root, path, true) orelse
+        fatal(about(arena, "find", path), @as(u32, 2));
+    defer _ = linux.close(target);
+    moveTree(arena, tree, target, path);
+}
+
+/// A detached clone of the mount at `path` from `dirfd` ("" for `dirfd` itself), with every mount
+/// under it, made read-only, nosuid, nodev and noexec; `what` names it when that fails the step.
+fn cloneTreeReadOnly(
+    arena: Allocator,
+    dirfd: linux.fd_t,
+    path: []const u8,
+    what: []const u8,
+) linux.fd_t {
     const open_tree_clone = 1;
     const at_recursive = 0x8000;
+    const empty: u32 = if (path.len == 0) linux.AT.EMPTY_PATH else 0;
     const tree = linux.syscall3(
         .open_tree,
-        @as(usize, @bitCast(@as(isize, linux.AT.FDCWD))),
+        @as(usize, @bitCast(@as(isize, dirfd))),
         @intFromPtr(z(arena, path)),
-        open_tree_clone | at_recursive | linux.SOCK.CLOEXEC,
+        open_tree_clone | at_recursive | linux.SOCK.CLOEXEC | empty,
     );
-    check("clone a host tree", tree);
-    defer _ = linux.close(@intCast(tree));
+    check(about(arena, "clone the mount of", what), tree);
     var attr: MountAttr = .{ .set = 0x1 | 0x2 | 0x4 | 0x8 };
-    check("make a host tree read-only", linux.syscall5(
+    check(about(arena, "make read-only", what), linux.syscall5(
         .mount_setattr,
         tree,
         @intFromPtr(""),
@@ -957,14 +1029,16 @@ fn bindTreeReadOnly(arena: Allocator, root: linux.fd_t, path: []const u8) void {
         @intFromPtr(&attr),
         @sizeOf(MountAttr),
     ));
-    const target = targetIn(arena, root, path, true) orelse
-        fatal(about(arena, "find", path), @as(u32, 2));
-    defer _ = linux.close(target);
+    return @intCast(tree);
+}
+
+/// Mounts the detached `tree` on `target` (a file descriptor), and fails the step when it cannot.
+fn moveTree(arena: Allocator, tree: linux.fd_t, target: linux.fd_t, what: []const u8) void {
     const move_mount_f_empty_path = 0x4;
     const move_mount_t_empty_path = 0x40;
-    check("mount a host tree", linux.syscall5(
+    check(about(arena, "mount read-only", what), linux.syscall5(
         .move_mount,
-        tree,
+        @as(usize, @intCast(tree)),
         @intFromPtr(""),
         @as(usize, @intCast(target)),
         @intFromPtr(""),
@@ -1019,26 +1093,58 @@ fn procFd(arena: Allocator, fd: linux.fd_t) [*:0]const u8 {
 /// Writes `f` into the overlay, `f.path` resolved inside it, its missing parents made as
 /// `withNewFile` makes them (root's, 0755).
 fn writeFileIn(arena: Allocator, root: linux.fd_t, f: Spec.File) void {
-    const rel = std.mem.trimStart(u8, f.path, "/");
+    const fd = createIn(arena, root, f.path, f.mode, true);
+    defer _ = linux.close(fd);
+    writeAll(fd, f.contents);
+}
+
+/// A secret file (`Spec.File.keep` false): written to the step's tmpfs (`secrets_dir`), and bound
+/// at `f.path` over an empty file made in the overlay, so the overlay's upper layer, on the
+/// store's disk, never holds its contents.
+fn bindSecretIn(arena: Allocator, root: linux.fd_t, f: Spec.File, i: usize) void {
+    const held = z(arena, std.fmt.allocPrint(arena, secrets_dir ++ "/{d}", .{i}) catch oom());
+    const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true };
+    const fd = linux.open(held, flags, f.mode);
+    check("write a secret file for the step", fd);
+    writeAll(@intCast(fd), f.contents);
+    _ = linux.close(@intCast(fd));
+    const at = createIn(arena, root, f.path, f.mode, false);
+    defer _ = linux.close(at);
+    const rc = linux.mount(held, procFd(arena, at), null, linux.MS.BIND, 0);
+    check("bind a secret file for the step", rc);
+}
+
+/// Opens `path` in the overlay for writing, made if missing (emptied when `truncate`), its
+/// missing parents made root's with mode 0755; never through a symlink at its end.
+fn createIn(
+    arena: Allocator,
+    root: linux.fd_t,
+    path: []const u8,
+    mode: u32,
+    truncate: bool,
+) linux.fd_t {
+    const rel = std.mem.trimStart(u8, path, "/");
     var i: usize = 0;
     while (std.mem.indexOfScalarPos(u8, rel, i, '/')) |slash| : (i = slash + 1) {
         const parent = dirIn(arena, root, rel[0..i]) orelse continue;
         defer _ = linux.close(parent);
         _ = linux.mkdirat(parent, z(arena, rel[i..slash]), 0o755);
     }
-    const fd = switch (openIn(root, z(arena, rel), .{
+    return switch (openIn(root, z(arena, rel), .{
         .ACCMODE = .WRONLY,
         .CREAT = true,
-        .TRUNC = true,
+        .TRUNC = truncate,
         .NOFOLLOW = true,
-    }, f.mode, 0)) {
+    }, mode, 0)) {
         .fd => |fd| fd,
         .err => |e| fatal("write a file for the step", @backingInt(e)),
     };
-    defer _ = linux.close(fd);
+}
+
+fn writeAll(fd: linux.fd_t, contents: []const u8) void {
     var done: usize = 0;
-    while (done < f.contents.len) {
-        const rc = linux.write(fd, f.contents[done..].ptr, f.contents.len - done);
+    while (done < contents.len) {
+        const rc = linux.write(fd, contents[done..].ptr, contents.len - done);
         check("write a file for the step", rc);
         done += rc;
     }

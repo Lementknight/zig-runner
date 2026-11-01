@@ -8,23 +8,85 @@
 //! jobs' traffic out is made with `iptables` (`natRules`): debt, recorded in the plan.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 
 const Allocator = std.mem.Allocator;
 
-/// The runner's bridge, its address, and the network the jobs' addresses come from.
+/// The runner's bridge. It is the host's, shared by every runner on the host, as the slots are
+/// (`slots_dir`).
 pub const bridge = "zr0";
-pub const gateway = [4]u8{ 10, 88, 0, 1 };
-pub const subnet = "10.88.0.0/16";
-const prefix_len = 16;
-/// Slots beyond this have no address (`jobAddress`).
+/// Slots beyond this have no address (`Subnet.jobAddress`) and no range of ids.
 pub const max_slots = 250;
 
-/// Slot `n`'s address in the jobs' network.
-pub fn jobAddress(slot: u32) [4]u8 {
-    std.debug.assert(slot < max_slots);
-    return .{ 10, 88, 1, @intCast(slot + 2) };
-}
+/// Where the slots' locks live: a fixed path on the host, not under a runner's store, since a
+/// slot names host-wide things (the veth `zrh<n>`, the address, the range of ids) that two runners
+/// with different stores would otherwise both take. A directory only root may enter, so no other
+/// user can hold a slot's lock. tmpfs: the locks go with a reboot, as the veths do.
+pub const slots_dir = "/run/zig-runner/slots";
+
+/// The jobs' network (`RUNNER_NATIVE_SUBNET`): the bridge is its first address, and slot n's job
+/// its 259th + n (`jobAddress`). A prefix of 8 to 23 bits, so there is room for every slot.
+pub const Subnet = struct {
+    base: [4]u8,
+    prefix: u8,
+
+    /// Not podman's 10.88.0.0/16, Docker's 172.17.0.0/16 or its pools' 172.18-31 and
+    /// 192.168.x, nor libvirt's 192.168.122.0/24.
+    pub const default: Subnet = .{ .base = .{ 10, 211, 0, 0 }, .prefix = 16 };
+    pub const default_text = "10.211.0.0/16";
+
+    /// `a.b.c.d/p`, with no host bits set and 8 <= p <= 23.
+    pub fn parse(text: []const u8) error{InvalidNativeSubnet}!Subnet {
+        const slash = std.mem.indexOfScalar(u8, text, '/') orelse return error.InvalidNativeSubnet;
+        const prefix = std.fmt.parseInt(u8, text[slash + 1 ..], 10) catch
+            return error.InvalidNativeSubnet;
+        if (prefix < 8 or prefix > 23) return error.InvalidNativeSubnet;
+        var base: [4]u8 = undefined;
+        var octets = std.mem.splitScalar(u8, text[0..slash], '.');
+        for (&base) |*b| b.* = std.fmt.parseInt(u8, octets.next() orelse
+            return error.InvalidNativeSubnet, 10) catch return error.InvalidNativeSubnet;
+        if (octets.next() != null) return error.InvalidNativeSubnet;
+        const s: Subnet = .{ .base = base, .prefix = prefix };
+        if (s.int() & ~s.mask() != 0) return error.InvalidNativeSubnet;
+        return s;
+    }
+
+    pub fn gateway(s: Subnet) [4]u8 {
+        return bytes(s.int() + 1);
+    }
+
+    /// Slot `n`'s address.
+    pub fn jobAddress(s: Subnet, slot: u32) [4]u8 {
+        std.debug.assert(slot < max_slots);
+        return bytes(s.int() + 256 + 2 + slot);
+    }
+
+    pub fn format(s: Subnet, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const b = s.base;
+        try w.print("{d}.{d}.{d}.{d}/{d}", .{ b[0], b[1], b[2], b[3], s.prefix });
+    }
+
+    /// Whether the network `dest`/`mask` (host order) shares an address with this one.
+    pub fn overlaps(s: Subnet, dest: u32, mask_: u32) bool {
+        const m = s.mask() & mask_;
+        return s.int() & m == dest & m;
+    }
+
+    fn int(s: Subnet) u32 {
+        return std.mem.readInt(u32, &s.base, .big);
+    }
+
+    fn mask(s: Subnet) u32 {
+        return ~@as(u32, 0) << @intCast(32 - @as(u32, s.prefix));
+    }
+
+    fn bytes(v: u32) [4]u8 {
+        var out: [4]u8 = undefined;
+        std.mem.writeInt(u32, &out, v, .big);
+        return out;
+    }
+};
 
 /// The host's end of slot `n`'s veth pair; the job's end is named `eth0` inside its namespace.
 pub fn hostLink(buf: *[16]u8, slot: u32) []const u8 {
@@ -32,34 +94,39 @@ pub fn hostLink(buf: *[16]u8, slot: u32) []const u8 {
 }
 
 /// The helper's subcommand that makes a job's network (`main.zig` dispatches it):
-/// `zig-runner native-net <namespace file> <slot>`.
+/// `zig-runner native-net <namespace file> <slot> <subnet>`.
 pub const command = "native-net";
 
 /// The helper's entry: the bridge (if it is not there), a new network namespace kept by
 /// bind-mounting it over `path`, with what a step needs in it (`lo`, ports below 1024 and ping
 /// without capabilities on the host's, since the namespace's owner is the host's root, not the
-/// job's), then the slot's veth pair, its address and the default route. A helper, as a thread of
-/// the runner must not change its namespace. Exits 0, or 1 with why on stderr.
-pub fn upMain(arena: Allocator, path: []const u8, slot_text: []const u8) u8 {
+/// job's; no IPv6, whose link-local addresses would reach the host past the IPv4 rules), then the
+/// slot's veth pair, isolated on the bridge, its address and the default route. The runner holds
+/// the slot's lock and removed a dead job's veth of it (`Backend.jobNetwork`). A helper, as a
+/// thread of the runner must not change its namespace. Exits 0, or 1 with why on stderr.
+pub fn upMain(
+    arena: Allocator,
+    path: []const u8,
+    slot_text: []const u8,
+    subnet_text: []const u8,
+) u8 {
     const slot = std.fmt.parseInt(u32, slot_text, 10) catch return fail("a slot number", .INVAL);
     if (slot >= max_slots) return fail("a slot number", .INVAL);
+    const subnet = Subnet.parse(subnet_text) catch return fail("a subnet", .INVAL);
     var host = Socket.open() catch return fail("open rtnetlink", .ACCES);
-    // A veth of this slot is a dead job's: the slot's lock was free.
-    host.deleteVeth(slot);
-    host.ensureBridge() catch return fail("make the bridge " ++ bridge, .INVAL);
+    host.ensureBridge(subnet) catch return fail("make the bridge " ++ bridge, .INVAL);
+    if (!writeSysctl(arena, "/proc/sys/net/ipv6/conf/" ++ bridge ++ "/disable_ipv6", "1"))
+        return fail("turn IPv6 off on the bridge", .ACCES);
     const unshared = linux.unshare(linux.CLONE.NEWNET);
     if (linux.errno(unshared) != .SUCCESS) return fail("unshare(net)", linux.errno(unshared));
     var job = Socket.open() catch return fail("open rtnetlink in the job's namespace", .ACCES);
     const sysctls = [_][2][]const u8{
         .{ "/proc/sys/net/ipv4/ip_unprivileged_port_start", "0" },
         .{ "/proc/sys/net/ipv4/ping_group_range", "0 2147483647" },
+        .{ "/proc/sys/net/ipv6/conf/all/disable_ipv6", "1" },
+        .{ "/proc/sys/net/ipv6/conf/default/disable_ipv6", "1" },
     };
-    for (sysctls) |kv| {
-        const fd = linux.open(z(arena, kv[0]), .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
-        if (linux.errno(fd) != .SUCCESS) return fail("open a sysctl", linux.errno(fd));
-        _ = linux.write(@intCast(fd), kv[1].ptr, kv[1].len);
-        _ = linux.close(@intCast(fd));
-    }
+    for (sysctls) |kv| if (!writeSysctl(arena, kv[0], kv[1])) return fail("set a sysctl", .ACCES);
     const flags: linux.O = .{ .ACCMODE = .RDONLY, .CREAT = true, .CLOEXEC = true };
     const file = linux.open(z(arena, path), flags, 0o444);
     if (linux.errno(file) != .SUCCESS) return fail("make the namespace's file", linux.errno(file));
@@ -68,9 +135,20 @@ pub fn upMain(arena: Allocator, path: []const u8, slot_text: []const u8) u8 {
     if (linux.errno(kept) != .SUCCESS) return fail("keep the namespace", linux.errno(kept));
     const ns = linux.open("/proc/self/ns/net", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(ns) != .SUCCESS) return fail("open the namespace", linux.errno(ns));
-    host.addVeth(slot, @intCast(ns)) catch return fail("make the veth pair", .INVAL);
-    job.configureJob(slot) catch return fail("configure the job's network", .INVAL);
+    host.addVeth(arena, slot, @intCast(ns)) catch return fail("make the veth pair", .INVAL);
+    job.configureJob(subnet, slot) catch return fail("configure the job's network", .INVAL);
     return 0;
+}
+
+/// Writes a sysctl; true when it took, or when the kernel has no such file under an IPv6 that is
+/// off altogether (`ipv6.disable=1`), where there is nothing to turn off.
+fn writeSysctl(arena: Allocator, path: []const u8, value: []const u8) bool {
+    const fd = linux.open(z(arena, path), .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) == .NOENT and std.mem.indexOf(u8, path, "/ipv6/") != null) return true;
+    if (linux.errno(fd) != .SUCCESS) return false;
+    defer _ = linux.close(@intCast(fd));
+    const n = linux.write(@intCast(fd), value.ptr, value.len);
+    return linux.errno(n) == .SUCCESS;
 }
 
 fn fail(what: []const u8, e: linux.E) u8 {
@@ -156,7 +234,7 @@ pub const Socket = struct {
 
     /// Makes the bridge, gives it the gateway's address and brings it up; none of it is an error
     /// when it is there already.
-    pub fn ensureBridge(s: *Socket) !void {
+    pub fn ensureBridge(s: *Socket, subnet: Subnet) !void {
         var m: Message = .init(.RTM_NEWLINK, linux.NLM_F_CREATE | linux.NLM_F_EXCL);
         m.ifinfo(0, 0);
         m.attrString(ifla_ifname, bridge);
@@ -165,13 +243,15 @@ pub const Socket = struct {
         m.end(info);
         try expect(s.request(&m), true);
         const i = s.index(bridge) orelse return error.NoBridge;
-        try s.addAddress(i, gateway);
+        try s.addAddress(i, subnet.gateway(), subnet.prefix);
         try s.up(i);
     }
 
     /// Makes the veth pair of slot `n`, its job's end in the namespace `netns` (a file
-    /// descriptor) and named `eth0` there, its host's end on the bridge and up.
-    pub fn addVeth(s: *Socket, slot: u32, netns: linux.fd_t) !void {
+    /// descriptor) and named `eth0` there, its host's end on the bridge, isolated
+    /// (`IFLA_BRPORT_ISOLATED`: the bridge forwards nothing between two isolated ports, so one
+    /// job cannot reach another's address), without IPv6, and up.
+    pub fn addVeth(s: *Socket, arena: Allocator, slot: u32, netns: linux.fd_t) !void {
         var buf: [16]u8 = undefined;
         const host = hostLink(&buf, slot);
         var m: Message = .init(.RTM_NEWLINK, linux.NLM_F_CREATE | linux.NLM_F_EXCL);
@@ -194,6 +274,16 @@ pub const Socket = struct {
         master.ifinfo(i, 0);
         master.attrU32(ifla_master, @intCast(b));
         try expect(s.request(&master), false);
+        var iso: Message = .init(.RTM_SETLINK, 0);
+        iso.put(IfInfoMsg, .{ .family = af_bridge, .index = i });
+        const protinfo = iso.begin(ifla_protinfo | nla_f_nested);
+        iso.attrBytes(ifla_brport_isolated, &.{1});
+        iso.end(protinfo);
+        try expect(s.request(&iso), false);
+        const v6 = try std.fmt.allocPrint(arena, "/proc/sys/net/ipv6/conf/{s}/disable_ipv6", .{
+            host,
+        });
+        if (!writeSysctl(arena, v6, "1")) return error.Ipv6;
         try s.up(i);
     }
 
@@ -208,20 +298,21 @@ pub const Socket = struct {
 
     /// Inside a job's namespace: `lo` and `eth0` up, `eth0` with slot `n`'s address, and the
     /// default route through the bridge.
-    pub fn configureJob(s: *Socket, slot: u32) !void {
+    pub fn configureJob(s: *Socket, subnet: Subnet, slot: u32) !void {
         try s.up(s.index("lo") orelse return error.NoLoopback);
         const eth = s.index("eth0") orelse return error.NoVeth;
-        try s.addAddress(eth, jobAddress(slot));
+        try s.addAddress(eth, subnet.jobAddress(slot), subnet.prefix);
         try s.up(eth);
         var m: Message = .init(.RTM_NEWROUTE, linux.NLM_F_CREATE | linux.NLM_F_EXCL);
         m.put(RtMsg, .{});
-        m.attrBytes(rta_gateway, &gateway);
+        const gw = subnet.gateway();
+        m.attrBytes(rta_gateway, &gw);
         try expect(s.request(&m), false);
     }
 
-    fn addAddress(s: *Socket, i: i32, addr: [4]u8) !void {
+    fn addAddress(s: *Socket, i: i32, addr: [4]u8, prefix: u8) !void {
         var m: Message = .init(.RTM_NEWADDR, linux.NLM_F_CREATE | linux.NLM_F_EXCL);
-        m.put(IfAddrMsg, .{ .index = @intCast(i) });
+        m.put(IfAddrMsg, .{ .index = @intCast(i), .prefixlen = prefix });
         m.attrBytes(ifa_local, &addr);
         m.attrBytes(ifa_address, &addr);
         try expect(s.request(&m), true);
@@ -242,6 +333,10 @@ fn expect(e: linux.E, exist_ok: bool) !void {
 
 const ifla_ifname = 3;
 const ifla_master = 10;
+const ifla_protinfo = 12;
+const ifla_brport_isolated = 33;
+const nla_f_nested = 0x8000;
+const af_bridge = 7;
 const ifla_linkinfo = 18;
 const ifla_net_ns_fd = 28;
 const ifla_info_kind = 1;
@@ -263,7 +358,7 @@ const IfInfoMsg = extern struct {
 
 const IfAddrMsg = extern struct {
     family: u8 = linux.AF.INET,
-    prefixlen: u8 = prefix_len,
+    prefixlen: u8,
     flags: u8 = 0,
     scope: u8 = 0,
     index: u32,
@@ -347,45 +442,151 @@ const Message = struct {
     }
 };
 
-/// What the runner needs from the host for its jobs' traffic to leave: forwarding on, the jobs'
-/// addresses masqueraded on their way out, and forwarding to and from the bridge accepted, in
-/// `FORWARD` and, on a Docker host, in `DOCKER-USER`, the chain Docker leaves for others' rules
-/// (its FORWARD policy drops the rest). Made with `iptables`, which every Docker host has and
-/// which puts them in the same tables as Docker's (debt: phase 5 makes them over netlink). Each
-/// rule is added once. On failure, what went wrong.
-pub fn natRules(arena: Allocator, io: std.Io) !?[]const u8 {
-    const fwd = std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = "/proc/sys/net/ipv4/ip_forward",
-        .data = "1",
-    });
-    fwd catch |e| return try std.fmt.allocPrint(arena, "cannot turn on IPv4 forwarding: {s}", .{
-        @errorName(e),
-    });
+/// What the runner needs from the host for its jobs' traffic to leave, and nothing more:
+///
+/// - IPv4 forwarding on. It is host-wide and stays on (other runners' jobs need it too); the
+///   runner says so in its log when it turns it on, and warns when the FORWARD policy would then
+///   route for anyone (ACCEPT).
+/// - The jobs' addresses masqueraded on their way out.
+/// - In `FORWARD`, and on a Docker host in `DOCKER-USER` (the chain Docker leaves for others'
+///   rules; its FORWARD policy drops the rest): the jobs' traffic accepted out through the host's
+///   uplinks (the interfaces of its default routes) and the replies back, and traffic from one job
+///   to another through the host dropped. Nothing else from `zr0` is accepted, so the host's
+///   policy (Docker's, ufw's) decides it: Docker's containers, other bridges and the host's other
+///   networks are not opened.
+/// - In `INPUT`, everything from `zr0` that is not a reply dropped: a job reaches no service on
+///   the host, at the bridge's address or any other of the host's.
+///
+/// Made with `iptables`, which every Docker host has and which puts them in the same tables as
+/// Docker's (debt: phase 5 makes them over netlink). Each rule is added once. On failure, what
+/// went wrong.
+pub fn natRules(
+    arena: Allocator,
+    io: std.Io,
+    subnet: Subnet,
+    ups: []const []const u8,
+) !?[]const u8 {
+    if (ups.len == 0) return "the host has no default route for the jobs' traffic to leave by";
+    const cwd = std.Io.Dir.cwd();
+    const fwd_path = "/proc/sys/net/ipv4/ip_forward";
+    var fwd_buf: [4]u8 = undefined;
+    const fwd = cwd.readFile(io, fwd_path, &fwd_buf) catch "0";
+    if (!std.mem.startsWith(u8, fwd, "1")) {
+        cwd.writeFile(io, .{ .sub_path = fwd_path, .data = "1" }) catch |e|
+            return try std.fmt.allocPrint(arena, "cannot turn on IPv4 forwarding: {s}", .{
+                @errorName(e),
+            });
+        std.log.warn("native: turned on IPv4 forwarding (net.ipv4.ip_forward=1, host-wide) for " ++
+            "the jobs' NAT; it stays on (docs/native-backend.md)", .{});
+    }
+    if (try iptablesOutput(arena, io, &.{ "-t", "filter", "-S", "FORWARD" })) |rules|
+        if (std.mem.indexOf(u8, rules, "-P FORWARD ACCEPT") != null)
+            std.log.warn("native: the FORWARD policy is ACCEPT, so with IPv4 forwarding on this " ++
+                "host routes for its neighbours; set it to DROP (the jobs' traffic has rules of " ++
+                "its own)", .{});
+
+    const sub = try std.fmt.allocPrint(arena, "{f}", .{subnet});
     const established = [_][]const u8{ "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED" };
-    const rules = [_]struct { table: []const u8, chain: []const u8, rule: []const []const u8 }{
-        .{
-            .table = "nat",
-            .chain = "POSTROUTING",
-            .rule = &.{ "-s", subnet, "!", "-o", bridge, "-j", "MASQUERADE" },
-        },
-        .{ .table = "filter", .chain = "FORWARD", .rule = &.{ "-i", bridge, "-j", "ACCEPT" } },
-        .{
-            .table = "filter",
-            .chain = "FORWARD",
-            .rule = &(.{ "-o", bridge } ++ established ++ .{ "-j", "ACCEPT" }),
-        },
+    const masq = [_][]const u8{ "-s", sub, "!", "-o", bridge, "-j", "MASQUERADE" };
+    if (try ensureRule(arena, io, "nat", "POSTROUTING", &masq)) |why| return why;
+    const not_reply = [_][]const u8{
+        "-i", bridge, "-m", "conntrack", "!", "--ctstate", "RELATED,ESTABLISHED", "-j", "DROP",
     };
-    for (rules) |r| if (try ensureRule(arena, io, r.table, r.chain, r.rule)) |why| return why;
+    if (try ensureRule(arena, io, "filter", "INPUT", &not_reply)) |why| return why;
+
+    // Each goes in at the chain's head, so the last is first: jobs to jobs dropped, then the
+    // uplinks, then the replies.
+    var forward: std.ArrayList([]const []const u8) = .empty;
+    try forward.append(arena, &(.{ "-o", bridge } ++ established ++ .{ "-j", "ACCEPT" }));
+    for (ups) |up| {
+        const out = [_][]const u8{ "-i", bridge, "-o", up, "-j", "ACCEPT" };
+        try forward.append(arena, try arena.dupe([]const u8, &out));
+    }
+    try forward.append(arena, &.{ "-i", bridge, "-o", bridge, "-j", "DROP" });
+    var chains: std.ArrayList([]const u8) = .empty;
+    try chains.append(arena, "FORWARD");
     // Docker's own chain, when this is a Docker host.
-    if (try iptables(arena, io, &.{ "-t", "filter", "-n", "-L", "DOCKER-USER" }) == null) {
-        const docker = [_][]const []const u8{
-            &.{ "-i", bridge, "-j", "ACCEPT" },
-            &(.{ "-o", bridge } ++ established ++ .{ "-j", "ACCEPT" }),
-        };
-        for (docker) |rule| if (try ensureRule(arena, io, "filter", "DOCKER-USER", rule)) |why|
-            return why;
+    if (try iptables(arena, io, &.{ "-t", "filter", "-n", "-L", "DOCKER-USER" }) == null)
+        try chains.append(arena, "DOCKER-USER");
+    for (chains.items) |chain| for (forward.items) |rule|
+        if (try ensureRule(arena, io, "filter", chain, rule)) |why| return why;
+    return null;
+}
+
+/// The host's uplinks: the interfaces of its IPv4 default routes (`/proc/net/route`), the bridge
+/// left out.
+pub fn uplinks(arena: Allocator, io: std.Io) ![]const []const u8 {
+    const text = routeTable(arena, io) orelse return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = routes(text);
+    while (it.next()) |r| {
+        if (r.dest != 0 or r.mask != 0 or std.mem.eql(u8, r.iface, bridge)) continue;
+        for (out.items) |o| {
+            if (std.mem.eql(u8, o, r.iface)) break;
+        } else try out.append(arena, try arena.dupe(u8, r.iface));
+    }
+    return out.items;
+}
+
+/// Why the jobs' subnet cannot be used here: a route of the host's (an interface's network,
+/// Docker's or podman's bridge, a VPN) other than the bridge's covers some of it. Null when none
+/// does. Default routes are left out: everything overlaps them.
+pub fn subnetClash(arena: Allocator, io: std.Io, subnet: Subnet) !?[]const u8 {
+    return clashIn(arena, routeTable(arena, io) orelse return null, subnet);
+}
+
+fn routeTable(arena: Allocator, io: std.Io) ?[]const u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, "/proc/net/route", arena, .limited(1 << 20)) catch
+        null;
+}
+
+fn clashIn(arena: Allocator, text: []const u8, subnet: Subnet) !?[]const u8 {
+    var it = routes(text);
+    while (it.next()) |r| {
+        if (r.mask == 0 or std.mem.eql(u8, r.iface, bridge)) continue;
+        if (subnet.overlaps(r.dest, r.mask)) return try std.fmt.allocPrint(arena, "the jobs' " ++
+            "subnet {f} (RUNNER_NATIVE_SUBNET) overlaps a route on {s}", .{ subnet, r.iface });
     }
     return null;
+}
+
+/// The lines of `/proc/net/route`: an interface, then its destination and mask as the kernel
+/// prints a network-order address, in hex of the host's byte order.
+fn routes(text: []const u8) RouteIterator {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    _ = lines.next();
+    return .{ .lines = lines };
+}
+
+const Route = struct { iface: []const u8, dest: u32, mask: u32 };
+
+const RouteIterator = struct {
+    lines: std.mem.SplitIterator(u8, .scalar),
+
+    fn next(it: *RouteIterator) ?Route {
+        while (it.lines.next()) |line| {
+            var f = std.mem.tokenizeAny(u8, line, " \t");
+            var cols: [8][]const u8 = undefined;
+            var n: usize = 0;
+            while (f.next()) |c| : (n += 1) {
+                if (n == cols.len) break;
+                cols[n] = c;
+            }
+            if (n < cols.len) continue;
+            const dest = std.fmt.parseInt(u32, cols[1], 16) catch continue;
+            const mask = std.fmt.parseInt(u32, cols[7], 16) catch continue;
+            return .{ .iface = cols[0], .dest = fromRouteHex(dest), .mask = fromRouteHex(mask) };
+        }
+        return null;
+    }
+};
+
+/// An address as `/proc/net/route` prints it (a network-order word read in the host's order) in
+/// host order.
+fn fromRouteHex(v: u32) u32 {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, builtin.cpu.arch.endian());
+    return std.mem.readInt(u32, &b, .big);
 }
 
 /// Adds `rule` at the head of `chain` unless it is there (`iptables -C`).
@@ -414,6 +615,14 @@ fn iptables(arena: Allocator, io: std.Io, args: []const []const u8) !?[]const u8
         try std.mem.join(arena, " ", args),
         std.mem.trim(u8, r.stderr, " \n"),
     });
+}
+
+/// What `iptables` with `args` printed, or null when it failed.
+fn iptablesOutput(arena: Allocator, io: std.Io, args: []const []const u8) !?[]const u8 {
+    const argv = try std.mem.concat(arena, []const u8, &.{ &.{ "iptables", "-w" }, args });
+    const r = std.process.run(arena, io, .{ .argv = argv }) catch return null;
+    if (r.term == .exited and r.term.exited == 0) return r.stdout;
+    return null;
 }
 
 /// The resolver a job's steps get: its own namespace cannot reach a resolver on the host's
@@ -452,8 +661,46 @@ test "a resolv.conf for a job's namespace names no loopback server" {
 }
 
 test "slots' addresses and links" {
-    try std.testing.expectEqual([4]u8{ 10, 88, 1, 2 }, jobAddress(0));
-    try std.testing.expectEqual([4]u8{ 10, 88, 1, 251 }, jobAddress(249));
+    const sub = Subnet.default;
+    try std.testing.expectEqual([4]u8{ 10, 211, 0, 1 }, sub.gateway());
+    try std.testing.expectEqual([4]u8{ 10, 211, 1, 2 }, sub.jobAddress(0));
+    try std.testing.expectEqual([4]u8{ 10, 211, 1, 251 }, sub.jobAddress(249));
+    const small = try Subnet.parse("192.168.64.0/23");
+    try std.testing.expectEqual([4]u8{ 192, 168, 65, 251 }, small.jobAddress(max_slots - 1));
     var buf: [16]u8 = undefined;
     try std.testing.expectEqualStrings("zrh7", hostLink(&buf, 7));
+}
+
+test "the jobs' subnet: what parses, and a clash with the host's routes" {
+    try std.testing.expectEqual(Subnet.default, try Subnet.parse(Subnet.default_text));
+    var text: [32]u8 = undefined;
+    const printed = try std.fmt.bufPrint(&text, "{f}", .{Subnet.default});
+    try std.testing.expectEqualStrings(Subnet.default_text, printed);
+    const bad = [_][]const u8{
+        "10.211.0.0",      "10.211.0.1/16", "10.211.0.0/24", "10.211.0.0/7", "10.211.0/16",
+        "10.211.0.0.0/16", "10.256.0.0/16", "10.211.0.0/x",  "",
+    };
+    for (bad) |b| try std.testing.expectError(error.InvalidNativeSubnet, Subnet.parse(b));
+    // podman's 10.88.0.0/16 and Docker's 172.17.0.0/16 on a little-endian host, a default route,
+    // and the bridge's own route.
+    const table =
+        \\Iface Destination Gateway  Flags RefCnt Use Metric Mask  MTU Window IRTT
+        \\wlp0s20f3 00000000 0101A8C0 0003 0 0 600 00000000 0 0 0
+        \\podman0 0000580A 00000000 0001 0 0 0 0000FFFF 0 0 0
+        \\docker0 000011AC 00000000 0001 0 0 0 0000FFFF 0 0 0
+        \\zr0 0000D30A 00000000 0001 0 0 0 0000FFFF 0 0 0
+        \\
+    ;
+    if (builtin.cpu.arch.endian() != .little) return;
+    const a = std.testing.allocator;
+    try std.testing.expect(try clashIn(a, table, Subnet.default) == null);
+    const podman = (try clashIn(a, table, try Subnet.parse("10.88.0.0/16"))).?;
+    defer a.free(podman);
+    try std.testing.expect(std.mem.indexOf(u8, podman, "podman0") != null);
+    // A wider subnet covering Docker's.
+    const wide = (try clashIn(a, table, try Subnet.parse("172.16.0.0/12"))).?;
+    defer a.free(wide);
+    try std.testing.expect(std.mem.indexOf(u8, wide, "docker0") != null);
+    var it = routes(table);
+    try std.testing.expectEqualStrings("wlp0s20f3", it.next().?.iface);
 }
