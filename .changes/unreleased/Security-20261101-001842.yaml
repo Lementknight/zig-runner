@@ -1,0 +1,3 @@
+kind: Security
+body: 'Zig''s global cache is no longer shared between jobs. Zig runs the compiled outputs it finds in `o/` without checking them, so one compromised job in a trust scope could plant a binary or object that every later Zig job in that scope linked or ran. Each job now gets the seed (`RUNNER_ZIG_SEED`) as a directory of its own container, or an empty cache without one, and what it writes there is gone when it ends; the seed copy into the volume is gone too. Only the package tarballs (`p/`), which Zig hashes again when it unpacks them, stay shared, in a new volume (`.../zig-packages`). Zig''s local cache volume (`RUNNER_ZIG_LOCAL_CACHE`, off by default) is still shared within a scope.'
+time: 2026-11-01T00:18:42.000000-04:00

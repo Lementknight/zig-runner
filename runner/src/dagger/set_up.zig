@@ -439,11 +439,12 @@ fn writeProvision(q: *Query, as_runner: bool) !void {
 }
 
 /// One cache volume mount per package manager the job uses (`cachesUsed`), owned by the step user
-/// when steps run as it. With a Zig cache seed, Zig's global cache volume starts as the seed when
-/// it is made (`source:`), and one that is already there gets what it lacks of it
-/// (`writeSeedCopy`).
+/// when steps run as it. Zig's global cache is the job's own, never a volume: Zig trusts the
+/// outputs it finds in `o/` without checking them, so a shared one would let one job plant a binary
+/// every later job runs. It starts as the seed, mounted as a directory whose writes go with the
+/// job's container, or empty in the container without one; only its package tarballs (`p/`, which
+/// Zig hashes again when it unpacks them) are in a volume.
 fn writeCacheMounts(q: *Query, arena: Allocator, plan: BasePlan) !void {
-    var zig_path: ?[]const u8 = null;
     for (plan.cache_ids, 0..) |id, i| {
         if (!plan.cache_used[i]) continue;
         const path = if (plan.as_runner) try runnerCachePath(
@@ -451,17 +452,16 @@ fn writeCacheMounts(q: *Query, arena: Allocator, plan: BasePlan) !void {
             i,
         ) else package_cache_dirs[i].path;
         const owner: ?[]const u8 = if (plan.as_runner) runner_user else null;
-        const zig = std.mem.eql(u8, package_cache_dirs[i].name, "zig");
-        if (zig) zig_path = path;
+        const zig = std.mem.eql(u8, package_cache_dirs[i].name, zig_packages);
+        if (zig) if (plan.zig_seed) |seed|
+            try q.call("withMountedDirectory", .{ .path = path, .source = seed, .owner = owner });
         try q.call("withMountedCache", .{
-            .path = path,
+            .path = if (zig) try std.mem.concat(arena, u8, &.{ path, "/p" }) else path,
             .cache = id,
-            .source = if (zig) plan.zig_seed else null,
             .owner = owner,
         });
     }
     if (plan.zig_local) |id| try writeZigLocalMount(q, id, plan.as_runner);
-    if (plan.zig_seed) |seed| if (zig_path) |path| try writeSeedCopy(q, arena, seed, path);
 }
 
 /// The values that identify this run: the event payload, the ran marker, uv's environment, and the
@@ -1061,8 +1061,14 @@ pub const package_cache_dirs = [_]struct {
         .env = "BUN_INSTALL_CACHE_DIR",
         .tools = &.{ "bun", "bunx" },
     },
-    // Decided by `usesZig`, as the seed is: a seeded job needs its volume.
-    .{ .name = "zig", .path = "/root/.cache/zig", .env = "ZIG_GLOBAL_CACHE_DIR", .tools = &.{} },
+    // Zig's global cache, of which only the package tarballs are in the volume (`writeCacheMounts`).
+    // Decided by `usesZig`, as the seed is.
+    .{
+        .name = zig_packages,
+        .path = "/root/.cache/zig",
+        .env = "ZIG_GLOBAL_CACHE_DIR",
+        .tools = &.{},
+    },
     .{
         .name = "gradle",
         .path = "/root/.gradle/caches",
@@ -1085,6 +1091,7 @@ pub const package_cache_dirs = [_]struct {
     },
     .{ .name = "go-telemetry", .path = "/root/.config/go/telemetry", .tools = &go_tools },
 };
+const zig_packages = "zig-packages";
 const node_tools = [_][]const u8{ "npm", "npx", "node", "nodejs" };
 const go_tools = [_][]const u8{ "go", "golang", "gofmt" };
 const rust_tools = [_][]const u8{ "cargo", "rust", "rustup", "rustc" };
@@ -1106,7 +1113,7 @@ fn cachesUsed(job: job_mod.Job) [package_cache_dirs.len]bool {
         else => {},
     };
     for (package_cache_dirs, &used) |d, *u| {
-        if (std.mem.eql(u8, d.name, "zig")) u.* = usesZig(job);
+        if (std.mem.eql(u8, d.name, zig_packages)) u.* = usesZig(job);
     }
     return used;
 }
@@ -1131,7 +1138,7 @@ fn namesAny(text: []const u8, words: []const []const u8) bool {
 /// Which volumes the job shares: `repo`, the repository's trusted jobs', only for a job the runner
 /// vouches for (`Options.trusted`, `trust.vouches`); every other job gets `untrusted`, so untrusted
 /// code cannot plant content in the caches trusted jobs read (GitHub scopes its cache by branch for
-/// the same reason). Several of them are not checked again on use (Go's module cache, Zig's package
+/// the same reason). Several of them are not checked again on use (Go's module cache, Zig's local
 /// cache, cargo's sources, the tool cache's binaries). It fails closed (#105): it used to give a
 /// separate scope only to a pull request whose head repository was named and was another, so a
 /// same-repository pull request, a `workflow_run` or `issue_comment` a fork triggered, or a fork's
@@ -1159,7 +1166,8 @@ pub fn packageCacheScope(
 // Zig trusts what it finds in `o/` without checking it, so the seed comes from trusted inputs only:
 // the Zig tarball, checked against the pinned sha256 inside the exec, and a `build.zig` the runner
 // writes. Nothing a job produced or can write goes in, which is why one seed may go to every
-// repository's volumes, `repo` and `untrusted` alike. The engine caches the exec by its recipe, so
+// repository's jobs, `repo` and `untrusted` alike, and what a job adds to it stays in that job
+// (`writeCacheMounts`). The engine caches the exec by its recipe, so
 // it runs once per engine, and Zig builds it bit for bit the same. Zig keys it on its version, the
 // OS and ABI and the CPU model, which the exec's `zig` detects in the default image on the engine's
 // host just as a job's does there.
@@ -1174,7 +1182,7 @@ const zig_seed_build_zig =
     \\}
     \\
 ;
-/// Where the seed is built, and where a Zig job's container has it while it is copied.
+/// Where the seed is built.
 const zig_seed_dir = "/zig-seed";
 
 /// The seed for this job, built or found in the engine's cache, when the runner has one, the job
@@ -1256,23 +1264,6 @@ fn usesZig(job: job_mod.Job) bool {
         else => {},
     };
     return false;
-}
-
-/// What an existing Zig volume lacks of the seed, copied in: `source:` fills only a volume being
-/// made. Nothing is overwritten or deleted, and the manifests (`h/`) go last, so a build running
-/// at the same time never finds a manifest whose outputs are not there yet (an `h/` entry without
-/// its `o/` breaks a Zig cache for good). A copy that fails leaves the job unseeded. The engine
-/// caches this exec as well (a volume is in its key by name only), so it copies once per volume.
-fn writeSeedCopy(q: *Query, arena: Allocator, seed: []const u8, path: []const u8) !void {
-    try q.call("withMountedDirectory", .{ .path = zig_seed_dir, .source = seed });
-    const script = try std.fmt.allocPrint(
-        arena,
-        "s={s}; d={s}; {{ for e in \"$s\"/*; do [ \"$e\" = \"$s/h\" ] || cp -an \"$e\" \"$d\"/; " ++
-            "done; cp -an \"$s/h\" \"$d\"/; }} 2>/dev/null || true",
-        .{ zig_seed_dir, path },
-    );
-    try q.call("withExec", .{ .args = &[_][]const u8{ "sh", "-c", script } });
-    try q.call("withoutMount", .{ .path = zig_seed_dir });
 }
 
 // The pre-warm (`loop.Warmer`): what every job of this runner builds before its first step and
@@ -1559,7 +1550,7 @@ test "package caches: one volume per tool, keyed by repository, shared only by v
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "c1: cacheVolume(key:\"zig-runner/o/r/{s}/npm\")", .{scope})) != null);
         // The tool cache is also keyed by the job's image (its binaries are built for it).
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "c0: cacheVolume(key:\"zig-runner/o/r/{s}/toolcache/ubuntu:24.04\")", .{scope})) != null);
-        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "cacheVolume(key:\"zig-runner/o/r/{s}/zig\")", .{scope})) != null);
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "cacheVolume(key:\"zig-runner/o/r/{s}/zig-packages\")", .{scope})) != null);
         // Asked for by key alone: a `source:` seed would put a Directory ID into every step's
         // recipe, so one may only ever be a trusted, pinned input (proofs/README.md, `Key` row).
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "source:") == null);
@@ -1567,7 +1558,7 @@ test "package caches: one volume per tool, keyed by repository, shared only by v
         // Mounted on the base container, so every step has them.
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/opt/hostedtoolcache\",cache:\"V0\")") != null);
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.npm\",cache:\"V1\")") != null);
-        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.cache/zig\",cache:\"V11\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.cache/zig/p\",cache:\"V11\")") != null);
         // Zig's local cache stays in the workspace unless `zig_local_cache` is on.
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "zig-local") == null);
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "ZIG_LOCAL_CACHE_DIR") == null);
@@ -1776,24 +1767,24 @@ test "the Zig cache seed: built from pinned, runner-written inputs, the same for
         }
         // The volumes are asked for as before: the seed goes on the mount, not into keys.
         const user_suffix: []const u8 = if (case.user == .runner) "/runner" else "";
-        try std.testing.expect(std.mem.indexOf(u8, r.seen[1], try std.fmt.allocPrint(arena, "c11: cacheVolume(key:\"zig-runner/{s}/{s}/zig{s}\")", .{ job.github.repository, case.scope, user_suffix })) != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.seen[1], try std.fmt.allocPrint(arena, "c11: cacheVolume(key:\"zig-runner/{s}/{s}/zig-packages{s}\")", .{ job.github.repository, case.scope, user_suffix })) != null);
         try std.testing.expect(std.mem.indexOf(u8, r.seen[1], "source:") == null);
         const base = r.seen[2];
         try std.testing.expect(braceBalanced(base));
+        // The global cache is the seed as a directory of the job's own container, so what a job
+        // writes there goes with it; only the package tarballs (`p/`, hashed again on unpack) are
+        // in the volume.
         const mount = if (case.user == .runner)
-            "withMountedCache(path:\"/home/runner/.cache/zig\",cache:\"V11\",source:\"SEED\",owner:\"runner\")"
+            "withMountedDirectory(path:\"/home/runner/.cache/zig\",source:\"SEED\",owner:\"runner\") { withMountedCache(path:\"/home/runner/.cache/zig/p\",cache:\"V11\",owner:\"runner\")"
         else
-            "withMountedCache(path:\"/root/.cache/zig\",cache:\"V11\",source:\"SEED\")";
+            "withMountedDirectory(path:\"/root/.cache/zig\",source:\"SEED\") { withMountedCache(path:\"/root/.cache/zig/p\",cache:\"V11\")";
         try std.testing.expect(std.mem.indexOf(u8, base, mount) != null);
-        // `source:` on the Zig volume and nowhere else; the copy into an existing volume, manifests
-        // last, with the seed unmounted after it.
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, base, "withMountedCache(path:\"/root/.cache/zig\",cache:\"V11\",source:") + std.mem.count(u8, base, "withMountedCache(path:\"/home/runner/.cache/zig\",cache:\"V11\",source:"));
-        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, base, "\"SEED\""));
-        const copy = std.mem.indexOf(u8, base, "withMountedDirectory(path:\"/zig-seed\",source:\"SEED\") { withExec(args:[\"sh\",\"-c\",\"s=/zig-seed; d=").?;
-        try std.testing.expect(std.mem.indexOf(u8, base, "do [ \\\"$e\\\" = \\\"$s/h\\\" ] || cp -an \\\"$e\\\" \\\"$d\\\"/; done; cp -an \\\"$s/h\\\" \\\"$d\\\"/; } 2>/dev/null || true\"]) { withoutMount(path:\"/zig-seed\") { ") != null);
-        try std.testing.expect(std.mem.indexOf(u8, base[copy..std.mem.indexOf(u8, base, "withoutMount").?], "rm ") == null);
-        // Before anything run-specific, so the engine keeps the copy for the next job.
-        try std.testing.expect(copy < std.mem.indexOf(u8, base, mark_env).?);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, base, "\"SEED\""));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, base, "cache:\"V11\""));
+        try std.testing.expect(std.mem.indexOf(u8, base, "source:\"SEED\") { withExec") == null);
+        try std.testing.expect(std.mem.indexOf(u8, base, "zig-seed") == null);
+        // Before anything run-specific, so the seed's mount is in no run's key of its own.
+        try std.testing.expect(std.mem.indexOf(u8, base, mount).? < std.mem.indexOf(u8, base, mark_env).?);
         try std.testing.expect(std.mem.indexOf(u8, r.log, "Zig global cache seeded from Zig 0.17.0") != null);
     }
 }
@@ -1822,6 +1813,9 @@ test "the Zig cache seed changes nothing for a job without Zig, without caches, 
     try std.testing.expectEqual(@as(usize, 3), r.seen.len);
     for (r.seen) |d| try std.testing.expect(std.mem.indexOf(u8, d, "zig-seed") == null and std.mem.indexOf(u8, d, "source:") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.log, "Zig global cache") == null);
+    // Unseeded, the global cache is in the job's container: only `p/` is in a volume.
+    try std.testing.expect(std.mem.indexOf(u8, r.seen[1], "withMountedCache(path:\"/root/.cache/zig/p\",cache:\"V11\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.seen[1], "path:\"/root/.cache/zig\"") == null);
 }
 
 test "a Zig cache seed that cannot be built leaves the job running, unseeded" {
@@ -1837,6 +1831,7 @@ test "a Zig cache seed that cannot be built leaves the job running, unseeded" {
         try std.testing.expectEqual(@as(usize, 4), r.seen.len);
         try std.testing.expect(std.mem.indexOf(u8, r.seen[2], "source:") == null);
         try std.testing.expect(std.mem.indexOf(u8, r.seen[2], "zig-seed") == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.seen[2], "withMountedDirectory(path:\"/root/.cache/zig\"") == null);
         try std.testing.expect(std.mem.indexOf(u8, r.log, "Zig cache seed not built, running unseeded: ") != null);
     }
 }
@@ -1852,7 +1847,7 @@ test "usesZig: a script or an action that names Zig" {
 test "cachesUsed: a job mounts the caches of the tools it names, and Zig's as usesZig decides" {
     const zig_only = cachesUsed(testJob(&.{testStep("zig build test --summary all")}));
     for (package_cache_dirs, zig_only) |d, u| {
-        try std.testing.expectEqual(std.mem.eql(u8, d.name, "zig"), u);
+        try std.testing.expectEqual(std.mem.eql(u8, d.name, zig_packages), u);
     }
     const nothing = cachesUsed(testJob(&.{testStep("echo hi && make check")}));
     for (nothing) |u| try std.testing.expect(!u);

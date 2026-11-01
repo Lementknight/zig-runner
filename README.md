@@ -202,15 +202,19 @@ installs a tool into the tool cache itself (not through a setup action, which ru
 is replayed after the volume was pruned leaves a later step a PATH to a directory that is gone
 (proofs/README.md, "Against today's code"; #102).
 
-`RUNNER_ZIG_SEED=<version>=<sha256>` (off when unset) seeds Zig's global cache volume in every job
-that runs Zig. Zig 0.17's `zig build` first compiles a build runner that is the same for every
+`RUNNER_ZIG_SEED=<version>=<sha256>` (off when unset) seeds Zig's global cache in every job that
+runs Zig. Zig 0.17's `zig build` first compiles a build runner that is the same for every
 project: 104 s on one core and about 1 GB. The runner builds it once per engine, with
 `zig build --help` on a `build.zig` it writes itself, using the Zig tarball checked against the
 pinned sha256. It never takes anything from a job, so one seed safely goes to `repo` and
 `untrusted` volumes in every repository. Copying such a seed into an empty global cache on the
 laptop cut a cold `zig build test` of zig-runner from 146 s to 49 s. It also cut the engine's
 working-set rise per job from 0.98 to 0.55 GB (runner-bench `zig-seed.yml`, `zig_cache=seeded`).
-A seed that cannot be built leaves the job unseeded, and "Set up job" says which happened.
+A seed that cannot be built leaves the job unseeded, and "Set up job" says which happened. Zig's
+global cache is never shared between jobs: Zig runs what it finds in `o/` without checking it, so
+each job gets the seed (or, without one, an empty cache) as its own copy, and what it adds there is
+gone when it ends. Only the package tarballs (`p/`, which Zig hashes again when it unpacks them)
+stay in the scope's volume.
 
 Steps get the Dagger engine (`RUNNER_DAGGER_NESTING`, privileged nesting, for `dagger call` inside
 a step) only when a pool turns it on (`RUNNER_DAGGER_NESTING=true`; off by default, and the runner
