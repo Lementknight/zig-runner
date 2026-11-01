@@ -888,10 +888,11 @@ pub fn run(
     return runSteps(arena, io, opts, job, &sh, results, transport, null);
 }
 
-/// Whether a step of `job` uses a remote action (`native/actions.zig` fetches it first).
-fn usesRemoteActions(job: job_mod.Job) bool {
+/// Whether a step of `job` uses an action (`native/actions.zig` fetches a remote one, and reads a
+/// local one from the job's commit, by git in the job's image, before the job).
+fn usesActions(job: job_mod.Job) bool {
     for (job.steps) |st| switch (st.action) {
-        .uses => |u| if (!u.local) return true,
+        .uses => return true,
         else => {},
     };
     return false;
@@ -948,7 +949,7 @@ fn runNative(
     // The actions are fetched before the job's image is pulled and provisioned (P3, in the
     // base): until the preload follows that, only the operator's provisioned default image is
     // there to fetch them with, and the base's provisioning must not drop their layers.
-    if (usesRemoteActions(job) and (cfg.rootfs.len == 0 or job.container != null or !opts.provision or
+    if (usesActions(job) and (cfg.rootfs.len == 0 or job.container != null or !opts.provision or
         !std.mem.eql(u8, resolveImage(opts.image), default_image)))
     {
         dagger_note.* = "This job runs on Dagger: its `uses:` actions are fetched before the " ++
@@ -958,7 +959,7 @@ fn runNative(
     }
     // What its `uses:` actions are is known once they are fetched: one native cannot run yet
     // sends the job to Dagger before anything is logged (`native/actions.zig`).
-    if (try native_actions.preload(&b, job)) |why| {
+    if (try native_actions.preload(&b, job, opts.js_runtime)) |why| {
         dagger_note.* = try std.fmt.allocPrint(arena, "This job runs on Dagger: {s}.", .{why});
         return null;
     }

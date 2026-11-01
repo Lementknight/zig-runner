@@ -36,6 +36,8 @@ const usesStep = @import("testing.zig").usesStep;
 const braceBalanced = @import("testing.zig").braceBalanced;
 
 const Allocator = std.mem.Allocator;
+const Backend = @import("../native/Backend.zig");
+const docker_action = @import("../native/docker_action.zig");
 
 /// JavaScript actions run with this binary, named `node` so that Bun behaves as Node. The shim on
 /// PATH answers `node --version`, which Bun named `node` does not handle, and runs the binary
@@ -96,6 +98,39 @@ fn runtimeQuery(arena: Allocator, rt: RuntimeSource, musl: bool) ![]const u8 {
     return q.finish();
 }
 
+/// The ids of a runtime's files (`runtimeQuery`'s answer): from Dagger, or on the native backend
+/// the files' host paths in the native store, the image pulled by P3 (`docker_action.find`), as
+/// `host:<path>` ids that the native backend binds (`Backend.applyMounts`). Null with `msg` when
+/// the image cannot be had. The native backend runs only the default image, never musl.
+fn runtimeFiles(x: *Exec, rt: RuntimeSource, msg: *[]const u8) !?std.json.Value {
+    const arena = x.arena;
+    const b = x.native orelse
+        return gql(arena, x.transport, try runtimeQuery(arena, rt, x.musl), msg) catch null;
+    // P3's pull (or the tests' images directory), as Dagger pulls the runtime's image.
+    const img = switch (try docker_action.find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, rt.image)) {
+        .image => |i| i,
+        .missing => |why| {
+            msg.* = why;
+            return null;
+        },
+    };
+    var obj: std.json.ObjectMap = .empty;
+    const id = struct {
+        fn f(ar: Allocator, rootfs: []const u8, path: []const u8) !std.json.Value {
+            var o: std.json.ObjectMap = .empty;
+            try o.put(ar, "id", .{ .string = try std.fmt.allocPrint(ar, "{s}{s}{s}", .{
+                Backend.host_id,
+                rootfs,
+                path,
+            }) });
+            return .{ .object = o };
+        }
+    }.f;
+    try obj.put(arena, "bin", try id(arena, img.rootfs, rt.binary));
+    if (rt.npm_dir) |npm| try obj.put(arena, "npm", try id(arena, img.rootfs, npm));
+    return .{ .object = obj };
+}
+
 /// Runs the musl Node with its own C++ runtime first on the library path.
 const node_fallback_wrapper = "#!/bin/sh\nLD_LIBRARY_PATH=" ++ fallback_dir ++
     "/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} exec " ++ fallback_dir ++ "/node-musl \"$@\"\n";
@@ -108,13 +143,13 @@ fn newFileMount(path: []const u8, contents: []const u8) Mount {
     return .{ .new_file = .{ .path = path, .contents = contents, .permissions = 0o755 } };
 }
 
-const RuntimeSource = struct {
+pub const RuntimeSource = struct {
     image: []const u8,
     binary: []const u8,
     npm_dir: ?[]const u8 = null,
 };
 /// Bun is pinned to the version the repository's images use (see api/Dockerfile).
-const runtimes: std.EnumArray(config.JsRuntime, RuntimeSource) = .init(.{
+pub const runtimes: std.EnumArray(config.JsRuntime, RuntimeSource) = .init(.{
     .bun = .{ .image = "oven/bun:1.4.3", .binary = "/usr/local/bin/bun" },
     .node = .{
         .image = "node:24-bookworm-slim",
@@ -322,7 +357,7 @@ pub fn appendJsRuntimeMounts(x: *Exec, num: u32, mounts: *std.ArrayList(Mount)) 
     const arena = x.arena;
     const rt = (if (x.musl) runtimes_musl else runtimes).get(x.js_runtime);
     var msg: []const u8 = "";
-    const data = gql(arena, x.transport, try runtimeQuery(arena, rt, x.musl), &msg) catch {
+    const data = (try runtimeFiles(x, rt, &msg)) orelse {
         _ = try x.actionFailed(num, "could not get the JavaScript runtime from {s}: {s}", .{
             rt.image,
             msg,
@@ -376,7 +411,7 @@ pub fn nodeFallback(x: *Exec, num: u32) !?[]const Mount {
     const arena = x.arena;
     const rt = (if (x.musl) runtimes_musl else runtimes).get(.node);
     var msg: []const u8 = "";
-    const data = gql(arena, x.transport, try runtimeQuery(arena, rt, x.musl), &msg) catch {
+    const data = (try runtimeFiles(x, rt, &msg)) orelse {
         _ = try x.actionFailed(num, "could not get Node from {s}: {s}", .{ rt.image, msg });
         return null;
     };
