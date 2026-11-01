@@ -40,6 +40,7 @@ const baseContainerId = @import("dagger/set_up.zig").baseContainerId;
 const Base = @import("dagger/set_up.zig").Base;
 pub const Backend = @import("native/Backend.zig");
 const docker_action = @import("native/docker_action.zig");
+const native_actions = @import("native/actions.zig");
 const execFor = @import("dagger/set_up.zig").execFor;
 const setUpJob = @import("dagger/set_up.zig").setUpJob;
 const package_cache_dirs = @import("dagger/set_up.zig").package_cache_dirs;
@@ -829,7 +830,7 @@ pub fn run(
             opts.backend_note = try std.fmt.allocPrint(arena, "This job runs on Dagger: {s}.", .{
                 w,
             });
-        } else return runNative(arena, io, opts, cfg, job, log);
+        } else if (try runNative(arena, io, opts, cfg, job, log, &opts.backend_note)) |r| return r;
     }
     var env = try environ.clone(arena);
     try env.put("NO_COLOR", "1");
@@ -892,7 +893,8 @@ fn runNative(
     cfg: Backend.Config,
     job: job_mod.Job,
     log: *sink.LogSink,
-) !Result {
+    dagger_note: *?[]const u8,
+) !?Result {
     var opts = opts_in;
     opts.step_cache = false;
     opts.output_keys = false;
@@ -906,7 +908,7 @@ fn runNative(
     @memset(results, .{});
     var sh = try jobLogFor(arena, io, opts, job, log);
     defer sh.flush();
-    var b = Backend.init(arena, io, opts.gpa, cfg) catch |e| return fail(
+    var b = Backend.init(arena, io, opts.gpa, cfg) catch |e| return try fail(
         &sh,
         results,
         try std.fmt.allocPrint(arena, "could not make the job's native store: {s}", .{
@@ -914,9 +916,15 @@ fn runNative(
         }),
     );
     defer b.deinit();
+    // What its `uses:` actions are is known once they are fetched: one native cannot run yet
+    // sends the job to Dagger before anything is logged (`native/actions.zig`).
+    if (try native_actions.preload(&b, job)) |why| {
+        dagger_note.* = try std.fmt.allocPrint(arena, "This job runs on Dagger: {s}.", .{why});
+        return null;
+    }
     // Which ids the job's steps have, as "Set up job" says (`Backend.idsNote`).
     opts.backend_note = try b.idsNote(arena);
-    return runSteps(arena, io, opts, job, &sh, results, b.transport(), &b);
+    return try runSteps(arena, io, opts, job, &sh, results, b.transport(), &b);
 }
 
 /// What every task of a job shares: the log, and one slot per log step — the job's steps, then

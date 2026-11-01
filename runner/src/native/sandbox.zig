@@ -86,10 +86,13 @@ pub const Spec = struct {
     /// what the action writes into the shared directories lands, as GitHub's `docker run` writes
     /// into the host's workspace through its bind. `files` go into the job's overlay too.
     pub const Container = struct {
-        /// The image's filesystem, absolute: the container's only lower layer.
-        rootfs: []const u8,
+        /// The image's layers, absolute, top first: its filesystem, or a built image's layers
+        /// over its base's (`dockerfile.build`). Each is the image's own ids, idmapped on a root
+        /// runner as the job's rootfs is.
+        lowers: []const []const u8,
         /// The container's own layer (thrown away when the step ends, as `docker run --rm`
-        /// does), its work directory and its mount point, relative to `root`.
+        /// does, or a build's new layer), its work directory and its mount point, relative to
+        /// `root` or absolute.
         upper: []const u8,
         work: []const u8,
         merged: []const u8,
@@ -410,8 +413,14 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
             makePrivate();
             lowers = idmapRootfs(arena, spec.lowers, userns);
             mountOverlay(arena, spec, lowers, false);
-            if (spec.container) |c|
-                mountContainer(arena, c, idmapped(arena, c.rootfs, userns, "I"), false);
+            if (spec.container) |c| {
+                const mapped = arena.alloc([]const u8, c.lowers.len) catch oom();
+                for (c.lowers, mapped, 0..) |l, *m, i| {
+                    const at = std.fmt.allocPrintSentinel(arena, "I{d}", .{i}, 0) catch oom();
+                    m.* = idmapped(arena, l, userns, at);
+                }
+                mountContainer(arena, c, mapped, false);
+            }
             // The binds, as the host's root: in the job's namespace the helper is nobody on the
             // host and may not search the directories on the way to a host path. They go on
             // with the overlay into the step's namespace (its bind onto itself is recursive).
@@ -429,7 +438,7 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
             if (spec.userns == .self) enterUserns();
             makePrivate();
             mountOverlay(arena, spec, lowers, true);
-            if (spec.container) |c| mountContainer(arena, c, c.rootfs, true);
+            if (spec.container) |c| mountContainer(arena, c, c.lowers, true);
         },
     }
 
@@ -515,7 +524,10 @@ fn bindAll(arena: Allocator, spec: Spec) void {
     const root: linux.fd_t = @intCast(rc);
     defer _ = linux.close(root);
     for (spec.binds) |bd| {
-        if (!bindIn(arena, root, bd.host, bd.at, !bd.optional)) continue;
+        // A Docker action's image gets a bind only where it has the path: the job's binds are
+        // made for the job's image, and nothing is made in the image for them.
+        const required = !bd.optional and spec.container == null;
+        if (!bindIn(arena, root, bd.host, bd.at, required)) continue;
         if (bd.read_only) remountReadOnly(arena, root, bd.at);
     }
 }
@@ -620,7 +632,7 @@ fn idmapped(
     arena: Allocator,
     rootfs: []const u8,
     userns: linux.fd_t,
-    comptime at: [:0]const u8,
+    at: [:0]const u8,
 ) []const u8 {
     const open_tree_clone = 1;
     const at_recursive = 0x8000;
@@ -655,11 +667,11 @@ fn idmapped(
     return at;
 }
 
-/// A Docker action's overlay: the image's filesystem (`lower`, idmapped on a root runner) under
-/// the container's own layer.
-fn mountContainer(arena: Allocator, c: Spec.Container, lower: []const u8, userxattr: bool) void {
+/// A Docker action's overlay: the image's layers (`lowers`, idmapped on a root runner) under the
+/// container's own layer.
+fn mountContainer(arena: Allocator, c: Spec.Container, lowers: []const []const u8, userxattr: bool) void {
     const opts = std.fmt.allocPrint(arena, "lowerdir={s},upperdir={s},workdir={s}{s}", .{
-        lower,
+        std.mem.join(arena, ":", lowers) catch oom(),
         c.upper,
         c.work,
         if (userxattr) ",userxattr" else "",
