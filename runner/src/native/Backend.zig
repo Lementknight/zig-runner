@@ -1564,13 +1564,17 @@ test "root runner: a job's own ids, its runner user, and sudo gaining nothing" {
     defer tmp.cleanup();
     var cfg = try testConfig(arena, &tmp);
     const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
-    // A sudo the job's root owns, as the provisioned image has (the host's, in the bound /usr, is
-    // owned by an id the job does not map), with its sudoers and PAM configuration; and a file
-    // only the host's root may read, bound in.
+    // What `set_up.provision_runner_script` gives the runner user (/tmp for all, /github and its
+    // home its own), a sudo the job's root owns, as the provisioned image has (the host's, in the
+    // bound /usr, is owned by an id the job does not map), with its sudoers and PAM
+    // configuration; and a file only the host's root may read, bound in.
     const setup = try std.fmt.allocPrint(arena,
         \\set -e
         \\cd '{s}'
         \\mkdir -p rootfs/opt rootfs/run rootfs/var/lib rootfs/etc/sudoers.d
+        \\chmod 1777 rootfs/tmp
+        \\mkdir -p rootfs/github rootfs/home/runner
+        \\chown 1001:1001 rootfs/github rootfs/home/runner
         \\cp /usr/bin/sudo rootfs/opt/sudo && chmod 4755 rootfs/opt/sudo
         \\mkdir -p rootfs/opt/sudo-plugins
         \\cp /usr/libexec/sudo/sudoers.so rootfs/opt/sudo-plugins/
