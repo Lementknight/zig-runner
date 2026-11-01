@@ -924,8 +924,8 @@ fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
         return skip(required, "the runner binary for native steps is not built");
     const d = tmp.dir;
     const dirs = [_][]const u8{
-        "rootfs/etc", "rootfs/usr",  "rootfs/tmp",  "rootfs/dev", "rootfs/proc",
-        "rootfs/sys", "rootfs/root", "rootfs/home", "store",
+        "rootfs/etc/ssl", "rootfs/usr",  "rootfs/tmp",  "rootfs/dev", "rootfs/proc",
+        "rootfs/sys",     "rootfs/root", "rootfs/home", "store",
     };
     for (dirs) |p| try d.createDirPath(io, p);
     const links = [_][2][]const u8{
@@ -953,6 +953,8 @@ fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
         .binds = &.{
             .{ .host = "/usr", .at = "/usr" },
             .{ .host = "/etc/ld.so.cache", .at = "/etc/ld.so.cache" },
+            // CA certificates, for the outbound test's HTTPS.
+            .{ .host = "/etc/ssl", .at = "/etc/ssl" },
         },
     };
     // One sandbox, to see whether this machine lets us make them at all.
@@ -1296,6 +1298,10 @@ test "the native checkout: the commit, its .git, and the checkout's fixed time" 
         "git rev-parse --abbrev-ref HEAD; git config remote.origin.url");
     var job = testJob(&.{ co, check });
     job.github.server_url = try std.fmt.allocPrint(arena, "file://{s}", .{root});
+    // On a root runner the repository made above is the host's root's, nobody in the job's
+    // namespace, and git refuses to fetch from a repository someone else owns. A repository on
+    // GitHub, fetched over HTTPS, has no owner to check.
+    job.env = &.{.{ .name = "GIT_CONFIG_PARAMETERS", .value = .{ .lit = "'safe.directory=*'" } }};
     var env: std.process.Environ.Map = .init(arena);
     var w: std.Io.Writer.Allocating = .init(arena);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
@@ -1306,7 +1312,12 @@ test "the native checkout: the commit, its .git, and the checkout's fixed time" 
     }, job, &log);
     const text = w.written();
     if (res.steps[0].outcome != .success or res.steps[1].outcome != .success) {
-        std.debug.print("{s}\n", .{text});
+        std.debug.print("checkout {s}, check {s}, engine {s}\n{s}\n", .{
+            @tagName(res.steps[0].outcome),
+            @tagName(res.steps[1].outcome),
+            res.engine_error orelse "-",
+            text,
+        });
         return error.TestUnexpectedResult;
     }
     const expect = [_][]const u8{
@@ -1561,10 +1572,15 @@ test "root runner: a job's own ids, its runner user, and sudo gaining nothing" {
         \\cd '{s}'
         \\mkdir -p rootfs/opt rootfs/run rootfs/var/lib rootfs/etc/sudoers.d
         \\cp /usr/bin/sudo rootfs/opt/sudo && chmod 4755 rootfs/opt/sudo
+        \\mkdir -p rootfs/opt/sudo-plugins
+        \\cp /usr/libexec/sudo/sudoers.so rootfs/opt/sudo-plugins/
         \\cp -a /etc/pam.d rootfs/etc/
-        \\for f in /etc/security /etc/login.defs /etc/nsswitch.conf /etc/sudo.conf; do
+        \\for f in /etc/security /etc/login.defs /etc/nsswitch.conf; do
         \\  [ -e "$f" ] && cp -a "$f" rootfs/etc/ || true
         \\done
+        \\for p in sudoers_policy sudoers_io sudoers_audit; do
+        \\  echo "Plugin $p /opt/sudo-plugins/sudoers.so"
+        \\done > rootfs/etc/sudo.conf
         \\printf 'root ALL=(ALL:ALL) ALL\nrunner ALL=(ALL) NOPASSWD:ALL\n' > rootfs/etc/sudoers
         \\chmod 0440 rootfs/etc/sudoers
         \\printf 'root:*:19000:0:99999:7:::\nrunner:*:19000:0:99999:7:::\n' > rootfs/etc/shadow
@@ -1588,7 +1604,11 @@ test "root runner: a job's own ids, its runner user, and sudo gaining nothing" {
         "/opt/sudo -n cat /proc/self/uid_map | sed 's/^/sudo-map /'";
     const r = try runNativeJob(arena, cfg, testJob(&.{testStep(script)}), .runner);
     if (r.res.steps[0].outcome != .success) {
-        std.debug.print("{s}\n", .{r.text});
+        std.debug.print("step {s}, engine {s}\n{s}\n", .{
+            @tagName(r.res.steps[0].outcome),
+            r.res.engine_error orelse "-",
+            r.text,
+        });
         return error.TestUnexpectedResult;
     }
     try expectLines(r.text, &.{
