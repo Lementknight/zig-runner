@@ -172,6 +172,11 @@ pub const Layer = struct {
     /// The key of the state the stack up to this layer is (`keyFor`), when it is in the store:
     /// replayed from it or published to it. Only a stored layer's key is a parent's.
     key: ?Store.Key = null,
+    /// On a root runner, whether its files have the canonical ids (0 to 65535, as the job's
+    /// namespace sees them: `Store.unshift`), so every step sees it through the job's ids, an
+    /// idmapped mount (`Spec.canonical`). A stored layer has, and so does a flattened one; the
+    /// job's own uppers, not published, keep its slot's host ids. Rootless, ids are never shifted.
+    canonical: bool = false,
 };
 
 /// Past systemd's ranges: its containers' (systemd-nspawn's private users and nsresourced's,
@@ -879,7 +884,7 @@ pub fn base(
     if (claim.hit != null) return;
     const ended = try b.exec(mk, try b.envStrings(&.{}), files, mk_uid, mk_gid, out.output());
     if (ended.failure.len == 0 and ended.code == 0) {
-        if (claim.key) |k| b.publishTop(k, .base, .{ .log = "", .fc = "" });
+        if (claim.key) |k| try b.publishTop(k, .base, .{ .log = "", .fc = "" });
     } else {
         err_msg.* = try std.fmt.allocPrint(arena, "could not set up the job's base: {s}{s}", .{
             ended.failure,
@@ -1046,7 +1051,7 @@ pub fn execScript(
         const out = try x.collect(num, data, .{ .doc = "", .at = 0 });
         x.loadPendingMatchers(num);
         if (claim.key) |k| if (ended.code == 0 and out.code == 0) if (live.record) |r|
-            b.publishTop(k, .step, .{ .log = r.items, .fc = all orelse "" });
+            try b.publishTop(k, .step, .{ .log = r.items, .fc = all orelse "" });
         return out;
     }
 }
@@ -1293,7 +1298,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
         out.output(),
     );
     if (ended.code == 0 and ended.failure.len == 0 and !ended.killed) {
-        if (claim.key) |k| b.publishTop(k, .fetch, .{ .log = "", .fc = "" });
+        if (claim.key) |k| try b.publishTop(k, .fetch, .{ .log = "", .fc = "" });
         f.result = .{ .dir = "native" };
         return f;
     }
@@ -1386,7 +1391,12 @@ fn exec(
     // The job's layers, newest first, then the seeds' and the rootfs: the image's own.
     const n = b.layers.items.len;
     const lowers = try arena.alloc([]const u8, n + b.seed_layers.items.len + 1);
-    for (b.layers.items, 0..) |l, i| lowers[n - 1 - i] = l.name;
+    // Which of the job's layers to see through the job's ids: those with the canonical ids.
+    const canonical = try arena.alloc(bool, n);
+    for (b.layers.items, 0..) |l, i| {
+        lowers[n - 1 - i] = l.name;
+        canonical[n - 1 - i] = l.canonical;
+    }
     @memcpy(lowers[n .. lowers.len - 1], b.seed_layers.items);
     lowers[lowers.len - 1] = b.rootfs;
     const ended = try sandbox.run(arena, b.io, b.how.argv_prefix, .{
@@ -1408,6 +1418,7 @@ fn exec(
         .netns = b.netns,
         .cgroup = if (b.job_cgroup) |j| j.dir else null,
         .image_layers = @intCast(b.seed_layers.items.len + 1),
+        .canonical = canonical,
         .volume_id_base = volumeIdBase(b.subid_base),
     }, &b.running, out);
     try b.layers.append(arena, .{ .name = upper, .path = upper_path });
@@ -1461,11 +1472,12 @@ fn keyFor(
 /// What a base's layer, and so every layer above it, depends on besides its own script: the
 /// store's format (`Store.store_format`), the job's cache scope and repository (a vouched fork's
 /// pull request never replays, or leaves, a layer its repository's own jobs use), the rootfs's
-/// fingerprint, how ids are mapped and, on a root runner, the slot's first id (a layer's
-/// files are owned by its job's range, so a layer is reused only by jobs with the same range: only
-/// misses come of it), the binds (where, not what: mounts' content is in no key), and the Zig cache
-/// seeds' layers between the rootfs and the job's (a layer replayed over another seed would show
-/// the wrong files). Null, and the job uncached, when the rootfs cannot be read.
+/// fingerprint, how ids are mapped (a rootless runner's layers are owned by its own user, a root
+/// runner's have the canonical ids), the binds (where, not what: mounts' content is in no key), and
+/// the Zig cache seeds' layers between the rootfs and the job's (a layer replayed over another seed
+/// would show the wrong files). Not the slot: a stored layer has the canonical ids, which every
+/// slot's job sees as its own (`Store.unshift`, `Spec.canonical`). Null, and the job uncached, when
+/// the rootfs cannot be read.
 fn below(b: *Backend) ?Store.Key {
     const fp = Store.rootfsFingerprint(b.arena, b.io, b.rootfs) catch |e| {
         std.log.warn("native: the rootfs's fingerprint: {s}; the job's steps are not cached", .{
@@ -1480,7 +1492,6 @@ fn below(b: *Backend) ?Store.Key {
         .repository = b.repository,
         .fingerprint = &fp,
         .userns = @tagName(b.how.userns),
-        .id_base = if (b.how.userns == .mapped) b.idBase() else 0,
         .binds = b.binds,
         .seeds = b.seed_layers.items,
     }, null);
@@ -1493,7 +1504,6 @@ pub const Below = struct {
     repository: []const u8,
     fingerprint: []const u8,
     userns: []const u8,
-    id_base: u64,
     binds: []const sandbox.Spec.Bind,
     /// The Zig cache seeds' layers (`volumes.Seed`), by path, which names the release,
     /// architecture and step user each was built for, once.
@@ -1512,7 +1522,6 @@ pub fn belowKey(in: Below, bytes: ?*std.Io.Writer) Store.Key {
     h.field(in.repository);
     h.field(in.fingerprint);
     h.field(in.userns);
-    h.int(in.id_base);
     h.int(in.binds.len);
     for (in.binds) |bd| {
         h.field(bd.host);
@@ -1532,12 +1541,27 @@ pub fn belowKey(in: Below, bytes: ?*std.Io.Writer) Store.Key {
     return h.final();
 }
 
-/// How the job's namespace sees host ids (`Store.Ids`), for a layer's digest.
+/// How the job's namespace sees a stored layer's ids (`Store.Ids`), for its digest: on a root
+/// runner they are the canonical ids already (`Store.unshift`), rootless the runner's own user's.
 fn ids(b: *const Backend) Store.Ids {
     return if (b.how.userns == .mapped)
-        .{ .base = b.idBase(), .count = ids_per_slot }
+        .{ .base = 0, .count = ids_per_slot }
     else
         .{ .base = std.os.linux.getuid(), .count = 1 };
+}
+
+/// How the job's namespace sees the host ids of the job's own uppers: its slot's range on a root
+/// runner.
+fn slotIds(b: *const Backend) Store.Ids {
+    return .{ .base = b.idBase(), .count = ids_per_slot };
+}
+
+/// The job's own upper `l` given the canonical ids (`Store.unshift`), on a root runner, before it
+/// is published or flattened; each step then sees it through the job's ids.
+fn canonicalize(b: *Backend, l: *Layer) !void {
+    if (b.how.userns != .mapped or l.canonical) return;
+    try Store.unshift(b.arena, b.io, l.path, b.slotIds());
+    l.canonical = true;
 }
 
 /// The digest of the store's layer under `key` (`Store.layerDigest`): what output keys will key
@@ -1596,21 +1620,31 @@ fn claimKey(b: *Backend, key: ?Store.Key) error{ Stopped, OutOfMemory }!Claim {
         return .{};
     };
     b.held.appendAssumeCapacity(hit.layer.lock);
-    b.layers.appendAssumeCapacity(.{ .name = name, .path = hit.layer.fs, .key = k });
+    b.layers.appendAssumeCapacity(.{
+        .name = name,
+        .path = hit.layer.fs,
+        .key = k,
+        .canonical = b.how.userns == .mapped,
+    });
     return .{ .key = k, .lock = lock, .hit = hit.rec };
 }
 
-/// The stack's top layer, which an exec under `key` just left, moved into the store
-/// (`Store.publish`) with its record, and the job's stack then links to it. Its parent is in the
-/// store (`keyFor`). A failure leaves the layer the job's own, and is logged: the job goes on,
-/// uncached from here.
-fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) void {
+/// The stack's top layer, which an exec under `key` just left, given the canonical ids
+/// (`canonicalize`, so any slot's job can use it) and moved into the store (`Store.publish`) with
+/// its record, and the job's stack then links to it. Its parent is in the store (`keyFor`). A
+/// failure to publish leaves the layer the job's own, and is logged: the job goes on, uncached from
+/// here. One to shift its ids is the job's: the layer is then half one range's, half the other's.
+fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) !void {
     const s = b.store orelse return;
     const arena = b.arena;
     if (rec.log.len > Store.max_record_bytes) return;
     // Room first: once the layer has moved, the job must hold it and point at it.
     b.held.ensureUnusedCapacity(arena, 1) catch return;
     const top = &b.layers.items[b.layers.items.len - 1];
+    b.canonicalize(top) catch |e| {
+        std.log.err("native: a step's layer could not be given the canonical ids: {s}", .{@errorName(e)});
+        return error.LayerNotShifted;
+    };
     const name = b.layerName('l') catch return;
     const link = std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, name }) catch return;
     const layer_fs = std.fmt.allocPrint(arena, "{s}/layers/{s}/fs", .{
@@ -1629,7 +1663,8 @@ fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) 
         return;
     };
     b.held.appendAssumeCapacity(layer.lock);
-    top.* = .{ .name = name, .path = layer.fs, .key = key };
+    const canonical = top.canonical;
+    top.* = .{ .name = name, .path = layer.fs, .key = key, .canonical = canonical };
 }
 
 /// The job's stack merged into one layer (`Store.flatten`), before overlay's limits on layers and
@@ -1638,7 +1673,12 @@ fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) 
 fn flatten(b: *Backend) !void {
     const arena = b.arena;
     const paths = try arena.alloc([]const u8, b.layers.items.len);
-    for (b.layers.items, paths) |l, *p| p.* = l.path;
+    // One tree, so one set of ids: the job's own uppers, consumed here, get the canonical ids the
+    // stored layers have, and the merged layer is seen through the job's ids as they are.
+    for (b.layers.items, paths) |*l, *p| {
+        try b.canonicalize(l);
+        p.* = l.path;
+    }
     const name = try b.layerName('F');
     const out = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, name });
     // Overlay's xattrs are `trusted.` when mounted as the host's root, `user.` under `userxattr`.
@@ -1649,7 +1689,12 @@ fn flatten(b: *Backend) !void {
     try Store.flatten(arena, b.io, paths, out, opaque_xattr);
     const top_key = b.layers.items[b.layers.items.len - 1].key;
     b.layers.clearRetainingCapacity();
-    try b.layers.append(arena, .{ .name = name, .path = out, .key = top_key });
+    try b.layers.append(arena, .{
+        .name = name,
+        .path = out,
+        .key = top_key,
+        .canonical = b.how.userns == .mapped,
+    });
 }
 
 fn put(b: *Backend, name: []const u8, value: []const u8) !void {
@@ -1760,8 +1805,8 @@ fn pullWithin(
 /// steps run as the runner user), as Dagger's base does in one cached exec: here a native step
 /// on the pulled image, its layer keyed by the image, the script and its env (P2's
 /// `Store.KeyHasher`) and flattened onto the image (`ImageStore.flatten`), so it runs once per
-/// store. The provisioned rootfs is a whole tree shared across slots, not P2's stacked layers:
-/// those belong to one slot's range of ids (only the lowest lower is idmapped).
+/// store. The provisioned rootfs is a whole tree with the image's ids, shared across slots and
+/// across stores' keys, not one of P2's stacked layers with a record.
 fn provision(b: *Backend, img: oci.Image, script: []const u8, err_msg: *[]const u8) ![]const u8 {
     const arena = b.arena;
     var env: std.ArrayList([]const u8) = .empty;
@@ -3561,9 +3606,8 @@ test "native step cache: steps with secrets or run-specific values always run, a
 }
 
 test "native step cache: two jobs with one key at once run it once; the other replays it" {
-    // On a root runner two jobs at once have two slots, two ranges of ids, so two keys (a layer
-    // is reused only by jobs with the same range): each runs its own.
-    const shared_key = std.os.linux.geteuid() != 0;
+    // On a root runner too, though two jobs at once have two slots: a stored layer has the
+    // canonical ids, and its key no slot's.
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -3598,10 +3642,85 @@ test "native step cache: two jobs with one key at once run it once; the other re
     defer dir.close(io);
     var it = dir.iterate();
     while (try it.next(io)) |e| made += @intFromBool(std.mem.startsWith(u8, e.name, "slow."));
-    try std.testing.expectEqual(@as(usize, if (shared_key) 1 else 2), made);
+    try std.testing.expectEqual(@as(usize, 1), made);
     const notes = std.mem.count(u8, mine.text, dagger.native_reused_note) +
         std.mem.count(u8, other_text, dagger.native_reused_note);
-    try std.testing.expectEqual(@as(usize, if (shared_key) 1 else 0), notes);
+    try std.testing.expectEqual(@as(usize, 1), notes);
+}
+
+/// The first host id of the job's range, from "Set up job" ("ids 0-65535 are host ids N-...").
+fn hostIdsOf(text: []const u8) ?u32 {
+    const at = std.mem.indexOf(u8, text, "are host ids ") orelse return null;
+    const rest = text[at + "are host ids ".len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '-') orelse return null;
+    return std.fmt.parseInt(u32, rest[0..end], 10) catch null;
+}
+
+test "root runner: jobs in different slots share a stored layer, its owners their own, a set-id file harmless" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    // A file of the job's runner user, and a set-uid file of the job's root.
+    const make = testStep("echo x >> /shared/made; mkdir -p /w && echo mine > /w/mine && " ++
+        "chown 1001:1001 /w/mine && cp /bin/true /w/suid && chmod 4755 /w/suid");
+    const look = testStep("stat -c 'seen %n %u:%g %a' /w/mine /w/suid; " ++
+        "head -n1 /proc/self/uid_map | tr -s ' ' | sed 's/^ //; s/^/map /'; " ++
+        "echo more >> /w/mine && stat -c 'copied up %u:%g' /w/mine");
+    // The first job in another slot than the first free one, which a second runner holds.
+    var other = c.cfg;
+    try tmp.dir.createDirPath(io, "store-2");
+    other.store = try std.fmt.allocPrint(arena, "{s}/store-2", .{try tmp.dir.realPathFileAlloc(io, ".", arena)});
+    var holder = try init(arena, io, std.testing.allocator, other);
+    const first = try runCached(arena, c.cfg, testJob(&.{make}), "j1");
+    holder.deinit();
+    try expectSucceeded(first);
+    const second = try runCached(arena, c.cfg, testJob(&.{ make, look }), "j2");
+    try expectSucceeded(second);
+    const first_ids = hostIdsOf(first.text).?;
+    const second_ids = hostIdsOf(second.text).?;
+    try std.testing.expect(first_ids != second_ids);
+
+    // The second job replayed the first's layer (its base's and its step's), in its own range.
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "made"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, second.text, dagger.native_reused_note));
+    try expectLines(second.text, &.{
+        "seen /w/mine 1001:1001 644",
+        "seen /w/suid 0:0 4755",
+        try std.fmt.allocPrint(arena, "map 0 {d} 65536", .{second_ids}),
+        // Copied up from the stored layer into the step's own, as the job's runner user still.
+        "copied up 1001:1001",
+    });
+
+    // On disk the layer has the canonical ids, the set-uid file the host's root's: harmless, as
+    // the store is the host's root's alone (0700), so no host user reaches it.
+    const layers = try std.fmt.allocPrint(arena, "{s}/layers", .{c.cfg.store});
+    var dir = try std.Io.Dir.cwd().openDir(io, layers, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    var found: ?[:0]const u8 = null;
+    while (try it.next(io)) |e| {
+        const p = try std.fmt.allocPrintSentinel(arena, "{s}/{s}/fs/w/suid", .{ layers, e.name }, 0);
+        var st: std.os.linux.Statx = undefined;
+        if (std.os.linux.errno(std.os.linux.statx(std.os.linux.AT.FDCWD, p, std.os.linux.AT.SYMLINK_NOFOLLOW, .{ .UID = true, .MODE = true }, &st)) != .SUCCESS) continue;
+        try std.testing.expectEqual(@as(u32, 0), st.uid);
+        try std.testing.expectEqual(@as(u32, 0o4755), st.mode & 0o7777);
+        const mine = try std.fmt.allocPrintSentinel(arena, "{s}/{s}/fs/w/mine", .{ layers, e.name }, 0);
+        _ = std.os.linux.statx(std.os.linux.AT.FDCWD, mine, 0, .{ .UID = true }, &st);
+        try std.testing.expectEqual(@as(u32, 1001), st.uid);
+        found = p;
+    }
+    var st: std.os.linux.Statx = undefined;
+    _ = std.os.linux.statx(std.os.linux.AT.FDCWD, try arena.dupeSentinel(u8, c.cfg.store, 0), 0, .{ .MODE = true }, &st);
+    try std.testing.expectEqual(@as(u32, 0o700), st.mode & 0o777);
+    const nobody = try std.process.run(arena, io, .{ .argv = &.{
+        "setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "test", "-e", found.?,
+    } });
+    try std.testing.expect(nobody.term == .exited and nobody.term.exited != 0);
 }
 
 test "native step cache: a long job's layers are flattened, files, deletions and replays intact" {

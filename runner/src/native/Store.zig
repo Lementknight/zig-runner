@@ -47,7 +47,7 @@ pub fn hex(k: Key) [2 * Sha256.digest_length]u8 {
 /// record's files and how they replay, the key's extras). Part of every base's parent
 /// (`Backend.below`), so every key: bump it with any change to those, and a runner upgraded
 /// finds none of the layers an older one left (they age out under the cap).
-pub const store_format = "zig-runner native store 2";
+pub const store_format = "zig-runner native store 3";
 
 /// What a key is of (P8's tag, proofs/Runner/Native.lean): a job's base, a step's container (a
 /// `run:` step's exec, or a checkout's fetch), or one keyed on what a step produced.
@@ -691,6 +691,132 @@ pub const Ids = struct {
     }
 };
 
+// --- canonical ids: a layer any slot can use ---
+
+/// Gives every entry of the tree `p` (its root too) the ids the job's namespace saw it with
+/// (`Ids.inside`): on a root runner, a layer a step left in its slot's host ids (`ids.base`
+/// onwards) gets the canonical ids, 0 to 65535, which any slot's job sees as its own through an
+/// idmapped mount (`sandbox.idmapLowers`); any other host id becomes the overflow id. So a layer
+/// is the same whichever slot made it, and its digest with `ids` before is its digest with the
+/// canonical ids after. Set-id bits, which `chown` clears, are put back; so are file capabilities
+/// (also cleared), with their root's id shifted (one outside the range drops them); ACL entries'
+/// ids are shifted. Through no symlink, with no limit on depth, each inode once. An error when
+/// any entry cannot be read or changed: the layer must then not be published.
+pub fn unshift(arena: Allocator, io: std.Io, p: []const u8, ids: Ids) !void {
+    const root = try openRoot(arena, p);
+    defer _ = linux.close(root);
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(root, "", linux.AT.EMPTY_PATH, stat_mask, &st)) != .SUCCESS)
+        return error.Stat;
+    try unshiftEntry(arena, root, "", st, ids);
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    var stack: std.ArrayList([]const u8) = .empty;
+    try stack.append(arena, "");
+    while (stack.pop()) |rel| {
+        const fd = if (rel.len == 0) root else try openRel(arena, root, rel);
+        defer if (fd != root) {
+            _ = linux.close(fd);
+        };
+        for (try listDir(arena, io, fd)) |n| {
+            // A hard link's second name: its inode has its canonical ids already, which a second
+            // shift would take for a host id outside the range.
+            if (n.st.nlink > 1 and n.kind() != linux.S.IFDIR) {
+                if ((try seen.getOrPut(arena, n.st.ino)).found_existing) continue;
+            }
+            try unshiftEntry(arena, fd, n.name, n.st, ids);
+            if (n.kind() != linux.S.IFDIR) continue;
+            try stack.append(arena, if (rel.len == 0)
+                try arena.dupe(u8, n.name)
+            else
+                try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, n.name }));
+        }
+    }
+}
+
+const cap_xattr = "security.capability";
+const acl_xattrs = [_][:0]const u8{ "system.posix_acl_access", "system.posix_acl_default" };
+
+/// One entry, `name` in `dir` (the directory itself when empty), shifted (`unshift`).
+fn unshiftEntry(arena: Allocator, dir: linux.fd_t, name: [:0]const u8, st: linux.Statx, ids: Ids) !void {
+    const kind = st.mode & linux.S.IFMT;
+    // Through `.` for the directory itself, so the `l*xattr` calls see it, not the magic link.
+    const p = if (name.len == 0)
+        try std.fmt.allocPrintSentinel(arena, "/proc/self/fd/{d}/.", .{dir}, 0)
+    else
+        try procPath(arena, dir, name);
+    // Read before the chown, which drops a file's capabilities.
+    const cap = if (kind == linux.S.IFREG) try ownXattr(arena, p, cap_xattr) else null;
+    const flags: u32 = linux.AT.SYMLINK_NOFOLLOW | @as(u32, if (name.len == 0) linux.AT.EMPTY_PATH else 0);
+    if (linux.errno(linux.fchownat(dir, name, ids.inside(st.uid), ids.inside(st.gid), flags)) != .SUCCESS)
+        return error.Chown;
+    if (kind == linux.S.IFLNK) return;
+    if (st.mode & (linux.S.ISUID | linux.S.ISGID) != 0 and
+        linux.errno(linux.fchmodat(dir, if (name.len == 0) "." else name, st.mode & 0o7777)) != .SUCCESS)
+        return error.Chmod;
+    for (acl_xattrs) |acl| {
+        const v = try ownXattr(arena, p, acl) orelse continue;
+        const shifted = try arena.dupe(u8, v);
+        unshiftAcl(shifted, ids);
+        if (linux.errno(linux.lsetxattr(p, acl, shifted.ptr, shifted.len, 0)) != .SUCCESS)
+            return error.SetXattr;
+    }
+    if (cap) |v| if (try unshiftCap(arena, v, ids)) |shifted| {
+        if (linux.errno(linux.lsetxattr(p, cap_xattr, shifted.ptr, shifted.len, 0)) != .SUCCESS)
+            return error.SetXattr;
+    };
+}
+
+/// An xattr's value, or null when the entry has none or its filesystem does not keep that kind.
+fn ownXattr(arena: Allocator, p: [:0]const u8, name: [:0]const u8) !?[]const u8 {
+    var buf: [64 * 1024]u8 = undefined;
+    const got = linux.lgetxattr(p, name, &buf, buf.len);
+    return switch (linux.errno(got)) {
+        .SUCCESS => try arena.dupe(u8, buf[0..got]),
+        .NODATA, .OPNOTSUPP => null,
+        else => error.GetXattr,
+    };
+}
+
+/// A POSIX ACL's xattr (a 4-byte header, then 8-byte entries of a u16 tag, a u16 permission and a
+/// u32 id, little-endian) with its named users' and groups' ids shifted in place.
+fn unshiftAcl(v: []u8, ids: Ids) void {
+    const acl_user = 0x02;
+    const acl_group = 0x08;
+    var i: usize = 4;
+    while (i + 8 <= v.len) : (i += 8) {
+        const tag = std.mem.readInt(u16, v[i..][0..2], .little);
+        if (tag != acl_user and tag != acl_group) continue;
+        const id = std.mem.readInt(u32, v[i + 4 ..][0..4], .little);
+        std.mem.writeInt(u32, v[i + 4 ..][0..4], ids.inside(id), .little);
+    }
+}
+
+/// A file's capabilities (`vfs_ns_cap_data`) to set again after the chown: a v2 as it was; a v3,
+/// whose root id is the host id of the namespace root they are for, as a v2 when that is the
+/// job's root, or with its id shifted when it is another of the job's ids. Null, dropping them,
+/// when that root is outside the job's range or the value is not one the kernel writes.
+fn unshiftCap(arena: Allocator, v: []const u8, ids: Ids) !?[]const u8 {
+    const revision_mask: u32 = 0xff000000;
+    const revision_2: u32 = 0x02000000;
+    const revision_3: u32 = 0x03000000;
+    const v2_len = 20;
+    if (v.len < 4) return null;
+    const magic = std.mem.readInt(u32, v[0..4], .little);
+    if (magic & revision_mask == revision_2 and v.len == v2_len) return v;
+    if (magic & revision_mask != revision_3 or v.len != v2_len + 4) return null;
+    const rootid = std.mem.readInt(u32, v[v2_len..][0..4], .little);
+    if (rootid < ids.base or rootid - ids.base >= ids.count) return null;
+    const inside = rootid - ids.base;
+    if (inside != 0) {
+        const out = try arena.dupe(u8, v);
+        std.mem.writeInt(u32, out[v2_len..][0..4], inside, .little);
+        return out;
+    }
+    const out = try arena.dupe(u8, v[0..v2_len]);
+    std.mem.writeInt(u32, out[0..4], (magic & ~revision_mask) | revision_2, .little);
+    return out;
+}
+
 /// What a digest covers of a regular file: its content (a layer's digest), or only its size and
 /// mtime (the rootfs's fingerprint, where reading every byte of an image would cost seconds).
 pub const Depth = enum { content, metadata };
@@ -1298,6 +1424,103 @@ test "native store: a digest sees ids as the job's namespace does, never the hos
     try std.testing.expectEqual(@as(u32, 65534), (Ids{ .base = 1000, .count = 1 }).inside(0));
     try std.testing.expectEqual(@as(u32, 1001), (Ids{ .base = 1_900_000_000, .count = 65536 }).inside(1_900_001_001));
     try std.testing.expectEqual(@as(u32, 65534), (Ids{ .base = 1_900_000_000, .count = 65536 }).inside(1_900_065_536));
+}
+
+test "native store: a layer shifted to canonical ids: owners, set-id bits, links, capabilities, ACLs, its digest" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    const slot: Ids = .{ .base = 1_900_131_072, .count = 65536 };
+    // Capabilities: a v3's root id is a host id; the job's root's become a v2, another of its ids
+    // is shifted, one outside the range drops them.
+    var v3: [24]u8 = @splat(0);
+    std.mem.writeInt(u32, v3[0..4], 0x03000001, .little);
+    std.mem.writeInt(u32, v3[4..8], 1 << 10, .little);
+    std.mem.writeInt(u32, v3[20..24], slot.base, .little);
+    const as_v2 = (try unshiftCap(arena, &v3, slot)).?;
+    try std.testing.expectEqual(@as(usize, 20), as_v2.len);
+    try std.testing.expectEqual(@as(u32, 0x02000001), std.mem.readInt(u32, as_v2[0..4], .little));
+    try std.testing.expectEqualSlices(u8, v3[4..20], as_v2[4..20]);
+    std.mem.writeInt(u32, v3[20..24], slot.base + 1001, .little);
+    try std.testing.expectEqual(@as(u32, 1001), std.mem.readInt(u32, (try unshiftCap(arena, &v3, slot)).?[20..24], .little));
+    std.mem.writeInt(u32, v3[20..24], 0, .little);
+    try std.testing.expect(try unshiftCap(arena, &v3, slot) == null);
+    try std.testing.expectEqualSlices(u8, as_v2, (try unshiftCap(arena, as_v2, slot)).?);
+    // ACLs: named users' and groups' ids shifted, the rest (ACL_UNDEFINED_ID) as they were.
+    var acl: [4 + 3 * 8]u8 = @splat(0);
+    std.mem.writeInt(u32, acl[0..4], 2, .little);
+    const entries = [_][2]u32{ .{ 0x01, 0xffffffff }, .{ 0x02, slot.base + 1001 }, .{ 0x08, 7 } };
+    for (entries, 0..) |e, i| {
+        std.mem.writeInt(u16, acl[4 + i * 8 ..][0..2], @intCast(e[0]), .little);
+        std.mem.writeInt(u32, acl[8 + i * 8 ..][0..4], e[1], .little);
+    }
+    unshiftAcl(&acl, slot);
+    try std.testing.expectEqual(@as(u32, 0xffffffff), std.mem.readInt(u32, acl[8..12], .little));
+    try std.testing.expectEqual(@as(u32, 1001), std.mem.readInt(u32, acl[16..20], .little));
+    try std.testing.expectEqual(@as(u32, 65534), std.mem.readInt(u32, acl[24..28], .little));
+
+    // A tree as a step in that slot leaves it; changing owners needs the host's root.
+    if (linux.geteuid() != 0) return;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const setup = try std.fmt.allocPrint(arena,
+        \\set -e
+        \\cd '{s}' && mkdir -p up/d
+        \\echo x > up/d/mine && chown {d}:{d} up/d/mine
+        \\cp /bin/true up/suid && chown {d}:{d} up/suid && chmod 4755 up/suid
+        \\echo y > up/stranger && chown 12345:0 up/stranger
+        \\ln up/d/mine up/twice
+        \\ln -s d/mine up/link && chown -h {d}:{d} up/link
+        \\chown {d}:{d} up up/d && chmod 2775 up/d
+    , .{
+        root,
+        slot.base + 1001,
+        slot.base + 1001,
+        slot.base,
+        slot.base,
+        slot.base + 1001,
+        slot.base + 1001,
+        slot.base,
+        slot.base,
+    });
+    const made = try std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", setup } });
+    try std.testing.expect(made.term == .exited and made.term.exited == 0);
+    const up = try std.fmt.allocPrint(arena, "{s}/up", .{root});
+    const before = try treeDigest(arena, io, up, .content, slot);
+    // A v3 for the slot's root, as a step's `setcap` leaves it (its digest aside: a capability's
+    // root id is a host id, digested raw).
+    const suid = try std.fmt.allocPrintSentinel(arena, "{s}/suid", .{up}, 0);
+    std.mem.writeInt(u32, v3[20..24], slot.base, .little);
+    const capped = linux.errno(linux.lsetxattr(suid, cap_xattr, &v3, v3.len, 0)) == .SUCCESS;
+    try unshift(arena, io, up, slot);
+    // As the job's namespace saw them, now on disk.
+    const want = [_]struct { []const u8, u32, u32 }{
+        .{ "", 0, 0o755 },         .{ "d", 0, 0o2775 },    .{ "d/mine", 1001, 0o644 },
+        .{ "twice", 1001, 0o644 }, .{ "suid", 0, 0o4755 }, .{ "stranger", 65534, 0o644 },
+        .{ "link", 1001, 0o777 },
+    };
+    for (want) |w| {
+        const p = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ up, w[0] }, 0);
+        var st: linux.Statx = undefined;
+        try std.testing.expectEqual(@as(usize, 0), linux.statx(linux.AT.FDCWD, p, linux.AT.SYMLINK_NOFOLLOW, .{ .UID = true, .MODE = true }, &st));
+        std.testing.expectEqual(w[1], st.uid) catch |e| {
+            std.debug.print("{s}: uid {d}\n", .{ w[0], st.uid });
+            return e;
+        };
+        if (st.mode & linux.S.IFMT != linux.S.IFLNK) try std.testing.expectEqual(w[2], st.mode & 0o7777);
+    }
+    if (capped) {
+        var got: [64]u8 = undefined;
+        const n = linux.lgetxattr(suid, cap_xattr, &got, got.len);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(n));
+        try std.testing.expectEqualSlices(u8, as_v2, got[0..n]);
+        _ = linux.lremovexattr(suid, cap_xattr);
+    }
+    // Its digest: the same tree as the namespace sees it, whichever ids it has on disk.
+    const after = try treeDigest(arena, io, up, .content, .{ .base = 0, .count = 65536 });
+    try std.testing.expectEqualSlices(u8, &before, &after);
 }
 
 test "native store: the rootfs's fingerprint changes when the rootfs is changed in place" {
