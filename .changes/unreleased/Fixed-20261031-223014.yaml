@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'The test suite takes about 1.3 s less to run (`zig build test`, warm, on the laptop), and every test asserts what it did, with the same deadlines and inputs. Independent slow cases now run side by side: the two 70000-deep YAML inputs, the two interpolation limit cases, the PostgreSQL client''s silent connect and silent statement, and the database writer''s queued-at-once case beside its 2 s connect timeout.'
-time: 2026-10-31T22:30:14.000000-04:00
