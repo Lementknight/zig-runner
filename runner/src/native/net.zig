@@ -5,7 +5,7 @@
 //! BuildKit's CNI network.
 //!
 //! Links, addresses and routes are made over rtnetlink here, with no `ip`. The NAT that takes the
-//! jobs' traffic out is the one rule set made with `nft` (`natRules`): debt, recorded in the plan.
+//! jobs' traffic out is made with `iptables` (`natRules`): debt, recorded in the plan.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -347,10 +347,12 @@ const Message = struct {
     }
 };
 
-/// What the runner needs from the host for its jobs' traffic to leave: forwarding on, and the
-/// NAT and forwarding rules, in a table of the runner's own (`zig_runner`) and, on a Docker host,
-/// in `DOCKER-USER`, whose policy would drop it otherwise. Made with `nft` (debt: phase 5 makes
-/// them over netlink). Idempotent. On failure, what went wrong.
+/// What the runner needs from the host for its jobs' traffic to leave: forwarding on, the jobs'
+/// addresses masqueraded on their way out, and forwarding to and from the bridge accepted, in
+/// `FORWARD` and, on a Docker host, in `DOCKER-USER`, the chain Docker leaves for others' rules
+/// (its FORWARD policy drops the rest). Made with `iptables`, which every Docker host has and
+/// which puts them in the same tables as Docker's (debt: phase 5 makes them over netlink). Each
+/// rule is added once. On failure, what went wrong.
 pub fn natRules(arena: Allocator, io: std.Io) !?[]const u8 {
     const fwd = std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = "/proc/sys/net/ipv4/ip_forward",
@@ -359,69 +361,59 @@ pub fn natRules(arena: Allocator, io: std.Io) !?[]const u8 {
     fwd catch |e| return try std.fmt.allocPrint(arena, "cannot turn on IPv4 forwarding: {s}", .{
         @errorName(e),
     });
-    const rules = "table ip zig_runner\ndelete table ip zig_runner\n" ++
-        "table ip zig_runner {\n" ++
-        "  chain postrouting { type nat hook postrouting priority srcnat;\n" ++
-        "    ip saddr " ++ subnet ++ " oifname != \"" ++ bridge ++ "\" masquerade }\n" ++
-        "  chain forward { type filter hook forward priority filter;\n" ++
-        "    iifname \"" ++ bridge ++ "\" accept\n" ++
-        "    oifname \"" ++ bridge ++ "\" ct state established,related accept }\n" ++
-        "}\n";
-    if (try nft(arena, io, rules)) |why| return why;
-    // Docker's FORWARD policy drops what its own rules do not accept; DOCKER-USER is where
-    // others' rules go. Absent (no Docker), there is nothing to add.
-    const docker = try nft(arena, io, "list chain ip filter DOCKER-USER\n");
-    if (docker == null) {
-        const listed = try nftOut(arena, io, "list chain ip filter DOCKER-USER\n");
-        if (std.mem.indexOf(u8, listed, bridge) == null) {
-            const add = "insert rule ip filter DOCKER-USER oifname \"" ++ bridge ++
-                "\" ct state established,related accept\n" ++
-                "insert rule ip filter DOCKER-USER iifname \"" ++ bridge ++ "\" accept\n";
-            if (try nft(arena, io, add)) |why| return why;
-        }
+    const established = [_][]const u8{ "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED" };
+    const rules = [_]struct { table: []const u8, chain: []const u8, rule: []const []const u8 }{
+        .{
+            .table = "nat",
+            .chain = "POSTROUTING",
+            .rule = &.{ "-s", subnet, "!", "-o", bridge, "-j", "MASQUERADE" },
+        },
+        .{ .table = "filter", .chain = "FORWARD", .rule = &.{ "-i", bridge, "-j", "ACCEPT" } },
+        .{
+            .table = "filter",
+            .chain = "FORWARD",
+            .rule = &(.{ "-o", bridge } ++ established ++ .{ "-j", "ACCEPT" }),
+        },
+    };
+    for (rules) |r| if (try ensureRule(arena, io, r.table, r.chain, r.rule)) |why| return why;
+    // Docker's own chain, when this is a Docker host.
+    if (try iptables(arena, io, &.{ "-t", "filter", "-n", "-L", "DOCKER-USER" }) == null) {
+        const docker = [_][]const []const u8{
+            &.{ "-i", bridge, "-j", "ACCEPT" },
+            &(.{ "-o", bridge } ++ established ++ .{ "-j", "ACCEPT" }),
+        };
+        for (docker) |rule| if (try ensureRule(arena, io, "filter", "DOCKER-USER", rule)) |why|
+            return why;
     }
     return null;
 }
 
-fn nft(arena: Allocator, io: std.Io, script: []const u8) !?[]const u8 {
-    const r = runNft(arena, io, script) catch |e|
-        return try std.fmt.allocPrint(arena, "cannot run nft: {s}", .{@errorName(e)});
-    if (r.ok) return null;
-    return try std.fmt.allocPrint(arena, "nft failed: {s}", .{std.mem.trim(u8, r.err, " \n")});
+/// Adds `rule` at the head of `chain` unless it is there (`iptables -C`).
+fn ensureRule(
+    arena: Allocator,
+    io: std.Io,
+    table: []const u8,
+    chain: []const u8,
+    rule: []const []const u8,
+) !?[]const u8 {
+    const check = try std.mem.concat(arena, []const u8, &.{ &.{ "-t", table, "-C", chain }, rule });
+    if (try iptables(arena, io, check) == null) return null;
+    const head: []const []const u8 = &.{ "-t", table, "-I", chain };
+    const insert = try std.mem.concat(arena, []const u8, &.{ head, rule });
+    return iptables(arena, io, insert);
 }
 
-fn nftOut(arena: Allocator, io: std.Io, script: []const u8) ![]const u8 {
-    const r = runNft(arena, io, script) catch return "";
-    return r.out;
-}
-
-const NftRun = struct { ok: bool, out: []const u8, err: []const u8 };
-
-fn runNft(arena: Allocator, io: std.Io, script: []const u8) !NftRun {
-    var child = try std.process.spawn(io, .{
-        .argv = &.{ "nft", "-f", "-" },
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .pipe,
+/// Runs `iptables` with `args` (waiting for its lock, as Docker may hold it); null when it
+/// succeeded, else why not.
+fn iptables(arena: Allocator, io: std.Io, args: []const []const u8) !?[]const u8 {
+    const argv = try std.mem.concat(arena, []const u8, &.{ &.{ "iptables", "-w" }, args });
+    const r = std.process.run(arena, io, .{ .argv = argv }) catch |e|
+        return try std.fmt.allocPrint(arena, "cannot run iptables: {s}", .{@errorName(e)});
+    if (r.term == .exited and r.term.exited == 0) return null;
+    return try std.fmt.allocPrint(arena, "iptables {s} failed: {s}", .{
+        try std.mem.join(arena, " ", args),
+        std.mem.trim(u8, r.stderr, " \n"),
     });
-    child.stdin.?.writeStreamingAll(io, script) catch {};
-    child.stdin.?.close(io);
-    child.stdin = null;
-    var out: std.ArrayList(u8) = .empty;
-    var err: std.ArrayList(u8) = .empty;
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = child.stdout.?.readStreaming(io, &.{&buf}) catch break;
-        if (n == 0) break;
-        try out.appendSlice(arena, buf[0..n]);
-    }
-    while (true) {
-        const n = child.stderr.?.readStreaming(io, &.{&buf}) catch break;
-        if (n == 0) break;
-        try err.appendSlice(arena, buf[0..n]);
-    }
-    const term = try child.wait(io);
-    return .{ .ok = term == .exited and term.exited == 0, .out = out.items, .err = err.items };
 }
 
 /// The resolver a job's steps get: its own namespace cannot reach a resolver on the host's

@@ -963,6 +963,9 @@ fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
     if (ended.failure.len > 0 or ended.code != 0)
         return skip(required, try std.fmt.allocPrint(arena, "this machine cannot make a " ++
             "native step's sandbox ({s}, exit {d})", .{ ended.failure, ended.code }));
+    // What `dagger.run` asks before a job goes native: a refusal here would send the tests' jobs
+    // to Dagger, which is not there.
+    if (usable(arena, io, std.testing.allocator, cfg)) |why| return skip(required, why);
     return cfg;
 }
 

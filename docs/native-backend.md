@@ -107,7 +107,7 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   rootless runner unless `RUNNER_NATIVE_ROOTLESS=1`, `container:`, `services:`, `uses:` actions,
   `docker://` steps, a custom image, Dagger in steps (`RUNNER_DAGGER_NESTING`), `hashFiles()`
   anywhere in the job (it reads the container through Dagger), a checkout with submodules, and a
-  machine whose probe fails (no user namespaces, `nft` missing, ids overlapping /etc/subuid).
+  machine whose probe fails (no user namespaces, `iptables` missing, ids overlapping /etc/subuid).
 - Off on native, as caches: the step cache and output keys (P2), the package caches, uv's
   environment in its cache, and Zig's local cache and seed (P4). Results do not depend on them.
 - "Set up job" says what the job got: "Native steps: ids 0-65535 are host ids N-N+65535, and the
@@ -185,9 +185,9 @@ docker export zr-rootfs | tar -x -C /var/lib/zig-runner/rootfs
 **What the runner needs.** As root (the supported mode): `CAP_SYS_ADMIN` (namespaces, mounts,
 idmapped mounts, `pivot_root`), `CAP_NET_ADMIN` (the bridge, veths, addresses, routes, NAT),
 `CAP_SETUID`/`CAP_SETGID` (writing the job's id maps), Linux 5.19 or later (idmapped overlay
-layers), `nft` on the host (the NAT rules, below), IPv4 forwarding (the runner turns it on), and
-a free 10.88.0.0/16. The runner makes `zr0` and its rules itself on its first native job, and
-removes each job's veth and namespace when the job ends, or at the next start after a crash
+layers), `iptables` on the host (the NAT rules, below), IPv4 forwarding (the runner turns it
+on), and a free 10.88.0.0/16. The runner makes `zr0` and its rules itself on its first native
+job, and removes each job's veth and namespace when the job ends, or at the next start after a crash
 (`sweep`, by the jobs' locks).
 
 - Under `deploy/compose.yaml` (not changed by P1): the runner image is `FROM scratch` and runs as
@@ -195,7 +195,7 @@ removes each job's veth and namespace when the job ends, or at the next start af
   NET_ADMIN]` with `security_opt: [seccomp=unconfined, apparmor=unconfined,
   systempaths=unconfined]`, and `network_mode: host` for the bridge to be the host's. The store
   must be a volume, not the container's own overlay filesystem (overlayfs cannot take an upper
-  directory on overlayfs), and the rootfs another volume. The image has no `nft`, so P1's NAT
+  directory on overlayfs), and the rootfs another volume. The image has no `iptables`, so P1's NAT
   needs the host's rules made outside it, or P5's netlink rules.
 - Under `deploy/zig-runner.service` on razorbill (not changed by P1): the unit runs as root with
   `ProtectSystem=strict`, which makes the store's default read-only. It needs
@@ -271,7 +271,7 @@ remains before native steps may run jobs the runner does not vouch for:
 
 - Resource limits come with phase 4's cgroups; until then, no untrusted job.
 - Seccomp as Docker's allow list rather than its deny list.
-- The NAT and forwarding rules over nftables netlink instead of `nft` (P1's debt).
+- The NAT and forwarding rules over nftables netlink instead of `iptables` (P1's debt).
 - Rootless: a userspace network stack for the job's network (the parts of pasta or slirp4netns it
   needs, ported) and subordinate ids through `newuidmap`.
 - `trust.zig` is unchanged: it decides before any step. Until P5 lands, native runs only jobs the
@@ -446,8 +446,10 @@ user then pulled the job's ids, its network and the sandbox hardening into P1. W
   resolv.conf. A job's own namespace cannot reach systemd-resolved on the host's 127.0.0.53; the
   runner binds the upstream list systemd-resolved keeps (`/run/systemd/resolve/resolv.conf`).
 - **NAT on a Docker host.** Docker sets the FORWARD policy to drop; a rule in another table cannot
-  overturn it, only `DOCKER-USER` can. P1 makes its NAT and forwarding rules with `nft` (debt:
-  links, addresses and routes are rtnetlink already; nftables over netlink is phase 5's).
+  overturn it, only `DOCKER-USER` can. P1 makes its NAT and forwarding rules with `iptables` (debt:
+  links, addresses and routes are rtnetlink already; nftables over netlink is phase 5's), not
+  `nft`: the hosted runner has no `nft`, and `iptables` writes into the same tables as Docker's
+  own rules, whichever backend the host uses.
 - **Smaller ones.** `hashFiles()` reads the container through Dagger, so it routes a job to Dagger
   until it is native. `--exec-job` bypassed the trusted refs; it no longer does. Overlay's
   work directory and a step's `chmod 000` both defeat a plain recursive delete, so removal gives
@@ -474,3 +476,12 @@ setup that P2's per-job helper does once.
   now goes in while PID 1 is still the namespace's root, before `setuid`. The root test checks
   that sudo gives uid 0 inside and nothing outside: a host-only file stays unreadable, the
   capabilities stay Docker's, and the uid map stays the job's.
+- **The root pass's first runs, one kernel rule each.** Four bugs no rootless run could show:
+  a link looked up by name through a socket opened after `unshare(NEWNET)` was looked up in the
+  job's namespace, not the host's (a socket stays in the namespace it was made in, so each
+  netlink socket now keeps its own lookup socket); joining a user namespace with `setns` changes
+  no ids, so the helper was still the host's root, unmapped there, and what it made belonged to no
+  one (EOVERFLOW: it now becomes the namespace's root, as runc does); the overlay, mounted in the
+  host's root's mount namespace, is locked in the job's, and `pivot_root` refuses a locked new
+  root (EINVAL: it is bound onto itself first, as runc does); and the hosted runner has no `nft`.
+  Also a file descriptor closed twice on `init`'s error path, which Zig's I/O caught.
