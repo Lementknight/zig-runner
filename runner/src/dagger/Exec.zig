@@ -258,6 +258,10 @@ pub const Phase = enum {
 
 pub const Out = struct {
     code: i32,
+    /// `code` is 1 only because a workflow or file command failed the step (a refused
+    /// `::set-env`, a malformed GITHUB_OUTPUT); the process itself exited 0. GitHub logs
+    /// "Process completed with exit code" only for the process's own (`logExitCode`).
+    command_failed: bool = false,
     outputs: []const job_mod.EnvVar,
     /// From GITHUB_STATE and `::save-state`; a JavaScript action's later phases get it as
     /// STATE_*.
@@ -793,7 +797,8 @@ fn liveThisExec(io: std.Io, sh: *JobLog, num: u32, ran: ?bool) bool {
 pub fn collect(x: *Exec, num: u32, data: std.json.Value, recorded: Recorded) !Out {
     const arena = x.arena;
     const ev = x.ev;
-    var code = exitCode(data);
+    const exited = exitCode(data);
+    var code = exited;
     // A cached step prints no log lines. Wait briefly for a live stream, then replay the
     // recorded output. Without step caching nothing is replayed from an earlier job:
     // run-specific values are part of every key.
@@ -885,7 +890,13 @@ pub fn collect(x: *Exec, num: u32, data: std.json.Value, recorded: Recorded) !Ou
             const in_out = std.mem.indexOf(u8, stdout, e) != null;
             if (in_out or std.mem.indexOf(u8, stderr, e) != null) break true;
         } else false);
-    return .{ .code = code, .outputs = outputs, .state = state, .bun_refused = refused };
+    return .{
+        .code = code,
+        .command_failed = exited == 0 and code != 0,
+        .outputs = outputs,
+        .state = state,
+        .bun_refused = refused,
+    };
 }
 
 /// `pairs` with one entry per name, compared without case: the first spelling and position, the
@@ -1016,7 +1027,12 @@ pub fn alwaysRunNote(x: *Exec) !?[]const u8 {
         "it uses secrets (run {s})", .{x.run_nonce});
 }
 
-/// `splitEnv` with this Exec's session, job and secret counter; the message in `x.err_msg`.
+/// `splitEnv` of a step's `env:` with this Exec's session, job and secret counter; the message
+/// in `x.err_msg`. The defaults GitHub sets again over the env context are left out of what the
+/// step's process gets (`Evaluator.withoutReapplied`): `env: {GITHUB_SHA: x}` leaves the commit in
+/// `$GITHUB_SHA`, as every handler of GitHub's runner applies them after the step's env
+/// (ScriptHandler.cs, NodeScriptActionHandler.cs, ContainerActionHandler.cs). The env context
+/// keeps the step's value.
 pub fn splitStepEnv(
     x: *Exec,
     env: []const job_mod.EnvVar,
@@ -1030,7 +1046,7 @@ pub fn splitStepEnv(
         x.job.*,
         x.sh,
         counter,
-        env,
+        try x.ev.withoutReapplied(env),
         plain,
         secret,
         &x.err_msg,

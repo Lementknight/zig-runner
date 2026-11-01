@@ -246,8 +246,8 @@ const Syntax = enum { v2, legacy };
 const Parts = struct { name: []const u8, props: []const u8, data: []const u8 };
 
 /// Parses one line of a step's output. `stopped_token` is the token of an active `stop-commands`.
-/// Command names are case-insensitive. In the `::` form, leading and trailing whitespace is
-/// ignored.
+/// Command and property names are case-insensitive. In the `::` form, leading whitespace is
+/// ignored and trailing whitespace is the data's.
 pub fn parseWorkflow(
     arena: Allocator,
     line: []const u8,
@@ -275,7 +275,10 @@ fn split(line: []const u8, syntax: Syntax) ?Parts {
     var data: []const u8 = undefined;
     switch (syntax) {
         .v2 => {
-            const t = std.mem.trim(u8, line, " \t\r");
+            // Leading whitespace only (`TrimStart` in `TryParseV2`): trailing whitespace is part
+            // of the data, as on GitHub (`::set-output name=x::a ` sets `a `). The `\r` is the
+            // line's end, which GitHub's line reader drops.
+            const t = std.mem.trimStart(u8, std.mem.trimEnd(u8, line, "\r"), &std.ascii.whitespace);
             if (!std.mem.startsWith(u8, t, "::")) return null;
             const end = std.mem.indexOfPos(u8, t, 2, "::") orelse return null;
             section = t[2..end];
@@ -350,7 +353,11 @@ pub fn stopTokenRefused(token: []const u8) bool {
     return false;
 }
 
-/// The value of property `key` in `k=v,k2=v2` (`k=v;k2=v2` in the legacy syntax).
+/// The value of property `key` in `k=v,k2=v2` (`k=v;k2=v2` in the legacy syntax), read as
+/// GitHub's runner reads them (`TryParseV2`, `TryParse` in ActionCommand.cs): names in any case
+/// (an `OrdinalIgnoreCase` dictionary) and not trimmed, so `file=a, line=3` has no `line`; the
+/// last of a name wins. Each pair is `Split('=', 2, RemoveEmptyEntries)`: leading `=`s and those
+/// after the name are skipped, and a pair left without a name or a value is ignored (`title=`).
 fn property(
     arena: Allocator,
     props: []const u8,
@@ -358,13 +365,19 @@ fn property(
     syntax: Syntax,
 ) Allocator.Error!?[]const u8 {
     const separator: u8 = if (syntax == .v2) ',' else ';';
-    var it = std.mem.splitScalar(u8, props, separator);
+    // The `::` form trims the property list as a whole; the legacy form does not.
+    const list = if (syntax == .v2) std.mem.trim(u8, props, &std.ascii.whitespace) else props;
+    var found: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, list, separator);
     while (it.next()) |p| {
-        const eq = std.mem.indexOfScalar(u8, p, '=') orelse continue;
-        if (std.mem.eql(u8, std.mem.trim(u8, p[0..eq], " "), key))
-            return try unescape(arena, p[eq + 1 ..], if (syntax == .v2) .property else .legacy);
+        const pair = std.mem.trimStart(u8, p, "=");
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const value = std.mem.trimStart(u8, pair[eq + 1 ..], "=");
+        if (value.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(pair[0..eq], key)) found = value;
     }
-    return null;
+    const v = found orelse return null;
+    return try unescape(arena, v, if (syntax == .v2) .property else .legacy);
 }
 
 /// Which of GitHub's escape tables applies (`ActionCommand`'s `_escapeDataMappings`,
@@ -414,7 +427,8 @@ test "workflow commands" {
     try std.testing.expect(try parseWorkflow(ar, "a ::group::not at the start", null) == .none);
     try std.testing.expect(try parseWorkflow(ar, "::unknown::x", null) == .none);
     try std.testing.expectEqualStrings("s3cret", (try parseWorkflow(ar, "::add-mask::s3cret", null)).add_mask);
-    try std.testing.expectEqualStrings("Build", (try parseWorkflow(ar, "  ::group::Build  ", null)).group);
+    // Leading whitespace goes, trailing whitespace is the data's (`TrimStart`).
+    try std.testing.expectEqualStrings("Build  ", (try parseWorkflow(ar, " \t::group::Build  \r", null)).group);
     try std.testing.expect(try parseWorkflow(ar, "::endgroup::", null) == .endgroup);
     try std.testing.expect(try parseWorkflow(ar, "::ENDGROUP::", null) == .endgroup);
     const err = (try parseWorkflow(ar, "::error file=a.js,line=3,title=Oops::two%0Alines 100%25", null)).annotation;
@@ -467,6 +481,37 @@ test "the legacy ##[command] syntax, anywhere in a line, with its own separator 
     // While stopped, the token resumes in either form, and commands are output.
     try std.testing.expect(try parseWorkflow(ar, "##[tok123]", "tok123") == .resume_commands);
     try std.testing.expect(try parseWorkflow(ar, "##[error]x", "tok123") == .none);
+}
+
+test "command data and property names as GitHub's ActionCommand reads them" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // Trailing whitespace is part of the data, in an output's value too.
+    const out = (try parseWorkflow(ar, "::set-output name=v::a b  ", null)).set_output;
+    try std.testing.expectEqualStrings("a b  ", out.value);
+    try std.testing.expectEqualStrings("msg ", (try parseWorkflow(ar, "::warning::msg ", null)).annotation.message);
+    // Property names in any case; the list is trimmed as a whole, each name is not.
+    const err = (try parseWorkflow(ar, "::error FILE=a.js,EndLine=4,Title=T  ::m", null)).annotation;
+    try std.testing.expectEqualStrings("a.js", err.file.?);
+    try std.testing.expectEqualStrings("4", err.end_line.?);
+    try std.testing.expectEqualStrings("T", err.title.?);
+    const spaced = (try parseWorkflow(ar, "::error file=a.js, line=3::m", null)).annotation;
+    try std.testing.expect(spaced.line == null);
+    try std.testing.expectEqualStrings("k", (try parseWorkflow(ar, "::SET-OUTPUT NAME=k::v", null)).set_output.name);
+    try std.testing.expectEqualStrings("X", (try parseWorkflow(ar, "::set-env Name=X::1", null)).set_env.name.?);
+    try std.testing.expectEqualStrings("o", (try parseWorkflow(ar, "::remove-matcher OWNER=o::", null)).remove_matcher);
+    // The last of a name wins; an empty value is no value; `=`s around the name are skipped
+    // (`Split('=', 2, RemoveEmptyEntries)`).
+    const twice = (try parseWorkflow(ar, "::error title=one,TITLE=two,file=,=line,col==5::m", null)).annotation;
+    try std.testing.expectEqualStrings("two", twice.title.?);
+    try std.testing.expect(twice.file == null and twice.line == null);
+    try std.testing.expectEqualStrings("5", twice.col.?);
+    // The legacy form compares names alike, and does not trim its property list.
+    const legacy = (try parseWorkflow(ar, "##[error File=a.c; line=3]m ", null)).annotation;
+    try std.testing.expectEqualStrings("a.c", legacy.file.?);
+    try std.testing.expect(legacy.line == null);
+    try std.testing.expectEqualStrings("m ", legacy.message);
 }
 
 test "stop-commands tokens GitHub refuses" {

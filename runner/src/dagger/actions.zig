@@ -23,7 +23,6 @@ const Outcome = @import("../dagger.zig").Outcome;
 const Resolved = @import("../dagger.zig").Resolved;
 const Mount = @import("../dagger.zig").Mount;
 const skippedStep = @import("../dagger.zig").skippedStep;
-const interpolateOptional = @import("../dagger.zig").interpolateOptional;
 const envContext = @import("../dagger.zig").envContext;
 const ActionOut = @import("Exec.zig").ActionOut;
 const LoadResult = @import("Exec.zig").LoadResult;
@@ -332,7 +331,8 @@ const NestedStep = struct {
 };
 
 /// The `uses:` step's env, split into plain variables and Dagger secrets, on top of the
-/// composite step's own.
+/// composite step's own; without the defaults GitHub sets again, as `Exec.splitStepEnv` leaves
+/// them out of the `uses:` step's.
 pub fn nestedEnv(
     x: *Exec,
     comp: CompositeRun,
@@ -349,7 +349,7 @@ pub fn nestedEnv(
         x.job.*,
         x.sh,
         &x.secrets,
-        nested_env,
+        try x.ev.withoutReapplied(nested_env),
         plain,
         secret,
         &x.err_msg,
@@ -422,12 +422,26 @@ pub fn runNestedScript(
     };
     // Without a name, the step is shown by its command as it will run.
     const display = if (st.name == null) firstLine(script) else step.display;
-    const shell = expr.interpolate(arena, st.shell.?, step.sc) catch st.shell.?;
+    // A shell or working directory that cannot be evaluated fails the step, as a job step's does
+    // (`prepareScript`): GitHub's runner evaluates them with the step's inputs, inside a
+    // composite action too (`EvaluateStepInputs`).
+    const shell = expr.interpolate(arena, st.shell.?, step.sc) catch {
+        const msg = try std.fmt.allocPrint(arena, "could not evaluate shell: {s}", .{ev.diag});
+        return x.nestedFailed(num, step.ctx_id, display, msg, outcome);
+    };
     if (!job_mod.validShell(shell)) {
         const msg = try job_mod.unsupportedShell(arena, shell);
         return x.nestedFailed(num, step.ctx_id, display, msg, outcome);
     }
-    const wd = interpolateOptional(arena, st.working_directory, step.sc);
+    var wd: ?[]const u8 = null;
+    if (st.working_directory) |t| wd = expr.interpolate(arena, t, step.sc) catch {
+        const msg = try std.fmt.allocPrint(
+            arena,
+            "could not evaluate working-directory: {s}",
+            .{ev.diag},
+        );
+        return x.nestedFailed(num, step.ctx_id, display, msg, outcome);
+    };
 
     // Env that carries a secret goes in as a Dagger secret, the rest in the script.
     var plain: std.ArrayList(job_mod.EnvVar) = .empty;
@@ -457,7 +471,7 @@ pub fn runNestedScript(
     const out = try x.execScript(num, fc, resolved, step.ctx_id, secret.items, mounts);
     try x.mounted_actions.put(arena, act.mount, {});
     if (out.code != 0) {
-        logExitCode(x.sh, num, out.code);
+        logExitCode(x.sh, num, out);
         x.noteNestingWithheld(num, script);
     }
     try outcome.record(ev, arena, step.ctx_id, out.code == 0, step.coe, out.outputs, out.code);
@@ -733,7 +747,7 @@ pub fn runPre(x: *Exec, num: u32, step: job_mod.Step) !void {
     };
     x.pre_state[num - 1] = out.state;
     if (out.code != 0) {
-        logExitCode(x.sh, ls, out.code);
+        logExitCode(x.sh, ls, out);
         ev.job_failed = true;
         x.hook_failed = true;
     } else ok = true;
@@ -956,7 +970,7 @@ fn runNestedPres(
         };
         try x.nested_pre_state.put(arena, try x.nestedKey(num), out.state);
         if (out.code != 0) {
-            logExitCode(x.sh, ls, out.code);
+            logExitCode(x.sh, ls, out);
             ok = false;
         }
     }
@@ -1020,7 +1034,7 @@ pub fn runPosts(x: *Exec) !void {
             continue;
         };
         if (out.code != 0) {
-            logExitCode(x.sh, ls, out.code);
+            logExitCode(x.sh, ls, out);
             x.hook_failed = true;
             x.ev.job_failed = true;
         }
@@ -1325,6 +1339,56 @@ test "action failures: an image that cannot be pulled, a missing action.yml, and
     // As GitHub's runner logs a script that exits non-zero.
     try std.testing.expect(std.mem.indexOf(u8, out, "##[error]Process completed with exit code 3.") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "o/none@v1 has no action.yml or action.yaml") != null);
+}
+
+test "composite run: steps: a shell or directory error fails the step; GitHub's defaults stay" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    // As a job's own steps (#205, #214): GitHub evaluates an inner step's inputs the same way.
+    const yml =
+        \\runs:
+        \\  using: composite
+        \\  steps:
+        \\    - shell: ${{ fromJSON('not json') }}
+        \\      run: echo never
+        \\    - if: always()
+        \\      shell: bash
+        \\      working-directory: ${{ fromJSON('not json') }}
+        \\      run: echo never
+        \\    - if: always()
+        \\      shell: bash
+        \\      env:
+        \\        RUNNER_TEMP: /elsewhere
+        \\        OWN: kept
+        \\      run: echo ctx=${{ env.RUNNER_TEMP }}
+    ;
+    const steps = [_]job_mod.Step{usesStep("act", "o", "act", "v1", &.{})};
+    const answers = [_][]const u8{
+        base_answer,
+        try treeAnswer(arena, "D1", &.{"action.yml"}),
+        try fileAnswer(arena, yml),
+        try exec(arena, "C1", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(!res.succeeded);
+    try std.testing.expectEqual(Outcome.failure, res.steps[0].outcome);
+    // Neither failing step ran: the only exec is the last one's.
+    const seen = fake.seen.items;
+    try std.testing.expectEqual(@as(usize, 4), seen.len);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "could not evaluate shell: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "could not evaluate working-directory: ") != null);
+    // The inner step's env reaches its process but for the defaults GitHub sets again; its env
+    // context has what it wrote.
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "echo ctx=/elsewhere") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "'RUNNER_TEMP=/elsewhere'") == null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "'OWN=kept'") != null);
 }
 
 test "inside a composite action, job.status is the job's, while success() is the action's" {

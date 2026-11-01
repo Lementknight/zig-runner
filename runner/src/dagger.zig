@@ -1183,11 +1183,15 @@ fn logRunHeader(
     sh.append(num, "##[endgroup]");
 }
 
-/// What GitHub's runner logs when a script exits non-zero.
-pub fn logExitCode(sh: *JobLog, num: u32, code: i32) void {
+/// What GitHub's runner logs when a script exits non-zero (ScriptHandler.cs ~354). Nothing for a
+/// step a workflow or file command failed: that failure is the step's `CommandResult`, merged in
+/// after the process (StepsRunner.cs ~348), and its own error line already says why.
+pub fn logExitCode(sh: *JobLog, num: u32, out: Exec.Out) void {
+    if (out.code == 0 or out.command_failed) return;
     sh.errorLine(
         num,
-        std.fmt.allocPrint(sh.arena, "Process completed with exit code {d}.", .{code}) catch return,
+        std.fmt.allocPrint(sh.arena, "Process completed with exit code {d}.", .{out.code}) catch
+            return,
     );
 }
 
@@ -1630,7 +1634,7 @@ fn runResolvedStep(
         else => return e,
     };
     if (resolved == .run and out.code != 0) {
-        logExitCode(x.sh, num, out.code);
+        logExitCode(x.sh, num, out);
         x.noteNestingWithheld(num, resolved.run.script);
     }
     // As actions/checkout, a post step once the checkout ran (see `Post.checkout`).
@@ -1655,11 +1659,6 @@ fn runResolvedStep(
 /// A JavaScript action's script as a `run:` step: no shell, no working directory.
 pub fn scriptRun(script: []const u8, env: []const job_mod.EnvVar) Resolved {
     return .{ .run = .{ .script = script, .shell = null, .working_directory = null, .env = env } };
-}
-
-pub fn interpolateOptional(arena: Allocator, s: ?[]const u8, sc: expr.Scope) ?[]const u8 {
-    const d = s orelse return null;
-    return expr.interpolate(arena, d, sc) catch d;
 }
 
 pub fn skippedStep(id: []const u8) StepCtx {
@@ -2860,6 +2859,8 @@ test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]Unable to process file command 'output' successfully.") != null);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]invalid format 'this is not valid' on line 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]Unable to process file command 'env' successfully.") != null);
+    // Its process exited 0, so no exit code is logged, as on GitHub (#214).
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Process completed with exit code") == null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[4], "withEnvVariable(name:\"BEFORE\",value:\"1\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[4], "AFTER") == null);
     try std.testing.expectEqual(Outcome.success, res.steps[3].outcome);
@@ -3557,6 +3558,9 @@ test "set-env and add-path fail the step, unless ACTIONS_ALLOW_UNSECURE_COMMANDS
             try std.testing.expect(std.mem.indexOf(u8, got, "##[error]The `set-env` command is disabled.") != null);
             try std.testing.expect(std.mem.indexOf(u8, got, "##[error]Unable to process command '::add-path::/opt/x' successfully.") != null);
             try std.testing.expect(std.mem.indexOf(u8, got, "##[error]The `add-path` command is disabled.") != null);
+            // No exit code is logged: GitHub logs only the process's own, and it exited 0
+            // (#214).
+            try std.testing.expect(std.mem.indexOf(u8, got, "Process completed with exit code") == null);
             try std.testing.expect(std.mem.indexOf(u8, step2, "name:\"X\"") == null);
             try std.testing.expect(std.mem.indexOf(u8, step2, "/opt/x") == null);
         }
@@ -4313,6 +4317,43 @@ test "a step's if: and name see its own env, and an env error fails it whatever 
     try std.testing.expectEqual(Outcome.failure, res.steps[1].outcome);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "could not evaluate env: ") != null);
     try std.testing.expect(!res.succeeded);
+}
+
+test "a step's env cannot change the variables GitHub sets again, though its env context has them" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var step = testStep("");
+    step.action.script.script = .{ .expr = "format('echo ctx={0}', env.RUNNER_TEMP)" };
+    step.env = &.{
+        .{ .name = "RUNNER_TEMP", .value = .{ .lit = "/elsewhere" } },
+        .{ .name = "GITHUB_ACTIONS", .value = .{ .lit = "false" } },
+        .{ .name = "CI", .value = .{ .lit = "false" } },
+        .{ .name = "OWN", .value = .{ .lit = "kept" } },
+    };
+    const steps = [_]job_mod.Step{step};
+    const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, "") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+    }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    const s1 = fake.seen.items[1];
+    // GitHub's handlers set the github and runner contexts' variables (and GITHUB_ACTIONS) over
+    // the step's env (ScriptHandler.cs), so the process keeps the runner's values; CI, which
+    // GitHub sets only when nothing else has, and any other name are the step's.
+    try std.testing.expect(std.mem.indexOf(u8, s1, "'RUNNER_TEMP=/elsewhere'") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s1, "'GITHUB_ACTIONS=false'") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s1, "'CI=false'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s1, "'OWN=kept'") != null);
+    // The env context, and the log header, have what the step wrote.
+    try std.testing.expect(std.mem.indexOf(u8, s1, "echo ctx=/elsewhere") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "  RUNNER_TEMP: /elsewhere") != null);
 }
 
 test "round trips: the job setup's query is sent again without the secrets when it fails with them" {
