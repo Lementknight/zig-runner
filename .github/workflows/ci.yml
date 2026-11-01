@@ -263,3 +263,153 @@ jobs:
       - name: Build for x86_64 and aarch64
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/build-binaries.sh v0.0.0-ci "$RUNNER_TEMP/dist"
+
+  # The end-to-end suite (.github/scripts/e2e.sh): the runner built from this change serves
+  # runner-bench's e2e workflows (Open-Blue/runner-bench, e2e.yml and e2e-cancel.yml) on GitHub's
+  # runner, through GitHub's broker and a real Dagger engine, once on Dagger and once native, and
+  # the suite checks the jobs, their steps and their logs through the API: a script installing into
+  # the tool cache (v0.22.0 broke that), a service, a docker:// step, a JavaScript action, the file
+  # commands, a masked secret, a cancelled run, and a rerun replayed from the step cache. The tests
+  # run every step against a fake engine session; this is the only check before a merge of the real
+  # thing, which otherwise first ran on prod. Each job's times on both backends go to the
+  # e2e-timings artifact.
+  #
+  # Everything on runner-bench is done as the GitHub App zig-runner-e2e (installed there only):
+  # the runner registers its just-in-time runners with its key, under a label of this run's own,
+  # and the suite dispatches and reads the workflows with one of its installation tokens. The key
+  # is the e2e environment's secret, which pull requests from forks do not get: without it (or its
+  # App ID, the environment's variable), the job skips its steps, still reporting, as it does on a
+  # change that cannot affect the runner (ci-scope.sh e2e). Not a required check yet; not on main,
+  # whose commits the merge queue checked.
+  e2e:
+    name: End to end
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: e2e
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Whether this change can affect the runner
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh e2e
+
+      # Whether the key is set, as true or false: the key itself goes only to the steps that use it.
+      - name: Whether the suite's GitHub App is set up
+        id: go
+        env:
+          SCOPE: ${{ steps.scope.outputs.run }}
+          HAVE_KEY: ${{ secrets.E2E_GH_APP_PRIVATE_KEY != '' }}
+          APP_ID: ${{ vars.E2E_GH_APP_ID }}
+        run: |
+          if [ "$SCOPE" != true ]; then
+            echo "run=false" >>"$GITHUB_OUTPUT"
+          elif [ "$HAVE_KEY" != true ] || [ -z "$APP_ID" ]; then
+            echo "::notice::End to end skipped: the e2e environment's secret E2E_GH_APP_PRIVATE_KEY or variable E2E_GH_APP_ID is not available (a pull request from a fork, or not set up yet)"
+            echo "run=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "run=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      # Pulled and started in the background, while Zig installs and the runner compiles.
+      - name: Start the engine
+        if: steps.go.outputs.run == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/e2e"
+          nohup .github/scripts/e2e.sh engine >"$RUNNER_TEMP/e2e/engine.log" 2>&1 &
+
+      - name: Install Zig
+        if: steps.go.outputs.run == 'true'
+        run: .github/scripts/install-zig.sh
+
+      - name: Build the runner
+        if: steps.go.outputs.run == 'true'
+        run: .github/scripts/e2e.sh build "$RUNNER_TEMP/zig-runner"
+
+      # The native pass's rootfs (apt in a container, about a minute), in the background: done
+      # while the Dagger pass runs, before the native one, which waits for it.
+      - name: Make the native rootfs
+        if: steps.go.outputs.run == 'true'
+        run: nohup .github/scripts/e2e.sh rootfs "$RUNNER_TEMP/zig-runner" >"$RUNNER_TEMP/e2e/rootfs.log" 2>&1 &
+
+      # What the suite needs on runner-bench, and nothing else the App may do.
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        if: steps.go.outputs.run == 'true'
+        id: app
+        with:
+          client-id: ${{ vars.E2E_GH_APP_ID }}
+          private-key: ${{ secrets.E2E_GH_APP_PRIVATE_KEY }}
+          owner: Open-Blue
+          repositories: runner-bench
+          permission-actions: write
+
+      # The runner's own copy, as deployments give it one (GH_APP_PRIVATE_KEY_FILE); removed at
+      # the end.
+      - name: The runner's key
+        if: steps.go.outputs.run == 'true'
+        env:
+          KEY: ${{ secrets.E2E_GH_APP_PRIVATE_KEY }}
+        run: (umask 077 && printf '%s\n' "$KEY" >"$RUNNER_TEMP/e2e-app.pem")
+
+      - name: End to end on Dagger
+        if: steps.go.outputs.run == 'true'
+        env:
+          GH_APP_ID: ${{ vars.E2E_GH_APP_ID }}
+          E2E_GH_TOKEN: ${{ steps.app.outputs.token }}
+          E2E_ZIG_RUNNER_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          label="e2e-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-dagger"
+          GH_APP_PRIVATE_KEY_FILE="$RUNNER_TEMP/e2e-app.pem" .github/scripts/e2e.sh start "$RUNNER_TEMP/zig-runner" dagger "$label"
+          status=0
+          .github/scripts/e2e.sh check "$label" dagger || status=$?
+          .github/scripts/e2e.sh stop
+          exit "$status"
+
+      # Run whatever Dagger's pass found, so one push shows both.
+      - name: End to end, native
+        if: ${{ !cancelled() && steps.go.outputs.run == 'true' }}
+        env:
+          GH_APP_ID: ${{ vars.E2E_GH_APP_ID }}
+          E2E_GH_TOKEN: ${{ steps.app.outputs.token }}
+          E2E_ZIG_RUNNER_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          label="e2e-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-native"
+          GH_APP_PRIVATE_KEY_FILE="$RUNNER_TEMP/e2e-app.pem" .github/scripts/e2e.sh start "$RUNNER_TEMP/zig-runner" native "$label"
+          status=0
+          .github/scripts/e2e.sh check "$label" native || status=$?
+          .github/scripts/e2e.sh stop
+          exit "$status"
+
+      # The runner masks the jobs' secrets in its own log; any token-shaped string is masked again.
+      # The jobs' own workflow commands in it (`##[error]`, `::add-mask::`) are only text here.
+      - name: The runner's log, on a failure
+        if: ${{ failure() && steps.go.outputs.run == 'true' }}
+        run: |
+          for f in "$RUNNER_TEMP"/e2e/engine.log "$RUNNER_TEMP"/e2e/rootfs.log "$RUNNER_TEMP"/e2e/runner-*.log; do
+            [ -e "$f" ] || continue
+            stop="e2e-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+            echo "::group::$(basename "$f")"
+            echo "::stop-commands::$stop"
+            tail -n 300 "$f" | sed -E 's/(gh[opsu]|github_pat)_[A-Za-z0-9_]{20,}/***/g'
+            echo "::$stop::"
+            echo "::endgroup::"
+          done
+
+      - name: Clean up
+        if: ${{ always() && steps.go.outputs.run == 'true' }}
+        run: |
+          .github/scripts/e2e.sh stop || true
+          rm -f "$RUNNER_TEMP/e2e-app.pem"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() && steps.go.outputs.run == 'true' }}
+        with:
+          name: e2e-timings
+          path: ${{ runner.temp }}/e2e/timings.tsv
+          if-no-files-found: ignore
