@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'Runners that share one Dagger engine pre-warm it one at a time. Two pools started together (razorbill''s two systemd units) both built the base container and the Zig seed at once, 205 s each, doubling the startup CPU and memory: the engine does not merge two identical builds. Each warm now takes a lock on the directory of the engine''s unix socket, which every runner of the engine can open under systemd and compose alike, and the next logs "pre-warm waiting for another runner''s warm on this engine", then finds it all cached. A stop ends the wait, and a runner that dies releases the lock.'
+time: 2026-11-01T00:26:14.000000-04:00

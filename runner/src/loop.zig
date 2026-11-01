@@ -487,6 +487,8 @@ pub const Warmer = struct {
 
     /// One warm, said in one line.
     fn once(w: *Warmer) void {
+        const turn = w.engineTurn() orelse return;
+        defer if (turn) |dir| dir.close(w.c.io);
         _ = w.arena.reset(.retain_capacity);
         const arena = w.arena.allocator();
         const cfg = w.c.cfg;
@@ -536,6 +538,48 @@ pub const Warmer = struct {
             if (warmed.packages != null) ", packages " else "",
             warmed.packages orelse "",
         });
+    }
+
+    /// This warm's turn on the engine: the directory of the engine's socket, locked, which closing
+    /// unlocks; null inside when there is nothing to lock; null outside when a stop came first.
+    /// Pools that share an engine (razorbill's two systemd units) started together and both built
+    /// the base container and the seed in parallel, 205 s each: the engine does not merge two
+    /// identical builds. One at a time, the second finds it all cached (`cached_ms`). The lock is
+    /// on the socket's directory because it is the one place every runner of an engine can open:
+    /// under systemd's ProtectSystem=strict and PrivateTmp it is read-only and /tmp is private, and
+    /// under compose the engine-socket volume is all the runner shares with the engine. Opening it
+    /// only needs read access, and flock works through a read-only mount and across containers (it
+    /// locks the inode). A holder that dies releases it with its descriptors. A TCP engine, or a
+    /// directory that cannot be opened or locked, warms unlocked, as before.
+    fn engineTurn(w: *Warmer) ??std.Io.Dir {
+        const io = w.c.io;
+        const host = w.c.cfg.engine_host;
+        if (!std.mem.startsWith(u8, host, "unix://")) return @as(?std.Io.Dir, null);
+        const path = std.fs.path.dirname(host["unix://".len..]) orelse
+            return @as(?std.Io.Dir, null);
+        // Iterable: opened for reading, not as a bare path, which flock refuses.
+        const dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch
+            return @as(?std.Io.Dir, null);
+        const file: std.Io.File = .{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
+        var said = false;
+        while (true) {
+            const taken = file.tryLock(io, .exclusive) catch {
+                dir.close(io);
+                return @as(?std.Io.Dir, null);
+            };
+            if (taken) return dir;
+            if (!said) sayUnallocated(
+                w.c,
+                "pre-warm waiting for another runner's warm on this engine ({s})",
+                .{path},
+            );
+            said = true;
+            // In steps, so a stop is not kept waiting.
+            if (stopRequested() or w.cancel.requested.load(.acquire)) break;
+            io.sleep(.fromMilliseconds(200), .awake) catch break;
+        }
+        dir.close(io);
+        return null;
     }
 
     /// The engine accepted the session: through the gate, as a job of its own, unless a stop
@@ -1483,7 +1527,7 @@ test "the pool logs what it trusts once at startup, and warns when prod trusts e
 
 /// `dagger.warm` for the Warmer's tests: what it was asked, and the gate as the warm found it.
 const FakeWarm = struct {
-    var calls: u32 = 0;
+    var calls: std.atomic.Value(u32) = .init(0);
     var opts: dagger.Options = .{};
     var memory: ?*admission.Admission = null;
     var during: ?admission.Admission.Slot = null;
@@ -1492,7 +1536,7 @@ const FakeWarm = struct {
     var rose_mb: ?u64 = null;
 
     fn warm(_: Allocator, _: std.Io, o: dagger.Options, ready: dagger.Ready, _: *[]const u8) anyerror!dagger.Warmed {
-        calls += 1;
+        _ = calls.fetchAdd(1, .acq_rel);
         opts = o;
         if (!ready.readyFn(ready.ptr)) return error.Cancelled;
         const w: *Warmer = @ptrCast(@alignCast(ready.ptr));
@@ -1518,7 +1562,7 @@ const FakeWarm = struct {
 fn testWarmer(c: Runner, memory: ?*admission.Admission) !*Warmer {
     const w = (try Warmer.init(c, memory, 1)).?;
     w.calls = FakeWarm.calls_;
-    FakeWarm.calls = 0;
+    FakeWarm.calls.store(0, .release);
     FakeWarm.memory = memory;
     FakeWarm.during = null;
     FakeWarm.took_ms = 0;
@@ -1561,7 +1605,7 @@ test "the pre-warm builds the job's base container and Zig seed through the memo
     // A stop while the gate holds the warm: it gives up there, having taken nothing.
     w.cancel.request(1);
     w.once();
-    try std.testing.expectEqual(@as(u32, 1), FakeWarm.calls);
+    try std.testing.expectEqual(@as(u32, 1), FakeWarm.calls.load(.acquire));
     try std.testing.expect(FakeWarm.during == null);
     try std.testing.expectEqual(@as(u32, 0), memory.polling);
     try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), slots[1].started_ms);
@@ -1665,6 +1709,58 @@ test "an engine start asks for a pre-warm: the gate's count where it sees the en
     try std.testing.expectEqual(@as(u32, 1), w.requests.load(.acquire));
     w.request();
     try std.testing.expectEqual(@as(u32, 2), w.requests.load(.acquire));
+}
+
+test "two pools on one engine pre-warm one after the other, and a stop ends the wait" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fs.path.join(arena, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    var out_buf: [2048]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var cfg: Config = .{
+        .gh_token = "",
+        .scope = undefined,
+        .trusted_refs = "refs/heads/main",
+        .engine_host = try std.fmt.allocPrint(arena, "unix://{s}/engine.sock", .{dir}),
+    };
+    const c = testRunner(arena, &log, &out, &cfg);
+    // Each its own open of the directory, as two processes have.
+    const first = try testWarmer(c, null);
+    defer first.arena.deinit();
+    const second = try testWarmer(c, null);
+    defer second.arena.deinit();
+
+    // The first is warming: the second waits for it, building nothing meanwhile, and warms once
+    // it is done.
+    const turn = first.engineTurn().?.?;
+    const t = try std.Thread.spawn(.{}, Warmer.once, .{second});
+    try io.sleep(.fromMilliseconds(600), .awake);
+    try std.testing.expectEqual(@as(u32, 0), FakeWarm.calls.load(.acquire));
+    turn.close(io);
+    t.join();
+    try std.testing.expectEqual(@as(u32, 1), FakeWarm.calls.load(.acquire));
+    const waiting = "pre-warm waiting for another runner's warm on this engine";
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.buffered(), waiting));
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "pre-warm: base container") != null);
+
+    // A stop while it waits: it gives up there, having built nothing.
+    out.end = 0;
+    const again = first.engineTurn().?.?;
+    defer again.close(io);
+    second.cancel.request(1);
+    second.once();
+    try std.testing.expectEqual(@as(u32, 1), FakeWarm.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.buffered(), waiting));
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "pre-warm:") == null);
+
+    // A TCP engine has no directory to share: warmed unlocked, as before.
+    cfg.engine_host = "tcp://127.0.0.1:1234";
+    try std.testing.expect(first.engineTurn().? == null);
 }
 
 test "no pre-warm when it is off, with RUNNER_ENGINE=cli, or when the runner trusts no ref" {
