@@ -263,8 +263,12 @@ The native backend (docs/native-backend.md) keeps its own step store, so the obl
 discharged under Dagger are the runner's, and `Runner/Native.lean` states and proves each one. The
 model above is unchanged; `Build` and its theorems describe both backends, and `Native` is the
 second refinement of it: `native_replay_eq_run` is P1 against the same `uncached`, and
-`native_eq_dagger` says the two backends give the same answers. Every theorem of `OutputKeys` holds
-natively as it stands, because the native job hands on the same `nextState` and `nextEnv`.
+`native_eq_dagger` says the two backends give the same answers. The theorems of `OutputKeys` about
+the keys a job asks (`keysFrom`, `cutoff`, `cutoff_needs_only_the_digest`, `nonced_stays`) hold
+natively as they stand, because the native job hands on the same `nextState` and `nextEnv`. Of the
+ones about what a cache can answer (`Clean`, `no_cutoff_without_keys`), only a marked step's own
+miss is proved natively (`Native.marked_misses`). An unmarked step after it, whose parent names the
+job, is still published, though no other job can ask for that key: P2 may skip it, as a saving.
 
 The store is P2's, specified and not yet merged, so the right-hand column names what P2 specifies;
 when it lands, each row is checked against its code and the names updated.

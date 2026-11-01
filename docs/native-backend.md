@@ -647,6 +647,9 @@ specification:
   the store changes by whole entries (one rename) and that a reader treats a missing or short part
   as a miss: either one alone closes torn reads, and an eviction part-way is the same case as a
   write part-way.
+- **Some entries no one can ask for.** With output keys off for a marked step, every step after it
+  starts from a container whose key names the job, so its entry, though honest, can only ever be
+  found by that job. Publishing it is safe and useless; P2 may skip it.
 - **A miss is always safe, and the proof says why in one line**: every invariant is "every entry
   that is there is honest", which removing entries or failing a read cannot break. LRU eviction and
   a read cut short need no argument of their own.
