@@ -50,6 +50,12 @@ next_layer: u32 = 0,
 store: ?Store = null,
 /// The store's settings, for `base` to turn it on.
 store_cfg: Store = .{ .root = "" },
+/// `Config.vouched`, and the job's cache scope and repository from it (`base`): a vouched fork's
+/// pull request keys its layers apart from its repository's own jobs, as its package caches are
+/// (`set_up.packageCacheScope`).
+vouched: bool = false,
+scope: []const u8 = "untrusted",
+repository: []const u8 = "",
 /// The store's layers the job uses, held shared until it ends (`Store.Layer`).
 held: std.ArrayList(std.Io.File) = .empty,
 /// Past this many layers, the stack is merged into one (`flatten`).
@@ -473,6 +479,7 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
         .subid_base = cfg.subid_base,
         .subnet = cfg.subnet,
         .store_cfg = .{ .root = cfg.store, .max_bytes = cfg.store_max_bytes },
+        .vouched = cfg.vouched,
         .flatten_at = @max(2, cfg.flatten_at),
     };
     errdefer b.deinit();
@@ -662,6 +669,8 @@ pub fn base(
     const arena = b.arena;
     try b.baseEnv(ev, plan);
     if (plan.step_cache) b.store = b.store_cfg;
+    b.repository = ev.job.github.repository;
+    b.scope = try set_up.packageCacheScope(arena, ev, b.repository, b.vouched);
     const event = try ev.eventJson();
     const event_in_env = plan.step_cache and event.len <= set_up.max_event_env;
     if (event_in_env) try b.put(dagger.event_env, event);
@@ -698,7 +707,7 @@ pub fn base(
     if (claim.hit != null) return;
     const ended = try b.exec(mk, try b.envStrings(&.{}), files, 0, 0, out.output());
     if (ended.failure.len == 0 and ended.code == 0) {
-        if (claim.key) |k| b.publishTop(k, .{ .log = "", .fc = "" });
+        if (claim.key) |k| b.publishTop(k, .base, .{ .log = "", .fc = "" });
     } else {
         err_msg.* = try std.fmt.allocPrint(arena, "could not set up the job's base: {s}{s}", .{
             ended.failure,
@@ -835,7 +844,7 @@ pub fn execScript(
     const out = try x.collect(num, data, .{ .doc = "", .at = 0 });
     x.loadPendingMatchers(num);
     if (claim.key) |k| if (ended.code == 0 and out.code == 0) if (live.record) |r|
-        b.publishTop(k, .{ .log = r.items, .fc = all orelse "" });
+        b.publishTop(k, .step, .{ .log = r.items, .fc = all orelse "" });
     return out;
 }
 
@@ -940,7 +949,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
         out.output(),
     );
     if (ended.code == 0 and ended.failure.len == 0 and !ended.killed) {
-        if (claim.key) |k| b.publishTop(k, .{ .log = "", .fc = "" });
+        if (claim.key) |k| b.publishTop(k, .fetch, .{ .log = "", .fc = "" });
         f.result = .{ .dir = "native" };
         return f;
     }
@@ -1100,7 +1109,9 @@ fn keyFor(
 }
 
 /// What a base's layer, and so every layer above it, depends on besides its own script: the
-/// rootfs's fingerprint, how ids are mapped and, on a root runner, the slot's first id (a layer's
+/// store's format (`Store.store_format`), the job's cache scope and repository (a vouched fork's
+/// pull request never replays, or leaves, a layer its repository's own jobs use), the rootfs's
+/// fingerprint, how ids are mapped and, on a root runner, the slot's first id (a layer's
 /// files are owned by its job's range, so a layer is reused only by jobs with the same range: only
 /// misses come of it), and the binds (where, not what: mounts' content is in no key). Null, and the
 /// job uncached, when the rootfs cannot be read.
@@ -1113,6 +1124,9 @@ fn below(b: *Backend) ?Store.Key {
         return null;
     };
     var h: Store.KeyHasher = .plain("below a base");
+    h.field(Store.store_format);
+    h.field(b.scope);
+    h.field(b.repository);
     h.field(&fp);
     h.field(@tagName(b.how.userns));
     h.int(if (b.how.userns == .mapped) b.idBase() else 0);
@@ -1167,30 +1181,43 @@ fn claimKey(b: *Backend, key: ?Store.Key) error{ Stopped, OutOfMemory }!Claim {
         return .{};
     };
     b.waiting.store(false, .release);
-    const layer = (s.open(arena, b.io, k) catch null) orelse return .{ .key = k, .lock = lock };
-    const fail: ?[]const u8 = fail: {
-        const rec = s.record(arena, b.io, k) catch |e| break :fail @errorName(e);
-        const name = try b.layerName('l');
-        const link = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, name });
-        std.Io.Dir.cwd().symLink(b.io, layer.fs, link, .{}) catch |e| break :fail @errorName(e);
-        try b.held.append(arena, layer.lock);
-        try b.layers.append(arena, .{ .name = name, .path = layer.fs, .key = k });
-        return .{ .key = k, .lock = lock, .hit = rec };
+    // A stored entry another job holds, but that cannot be replayed: run, and keep nothing.
+    const hit = (s.open(arena, b.io, k) catch |e| {
+        std.log.warn("native: a stored layer cannot be replayed ({s}); the step runs", .{
+            @errorName(e),
+        });
+        lock.close(b.io);
+        return .{};
+    }) orelse return .{ .key = k, .lock = lock };
+    errdefer hit.layer.lock.close(b.io);
+    errdefer lock.close(b.io);
+    try b.layers.ensureUnusedCapacity(arena, 1);
+    try b.held.ensureUnusedCapacity(arena, 1);
+    const name = try b.layerName('l');
+    const link = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, name });
+    std.Io.Dir.cwd().symLink(b.io, hit.layer.fs, link, .{}) catch |e| {
+        std.log.warn("native: a stored layer cannot be linked ({s}); the step runs", .{
+            @errorName(e),
+        });
+        hit.layer.lock.close(b.io);
+        lock.close(b.io);
+        return .{};
     };
-    std.log.warn("native: a stored layer cannot be replayed ({s}); the step runs", .{fail.?});
-    layer.lock.close(b.io);
-    lock.close(b.io);
-    return .{};
+    b.held.appendAssumeCapacity(hit.layer.lock);
+    b.layers.appendAssumeCapacity(.{ .name = name, .path = hit.layer.fs, .key = k });
+    return .{ .key = k, .lock = lock, .hit = hit.rec };
 }
 
 /// The stack's top layer, which an exec under `key` just left, moved into the store
 /// (`Store.publish`) with its record, and the job's stack then links to it. Its parent is in the
 /// store (`keyFor`). A failure leaves the layer the job's own, and is logged: the job goes on,
 /// uncached from here.
-fn publishTop(b: *Backend, key: Store.Key, rec: Store.Record) void {
+fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) void {
     const s = b.store orelse return;
     const arena = b.arena;
     if (rec.log.len > Store.max_record_bytes) return;
+    // Room first: once the layer has moved, the job must hold it and point at it.
+    b.held.ensureUnusedCapacity(arena, 1) catch return;
     const top = &b.layers.items[b.layers.items.len - 1];
     const name = b.layerName('l') catch return;
     const link = std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, name }) catch return;
@@ -1204,15 +1231,12 @@ fn publishTop(b: *Backend, key: Store.Key, rec: Store.Record) void {
         std.log.warn("native: cannot link a layer into the store: {s}", .{@errorName(e)});
         return;
     };
-    const layer = s.publish(arena, b.io, key, top.path, rec) catch |e| {
+    const layer = s.publish(arena, b.io, key, kind, top.path, rec) catch |e| {
         std.log.warn("native: cannot publish a layer to the store: {s}", .{@errorName(e)});
         cwd.deleteFile(b.io, link) catch {};
         return;
     };
-    b.held.append(arena, layer.lock) catch {
-        layer.lock.close(b.io);
-        return;
-    };
+    b.held.appendAssumeCapacity(layer.lock);
     top.* = .{ .name = name, .path = layer.fs, .key = key };
 }
 
@@ -2725,6 +2749,44 @@ test "native step cache: measured, replay per step and the store's size over 50 
     }
     std.debug.print("native bench: store after 50 jobs: {d} layers, {d} KiB\n", .{
         try storeLayers(arena, c.cfg.store),
-        Store.treeBytes(arena, io, layers) / 1024,
+        (try Store.treeBytes(arena, io, layers)) / 1024,
     });
+}
+
+test "native step cache: a fork's pull request keys its layers apart from its repository's jobs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    // Two pull requests, alike but for the head's repository: the repository's own, and a fork's.
+    const pr = struct {
+        fn job(ar: Allocator, head: []const u8) !job_mod.Job {
+            // The steps in the arena: a literal's would not outlive this call.
+            const steps = try ar.dupe(job_mod.Step, &.{testStep("echo x >> /shared/s")});
+            var j = testJob(steps);
+            j.context_data = try std.json.parseFromSliceLeaky(
+                std.json.Value,
+                ar,
+                try std.fmt.allocPrint(ar, "{{\"github\":{{\"t\":2,\"d\":[" ++
+                    "{{\"k\":\"repository\",\"v\":\"o/r\"}},{{\"k\":\"event\",\"v\":{{\"t\":2,\"d\":[" ++
+                    "{{\"k\":\"pull_request\",\"v\":{{\"t\":2,\"d\":[{{\"k\":\"head\",\"v\":{{\"t\":2," ++
+                    "\"d\":[{{\"k\":\"repo\",\"v\":{{\"t\":2,\"d\":[{{\"k\":\"full_name\",\"v\":" ++
+                    "\"{s}\"}}]}}}}]}}}}]}}}}]}}}}]}}}}", .{head}),
+                .{},
+            );
+            return j;
+        }
+    }.job;
+    const own = try pr(arena, "o/r");
+    const fork = try pr(arena, "fork/r");
+    try expectSucceeded(try runCached(arena, c.cfg, own, "j1"));
+    try expectSucceeded(try runCached(arena, c.cfg, own, "j2"));
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "s"));
+    // The fork's does not replay the repository's layer, but replays its own.
+    try expectSucceeded(try runCached(arena, c.cfg, fork, "j3"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "s"));
+    try expectSucceeded(try runCached(arena, c.cfg, fork, "j4"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "s"));
 }
