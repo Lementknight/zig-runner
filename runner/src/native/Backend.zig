@@ -1100,7 +1100,7 @@ fn keyFor(
 }
 
 /// What a base's layer, and so every layer above it, depends on besides its own script: the
-/// rootfs's fingerprint, how ids are mapped and, on a root runner, the slot's first id (a layer's
+/// store's format (`Store.store_format`), the rootfs's fingerprint, how ids are mapped and, on a root runner, the slot's first id (a layer's
 /// files are owned by its job's range, so a layer is reused only by jobs with the same range: only
 /// misses come of it), and the binds (where, not what: mounts' content is in no key). Null, and the
 /// job uncached, when the rootfs cannot be read.
@@ -1113,6 +1113,7 @@ fn below(b: *Backend) ?Store.Key {
         return null;
     };
     var h: Store.KeyHasher = .plain("below a base");
+    h.field(Store.store_format);
     h.field(&fp);
     h.field(@tagName(b.how.userns));
     h.int(if (b.how.userns == .mapped) b.idBase() else 0);

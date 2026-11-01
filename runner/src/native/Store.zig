@@ -43,6 +43,12 @@ pub fn hex(k: Key) [2 * Sha256.digest_length]u8 {
     return std.fmt.bytesToHex(k, .lower);
 }
 
+/// The store's format: what a layer and its record mean (the sandbox that made the tree, the
+/// record's files and how they replay, the key's extras). Part of every base's parent
+/// (`Backend.below`), so every key: bump it with any change to those, and a runner upgraded
+/// finds none of the layers an older one left (they age out under the cap).
+pub const store_format = "zig-runner native store 2";
+
 /// What a key is of (P8's tag, proofs/Runner/Native.lean): a job's base, a step's container (a
 /// `run:` step's exec, or a checkout's fetch), or one keyed on what a step produced.
 pub const Tag = enum(u64) { base = 0, step = 1, output_keyed = 2 };
