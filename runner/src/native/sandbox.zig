@@ -381,6 +381,12 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
             mountOverlay(arena, spec, lowers, false);
             check("enter the job's user namespace", linux.setns(userns, linux.CLONE.NEWUSER));
             _ = linux.close(userns);
+            // Joining a user namespace changes no ids: the helper is still the host's root,
+            // which the job's namespace does not map, so what it made would belong to no one
+            // there (EOVERFLOW). It becomes the namespace's root, as runc does after joining.
+            check("setgroups", linux.setgroups(0, no_groups));
+            check("setgid", linux.setgid(0));
+            check("setuid", linux.setuid(0));
         },
         .self, .inherited => {
             if (spec.userns == .self) enterUserns();
