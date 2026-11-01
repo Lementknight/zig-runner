@@ -3,6 +3,7 @@
 #
 #   ci-scope.sh tests        Format, build and test; Database tests (ci.yml)
 #   ci-scope.sh binaries     Release builds (ci.yml)
+#   ci-scope.sh e2e          End to end (ci.yml)
 #   ci-scope.sh proofs       Proofs (proofs.yml)
 #   ci-scope.sh packaging    Binaries (check), Binaries (same as zig build), Image (release.yml)
 #
@@ -64,16 +65,30 @@ needed() {
 		*) return 1 ;;
 		esac
 		;;
+	e2e)
+		# The runner as the suite builds and runs it (e2e.sh: compiled as build-binaries.sh compiles
+		# it, against the engine deploy/compose.yaml runs, with deploy/engine.json), and the harness.
+		# The workflows it runs are runner-bench's, outside this repository.
+		case $1 in
+		runner/src/* | runner/build.zig | runner/build.zig.zon | deploy/engine.json | \
+			.github/workflows/ci.yml | .github/scripts/ci-scope.sh | \
+			.github/scripts/install-zig.sh | .github/scripts/zig-modules.sh | \
+			.github/scripts/e2e.sh) return 0 ;;
+		*) return 1 ;;
+		esac
+		;;
 	proofs)
 		# `lake build` reads proofs/ alone (its lakefile, manifest and toolchain included); the
 		# hashFiles model's comparison (glob-lean-diff.sh) builds proofs/Oracle.lean and runs it
-		# against glob.zig, compiled by itself (it imports only std) into globleancorpus.zig. Lean's
+		# against glob.zig, compiled by itself (it imports only std) into globleancorpus.zig; and
+		# key-vectors.sh compares the native key's vectors with `keyoracle`'s output. Lean's
 		# version is install-lean.sh's, checked against proofs/lean-toolchain.
 		case $1 in
 		proofs/* | runner/src/glob.zig | runner/tools/globleancorpus.zig | \
+			runner/src/native/testdata/step_keys.tsv | \
 			.github/workflows/proofs.yml | .github/scripts/ci-scope.sh | \
 			.github/scripts/install-zig.sh | .github/scripts/install-lean.sh | \
-			.github/scripts/glob-lean-diff.sh) return 0 ;;
+			.github/scripts/glob-lean-diff.sh | .github/scripts/key-vectors.sh) return 0 ;;
 		*) return 1 ;;
 		esac
 		;;
@@ -99,9 +114,9 @@ needed() {
 }
 
 case $scope in
-tests | binaries | proofs | packaging) ;;
+tests | binaries | e2e | proofs | packaging) ;;
 *)
-	echo "usage: ci-scope.sh tests|binaries|proofs|packaging" >&2
+	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging" >&2
 	exit 2
 	;;
 esac
