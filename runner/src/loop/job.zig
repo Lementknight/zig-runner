@@ -6,6 +6,7 @@ const std = @import("std");
 const Config = @import("../config.zig").Config;
 const auth = @import("../github/auth.zig");
 const broker = @import("../github/broker.zig");
+const http = @import("../github/http.zig");
 const runservice = @import("../github/runservice.zig");
 const job_mod = @import("../job.zig");
 const trust = @import("../trust.zig");
@@ -26,7 +27,6 @@ const stop_signals = &@import("../loop.zig").stop_signals;
 const say = @import("../loop.zig").say;
 const sayUnallocated = @import("../loop.zig").sayUnallocated;
 const token_refresh_secs = @import("../loop.zig").token_refresh_secs;
-const poll_timeout = @import("../loop.zig").poll_timeout;
 const mintToken = @import("../loop.zig").mintToken;
 const jsonString = @import("../loop.zig").jsonString;
 const fail = @import("../loop.zig").fail;
@@ -940,6 +940,14 @@ const CancelWatch = struct {
     log_job: u64,
     cancel: *dagger.Cancel,
     stop: std.atomic.Value(bool) = .init(false),
+    /// How long each poll is held open before a new one goes out. The broker answers a poll with
+    /// a message queued before the poll came, but not with one queued while it waits: a cancel
+    /// reached the runner only once the poll in flight had ended, 48-56 s later (#134). A new poll
+    /// picks it up at once, so a cancel arrives within `cycle`, for one request every `cycle`
+    /// while a job runs (there is still only ever one open).
+    cycle: std.Io.Duration = .fromSeconds(cycle_secs),
+
+    pub const cycle_secs = 5;
 
     fn run(w: *CancelWatch) void {
         var state: std.heap.ArenaAllocator = .init(w.c.gpa);
@@ -962,11 +970,16 @@ const CancelWatch = struct {
             // Stopped at the job's end by cancelling this poll, which the HTTP client can report as
             // an error other than Canceled. Without the `stop` check the watch then slept 5 s that
             // nothing interrupted, and the job's end waited it out: 5.1 s between every two jobs.
-            // A long poll, so a request's usual deadline would end every one (`poll_timeout`).
-            const m = broker.request(cc.arena, cc.io, .GET, w.session.url, null, .{
-                .token = token,
-                .deadline = poll_timeout,
-            }) catch |e| {
+            // Given up after `cycle` for a new one (see `cycle`): no request deadline of its own.
+            const polled = http.within(cc.io, w.cycle, broker.request, .{
+                cc.arena,
+                cc.io,
+                .GET,
+                w.session.url,
+                null,
+                .{ .token = token, .deadline = null },
+            }) catch return;
+            const m = (polled orelse continue) catch |e| {
                 if (e == error.Canceled or w.stop.load(.acquire)) return;
                 cc.io.sleep(.fromSeconds(5), .awake) catch return;
                 continue;
@@ -1274,6 +1287,62 @@ test "a job's cancel watch stops at once when the job ends, mid-poll" {
     const took = std.Io.Clock.awake.now(io).toMilliseconds() - started;
     try std.testing.expect(took < 1000);
     try std.testing.expect(!cancel.requested.load(.acquire));
+}
+
+test "a cancel queued while the watch's poll waits reaches the job within a cycle (#134)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var server: @import("../github/testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    var url_buf: [64]u8 = undefined;
+
+    var out_buf: [1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var err_buf: [1024]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+    var cfg: Config = .{ .gh_token = "", .scope = undefined };
+    const c = testRunner(arena, &log, &err, &cfg);
+    const job: job_mod.Job = .{
+        .plan_id = "p",
+        .job_id = "j",
+        .job_token = "t",
+        .check_run_id = 7,
+        .secrets = &.{},
+        .steps = &.{},
+    };
+    var cancel: dagger.Cancel = .{};
+    var watcher = CancelWatch.init(c, .{
+        .creds = undefined,
+        .token = "token",
+        .token_at = std.Io.Clock.real.now(io).toSeconds(),
+        .url = try arena.dupe(u8, server.url(&url_buf, "127.0.0.1", "/broker/busy?sessionId=s")),
+    }, job, &cancel);
+    // Shorter than in use, to keep the test quick; GitHub's in-flight poll never answers here.
+    watcher.cycle = .fromMilliseconds(500);
+    var watching = try io.concurrent(CancelWatch.run, .{&watcher});
+    defer {
+        watcher.stop.store(true, .release);
+        watching.cancel(io);
+    }
+
+    // GitHub cancels the job while the watch's first poll waits.
+    try io.sleep(.fromMilliseconds(200), .awake);
+    const queued = std.Io.Clock.real.now(io).toMilliseconds();
+    server.cancel_queued.store(true, .release);
+    while (!cancel.requested.load(.acquire)) {
+        try std.testing.expect(std.Io.Clock.real.now(io).toMilliseconds() - queued < 2000);
+        try io.sleep(.fromMilliseconds(20), .awake);
+    }
+    try std.testing.expect(server.polls.load(.acquire) >= 2);
+    // With the grace GitHub gave (30 s) for what still runs.
+    const hard = cancel.hard_deadline_ms.load(.acquire);
+    try std.testing.expect(hard >= queued + 30_000 and hard < queued + 32_000);
+    // In use, a cancel arrives within a few seconds of GitHub's.
+    comptime std.debug.assert(CancelWatch.cycle_secs <= 5);
 }
 
 test "a stop cancels a running job once its grace has passed, and not a job that ended first" {

@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A job cancelled on GitHub (in its UI, or at its timeout-minutes) stops within about 5 s instead of up to a minute (#134). The broker answers a poll only with messages queued before the poll came, so the cancel waited for the long poll in flight to end, 48-56 s later. While a job runs, the runner now holds each poll open for 5 s and then sends a new one (one open at a time, 12 a minute instead of about 1), and the new poll picks the cancel up at once.'
+time: 2026-11-01T01:34:17.000000-04:00

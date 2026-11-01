@@ -13,6 +13,10 @@
 //!   /unavailable/...  503
 //!   /broker/message?...  200, a `RunnerJobRequest` whose run service is /nowhere (so acquirejob
 //!                answers 404); each one counted in `Server.polls`
+//!   /broker/busy?...  the broker while a job runs, as measured (#134): a poll that came before
+//!                `Server.cancel_queued` was set is never answered (GitHub answers it empty about
+//!                50 s later), one after it gets the `JobCancellation` of job "j"; each one counted
+//!                in `Server.polls`
 //!   /silent      never answered: the connection stays open, as one to a peer that went away
 //!                without a word does (written to, never read from)
 //!   /silent-once/...  never answered the first time (of all such paths), 200 "ok" after that
@@ -36,6 +40,8 @@ pub const Server = struct {
     thread: std.Thread,
     /// Requests to /broker/message so far.
     polls: std.atomic.Value(u32),
+    /// Set by a test when GitHub cancels the job (/broker/busy).
+    cancel_queued: std.atomic.Value(bool),
     /// Connections accepted so far.
     accepts: std.atomic.Value(u32),
     /// Installation tokens minted so far (/app/installations/...).
@@ -53,6 +59,7 @@ pub const Server = struct {
         s.listener = try addr.listen(io, .{ .reuse_address = true });
         s.port = s.listener.socket.address.getPort();
         s.polls = .init(0);
+        s.cancel_queued = .init(false);
         s.accepts = .init(0);
         s.app_tokens = .init(0);
         s.silent_once = 0;
@@ -139,6 +146,10 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
     r.interface.discardAll(body_len) catch {};
     if (std.mem.eql(u8, path, "/quit")) return .quit;
     if (std.mem.eql(u8, path, "/silent")) return .hold;
+    if (std.mem.startsWith(u8, path, "/broker/busy?")) {
+        _ = s.polls.fetchAdd(1, .acq_rel);
+        if (!s.cancel_queued.load(.acquire)) return .hold;
+    }
     if (std.mem.startsWith(u8, path, "/silent-once/")) {
         s.silent_once += 1;
         if (s.silent_once == 1) return .hold;
@@ -174,6 +185,9 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
             .{port},
         ) catch return .close;
         respond(out, "200 OK", null, body);
+    } else if (std.mem.startsWith(u8, path, "/broker/busy?")) {
+        respond(out, "200 OK", null, "{\"messageType\":\"JobCancellation\",\"body\":" ++
+            "\"{\\\"jobId\\\":\\\"j\\\",\\\"timeout\\\":\\\"00:00:30\\\"}\"}");
     } else if (std.mem.startsWith(u8, path, "/silent-once/")) {
         respond(out, "200 OK", null, "ok");
     } else if (std.mem.eql(u8, path, "/keep") or std.mem.eql(u8, path, "/keep-close")) {
