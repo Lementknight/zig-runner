@@ -1712,8 +1712,7 @@ test "a native step is contained: pivot_root, masked /proc, Docker's capabilitie
         "personality read-implies-exec -1 1",
         "personality query 0",
     });
-    const info = "/proc/self/mountinfo";
-    const mounts = try std.Io.Dir.cwd().readFileAlloc(io, info, arena, .limited(1 << 20));
+    const mounts = net.readProc(arena, io, "/proc/self/mountinfo") orelse "";
     if (std.mem.indexOf(u8, mounts, " /proc/sys/fs/binfmt_misc ") != null)
         std.debug.print("native backend test: the host's /proc/sys has binfmt_misc\n", .{});
 }

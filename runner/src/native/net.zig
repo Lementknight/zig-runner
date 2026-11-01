@@ -466,8 +466,7 @@ pub fn natRules(
     if (ups.len == 0) return "the host has no default route for the jobs' traffic to leave by";
     const cwd = std.Io.Dir.cwd();
     const fwd_path = "/proc/sys/net/ipv4/ip_forward";
-    var fwd_buf: [4]u8 = undefined;
-    const fwd = cwd.readFile(io, fwd_path, &fwd_buf) catch "0";
+    const fwd = readProc(arena, io, fwd_path) orelse "0";
     if (!std.mem.startsWith(u8, fwd, "1")) {
         cwd.writeFile(io, .{ .sub_path = fwd_path, .data = "1" }) catch |e|
             return try std.fmt.allocPrint(arena, "cannot turn on IPv4 forwarding: {s}", .{
@@ -533,8 +532,25 @@ pub fn subnetClash(arena: Allocator, io: std.Io, subnet: Subnet) !?[]const u8 {
 }
 
 fn routeTable(arena: Allocator, io: std.Io) ?[]const u8 {
-    return std.Io.Dir.cwd().readFileAlloc(io, "/proc/net/route", arena, .limited(1 << 20)) catch
-        null;
+    return readProc(arena, io, "/proc/net/route");
+}
+
+/// A /proc file's contents, read to its end (up to 1 MiB): /proc reports its files' sizes as 0,
+/// so a read sized by `stat` (`readFileAlloc`) gets nothing.
+pub fn readProc(arena: Allocator, io: std.Io, path: []const u8) ?[]const u8 {
+    const f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer f.close(io);
+    var out: std.ArrayList(u8) = .empty;
+    var buf: [4096]u8 = undefined;
+    while (out.items.len < 1 << 20) {
+        const n = f.readStreaming(io, &.{&buf}) catch |e| switch (e) {
+            error.EndOfStream => break,
+            else => return null,
+        };
+        if (n == 0) break;
+        out.appendSlice(arena, buf[0..n]) catch return null;
+    }
+    return out.items;
 }
 
 fn clashIn(arena: Allocator, text: []const u8, subnet: Subnet) !?[]const u8 {
@@ -700,4 +716,9 @@ test "the jobs' subnet: what parses, and a clash with the host's routes" {
     try std.testing.expect(std.mem.indexOf(u8, wide, "docker0") != null);
     var it = routes(table);
     try std.testing.expectEqualStrings("wlp0s20f3", it.next().?.iface);
+    // The real table, read whole although /proc says it is empty: at least its header.
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const real = readProc(arena.allocator(), std.testing.io, "/proc/net/route").?;
+    try std.testing.expect(std.mem.startsWith(u8, real, "Iface"));
 }
