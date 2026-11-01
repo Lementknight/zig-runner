@@ -40,6 +40,7 @@ const baseContainerId = @import("dagger/set_up.zig").baseContainerId;
 const Base = @import("dagger/set_up.zig").Base;
 pub const Backend = @import("native/Backend.zig");
 const docker_action = @import("native/docker_action.zig");
+const native_actions = @import("native/actions.zig");
 const execFor = @import("dagger/set_up.zig").execFor;
 const setUpJob = @import("dagger/set_up.zig").setUpJob;
 const package_cache_dirs = @import("dagger/set_up.zig").package_cache_dirs;
@@ -830,7 +831,13 @@ pub fn run(
             opts.backend_note = try std.fmt.allocPrint(arena, "This job runs on Dagger: {s}.", .{
                 w,
             });
-        } else return runNative(arena, io, opts, cfg, job, log);
+        } else if (try runNative(arena, io, opts, cfg, job, log, &opts.backend_note)) |r| {
+            return r;
+        } else if (cfg.gate) |g| {
+            // Native set the job up (its cgroup told the gate) and then sent it here (P7's
+            // preload): the gate measures it on the engine again, learning nothing from it.
+            g.backToEngine();
+        }
     }
     var env = try environ.clone(arena);
     try env.put("NO_COLOR", "1");
@@ -881,6 +888,15 @@ pub fn run(
     return runSteps(arena, io, opts, job, &sh, results, transport, null);
 }
 
+/// Whether a step of `job` uses a remote action (`native/actions.zig` fetches it first).
+fn usesRemoteActions(job: job_mod.Job) bool {
+    for (job.steps) |st| switch (st.action) {
+        .uses => |u| if (!u.local) return true,
+        else => {},
+    };
+    return false;
+}
+
 /// The job on the native backend (`native/Backend.zig`): no Dagger session, the same steps code.
 /// The step cache is the native layer store's (`native/Store.zig`). What the native backend has
 /// no counterpart for yet is off for the job: output keys, and the tool cache's checked trees.
@@ -894,7 +910,8 @@ fn runNative(
     cfg: Backend.Config,
     job: job_mod.Job,
     log: *sink.LogSink,
-) !Result {
+    dagger_note: *?[]const u8,
+) !?Result {
     var opts = opts_in;
     opts.output_keys = false;
     opts.package_caches = false;
@@ -909,18 +926,45 @@ fn runNative(
     defer sh.flush();
     // After the last step, as for a Dagger session: each replayed step's log ends with the note.
     defer noteReusedSteps(&sh, native_reused_note);
-    var b = Backend.init(arena, io, opts.gpa, cfg) catch |e| return fail(
-        &sh,
-        results,
-        try std.fmt.allocPrint(arena, "could not make the job's native store: {s}", .{
-            @errorName(e),
-        }),
-    );
+    var b = Backend.init(arena, io, opts.gpa, cfg) catch |e| {
+        // A job the runner does not vouch for whose cgroup could not be made with its limits
+        // after all (P4, P5's `job_limits`): not native, and not failed either.
+        if (e == error.NoJobLimits) {
+            dagger_note.* = "This job runs on Dagger: native steps run a job this runner does " ++
+                "not vouch for only within a cgroup of its own with memory and process limits, " ++
+                "which could not be made for it.";
+            return null;
+        }
+        return try fail(
+            &sh,
+            results,
+            try std.fmt.allocPrint(arena, "could not make the job's native store: {s}", .{
+                @errorName(e),
+            }),
+        );
+    };
     defer b.deinit();
     b.caches = .of(opts_in);
+    // The actions are fetched before the job's image is pulled and provisioned (P3, in the
+    // base): until the preload follows that, only the operator's provisioned default image is
+    // there to fetch them with, and the base's provisioning must not drop their layers.
+    if (usesRemoteActions(job) and (cfg.rootfs.len == 0 or job.container != null or !opts.provision or
+        !std.mem.eql(u8, resolveImage(opts.image), default_image)))
+    {
+        dagger_note.* = "This job runs on Dagger: its `uses:` actions are fetched before the " ++
+            "job's image is pulled natively, which needs the operator's provisioned default " ++
+            "image (RUNNER_NATIVE_ROOTFS) until the fetch follows the pull.";
+        return null;
+    }
+    // What its `uses:` actions are is known once they are fetched: one native cannot run yet
+    // sends the job to Dagger before anything is logged (`native/actions.zig`).
+    if (try native_actions.preload(&b, job)) |why| {
+        dagger_note.* = try std.fmt.allocPrint(arena, "This job runs on Dagger: {s}.", .{why});
+        return null;
+    }
     // Which ids the job's steps have, as "Set up job" says (`Backend.idsNote`).
     opts.backend_note = try b.idsNote(arena);
-    return runSteps(arena, io, opts, job, &sh, results, b.transport(), &b);
+    return try runSteps(arena, io, opts, job, &sh, results, b.transport(), &b);
 }
 
 /// What every task of a job shares: the log, and one slot per log step — the job's steps, then

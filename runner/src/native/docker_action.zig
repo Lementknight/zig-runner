@@ -22,6 +22,8 @@ const images = @import("images.zig");
 const Exec = @import("../dagger/Exec.zig");
 const SpanDemux = @import("../dagger/JobLog.zig").SpanDemux;
 const scripts = @import("../dagger/scripts.zig");
+const dockerfile = @import("dockerfile.zig");
+const layers = @import("layers.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -100,22 +102,31 @@ pub fn run(
     state: []const job_mod.EnvVar,
 ) !?Exec.Out {
     const arena = b.arena;
-    const ref = switch (dr.image) {
-        .pull => |r| r,
-        // Only `uses:` actions are built, and they are not native yet (`Backend.unsupported`).
-        .build => |bd| {
-            _ = try x.actionFailed(num, "could not build {s} of {s}: native steps do not " ++
-                "build Dockerfiles yet", .{ bd.dockerfile, dr.label });
-            return null;
+    var img_lowers: []const []const u8 = &.{};
+    const ref, const img = switch (dr.image) {
+        .pull => |r| .{ r, switch (try find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, r)) {
+            .image => |i| i,
+            .missing => |why| {
+                _ = try x.actionFailed(num, "could not pull {s} for {s}: {s}", .{ r, dr.label, why });
+                return null;
+            },
+        } },
+        .build => |bd| switch (try buildImage(b, bd)) {
+            .image => |built| blk: {
+                img_lowers = built.lowers;
+                break :blk .{ bd.dockerfile, built.config };
+            },
+            .failed => |why| {
+                _ = try x.actionFailed(num, "could not build {s} of {s}: {s}", .{
+                    bd.dockerfile,
+                    dr.label,
+                    why,
+                });
+                return null;
+            },
         },
     };
-    const img = switch (try find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, ref)) {
-        .image => |i| i,
-        .missing => |why| {
-            _ = try x.actionFailed(num, "could not pull {s} for {s}: {s}", .{ ref, dr.label, why });
-            return null;
-        },
-    };
+    if (img_lowers.len == 0) img_lowers = try arena.dupe([]const u8, &.{img.rootfs});
     if (!images.runsAsRoot(img.user)) {
         _ = try x.actionFailed(num, "{s}: the image runs as USER {s}; native Docker actions " ++
             "run as root only yet", .{ dr.label, img.user });
@@ -175,7 +186,7 @@ pub fn run(
     b.workdir = dagger.docker_workspace;
     defer b.workdir = workdir;
     const ended = try b.execOn(argv, env, files.items, 0, 0, out, .{
-        .rootfs = img.rootfs,
+        .lowers = img_lowers,
         .upper = upper,
         .work = "CW",
         .merged = "C",
@@ -246,6 +257,229 @@ fn ownTree(io: std.Io, dir: std.Io.Dir, uid: u32, gid: u32, depth: u32) void {
             continue;
         defer sub.close(io);
         ownTree(io, sub, uid, gid, depth + 1);
+    }
+}
+
+const Build = @FieldType(Exec.DockerRun.Image, "build");
+
+/// The Dockerfile's build context, opened through no symlink below the action's repository
+/// (`Loaded.dir`, its directory in the layer its fetch made), as `/proc/self/fd/<n>` for the
+/// builder's paths; and the open directory, to close.
+fn openContext(arena: Allocator, io: std.Io, bd: Build) !struct { path: []const u8, dir: std.Io.Dir } {
+    var dir = try std.Io.Dir.cwd().openDir(io, bd.dir, .{ .follow_symlinks = false });
+    var parts = std.mem.tokenizeScalar(u8, bd.context, '/');
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, ".")) continue;
+        if (std.mem.eql(u8, part, "..")) return error.ContextOutsideTheAction;
+        const sub = dir.openDir(io, part, .{ .follow_symlinks = false }) catch |e| {
+            dir.close(io);
+            return e;
+        };
+        dir.close(io);
+        dir = sub;
+    }
+    return .{ .path = try std.fmt.allocPrint(arena, "/proc/self/fd/{d}", .{dir.handle}), .dir = dir };
+}
+
+const Planned = union(enum) { plan: dockerfile.Plan, base: images.Image, failed: []const u8 };
+
+/// The Dockerfile of `bd` read and planned on its base image from the native store; `digests`:
+/// the COPY sources' content keyed (a build), else a fixed one (only whether it can be built).
+fn planBuild(b: *Backend, bd: Build, ctx: []const u8, digests: bool) !struct { dockerfile.Plan, images.Image } {
+    const arena = b.arena;
+    const text = switch (try sandbox.readIn(arena, ctx, bd.dockerfile, 1 << 20)) {
+        .text => |t| t,
+        .missing, .whiteout => return error.NoDockerfile,
+    };
+    const ins = switch (try dockerfile.parse(arena, text)) {
+        .ok => |i| i,
+        .refused => |r| {
+            b.build_reason = try std.fmt.allocPrint(arena, "line {d}: {s}", .{ r.line, r.why });
+            return error.Refused;
+        },
+    };
+    const Ctx = struct {
+        dir: []const u8,
+        io: std.Io,
+        digests: bool,
+        fn digest(ptr: *anyopaque, ar: Allocator, sources: []const []const u8) anyerror![64]u8 {
+            const c: *@This() = @ptrCast(@alignCast(ptr));
+            if (!c.digests) return @splat('0');
+            return dockerfile.contextDigest(ar, c.io, c.dir, sources);
+        }
+    };
+    var c: Ctx = .{ .dir = ctx, .io = b.io, .digests = digests };
+    const context: dockerfile.Context = .{ .ptr = &c, .digestFn = Ctx.digest };
+    // The base's reference first (it may come from an ARG), then the plan on its config.
+    const first = try dockerfile.plan(arena, ins, .{ .rootfs = "" }, &.{}, context);
+    const base_ref = switch (first) {
+        .ok => |p| p.base,
+        .refused => |r| {
+            b.build_reason = try std.fmt.allocPrint(arena, "line {d}: {s}", .{ r.line, r.why });
+            return error.Refused;
+        },
+    };
+    const base = switch (try find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, base_ref)) {
+        .image => |i| i,
+        .missing => |why| {
+            b.build_reason = why;
+            return error.Refused;
+        },
+    };
+    const p = (try dockerfile.plan(arena, ins, base, &.{}, context)).ok;
+    if (!images.runsAsRoot(p.config.user)) {
+        b.build_reason = try std.fmt.allocPrint(arena, "the image runs as USER {s}, and native " ++
+            "Docker actions run as root only yet", .{p.config.user});
+        return error.Refused;
+    }
+    for (p.steps) |st| if (st.op == .run and !images.runsAsRoot(st.op.run.user)) {
+        b.build_reason = try std.fmt.allocPrint(arena, "line {d}: a RUN as USER {s} is not " ++
+            "native yet", .{ st.line, st.op.run.user });
+        return error.Refused;
+    };
+    return .{ p, base };
+}
+
+/// Why the Dockerfile action `label` cannot be built natively, or null (`actions.preload`).
+pub fn buildReason(b: *Backend, bd: Build, label: []const u8) !?[]const u8 {
+    const arena = b.arena;
+    const ctx = openContext(arena, b.io, bd) catch return try std.fmt.allocPrint(
+        arena,
+        "the build context {s} of {s} is not a directory of the action",
+        .{ bd.context, label },
+    );
+    defer ctx.dir.close(b.io);
+    _ = planBuild(b, bd, ctx.path, false) catch |e| return switch (e) {
+        error.Refused => try std.fmt.allocPrint(arena, "{s}'s Dockerfile cannot be built " ++
+            "natively: {s}", .{ label, b.build_reason }),
+        error.NoDockerfile => try std.fmt.allocPrint(arena, "{s} has no {s}", .{ label, bd.dockerfile }),
+        else => e,
+    };
+    return null;
+}
+
+const Built = union(enum) {
+    image: struct { lowers: []const []const u8, config: images.Image },
+    failed: []const u8,
+};
+
+/// A Dockerfile action's image, built natively on its base from the image store: each
+/// instruction's layer taken from the native layer store by its key, or made and stored there
+/// (`dockerfile.build`), a RUN in a sandbox on the layers before it (`Backend.execBuild`).
+fn buildImage(b: *Backend, bd: Build) !Built {
+    const arena = b.arena;
+    const ctx = openContext(arena, b.io, bd) catch return .{ .failed = "the build context is " ++
+        "not a directory of the action" };
+    defer ctx.dir.close(b.io);
+    const p, const base = planBuild(b, bd, ctx.path, true) catch |e| return switch (e) {
+        error.Refused => .{ .failed = b.build_reason },
+        error.NoDockerfile => .{ .failed = "the action has no such Dockerfile" },
+        else => e,
+    };
+    // P2's layer store: published there, held for the job, evicted under its cap.
+    const store: layers.Store = .{ .dir = b.dir, .store = b.store_cfg, .held = &b.held };
+    var runner: BuildRunner = .{ .b = b };
+    return switch (try dockerfile.build(arena, b.io, p, base.rootfs, ctx.path, store, runner.runner())) {
+        .ok => |built| .{ .image = .{ .lowers = built.lowers, .config = built.config } },
+        .failed => |f| .{ .failed = if (runner.failure.len > 0)
+            try std.fmt.allocPrint(arena, "the RUN on line {d}: {s}", .{ f.line, runner.failure })
+        else
+            try std.fmt.allocPrint(arena, "the RUN on line {d} exited with {d}: {s}", .{
+                f.line,
+                f.code,
+                runner.last.tail(),
+            }) },
+    };
+}
+
+/// `dockerfile.Runner` over the sandbox: a RUN on the image's layers so far (each idmapped on a
+/// root runner, as the image's are when it runs), writing into the build's new layer. On a root
+/// runner what the RUN writes has the job's host ids; they are shifted back to the image's own
+/// (`unshift`), so the layer is the same whichever job's range built it.
+const BuildRunner = struct {
+    b: *Backend,
+    last: Backend.Captured = undefined,
+    failure: []const u8 = "",
+
+    fn runner(r: *BuildRunner) dockerfile.Runner {
+        return .{ .ptr = r, .runFn = runStep };
+    }
+
+    fn runStep(
+        ptr: *anyopaque,
+        lowers: []const []const u8,
+        upper: []const u8,
+        op: @FieldType(dockerfile.Step.Op, "run"),
+    ) anyerror!i32 {
+        const r: *BuildRunner = @ptrCast(@alignCast(ptr));
+        const b = r.b;
+        const arena = b.arena;
+        for ([_][]const u8{ "BU", "BW", "BC" }) |d|
+            try std.Io.Dir.cwd().createDirPath(b.io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, d }));
+        const mapped = b.how.userns == .mapped;
+        if (mapped) {
+            const p = try arena.dupeSentinel(u8, upper, 0);
+            _ = std.os.linux.chown(p, b.idBase(), b.idBase());
+        }
+        const workdir = b.workdir;
+        b.workdir = op.workdir;
+        defer b.workdir = workdir;
+        r.last = .{ .arena = arena };
+        const ended = try b.execBuild(op.argv, op.env, 0, 0, r.last.output(), .{
+            .lowers = lowers,
+            .upper = upper,
+            .work = "BW",
+            .merged = "BC",
+        });
+        // The sandbox's own failure is the build's, with why.
+        if (ended.failure.len > 0) {
+            r.failure = ended.failure;
+            return 125;
+        }
+        if (mapped) unshift(b.io, upper, b.idBase());
+        return ended.code;
+    }
+};
+
+/// Gives everything in `layer` with an id of the job's range (`base` onwards) the image's own id
+/// (base subtracted), through no symlink.
+fn unshift(io: std.Io, layer: []const u8, base: u32) void {
+    var dir = std.Io.Dir.cwd().openDir(io, layer, .{ .follow_symlinks = false, .iterate = true }) catch return;
+    defer dir.close(io);
+    shiftOne(dir.handle, "", base, std.os.linux.AT.EMPTY_PATH);
+    shiftTree(io, dir, base, 0);
+}
+
+fn shiftOne(fd: std.os.linux.fd_t, name: [*:0]const u8, base: u32, flags: u32) void {
+    const linux = std.os.linux;
+    var st: linux.Statx = undefined;
+    const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true, .GID = true };
+    if (linux.errno(linux.statx(fd, name, flags | linux.AT.SYMLINK_NOFOLLOW, mask, &st)) != .SUCCESS)
+        return;
+    const in = struct {
+        fn f(id: u32, b: u32) u32 {
+            return if (id >= b and id - b < Backend.ids_per_slot) id - b else id;
+        }
+    }.f;
+    _ = linux.fchownat(fd, name, in(st.uid, base), in(st.gid, base), flags | linux.AT.SYMLINK_NOFOLLOW);
+    // chown clears set-id bits; the layer keeps the modes the RUN gave.
+    if (st.mode & (linux.S.ISUID | linux.S.ISGID) != 0 and st.mode & linux.S.IFMT != linux.S.IFLNK)
+        _ = linux.fchmodat(fd, name, st.mode & 0o7777);
+}
+
+fn shiftTree(io: std.Io, dir: std.Io.Dir, base: u32, depth: u32) void {
+    if (depth > 256) return;
+    var name: [std.fs.max_name_bytes + 1]u8 = undefined;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.name.len >= name.len) continue;
+        @memcpy(name[0..e.name.len], e.name);
+        name[e.name.len] = 0;
+        shiftOne(dir.handle, name[0..e.name.len :0], base, 0);
+        if (e.kind != .directory) continue;
+        var sub = dir.openDir(io, e.name, .{ .follow_symlinks = false, .iterate = true }) catch continue;
+        defer sub.close(io);
+        shiftTree(io, sub, base, depth + 1);
     }
 }
 
@@ -330,7 +564,7 @@ const testJob = @import("../dagger/testing.zig").testJob;
 /// An image in the native store at `<tmp>/images`, as `images.zig` reads it: a rootfs of a few
 /// directories (the tests bind the host's /usr over it, as over the job's) holding
 /// `/image-marker`, and `config` as its config.json.
-fn testImage(arena: Allocator, tmp: *std.testing.TmpDir, ref: []const u8, config: []const u8) ![]const u8 {
+pub fn testImage(arena: Allocator, tmp: *std.testing.TmpDir, ref: []const u8, config: []const u8) ![]const u8 {
     const io = std.testing.io;
     const d = tmp.dir;
     const base = try std.fmt.allocPrint(arena, "images/{s}", .{try images.key(arena, ref)});

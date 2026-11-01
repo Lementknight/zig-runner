@@ -63,6 +63,10 @@ image_gid: u32 = 0,
 runtime_path: ?[]const u8 = null,
 /// What "Set up job" says of the image and its provisioning, the job's cgroup and its caches.
 notes: std.ArrayList([]const u8) = .empty,
+/// Remote actions fetched before "Set up job" (`actions.preload`), by `Exec.loadAction`'s key.
+actions: std.StringHashMapUnmanaged(Exec.LoadResult) = .empty,
+/// Why the last Dockerfile could not be planned or built, for the step's message.
+build_reason: []const u8 = "",
 binds: []const sandbox.Spec.Bind,
 /// The host's resolver and hosts file over the image's (`jobBinds`), in `binds` too; services get
 /// these and `service_binds` (`serviceBinds`).
@@ -259,7 +263,7 @@ pub const Slot = struct { n: u32, lock: std.Io.File };
 
 /// The default image's PATH (`ubuntu:24.04`'s config), with the operator's rootfs, and BuildKit's
 /// default for an image whose config sets none.
-const image_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+pub const image_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 /// `runner_user`'s ids in the provisioned image (`set_up.provision_runner_script`).
 const runner_uid = 1001;
 /// Overlay takes at most 500 lower layers, and its options one page: past this many, the stack
@@ -297,7 +301,8 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
         "range of ids, which a rootless runner does not have (RUNNER_STEP_USER=root, or a root " ++
         "runner)";
     for (job.steps) |step| switch (step.action) {
-        .uses => return "`uses:` actions are not native yet (phase 7)",
+        // What they are is in their `action.yml`: decided once fetched (`actions.preload`).
+        .uses => {},
         // Native when their image is in the native store (`docker_action.unsupported`).
         .docker => {},
         .checkout => |inputs| for (inputs) |in| {
@@ -906,8 +911,9 @@ pub fn deinit(b: *Backend) void {
     for (b.held.items) |f| f.close(b.io);
     if (b.slot) |s| s.lock.close(b.io);
     b.lock.close(b.io);
-    // The store kept under its cap, now that this job holds none of its layers.
-    if (b.store) |s| s.collect(arena, b.io);
+    // The store kept under its cap, now that this job holds none of its layers: whether or not
+    // the job cached steps, as Dockerfile builds publish layers too (`layers.zig`).
+    if (b.store_cfg.root.len > 0) b.store_cfg.collect(arena, b.io);
 }
 
 fn detachNetns(arena: Allocator, path: []const u8) void {
@@ -1503,13 +1509,42 @@ pub fn execOn(
     out: sandbox.Output,
     container: ?sandbox.Spec.Container,
 ) !sandbox.Ended {
+    return b.execIn(argv, env, files, uid, gid, out, container, true);
+}
+
+/// A Dockerfile's `RUN` in its `container` (`docker_action.zig`): what it writes goes to the
+/// container's upper, the build's layer, and the job gets no layer (its overlay's upper is a
+/// scratch one, which nothing writes, since the build shares nothing).
+pub fn execBuild(
+    b: *Backend,
+    argv: []const []const u8,
+    env: []const []const u8,
+    uid: u32,
+    gid: u32,
+    out: sandbox.Output,
+    container: sandbox.Spec.Container,
+) !sandbox.Ended {
+    return b.execIn(argv, env, &.{}, uid, gid, out, container, false);
+}
+
+fn execIn(
+    b: *Backend,
+    argv: []const []const u8,
+    env: []const []const u8,
+    files: []const sandbox.Spec.File,
+    uid: u32,
+    gid: u32,
+    out: sandbox.Output,
+    container: ?sandbox.Spec.Container,
+    new_layer: bool,
+) !sandbox.Ended {
     const arena = b.arena;
     if (b.layers.items.len >= b.flatten_at) b.flatten() catch |e| return .{
         .code = 1,
         .failure = try std.fmt.allocPrint(arena, "could not flatten the job's {d} layers " ++
             "into one: {s}", .{ b.layers.items.len, @errorName(e) }),
     };
-    const upper = try b.layerName('L');
+    const upper = if (new_layer) try b.layerName('L') else "BU";
     const upper_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, upper });
     try std.Io.Dir.cwd().createDirPath(b.io, upper_path);
     const base_id = b.idBase();
@@ -1548,7 +1583,7 @@ pub fn execOn(
         .volume_id_base = volumeIdBase(b.subid_base),
         .container = container,
     }, &b.running, out);
-    try b.layers.append(arena, .{ .name = upper, .path = upper_path });
+    if (new_layer) try b.layers.append(arena, .{ .name = upper, .path = upper_path });
     return ended;
 }
 
@@ -1943,10 +1978,10 @@ const Provision = struct {
         var out: Captured = .{ .arena = arena };
         const ended = try b.exec(p.script, p.env, &.{}, 0, 0, out.output());
         const upper = b.layers.items[b.layers.items.len - 1].path;
-        // The step's layer is consumed: the next exec of the job starts again from L0.
+        // The step's layer is consumed; the job's other layers, if any, stay.
         defer {
             removeTree(arena, b.io, upper);
-            b.layers.clearRetainingCapacity();
+            _ = b.layers.pop();
         }
         if (ended.failure.len > 0 or ended.code != 0) {
             // Its last lines: apt's own last line ("dpkg returned an error code") says little.
@@ -2096,13 +2131,13 @@ pub const Live = struct {
 
 /// The output of an exec that is not a step's (the base, a checkout's fetch), kept for the
 /// reason when it fails: its last lines.
-const Captured = struct {
+pub const Captured = struct {
     arena: Allocator,
     text: std.ArrayList(u8) = .empty,
 
     const keep = 4096;
 
-    fn output(c: *Captured) sandbox.Output {
+    pub fn output(c: *Captured) sandbox.Output {
         return .{ .ptr = c, .chunkFn = chunk };
     }
 
@@ -2126,7 +2161,7 @@ const Captured = struct {
         return std.mem.replaceOwned(u8, c.arena, lines, "\n", " | ") catch lines;
     }
 
-    fn tail(c: *const Captured) []const u8 {
+    pub fn tail(c: *const Captured) []const u8 {
         const t = std.mem.trim(u8, c.text.items, " \n");
         const last = std.mem.lastIndexOfScalar(u8, t, '\n') orelse return t;
         return t[last + 1 ..];
@@ -2353,7 +2388,8 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
 
     var uses = testStep("");
     uses.action = .{ .uses = .{ .owner = "actions", .name = "setup-node", .ref = "v4" } };
-    try expectReason("`uses:`", unsupported(io, testJob(&.{uses}), root, ok));
+    // Decided once the action is fetched (`actions.preload`), not here.
+    try std.testing.expect(unsupported(io, testJob(&.{uses}), root, ok) == null);
 
     var with_services = run_only;
     with_services.services = &.{.{ .name = "pg", .image = .{ .lit = "postgres" } }};
