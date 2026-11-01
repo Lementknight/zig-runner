@@ -44,9 +44,9 @@ pub const Config = struct {
     /// Absent means "log to stdout only" (StdoutSink).
     database_url: ?[]const u8 = null,
     dagger_cmd: []const u8 = "dagger",
-    /// Base image for jobs. The default gets git, curl and CA certificates installed (cached by
-    /// Dagger); a custom image is used as is.
-    image: []const u8 = "ubuntu:24.04",
+    /// Base image for jobs. The default (pinned by digest; its bare name means the same) gets git,
+    /// curl and CA certificates installed (cached by Dagger); a custom image is used as is.
+    image: []const u8 = @import("dagger.zig").default_image,
     log_flush_lines: u32 = 200,
     log_flush_ms: u32 = 500,
     /// What runs JavaScript actions (`runs.using: node*`). Bun by default; Node for exact Node

@@ -526,11 +526,15 @@ pub const Warmer = struct {
             return;
         };
         w.failed = null;
-        sayUnallocated(w.c, "pre-warm: base container{s} built in {d}.{d} s ({s})", .{
+        // The packages' fingerprint names the provisioned seed, whose packages are the archive's
+        // on the day it was built (set_up.zig, `provision_packages`).
+        sayUnallocated(w.c, "pre-warm: base container{s} built in {d}.{d} s ({s}{s}{s})", .{
             if (warmed.seeded) " and Zig seed" else "",
             @divTrunc(ms, 1000),
             @divTrunc(@mod(ms, 1000), 100),
             warmed.image,
+            if (warmed.packages != null) ", packages " else "",
+            warmed.packages orelse "",
         });
     }
 
@@ -1501,7 +1505,7 @@ const FakeWarm = struct {
                 s.peak_mb = 600 + mb;
             }
         }
-        return .{ .image = "docker.io/library/ubuntu:24.04@sha256:abc", .seeded = o.zig_seed != null };
+        return .{ .image = "docker.io/library/ubuntu:24.04@sha256:abc", .seeded = o.zig_seed != null, .packages = "0123456789ab" };
     }
     fn socket(_: std.Io, _: []const u8) ?engine.SocketIdentity {
         return sockets[@min(looks, sockets.len - 1)];
@@ -1579,7 +1583,7 @@ test "the pre-warm builds the job's base container and Zig seed through the memo
     try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), slots[1].started_ms);
     try std.testing.expectEqual(@as(u32, 0), memory.polling);
     try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "pre-warm: base container and Zig seed built in 0.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "(docker.io/library/ubuntu:24.04@sha256:abc)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "(docker.io/library/ubuntu:24.04@sha256:abc, packages 0123456789ab)") != null);
 }
 
 test "a pre-warm that found everything cached is not learned from: the cold warm's estimate stays" {
