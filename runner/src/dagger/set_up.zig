@@ -276,6 +276,9 @@ const BasePlan = struct {
     /// The volume of the tool cache's lists, when the tool cache's trees are checked
     /// (`verifyToolTrees`).
     tool_trees: ?[]const u8 = null,
+    /// Where a `repo` job's checked trees report the Zig versions its tool cache holds, to be
+    /// verified and seeded in later jobs (`zig_release.Registry`).
+    zig_discover: ?*zig_release.Registry = null,
     ran_marker: []const u8,
     /// The job's `mark_env` value (`JobLog.mark`).
     mark: []const u8,
@@ -313,6 +316,7 @@ pub fn baseContainerId(
     const runtime_path = jsonFindString(data, "zig_runtime_path");
     const lists = plan.tool_trees orelse return .{ .id = id, .runtime_path = runtime_path };
     const checked = try verifyToolTrees(arena, transport, id, lists, plan.ran_marker, err_msg);
+    if (plan.zig_discover) |r| r.discover(tool_cache_dir, checked.env);
     return .{ .id = checked.id, .runtime_path = runtime_path, .tool_trees_note = checked.note };
 }
 
@@ -367,7 +371,7 @@ fn verifyToolTrees(
     lists: []const u8,
     nonce: []const u8,
     err_msg: *[]const u8,
-) !struct { id: []const u8, note: []const u8 } {
+) !struct { id: []const u8, note: []const u8, env: []const u8 } {
     var check: Query = .init(arena);
     try check.call("loadContainerFromID", .{ .id = base });
     try check.call("withMountedCache", .{ .path = tool_trees_dir, .cache = lists });
@@ -396,7 +400,7 @@ fn verifyToolTrees(
         "Tool cache: not checked ({s}); steps check what they use themselves",
         .{msg},
     ) else verdict.note;
-    return .{ .id = id, .note = note };
+    return .{ .id = id, .note = note, .env = verdict.env };
 }
 
 /// `tool_trees_env`'s value and "Set up job"'s line, from tool_trees.sh's `DIGEST TREE FILES
@@ -743,6 +747,11 @@ pub fn basePlan(
             null,
         .outputs_volume = volumes.outputs,
         .tool_trees = volumes.tool_trees,
+        .zig_discover = if (opts.zig_seed_registry) |r| if (std.mem.eql(
+            u8,
+            try packageCacheScope(arena, ev, job.github.repository, opts.trusted),
+            "repo",
+        )) r else null else null,
         .ran_marker = ran_marker,
         .mark = mark,
     };
@@ -2336,6 +2345,24 @@ fn toolTreesRun(arena: Allocator, opts: Options, check: []const u8) !SeedRun {
 
 const zig_tree = tool_cache_dir ++ "/zig/0.17.0/zig-x86_64-linux-0.17.0";
 const zig_digest = "310d0a4a95f328f94a350c4339226a4796daee589472b23f2a816d18874efaed";
+
+test "a repo job's checked trees tell the seed registry the Zig versions its tool cache holds; an untrusted job's do not" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const older = tool_cache_dir ++ "/zig/0.16.0/zig-x86_64-linux-0.16.0";
+    const check = "{\"data\":{\"loadContainerFromID\":{\"withMountedCache\":{\"withUser\":{\"withEnvVariable\":{\"withExec\":{\"stdout\":\"" ++
+        zig_digest ++ " " ++ zig_tree ++ " 19500 0\\n" ++ zig_digest ++ " " ++ older ++ " 19400 0\\n\"}}}}}}}";
+    for ([_]bool{ true, false }) |trusted| {
+        var reg: zig_release.Registry = .{ .io = std.testing.io, .gpa = arena, .client = null };
+        try reg.add(.{ .seeds = &.{test_zig_seed}, .unverified = &.{} });
+        _ = try toolTreesRun(arena, .{ .trusted = trusted, .nesting = false, .zig_seed_registry = &reg }, check);
+        if (trusted) {
+            try std.testing.expectEqual(@as(usize, 1), reg.pending.items.len);
+            try std.testing.expectEqualStrings("0.16.0", reg.pending.items[0]);
+        } else try std.testing.expectEqual(@as(usize, 0), reg.pending.items.len);
+    }
+}
 
 test "the tool cache's trees are checked on a branch of their own, and steps get only the digests" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);

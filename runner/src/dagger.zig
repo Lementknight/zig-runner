@@ -32,6 +32,7 @@ const expr = @import("expr.zig");
 const context = @import("context.zig");
 const commands = @import("commands.zig");
 const config = @import("config.zig");
+const zig_release = @import("zig_release.zig");
 const engine = @import("engine.zig");
 const Query = @import("dagger/query.zig").Query;
 const basePlan = @import("dagger/set_up.zig").basePlan;
@@ -515,6 +516,8 @@ pub const Options = struct {
     zig_seeds: []const config.ZigSeed = &.{},
     /// `Config.zig_seeds_unverified`: releases left unseeded because they did not verify.
     zig_seeds_unverified: []const []const u8 = &.{},
+    /// `Config.zig_seed_registry`: told the Zig versions a `repo` job's tool cache holds.
+    zig_seed_registry: ?*zig_release.Registry = null,
     /// Stored outputs not produced again for this many days are removed
     /// (`RUNNER_OUTPUT_KEYS_DAYS`).
     output_keys_days: u32 = 7,

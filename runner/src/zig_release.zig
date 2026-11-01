@@ -133,6 +133,96 @@ pub fn resolve(
     return .{ .seeds = out.items, .unverified = unverified.items };
 }
 
+/// The seeds jobs get, shared by the process's runners: the configured releases (`resolve`, at
+/// startup), and the Zig versions `repo` jobs' tool caches hold (`discover`, from the runner's own
+/// tree check, `set_up.verifyToolTrees`), each verified before any job is seeded from it
+/// (`forJob`). Every version tried counts against `max_versions`, verified or not, so a tool cache
+/// full of made-up versions costs a few failed downloads, once each, and no more. Only `repo` jobs
+/// add to it: an untrusted job cannot choose what trusted jobs are seeded from, even among
+/// official releases.
+pub const Registry = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    client: ?*std.http.Client,
+    mu: std.Io.Mutex = .init,
+    seeds: std.ArrayList(config.ZigSeed) = .empty,
+    unverified: std.ArrayList([]const u8) = .empty,
+    pending: std.ArrayList([]const u8) = .empty,
+    /// Taken from `pending` by a job verifying them.
+    inflight: std.ArrayList([]const u8) = .empty,
+
+    fn known(r: *Registry) usize {
+        return r.seeds.items.len + r.unverified.items.len + r.pending.items.len +
+            r.inflight.items.len;
+    }
+
+    fn has(r: *Registry, v: []const u8) bool {
+        for (r.seeds.items) |s| if (std.mem.eql(u8, s.version, v)) return true;
+        for (r.unverified.items) |u| if (std.mem.eql(u8, u, v)) return true;
+        for (r.pending.items) |p| if (std.mem.eql(u8, p, v)) return true;
+        for (r.inflight.items) |p| if (std.mem.eql(u8, p, v)) return true;
+        return false;
+    }
+
+    /// Starts with what `resolve` found.
+    pub fn add(r: *Registry, resolved: Resolved) !void {
+        try r.seeds.appendSlice(r.gpa, resolved.seeds);
+        try r.unverified.appendSlice(r.gpa, resolved.unverified);
+    }
+
+    /// Queues the Zig versions of the tool cache's trees (`DIGEST TREE` lines, TREE
+    /// `<tool cache>/zig/<version>/...`) that it does not know, while there is room.
+    pub fn discover(r: *Registry, tool_cache: []const u8, trees: []const u8) void {
+        r.mu.lockUncancelable(r.io);
+        defer r.mu.unlock(r.io);
+        var lines = std.mem.tokenizeScalar(u8, trees, '\n');
+        while (lines.next()) |line| {
+            const tree = line[(std.mem.indexOfScalar(u8, line, ' ') orelse continue) + 1 ..];
+            const prefix_len = tool_cache.len + "/zig/".len;
+            if (tree.len <= prefix_len or !std.mem.startsWith(u8, tree, tool_cache) or
+                !std.mem.eql(u8, tree[tool_cache.len..prefix_len], "/zig/")) continue;
+            const rest = tree[prefix_len..];
+            const v = rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse rest.len];
+            if (!config.validZigVersion(v) or r.has(v) or r.known() >= max_versions) continue;
+            const copy = r.gpa.dupe(u8, v) catch return;
+            r.pending.append(r.gpa, copy) catch return;
+            std.log.info("Zig seed: {s} found in a tool cache, to be verified", .{v});
+        }
+    }
+
+    /// The seeds for a job, copied into `arena`, after verifying what `discover` queued (a
+    /// download each, once, outside the lock).
+    pub fn forJob(r: *Registry, arena: std.mem.Allocator) !Resolved {
+        var taken: []const []const u8 = &.{};
+        if (r.client != null) {
+            r.mu.lockUncancelable(r.io);
+            defer r.mu.unlock(r.io);
+            taken = try arena.dupe([]const u8, r.pending.items);
+            try r.inflight.appendSlice(r.gpa, r.pending.items);
+            r.pending.clearRetainingCapacity();
+        }
+        if (taken.len > 0) {
+            const todo = try std.mem.join(arena, ",", taken);
+            const got = try resolve(r.gpa, r.gpa, r.client.?, todo);
+            r.mu.lockUncancelable(r.io);
+            defer r.mu.unlock(r.io);
+            for (taken) |v| for (r.inflight.items, 0..) |w, i| {
+                if (std.mem.eql(u8, v, w)) {
+                    _ = r.inflight.orderedRemove(i);
+                    break;
+                }
+            };
+            try r.add(got);
+        }
+        r.mu.lockUncancelable(r.io);
+        defer r.mu.unlock(r.io);
+        return .{
+            .seeds = try arena.dupe(config.ZigSeed, r.seeds.items),
+            .unverified = try arena.dupe([]const u8, r.unverified.items),
+        };
+    }
+};
+
 const download_deadline: std.Io.Duration = .fromSeconds(300);
 const max_download = 256 * 1024 * 1024;
 
@@ -194,4 +284,27 @@ test "check: a signed tarball gives its sha256; a tampered one, or another relea
     try std.testing.expectError(error.WrongFile, check(arena, pk, "0.16.0", tarball, f.minisig));
     // Signed by another key (not Zig's).
     try std.testing.expectError(error.WrongKey, check(arena, try minisign.PublicKey.parse(public_key), "0.17.0", tarball, f.minisig));
+}
+
+test "Registry: tool cache versions are queued once each, within the cap, and only Zig's" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var r: Registry = .{ .io = std.testing.io, .gpa = arena, .client = null };
+    try r.add(.{ .seeds = &.{.{ .version = "0.17.0", .sha256 = "00" }}, .unverified = &.{} });
+    const tc = "/opt/hostedtoolcache";
+    r.discover(tc, "d " ++ tc ++ "/zig/0.17.0/zig-x86_64-linux-0.17.0\n" ++
+        "d " ++ tc ++ "/node/22.1.0/x64\n" ++
+        "d " ++ tc ++ "/zig/0.16.0/zig-x86_64-linux-0.16.0\n" ++
+        "d " ++ tc ++ "/zig/0.16.0/other\n" ++
+        "d " ++ tc ++ "/zig/0.15.2/zig-x86_64-linux-0.15.2\n" ++
+        "d " ++ tc ++ "/zig/0.14.1/zig-x86_64-linux-0.14.1\n" ++
+        "d /elsewhere/zig/0.13.0/x");
+    try std.testing.expectEqual(@as(usize, 2), r.pending.items.len);
+    try std.testing.expectEqualStrings("0.16.0", r.pending.items[0]);
+    try std.testing.expectEqualStrings("0.15.2", r.pending.items[1]);
+    // Without a client nothing is verified, so nothing pending is seeded.
+    const got = try r.forJob(arena);
+    try std.testing.expectEqual(@as(usize, 1), got.seeds.len);
+    try std.testing.expectEqualStrings("0.17.0", got.seeds[0].version);
 }

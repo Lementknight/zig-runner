@@ -1,6 +1,7 @@
 //! Runner configuration (SPEC §2). Environment variables, overridden by flags.
 const std = @import("std");
 const builtin = @import("builtin");
+const zig_release = @import("zig_release.zig");
 const pg = @import("pg.zig");
 const engine = @import("engine.zig");
 const admission = @import("admission.zig");
@@ -160,6 +161,9 @@ pub const Config = struct {
     zig_seeds: []const ZigSeed = &.{},
     /// The `zig_seed_versions` that did not verify (`zig_release.resolve`), for "Set up job".
     zig_seeds_unverified: []const []const u8 = &.{},
+    /// Where the seeds live once the runner runs jobs: the configured ones, and the tool caches'
+    /// Zig versions as they are found and verified (set by `main`; null with `zig_seed`).
+    zig_seed_registry: ?*zig_release.Registry = null,
     /// Build the default image's provisioned base container, and the Zig cache seed, in the
     /// background when the runner starts and when the engine comes back after a restart (its
     /// cache may be wiped then), so the first job does not spend 27-40 s, and the seed's 104 s,

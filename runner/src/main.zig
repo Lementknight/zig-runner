@@ -124,13 +124,17 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer client.deinit();
     http.shared.store(&client, .release);
-    // The seeds' tarballs are checked here, once, outside any job (`zig_release.zig`).
+    // The seeds' tarballs are checked here, once, outside any job (`zig_release.zig`); the tool
+    // caches' Zig versions join them as `repo` jobs find them.
+    var zig_seeds: zig_release.Registry = .{ .io = io, .gpa = init.gpa, .client = &client };
     if (cfg.zig_seed) |*s| {
         cfg.zig_seeds = s[0..1];
     } else if (cfg.package_caches) {
         const r = try zig_release.resolve(arena, init.gpa, &client, cfg.zig_seed_versions);
         cfg.zig_seeds = r.seeds;
         cfg.zig_seeds_unverified = r.unverified;
+        try zig_seeds.add(r);
+        cfg.zig_seed_registry = &zig_seeds;
     }
     const stale = try settleRegistrations(arena, io, &cfg, log);
     installStopSignals();

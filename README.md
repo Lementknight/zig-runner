@@ -212,9 +212,11 @@ is replayed after the volume was pruned leaves a later step a PATH to a director
 Zig jobs' global cache is seeded by default. Zig 0.17's `zig build` first compiles a build runner
 that is the same for every project: 104 s on one core and about 1 GB. The runner builds it once per
 engine, with `zig build --help` on a `build.zig` it writes itself, for each release in
-`RUNNER_ZIG_SEED_VERSIONS` (comma-separated, at most 3; by default the Zig the runner is built with;
-empty for none). When the runner starts, it downloads each release's tarball and `.minisig` from
-ziglang.org and checks the signature, and its trusted comment, against Zig's public key, pinned in
+`RUNNER_ZIG_SEED_VERSIONS` (comma-separated; by default the Zig the runner is built with) and each
+Zig version the runner's tool-cache check finds in a `repo` job's tool cache (`zig/<version>/`), at
+most 3 in all. A version only picks which official, signed release is seeded, never its content.
+Before seeding from a release, the runner downloads its tarball and `.minisig` from ziglang.org
+and checks the signature, and its trusted comment, against Zig's public key, pinned in
 `runner/src/zig_release.zig`, natively (Ed25519 over BLAKE2b-512). Only then does the seed build get
 the tarball's sha256, which its exec checks the tarball it downloads against. A release that does
 not verify is not seeded, and "Set up job" says so. `RUNNER_ZIG_SEED=<version>=<sha256>` pins one
