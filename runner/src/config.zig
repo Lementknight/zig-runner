@@ -9,6 +9,7 @@ const trust = @import("trust.zig");
 const app = @import("github/app.zig");
 const NativeBackend = @import("native/Backend.zig");
 const native_net = @import("native/net.zig");
+const NativeStore = @import("native/Store.zig");
 const native_cgroup = @import("native/cgroup.zig");
 
 pub const Scope = union(enum) {
@@ -123,8 +124,9 @@ pub const Config = struct {
     /// What runs steps (`RUNNER_BACKEND`): Dagger, or the native backend with Dagger for the jobs
     /// it cannot run yet.
     backend: StepBackend = .dagger,
-    /// The native backend's rootfs, the default image provisioned (`RUNNER_NATIVE_ROOTFS`), and
-    /// where jobs' layers go while they run (`RUNNER_NATIVE_STORE`; "" for the default,
+    /// The native backend's rootfs, the default image provisioned, used instead of pulling and
+    /// provisioning it natively (`RUNNER_NATIVE_ROOTFS`; "" to pull it), and where jobs' layers,
+    /// pulled images and provisioned rootfs go (`RUNNER_NATIVE_STORE`; "" for the default,
     /// `nativeStore`).
     native_rootfs: []const u8 = "",
     native_store: []const u8 = "",
@@ -137,6 +139,9 @@ pub const Config = struct {
     native_subid_base: u32 = NativeBackend.default_subid_base,
     /// The native jobs' network on a root runner (`RUNNER_NATIVE_SUBNET`, `net.Subnet.parse`).
     native_subnet: []const u8 = native_net.Subnet.default_text,
+    /// Past this many MiB, the native step store's least recently used layers go
+    /// (`RUNNER_NATIVE_STORE_MAX_MB`, `native/Store.zig`).
+    native_store_max_mb: u64 = NativeStore.default_max_bytes / (1024 * 1024),
     /// Where native jobs' cgroups go (`RUNNER_NATIVE_CGROUP`: "", `self`, `none` or a cgroup's
     /// path), and each job's limits (`RUNNER_NATIVE_MEMORY_MAX_MB`, null for three quarters of
     /// the machine's memory and 0 for none; `RUNNER_NATIVE_PIDS_MAX`, 0 for none). See
@@ -410,6 +415,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_ROOTLESS")) |v| c.native_rootless = try boolean(v);
         if (environ.get("RUNNER_NATIVE_SUBID_BASE")) |v| c.native_subid_base = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_SUBNET")) |v| c.native_subnet = v;
+        if (environ.get("RUNNER_NATIVE_STORE_MAX_MB")) |v| c.native_store_max_mb = try num(u64, v);
         if (environ.get("RUNNER_NATIVE_CGROUP")) |v| c.native_cgroup = v;
         if (environ.get("RUNNER_NATIVE_MEMORY_MAX_MB")) |v| c.native_memory_max_mb = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_PIDS_MAX")) |v| c.native_pids_max = try num(u32, v);
@@ -485,6 +491,7 @@ pub const Config = struct {
         else if (eq(key, "native-rootless")) c.native_rootless = try boolean(val) //
         else if (eq(key, "native-subid-base")) c.native_subid_base = try num(u32, val) //
         else if (eq(key, "native-subnet")) c.native_subnet = val //
+        else if (eq(key, "native-store-max-mb")) c.native_store_max_mb = try num(u64, val) //
         else if (eq(key, "native-cgroup")) c.native_cgroup = val //
         else if (eq(key, "native-memory-max-mb")) c.native_memory_max_mb = try num(u32, val) //
         else if (eq(key, "native-pids-max")) c.native_pids_max = try num(u32, val) //

@@ -164,6 +164,9 @@ pub const Plan = struct {
     env: std.ArrayList(job_mod.EnvVar) = .empty,
     /// uv's environment in its volume: the workspace's `.venv` links to it.
     uv_env: ?[]const u8 = null,
+    /// Where the `toolcache` volume is bound (RUNNER_TOOL_CACHE), when the job has one: what a
+    /// step installs there is in no layer, so a replay is checked against it (`Exec.tool_cache`).
+    tool_cache: ?[]const u8 = null,
     /// Zig's local cache volume, when its generations are rolled (`zig_local_cache_max_mb`).
     zig_local_roll: ?[]const u8 = null,
     /// The Zig cache seeds the job runs with, built if missing (`Seed`).
@@ -195,6 +198,8 @@ pub fn plan(
     opts: Options,
     scope: []const u8,
     job: job_mod.Job,
+    /// The job's image (`dagger.resolveImage`): the tool cache is one per image, as on Dagger.
+    job_image: []const u8,
     as_runner: bool,
     step_cache: bool,
     volume_owner: ?u32,
@@ -216,13 +221,12 @@ pub fn plan(
         var key: std.ArrayList([]const u8) = .empty;
         try key.appendSlice(arena, &.{ repo_owner, repo_name, scope, d.name });
         // The tool cache holds binaries built for one image: one per image, by name.
-        if (std.mem.eql(u8, d.name, "toolcache")) try key.append(arena, dagger.imageName(
-            dagger.default_image,
-        ));
+        if (std.mem.eql(u8, d.name, "toolcache")) try key.append(arena, dagger.imageName(job_image));
         if (as_runner) try key.append(arena, dagger.runner_user);
         const v = try open(arena, io, store, key.items, .shared, owner);
         try p.held.append(arena, v);
         const path = if (as_runner) try set_up.runnerCachePath(arena, i) else d.path;
+        if (std.mem.eql(u8, d.name, "toolcache")) p.tool_cache = path;
         const zig = std.mem.eql(u8, d.name, set_up.zig_packages);
         // Zig's global cache is the job's own (its layers, over the seed); only its package
         // tarballs, which Zig hashes again when it unpacks them, are in the volume.
@@ -487,7 +491,7 @@ test "native volumes: the job's caches, by scope and step user, as the Dagger ba
         .zig_local_cache_max_mb = 512,
         .zig_seeds = &.{.{ .version = "0.17.0", .sha256 = "ab" }},
     };
-    var trusted = try plan(arena, io, store, opts, "repo", job, true, false, null);
+    var trusted = try plan(arena, io, store, opts, "repo", job, dagger.default_image, true, false, null);
     defer trusted.release(io);
     var ats: std.ArrayList([]const u8) = .empty;
     for (trusted.binds.items) |b| {
@@ -522,9 +526,11 @@ test "native volumes: the job's caches, by scope and step user, as the Dagger ba
     try std.testing.expect(trusted.zig_local_roll != null);
     try std.testing.expectEqual(@as(usize, 1), trusted.seeds.items.len);
     try std.testing.expectEqualStrings("home/runner/.cache/zig", trusted.seeds.items[0].cache);
+    // The tool cache is bound where Dagger mounts it, for every step user.
+    try std.testing.expectEqualStrings(set_up.tool_cache_dir, trusted.tool_cache.?);
 
     // Untrusted: its own tree, and no shared Zig local cache.
-    var untrusted = try plan(arena, io, store, opts, "untrusted", job, false, false, null);
+    var untrusted = try plan(arena, io, store, opts, "untrusted", job, dagger.default_image, false, false, null);
     defer untrusted.release(io);
     for (untrusted.binds.items) |b| {
         try std.testing.expect(std.mem.indexOf(u8, b.host, "/volumes/o/r/untrusted/") != null);
@@ -537,10 +543,10 @@ test "native volumes: the job's caches, by scope and step user, as the Dagger ba
     // No caches, or no repository to key them by: nothing.
     var off = opts;
     off.package_caches = false;
-    const none = try plan(arena, io, store, off, "repo", job, false, false, null);
+    const none = try plan(arena, io, store, off, "repo", job, dagger.default_image, false, false, null);
     try std.testing.expectEqual(@as(usize, 0), none.binds.items.len);
     // With step caching (P2), uv's environment stays in the workspace (#70).
-    var cached = try plan(arena, io, store, opts, "repo", job, false, true, null);
+    var cached = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, true, null);
     defer cached.release(io);
     try std.testing.expect(cached.uv_env == null);
 }

@@ -52,6 +52,7 @@ const readLogs = @import("dagger/JobLog.zig").readLogs;
 const SpanDemux = @import("dagger/JobLog.zig").SpanDemux;
 const awaitLiveOrReplay = @import("dagger/JobLog.zig").awaitLiveOrReplay;
 pub const reused_note = @import("dagger/JobLog.zig").reused_note;
+pub const native_reused_note = @import("dagger/JobLog.zig").native_reused_note;
 const noteReusedSteps = @import("dagger/JobLog.zig").noteReusedSteps;
 const Evaluator = @import("dagger/Evaluator.zig");
 const StepCtx = @import("dagger/Evaluator.zig").StepCtx;
@@ -865,7 +866,7 @@ pub fn run(
         reader.await(io);
         stderr.close(io);
         _ = child.wait(io) catch {};
-        noteReusedSteps(&sh);
+        noteReusedSteps(&sh, reused_note);
         sh.flush();
     }
 
@@ -879,11 +880,12 @@ pub fn run(
 }
 
 /// The job on the native backend (`native/Backend.zig`): no Dagger session, the same steps code.
-/// What the native backend has no counterpart for yet is off for the job: the step cache and
-/// output keys (phase 2), and the tool cache's checked trees. They are caches, so a job's results
-/// do not depend on them. The cache volumes, Zig's local cache and seeds are the backend's own
-/// (`native/volumes.zig`): off here for the shared code, which would ask a Dagger session for
-/// them, and handed to the backend as they were.
+/// The step cache is the native layer store's (`native/Store.zig`). What the native backend has
+/// no counterpart for yet is off for the job: output keys, and the tool cache's checked trees (a
+/// replayed step that points into the tool cache's volume runs again, `Exec.tool_cache`). They
+/// are caches, so a job's results do not depend on them. The cache volumes, Zig's local cache
+/// and seeds are the backend's own (`native/volumes.zig`): off here for the shared code, which
+/// would ask a Dagger session for them, and handed to the backend as they were.
 fn runNative(
     arena: Allocator,
     io: std.Io,
@@ -893,7 +895,6 @@ fn runNative(
     log: *sink.LogSink,
 ) !Result {
     var opts = opts_in;
-    opts.step_cache = false;
     opts.output_keys = false;
     opts.package_caches = false;
     opts.zig_local_cache = false;
@@ -905,6 +906,8 @@ fn runNative(
     @memset(results, .{});
     var sh = try jobLogFor(arena, io, opts, job, log);
     defer sh.flush();
+    // After the last step, as for a Dagger session: each replayed step's log ends with the note.
+    defer noteReusedSteps(&sh, native_reused_note);
     var b = Backend.init(arena, io, opts.gpa, cfg) catch |e| return fail(
         &sh,
         results,
@@ -1031,7 +1034,7 @@ fn runDirect(
     defer {
         sess.close();
         demux.flushPartial();
-        noteReusedSteps(sh);
+        noteReusedSteps(sh, reused_note);
         sh.flush();
     }
     var st: SessionTransport = .{ .s = &sess };
@@ -1818,7 +1821,7 @@ fn runSteps(
             error.BaseContainerFailed => return fail(sh, results, err_msg),
             else => return e,
         };
-        break :base .{ .id = "native", .runtime_path = null };
+        break :base .{ .id = "native", .runtime_path = b.runtime_path };
     } else baseContainerId(arena, transport, &ev, job, plan, &secrets, &err_msg) catch |e|
         switch (e) {
             error.BaseContainerFailed => return fail(sh, results, err_msg),
@@ -1828,6 +1831,9 @@ fn runSteps(
     x.container_path = base.runtime_path;
     x.native = native;
     x.tool_trees = base.tool_trees;
+    // A native job's tool cache is its `toolcache` volume, in no layer, so a replayed step that
+    // points at a tree there runs again (#229): no tree is checked natively (`tool_trees`).
+    if (native) |b| x.tool_cache = b.cache_plan.tool_cache;
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
 
     var watch: Watch = .{ .io = io, .transport = transport, .cancel = opts.cancel };

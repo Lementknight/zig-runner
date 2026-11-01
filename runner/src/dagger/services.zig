@@ -165,6 +165,12 @@ pub fn pullJobContainer(x: *Exec, ls: u32, jc: job_mod.Service) !bool {
     const ev = x.ev;
     x.sh.append(ls, "##[group]Starting job container");
     x.sh.append(ls, try std.fmt.allocPrint(arena, "Pulling {s}", .{x.job_image}));
+    // On the native backend the image was pulled for the job's base (`Backend.prepareRootfs`).
+    if (x.native) |b| {
+        if (b.image) |img| x.sh.append(ls, try std.fmt.allocPrint(arena, "Digest: {s}", .{img.digest}));
+        x.sh.append(ls, "##[endgroup]");
+        return true;
+    }
     var auth_msg: []const u8 = "";
     const head: ImageHead = .{
         .auth = try registryAuth(

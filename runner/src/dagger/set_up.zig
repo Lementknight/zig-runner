@@ -88,7 +88,7 @@ pub const package_fingerprint_script =
 
 const chown_runner = " && chown -R " ++ runner_user ++ ":" ++ runner_user ++ " " ++ work_root;
 
-const provision_runner_script = provision_script ++
+pub const provision_runner_script = provision_script ++
     " && (id -u " ++ runner_user ++ " >/dev/null 2>&1 || " ++
     "useradd -m -u 1001 -s /bin/bash " ++ runner_user ++ ")" ++
     " && printf '%s\\n' '" ++ runner_user ++ " ALL=(ALL) NOPASSWD:ALL' > " ++
@@ -367,7 +367,7 @@ const tool_trees_env = "ZIG_RUNNER_TOOL_TREES";
 const tool_cache_index = for (package_cache_dirs, 0..) |d, i| {
     if (std.mem.eql(u8, d.name, "toolcache")) break i;
 } else unreachable;
-const tool_cache_dir = package_cache_dirs[tool_cache_index].path;
+pub const tool_cache_dir = package_cache_dirs[tool_cache_index].path;
 /// The check runs with the image's bash and none of the job's environment (a workflow's
 /// `BASH_ENV` or `PATH` must not run in it).
 const tool_trees_argv = [_][]const u8{
@@ -1228,7 +1228,7 @@ fn emptySlices(arena: Allocator, comptime T: type, n: usize) ![][]const T {
 }
 
 /// Linux limits one environment string to 128 KiB; larger payloads are written as a file instead.
-const max_event_env = 100 * 1024;
+pub const max_event_env = 100 * 1024;
 
 /// `<run_id>.<run_attempt>`, or the time when the job has no run id (`--exec-job`).
 fn runNonce(arena: Allocator, io: std.Io, ev: *const Evaluator) ![]const u8 {
