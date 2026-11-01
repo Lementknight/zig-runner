@@ -88,7 +88,7 @@ pub const package_fingerprint_script =
 
 const chown_runner = " && chown -R " ++ runner_user ++ ":" ++ runner_user ++ " " ++ work_root;
 
-const provision_runner_script = provision_script ++
+pub const provision_runner_script = provision_script ++
     " && (id -u " ++ runner_user ++ " >/dev/null 2>&1 || " ++
     "useradd -m -u 1001 -s /bin/bash " ++ runner_user ++ ")" ++
     " && printf '%s\\n' '" ++ runner_user ++ " ALL=(ALL) NOPASSWD:ALL' > " ++

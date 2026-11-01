@@ -1818,7 +1818,7 @@ fn runSteps(
             error.BaseContainerFailed => return fail(sh, results, err_msg),
             else => return e,
         };
-        break :base .{ .id = "native", .runtime_path = null };
+        break :base .{ .id = "native", .runtime_path = b.runtime_path };
     } else baseContainerId(arena, transport, &ev, job, plan, &secrets, &err_msg) catch |e|
         switch (e) {
             error.BaseContainerFailed => return fail(sh, results, err_msg),
@@ -1843,6 +1843,7 @@ fn runSteps(
     if (plan.zig_local_note) |note| x.setUpLine(note);
     if (base.tool_trees_note) |note| x.setUpLine(note);
     if (opts.backend_note) |note| x.setUpLine(note);
+    if (native) |b| for (b.notes.items) |note| x.setUpLine(note);
 
     if (job.container != null or !no_services) {
         if (!try x.startServices()) return servicesFailed(&x, arena, sh, results);
