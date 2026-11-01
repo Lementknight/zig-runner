@@ -1319,11 +1319,13 @@ const go_tools = [_][]const u8{ "go", "golang", "gofmt" };
 const rust_tools = [_][]const u8{ "cargo", "rust", "rustup", "rustc" };
 
 /// Which package caches the job mounts: those whose `tools` a `run:` script or an action's owner or
-/// name names as a word (`setup-node`, `python3 -m pip`), the tool cache for any action, and Zig's
-/// when `usesZig`. Each mount costs every step engine time (about 45 ms of CPU for all of them), so
-/// a job pays only for those it plausibly uses. A miss costs a cold cache, never a failure: the
-/// tool fills its directory in the container instead, as on a fresh machine. A step's key holds
-/// its mounts, so a job's keys change only when its mounts do.
+/// name names as a word (`setup-node`, `python3 -m pip`), and Zig's when `usesZig`. Each mount costs
+/// every step engine time (about 45 ms of CPU for all of them), so a job pays only for those it
+/// plausibly uses: a miss there costs a cold cache, the tool filling its directory under the home
+/// directory as on a fresh machine. The tool cache is the exception, mounted for every job: it is
+/// under /opt, where the step user cannot make it, so a miss there failed the job (v0.22.0: a
+/// script file that installs into it, such as zig-runner's install-zig.sh, names it nowhere in the
+/// workflow). A step's key holds its mounts, so a job's keys change only when its mounts do.
 fn cachesUsed(job: job_mod.Job) [package_cache_dirs.len]bool {
     var used: [package_cache_dirs.len]bool = @splat(false);
     for (job.steps) |st| for (package_cache_dirs, &used) |d, *u| switch (st.action) {
@@ -1336,6 +1338,7 @@ fn cachesUsed(job: job_mod.Job) [package_cache_dirs.len]bool {
     };
     for (package_cache_dirs, &used) |d, *u| {
         if (std.mem.eql(u8, d.name, zig_packages)) u.* = usesZig(job);
+        if (std.mem.eql(u8, d.name, "toolcache")) u.* = true;
     }
     return used;
 }
@@ -2246,17 +2249,22 @@ test "usesZig: a script or an action that names Zig" {
     try std.testing.expect(!usesZig(testJob(&.{ testStep("npm ci"), uses_node })));
 }
 
-test "cachesUsed: a job mounts the caches of the tools it names, and Zig's as usesZig decides" {
+test "cachesUsed: a job mounts the caches of the tools it names, Zig's as usesZig decides, and the tool cache always" {
     const zig_only = cachesUsed(testJob(&.{testStep("zig build test --summary all")}));
     for (package_cache_dirs, zig_only) |d, u| {
-        try std.testing.expectEqual(std.mem.eql(u8, d.name, zig_packages), u);
+        const want = std.mem.eql(u8, d.name, zig_packages) or std.mem.eql(u8, d.name, "toolcache");
+        try std.testing.expectEqual(want, u);
     }
-    const nothing = cachesUsed(testJob(&.{testStep("echo hi && make check")}));
-    for (nothing) |u| try std.testing.expect(!u);
+    // A script file that installs into the tool cache names it nowhere in the workflow (v0.22.0).
+    const nothing = cachesUsed(testJob(&.{testStep(".github/scripts/install-tools.sh")}));
+    for (package_cache_dirs, nothing) |d, u| {
+        try std.testing.expectEqual(std.mem.eql(u8, d.name, "toolcache"), u);
+    }
     // `go` is a word of its own: not in `cargo`, though it is in `setup-go`.
     const cargo = cachesUsed(testJob(&.{testStep("cargo build --release")}));
     for (package_cache_dirs, cargo) |d, u| {
-        try std.testing.expectEqual(std.mem.startsWith(u8, d.name, "cargo-"), u);
+        const want = std.mem.startsWith(u8, d.name, "cargo-") or std.mem.eql(u8, d.name, "toolcache");
+        try std.testing.expectEqual(want, u);
     }
     const setup_go = cachesUsed(testJob(&.{usesStep("s", "actions", "setup-go", "v5", &.{})}));
     for (package_cache_dirs, setup_go) |d, u| {
