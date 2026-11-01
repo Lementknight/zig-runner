@@ -157,11 +157,7 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
             if (!std.mem.eql(u8, lit, "false")) return "a checkout with submodules is not " ++
                 "native yet";
         },
-        .script => |sc| if (as_runner and
-            std.mem.indexOf(u8, templateText(sc.script), "sudo") != null)
-            return "a step calls sudo, which native steps as the runner user cannot " ++
-                "(no_new_privs)",
-        .unsupported => {},
+        .script, .unsupported => {},
     };
     return null;
 }
@@ -1157,14 +1153,14 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     no_rootfs.rootfs = "/nonexistent/rootfs";
     try expectReason("cannot be read", unsupported(io, run_only, root, no_rootfs));
 
-    // Steps as the runner user need ids a rootless runner cannot map, and cannot use sudo under
-    // no_new_privs.
+    // Steps as the runner user need ids a rootless runner cannot map; on a root runner they may
+    // call sudo.
     const as_runner: dagger.Options = .{ .step_user = .runner };
     const why = unsupported(io, run_only, as_runner, ok);
     if (std.os.linux.geteuid() == 0) {
         try std.testing.expect(why == null);
         const sudo = testJob(&.{testStep("sudo apt-get update")});
-        try expectReason("sudo", unsupported(io, sudo, as_runner, ok));
+        try std.testing.expect(unsupported(io, sudo, as_runner, ok) == null);
     } else try expectReason("runner user", why);
 }
 
@@ -1548,13 +1544,44 @@ test "root runner: a job's own ids, its runner user, and sudo gaining nothing" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cfg = try testConfig(arena, &tmp);
-    const script = "id -u; id -g; echo HOME=$HOME; cat /proc/self/uid_map; " ++
-        "touch \"$GITHUB_WORKSPACE/mine\" && stat -c owner=%u \"$GITHUB_WORKSPACE/mine\"; " ++
-        // Spelled so `unsupported` does not see a step calling sudo, which it sends to Dagger.
-        "s=su; ${s}do -n id -u 2>/dev/null && echo escalated || echo escalation-refused";
+    var cfg = try testConfig(arena, &tmp);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    // A sudo the job's root owns, as the provisioned image has (the host's, in the bound /usr, is
+    // owned by an id the job does not map), with its sudoers and PAM configuration; and a file
+    // only the host's root may read, bound in.
+    const setup = try std.fmt.allocPrint(arena,
+        \\set -e
+        \\cd '{s}'
+        \\mkdir -p rootfs/opt rootfs/run rootfs/var/lib rootfs/etc/sudoers.d
+        \\cp /usr/bin/sudo rootfs/opt/sudo && chmod 4755 rootfs/opt/sudo
+        \\cp -a /etc/pam.d rootfs/etc/
+        \\for f in /etc/security /etc/login.defs /etc/nsswitch.conf /etc/sudo.conf; do
+        \\  [ -e "$f" ] && cp -a "$f" rootfs/etc/ || true
+        \\done
+        \\printf 'root ALL=(ALL:ALL) ALL\nrunner ALL=(ALL) NOPASSWD:ALL\n' > rootfs/etc/sudoers
+        \\chmod 0440 rootfs/etc/sudoers
+        \\printf 'root:*:19000:0:99999:7:::\nrunner:*:19000:0:99999:7:::\n' > rootfs/etc/shadow
+        \\chmod 0640 rootfs/etc/shadow
+        \\echo host-only > host-secret && chmod 0600 host-secret
+        \\: > rootfs/opt/host-secret
+    , .{root});
+    const made = try std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", setup } });
+    try std.testing.expect(made.term == .exited and made.term.exited == 0);
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{
+        .host = try std.fmt.allocPrint(arena, "{s}/host-secret", .{root}),
+        .at = "/opt/host-secret",
+    }} });
+
+    const script = "id -u; echo HOME=$HOME; cat /proc/self/uid_map; " ++
+        "touch \"$GITHUB_WORKSPACE/mine\" && stat -c owner=%u \"$GITHUB_WORKSPACE/mine\"\n" ++
+        "echo sudo-uid=$(/opt/sudo -n id -u)\n" ++
+        "/opt/sudo -n cat /opt/host-secret 2>/dev/null && echo host-file-read || " ++
+        "echo host-file-refused\n" ++
+        "/opt/sudo -n grep -E '^CapEff' /proc/self/status\n" ++
+        "/opt/sudo -n cat /proc/self/uid_map | sed 's/^/sudo-map /'";
     const r = try runNativeJob(arena, cfg, testJob(&.{testStep(script)}), .runner);
     if (r.res.steps[0].outcome != .success) {
         std.debug.print("{s}\n", .{r.text});
@@ -1564,12 +1591,33 @@ test "root runner: a job's own ids, its runner user, and sudo gaining nothing" {
         "stdout] 1001",
         "HOME=/home/runner",
         "owner=1001",
-        "escalation-refused",
+        // sudo works: the runner user becomes the job's root...
+        "sudo-uid=0",
+        // ...and that root is nobody on the host: not the host's root's file, no more than
+        // Docker's capabilities, and the same range of host ids.
+        "host-file-refused",
+        try std.fmt.allocPrint(arena, "CapEff:\t{x:0>16}", .{sandbox.docker_caps}),
+        "sudo-map ",
         "Native steps: ids 0-65535 are host ids",
     });
-    // The map: 0 inside is a host id far from the host's own users.
-    try std.testing.expect(std.mem.indexOf(u8, r.text, "         0 1000") != null or
-        std.mem.indexOf(u8, r.text, "0 1000") != null);
+    const map = try std.fmt.allocPrint(arena, "0 {d}", .{default_subid_base});
+    var lines = std.mem.splitScalar(u8, r.text, '\n');
+    var maps: u32 = 0;
+    while (lines.next()) |l| {
+        if (std.mem.indexOf(u8, l, "sudo-map") == null and std.mem.indexOf(u8, l, "65536") == null)
+            continue;
+        const words = try std.mem.join(arena, " ", try collectWords(arena, l));
+        if (std.mem.indexOf(u8, words, map) != null) maps += 1;
+    }
+    // The step's map and sudo's: both the job's range.
+    try std.testing.expect(maps >= 2);
+}
+
+fn collectWords(arena: Allocator, line: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.tokenizeAny(u8, line, " \t");
+    while (it.next()) |w| try out.append(arena, w);
+    return out.items;
 }
 
 test "root runner: each job has its own network, and the host's loopback is out of reach" {

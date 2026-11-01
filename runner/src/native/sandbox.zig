@@ -416,7 +416,10 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
     check("fork", pid);
     if (pid == 0) {
         _ = linux.close(alive[1]);
-        stepInit(arena, root, workdir, spec.uid, spec.gid, alive[0], argv, envp);
+        // no_new_privs for every step but the runner user's on a root runner: its sudo can
+        // reach only the job's own root, bounded still by the capabilities and seccomp below.
+        const nnp = spec.userns != .mapped or spec.uid == 0;
+        stepInit(arena, root, workdir, spec.uid, spec.gid, nnp, alive[0], argv, envp);
     }
     _ = linux.close(alive[0]);
     const st = superviseStep(@intCast(pid));
@@ -597,6 +600,7 @@ fn stepInit(
     workdir: [*:0]const u8,
     uid: u32,
     gid: u32,
+    no_new_privs: bool,
     alive: linux.fd_t,
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
@@ -622,6 +626,11 @@ fn stepInit(
     check("chdir to the working directory", linux.chdir(workdir));
 
     dropCapabilities();
+    // The filter goes in while PID 1 is still the namespace's root: without no_new_privs (the
+    // runner user on a root runner), installing one takes CAP_SYS_ADMIN, which the bounding set
+    // no longer holds but the effective set does until `setuid` or exec. It binds every process
+    // the step makes, sudo's root included.
+    installSeccomp();
     if (uid != 0 or gid != 0) {
         check("setgroups", linux.setgroups(0, no_groups));
         check("setgid", linux.setgid(gid));
@@ -630,9 +639,10 @@ fn stepInit(
         armParentDeath(alive);
     }
     _ = linux.close(alive);
-    // No setuid program gains anything, sudo included.
-    check("no_new_privs", linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0));
-    installSeccomp();
+    // No setuid program gains anything. Every step but the runner user's on a root runner, whose
+    // sudo reaches only the job's own root (`runStep`).
+    if (no_new_privs)
+        check("no_new_privs", linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0));
     // The step gets no stdin, as on GitHub.
     const devnull = linux.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     check("open /dev/null", devnull);
@@ -833,8 +843,10 @@ fn makeDev(arena: Allocator, root: linux.fd_t) void {
     for ([_][]const u8{ "null", "zero", "full", "random", "urandom", "tty" }) |name| {
         const at = std.fmt.allocPrint(arena, "/dev/{s}", .{name}) catch oom();
         const node: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true };
-        const fd = openIn(root, z(arena, at[1..]), node, 0o666, 0);
-        if (fd == .fd) _ = linux.close(fd.fd);
+        switch (openIn(root, z(arena, at[1..]), node, 0o666, 0)) {
+            .fd => |f| _ = linux.close(f),
+            .err => |e| fatal(about(arena, "make", at), @backingInt(e)),
+        }
         _ = bindIn(arena, root, at, at, true);
     }
     const dev = dirIn(arena, root, "/dev") orelse fatal("open /dev", @as(u32, 0));
@@ -865,7 +877,7 @@ fn mountIn(
     flags: u32,
     data: ?[*:0]const u8,
 ) void {
-    const fd = targetIn(arena, root, at, true) orelse fatal("find a mount's target", @as(u32, 2));
+    const fd = targetIn(arena, root, at, true) orelse fatal(about(arena, "find", at), @as(u32, 2));
     defer _ = linux.close(fd);
     const d: usize = if (data) |p| @intFromPtr(p) else 0;
     check("mount", linux.mount(source, procFd(arena, fd), fstype, flags, d));
@@ -883,7 +895,7 @@ fn bindIn(
     const rel = z(arena, std.mem.trimStart(u8, at, "/"));
     const fd = switch (openIn(root, rel, .{ .ACCMODE = .RDONLY, .PATH = true }, 0, 0)) {
         .fd => |f| f,
-        .err => |e| if (required) fatal("find a bind's target", @backingInt(e)) else return false,
+        .err => |e| if (required) fatal(about(arena, "find", at), @backingInt(e)) else return false,
     };
     defer _ = linux.close(fd);
     const rc = linux.mount(z(arena, host), procFd(arena, fd), null, linux.MS.BIND, 0);
@@ -916,7 +928,7 @@ fn bindTreeReadOnly(arena: Allocator, root: linux.fd_t, path: []const u8) void {
         @sizeOf(MountAttr),
     ));
     const target = targetIn(arena, root, path, true) orelse
-        fatal("find a mount's target", @as(u32, 2));
+        fatal(about(arena, "find", path), @as(u32, 2));
     defer _ = linux.close(target);
     const move_mount_f_empty_path = 0x4;
     const move_mount_t_empty_path = 0x40;
@@ -935,7 +947,7 @@ fn bindTreeReadOnly(arena: Allocator, root: linux.fd_t, path: []const u8) void {
 /// atime ones) are locked, and a remount that drops any of them is refused, as runc found.
 fn remountReadOnly(arena: Allocator, root: linux.fd_t, at: []const u8) void {
     const fd = targetIn(arena, root, at, false) orelse
-        fatal("find a mount to remount", @as(u32, 2));
+        fatal(about(arena, "find", at), @as(u32, 2));
     defer _ = linux.close(fd);
     var st: [120]u8 align(8) = undefined;
     check("statfs a mount", linux.syscall2(.fstatfs, @as(usize, @intCast(fd)), @intFromPtr(&st)));
@@ -1076,8 +1088,13 @@ fn check(what: []const u8, rc: usize) void {
     if (e != .SUCCESS) fatal(what, @backingInt(e));
 }
 
+/// "<what> <path>", for `fatal`.
+fn about(arena: Allocator, what: []const u8, path: []const u8) []const u8 {
+    return std.fmt.allocPrint(arena, "{s} {s}", .{ what, path }) catch what;
+}
+
 fn fatal(what: []const u8, code: anytype) noreturn {
-    var buf: [256]u8 = undefined;
+    var buf: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "native step: {s} failed (errno {d})\n", .{
         what,
         code,

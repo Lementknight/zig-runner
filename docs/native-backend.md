@@ -106,9 +106,8 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   configured, a job the runner does not vouch for (`trust.vouches`, for `--exec-job` too), a
   rootless runner unless `RUNNER_NATIVE_ROOTLESS=1`, `container:`, `services:`, `uses:` actions,
   `docker://` steps, a custom image, Dagger in steps (`RUNNER_DAGGER_NESTING`), `hashFiles()`
-  anywhere in the job (it reads the container through Dagger), a checkout with submodules, a
-  step that calls `sudo` as the runner user (no_new_privs), and a machine whose probe fails (no
-  user namespaces, `nft` missing, ids overlapping /etc/subuid).
+  anywhere in the job (it reads the container through Dagger), a checkout with submodules, and a
+  machine whose probe fails (no user namespaces, `nft` missing, ids overlapping /etc/subuid).
 - Off on native, as caches: the step cache and output keys (P2), the package caches, uv's
   environment in its cache, and Zig's local cache and seed (P4). Results do not depend on them.
 - "Set up job" says what the job got: "Native steps: ids 0-65535 are host ids N-N+65535, and the
@@ -138,7 +137,9 @@ On a root runner, each step runs:
   and read-only ones (`/proc/sys`, `sysrq-trigger`, `irq`, `bus`, `fs`), /sys read-only with
   every mount under it.
 - with **Docker's default capabilities** (the bounding set cut to them, ambient cleared),
-  **no_new_privs**, and a **seccomp filter** that refuses Docker's default profile's dangerous
+  **no_new_privs** for root steps and rootless ones (not for the runner user on a root runner,
+  whose sudo works as on GitHub and reaches only the job's own root, within the same capabilities
+  and filter), and a **seccomp filter** that refuses Docker's default profile's dangerous
   calls (module loading, kexec, keyrings, bpf, perf, mount and the new mount API, namespaces,
   clone with namespace flags, the clock, swap, reboot, `open_by_handle_at`).
 - with every path inside the overlay resolved inside it (`openat2(RESOLVE_IN_ROOT)`), by the
@@ -150,9 +151,6 @@ What it does not provide yet:
   (phase 4's cgroups, with `pids.max` and `memory.max`).
 - **The seccomp filter is Docker's deny list, not its allow list.** Calls Docker refuses by
   omission are allowed here.
-- **sudo as the runner user.** no_new_privs makes setuid programs inert, so a native job whose
-  steps call sudo as the runner user goes to Dagger. Once ids are mapped, sudo would gain only the
-  job's own root; dropping no_new_privs for the runner user is a decision for phase 5.
 - **Rootless runners.** Only one id is mapped and steps share the host's network: off unless
   `RUNNER_NATIVE_ROOTLESS=1`, for tests and the laptop. A rootless job network needs a userspace
   stack (a Zig port of the parts of pasta or slirp4netns it needs), and full ids need
@@ -276,7 +274,6 @@ remains before native steps may run jobs the runner does not vouch for:
 - The NAT and forwarding rules over nftables netlink instead of `nft` (P1's debt).
 - Rootless: a userspace network stack for the job's network (the parts of pasta or slirp4netns it
   needs, ported) and subordinate ids through `newuidmap`.
-- Whether the runner user keeps no_new_privs (sudo inert) now that its root is the job's alone.
 - `trust.zig` is unchanged: it decides before any step. Until P5 lands, native runs only jobs the
   runner vouches for (`trust.vouches`); others fall back.
 - Exit: the hostile-job tests (fork bomb, memory hog, mount escape attempts, network to the host's
@@ -468,3 +465,12 @@ user then pulled the job's ids, its network and the sandbox hardening into P1. W
 Measured: hardened, a cold trivial step costs 32.7 ms on the laptop (rootless, busier than for the
 first cut's 18.1 ms), still about 7 times faster than Dagger's ~224 ms. The difference is per-step
 setup that P2's per-job helper does once.
+- **no_new_privs and sudo, decided.** With no_new_privs on, sudo as the runner user did nothing,
+  and jobs that call it (most that install packages) had to go to Dagger. Once each job has its
+  own range of ids, sudo can only become the job's own root, which is nobody on the host and is
+  still held to Docker's capabilities and the seccomp filter: the user dropped no_new_privs for
+  the runner user on a root runner, and kept it for root steps and rootless ones. The catch was
+  ordering: without no_new_privs, installing a seccomp filter takes CAP_SYS_ADMIN, so the filter
+  now goes in while PID 1 is still the namespace's root, before `setuid`. The root test checks
+  that sudo gives uid 0 inside and nothing outside: a host-only file stays unreadable, the
+  capabilities stay Docker's, and the uid map stays the job's.
