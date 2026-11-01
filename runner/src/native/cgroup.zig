@@ -306,7 +306,10 @@ pub const Job = struct {
         const pids_events = readIn(io, j.dir, "pids.events", &events_buf) catch "";
         return .{
             .working_set_mb = admission.workingSetMb(io, j.dir),
-            .peak_mb = if (admission.readCgroupBytes(io, j.dir, "memory.peak")) |b| b >> 20 else null,
+            .peak_mb = if (admission.readCgroupBytes(io, j.dir, "memory.peak")) |b|
+                b >> 20
+            else
+                null,
             .oom_kills = oom_kills,
             .pids_max_hits = admission.parseStat(pids_events, "max") orelse 0,
         };

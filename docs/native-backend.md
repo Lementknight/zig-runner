@@ -353,9 +353,9 @@ per-job helper makes the namespaces and the static mounts once.
   (`set_up.zig_local_roll_script`), run in a sandbox of its own whose layer is dropped.
 - The Zig cache seed (minisign-verified releases, `Options.zig_seeds`) is built once per release,
   architecture and step user, with the Dagger backend's script (the tarball checked against its
-  pinned sha256 before it runs), under a lock, in a sandbox; its cache is moved into
-  `seeds/<arch>-<version>-<user>` with the directories above it as the rootfs has them, its files
-  owned as the image's files are and no setuid bit, and published by rename. It is an image layer
+  pinned sha256 before it runs), under a lock, in a sandbox without the job's volumes; its cache
+  is moved into `seeds/<arch>-<version>-<user>` with the directories above it as the rootfs has
+  them, its files owned as the image's files are and no setuid bit, and published by rename. It is an image layer
   between the rootfs and the job's layers, seen through the job's ids as the rootfs is
   (`sandbox.idmapLowers`), so a job's own writes to its global cache stay in its layers.
 - `runner/src/native/cgroup.zig` is the job's cgroup: `memory.max` (`RUNNER_NATIVE_MEMORY_MAX_MB`,

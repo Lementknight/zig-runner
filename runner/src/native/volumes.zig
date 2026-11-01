@@ -135,7 +135,8 @@ pub fn open(
         .SUCCESS, .EXIST => {},
         else => return error.VolumeNotMade,
     }
-    if (owner) |o| if (linux.errno(linux.lchown(at_z, o, o)) != .SUCCESS) return error.VolumeNotOwned;
+    if (owner) |o| if (linux.errno(linux.lchown(at_z, o, o)) != .SUCCESS)
+        return error.VolumeNotOwned;
     return .{ .dir = at, .lock = lock, .private = private };
 }
 
@@ -360,7 +361,10 @@ pub fn adoptSeed(
             break;
         }
         const at = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ new, rel.items }, 0);
-        const in_rootfs = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ rootfs, rel.items }, 0);
+        const in_rootfs = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{
+            rootfs,
+            rel.items,
+        }, 0);
         var st: linux.Statx = undefined;
         const mask: linux.STATX = .{ .MODE = true, .UID = true, .GID = true, .TYPE = true };
         const rc = linux.statx(linux.AT.FDCWD, in_rootfs, linux.AT.SYMLINK_NOFOLLOW, mask, &st);

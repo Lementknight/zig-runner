@@ -555,7 +555,8 @@ fn bindVolumeIn(
         @intFromPtr(&attr),
         @sizeOf(MountAttr),
     ));
-    const target = targetIn(arena, root, at, true) orelse fatal(about(arena, "find", at), @as(u32, 2));
+    const target = targetIn(arena, root, at, true) orelse
+        fatal(about(arena, "find", at), @as(u32, 2));
     defer _ = linux.close(target);
     const move_mount_f_empty_path = 0x4;
     const move_mount_t_empty_path = 0x40;

@@ -934,11 +934,23 @@ fn setUpCaches(b: *Backend, ev: *Evaluator, plan: anytype) !void {
     const job = ev.job.*;
     const scope = try set_up.packageCacheScope(arena, ev, job.github.repository, b.caches.trusted);
     const owner: ?u32 = if (b.how.userns == .mapped) volumeIdBase(b.subid_base) else null;
-    b.cache_plan = try volumes.plan(arena, b.io, b.store, b.caches, scope, job, plan.as_runner, false, owner);
-    b.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ b.binds, b.cache_plan.binds.items });
+    b.cache_plan = try volumes.plan(
+        arena,
+        b.io,
+        b.store,
+        b.caches,
+        scope,
+        job,
+        plan.as_runner,
+        false,
+        owner,
+    );
     try b.notes.appendSlice(arena, b.cache_plan.notes.items);
-    if (b.cache_plan.zig_local_roll != null) b.rollZigLocal(plan.as_runner);
+    // Before the volumes are bound: nothing a job wrote may reach a seed, which every scope's
+    // jobs run with.
     if (b.cache_plan.seeds.items.len > 0) try b.seeds(plan.as_runner);
+    b.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ b.binds, b.cache_plan.binds.items });
+    if (b.cache_plan.zig_local_roll != null) b.rollZigLocal(plan.as_runner);
 }
 
 /// `set_up.zig_local_roll_script` on the job's Zig local-cache volume, as root, in a sandbox
@@ -990,7 +1002,11 @@ fn seed(b: *Backend, s: volumes.Seed, as_runner: bool) ?[]const u8 {
     const arena = b.arena;
     const cwd = std.Io.Dir.cwd();
     if (cwd.access(b.io, s.dir, .{})) |_| return null else |_| {}
-    cwd.createDirPath(b.io, std.fs.path.dirname(s.dir).?) catch |e| return @errorName(e);
+    const seeds_dir = std.fs.path.dirname(s.dir).?;
+    cwd.createDirPath(b.io, seeds_dir) catch |e| return @errorName(e);
+    // Only the runner's user may look in, as in the volumes'.
+    const seeds_z = arena.dupeSentinel(u8, seeds_dir, 0) catch return "out of memory";
+    _ = std.os.linux.chmod(seeds_z, 0o700);
     const lock = lockFile(arena, b.io, std.fmt.allocPrint(arena, "{s}.lock", .{s.dir}) catch
         return "out of memory", true) catch |e| return @errorName(e);
     defer lock.close(b.io);
@@ -2492,14 +2508,18 @@ test "root runner: a native job's runaway is OOM-killed in its own cgroup, a for
     var cfg = try testConfig(arena, &tmp);
     try testCgroup(arena, &cfg);
     var runaway = cfg;
-    runaway.cgroup.memory_max_mb = 64;
+    // Room for the step's shell and the helper: the kernel kills the largest process first, but
+    // a limit near their own size takes them too (seen on the root pass at 64 MB).
+    runaway.cgroup.memory_max_mb = 256;
     runaway.cgroup.pids_max = 64;
 
     // The runaway job holds more and more memory, and a fork bomb after it; its neighbour, at
     // the same time, holds 200 MB under the default limit and must not notice.
     const hog = testStep("python3 -c 'x = []\nwhile True: x.append(b\"x\" * (8 << 20))' || " ++
         "echo exit=$?");
-    const bomb = testStep("bomb() { bomb | bomb & }; bomb; sleep 2; echo after-the-bomb");
+    // `sleep` may itself be refused a process while the bomb holds them all (bash's `-e`).
+    var bomb = testStep("bomb() { bomb | bomb & }; bomb; sleep 2 || true; echo after-the-bomb");
+    bomb.condition = "always()";
     var near = testStep("python3 -c 'import time; x = b\"x\" * (200 << 20); time.sleep(6); " ++
         "print(\"neighbour held\", len(x) >> 20)'");
     near.name = "neighbour";
@@ -2532,14 +2552,17 @@ test "root runner: a native job's runaway is OOM-killed in its own cgroup, a for
     const r = results[0] orelse return error.TestUnexpectedResult;
     std.debug.print("runaway job:\n{s}\n", .{texts[0]});
     try expectLines(texts[0], &.{
-        "exit=137",
-        "The job reached its memory limit (64 MB, RUNNER_NATIVE_MEMORY_MAX_MB): the kernel " ++
-            "killed 1 process(es) of this step",
+        "The job reached its memory limit (256 MB, RUNNER_NATIVE_MEMORY_MAX_MB): the kernel " ++
+            "killed ",
         "after-the-bomb",
         "The job reached its process limit (64, RUNNER_NATIVE_PIDS_MAX)",
-        "with memory.max 64 MB and pids.max 64",
+        "with memory.max 256 MB and pids.max 64",
     });
-    try std.testing.expectEqual(dagger.Outcome.success, r.steps[0].outcome);
+    // The hog itself was killed (its step goes on to say so, or ends with it: 137), and the bomb
+    // stopped at the limit and the job went on.
+    try std.testing.expect(std.mem.indexOf(u8, texts[0], "exit=137") != null or
+        r.steps[0].exit_code == 137);
+    try std.testing.expectEqual(dagger.Outcome.success, r.steps[1].outcome);
     // The neighbour ran through, its 200 MB held, nothing of its own killed or refused.
     const n = results[1] orelse return error.TestUnexpectedResult;
     if (n.steps[0].outcome != .success) std.debug.print("neighbour:\n{s}\n", .{texts[1]});
