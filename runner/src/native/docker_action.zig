@@ -459,10 +459,13 @@ test "on a root runner, what a Docker action writes in the workspace is the runn
     cfg.images = try testImage(arena, &tmp, "zr-test/tool:1",
         \\{"config":{"Env":["PATH=/usr/bin:/bin"]}}
     );
-    // /github is the runner user's in the provisioned image (`set_up.provision_runner_script`).
+    // /github is the runner user's in the provisioned image (`set_up.provision_runner_script`),
     try tmp.dir.createDirPath(io, "rootfs/github");
     const github = try std.fmt.allocPrintSentinel(arena, "{s}/github", .{cfg.rootfs}, 0);
     try std.testing.expectEqual(@as(usize, 0), std.os.linux.chown(github, 1001, 1001));
+    // and /tmp is everyone's, for the runner user's step scripts.
+    const tmp_dir = try std.fmt.allocPrintSentinel(arena, "{s}/tmp", .{cfg.rootfs}, 0);
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.chmod(tmp_dir, 0o1777));
 
     var s1 = testStep("echo kept > kept.txt");
     s1.name = "job";
