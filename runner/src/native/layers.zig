@@ -1,47 +1,68 @@
 //! Layers by key (docs/native-backend.md, P2 and P7): the narrowest interface the Dockerfile
-//! builder needs from P2's layer store, "the layer stored under key K, or store this directory
-//! under K". This stand-in keeps each layer as a directory `<dir>/<key>` and publishes one by
-//! renaming a directory made beside it, so a reader never sees half a layer and two builders of
-//! one key keep the first. P2's store (flock per key, LRU eviction, deterministic digests)
-//! replaces it behind the same three calls.
+//! builder needs, "the layer stored under key K, or store this directory under K", over P2's
+//! layer store (`Store.zig`). A layer is published there by one rename that never replaces (two
+//! builders of one key keep the first), held shared while the job uses it, and evicted least
+//! recently used under the store's cap like a step's. Its record is empty: a build layer is never
+//! replayed as a step.
+//!
+//! The keys are the builder's own 64-hex sha256 (`dockerfile.plan`); they are taken as P2 keys by
+//! their bytes. A build layer's files have the image's ids (`docker_action.unshift`), not a job's
+//! range, so one layer serves every slot.
 
 const std = @import("std");
+const P2Store = @import("Store.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const Store = struct {
+    /// Where a layer is built before it is published: the job's directory.
     dir: []const u8,
+    /// P2's layer store.
+    store: P2Store,
+    /// The locks of the layers in use, held until the job ends (`Backend.held`).
+    held: *std.ArrayList(std.Io.File),
 
-    /// The layer stored under `key`, or null.
-    pub fn get(s: Store, arena: Allocator, io: std.Io, key: []const u8) !?[]const u8 {
-        const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ s.dir, key });
-        std.Io.Dir.accessAbsolute(io, path, .{}) catch return null;
-        return path;
+    fn key(hex: []const u8) !P2Store.Key {
+        var k: P2Store.Key = undefined;
+        if (hex.len != 2 * k.len) return error.BadLayerKey;
+        _ = std.fmt.hexToBytes(&k, hex) catch return error.BadLayerKey;
+        return k;
     }
 
-    /// A new, empty directory beside the layers, to build the layer for `key` in.
-    pub fn begin(s: Store, arena: Allocator, io: std.Io, key: []const u8) ![]const u8 {
+    /// The layer stored under `key`, held for the job, or null.
+    pub fn get(s: Store, arena: Allocator, io: std.Io, hex: []const u8) !?[]const u8 {
+        const hit = (try s.store.open(arena, io, try key(hex))) orelse return null;
+        try s.held.append(arena, hit.layer.lock);
+        return hit.layer.fs;
+    }
+
+    /// A new, empty directory in the job's, to build the layer for `key` in.
+    pub fn begin(s: Store, arena: Allocator, io: std.Io, hex: []const u8) ![]const u8 {
         var raw: [8]u8 = undefined;
         io.random(&raw);
-        const path = try std.fmt.allocPrint(arena, "{s}/.new-{s}-{s}", .{
+        const path = try std.fmt.allocPrint(arena, "{s}/B-{s}-{s}", .{
             s.dir,
-            key[0..16],
+            hex[0..16],
             &std.fmt.bytesToHex(raw, .lower),
         });
         try std.Io.Dir.cwd().createDirPath(io, path);
         return path;
     }
 
-    /// Stores the directory `begin` gave under `key`, and returns the layer's path. When another
-    /// builder stored the key first, its layer is kept and this one removed.
-    pub fn publish(s: Store, arena: Allocator, io: std.Io, built: []const u8, key: []const u8) ![]const u8 {
-        const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ s.dir, key });
-        const cwd = std.Io.Dir.cwd();
-        cwd.rename(built, cwd, path, io) catch |e| switch (e) {
-            error.DirNotEmpty => cwd.deleteTree(io, built) catch {},
-            else => return e,
+    /// Stores the directory `begin` gave under `key`, held for the job, and returns the layer's
+    /// path. When another builder stored the key first, its layer is used and this one removed.
+    pub fn publish(s: Store, arena: Allocator, io: std.Io, built: []const u8, hex: []const u8) ![]const u8 {
+        const k = try key(hex);
+        // Kind `fetch`: a tree with an empty record, never replayed as a step's (P2 has no
+        // `build` kind yet).
+        const layer = s.store.publish(arena, io, k, .fetch, built, .{ .log = "", .fc = "" }) catch |e| {
+            const first = (try s.store.open(arena, io, k)) orelse return e;
+            P2Store.removeTree(arena, io, built);
+            try s.held.append(arena, first.layer.lock);
+            return first.layer.fs;
         };
-        return path;
+        try s.held.append(arena, layer.lock);
+        return layer.fs;
     }
 };
 
@@ -52,7 +73,11 @@ test "a layer is published once, whole, under its key" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const store: Store = .{ .dir = try tmp.dir.realPathFileAlloc(io, ".", arena) };
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try P2Store.prepare(arena, io, root);
+    var held: std.ArrayList(std.Io.File) = .empty;
+    defer for (held.items) |f| f.close(io);
+    const store: Store = .{ .dir = root, .store = .{ .root = root }, .held = &held };
     const key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     try std.testing.expect(try store.get(arena, io, key) == null);
     const first = try store.begin(arena, io, key);

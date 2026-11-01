@@ -104,7 +104,7 @@ fn reasonFor(b: *Backend, job: job_mod.Job, u: job_mod.Uses, depth: u32) anyerro
 }
 
 fn imageReason(b: *Backend, image: []const u8) !?[]const u8 {
-    return switch (try images.lookup(b.arena, b.io, b.images, image)) {
+    return switch (try docker_action.find(b.arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, image)) {
         .missing => |why| why,
         .image => |img| if (images.runsAsRoot(img.user)) null else try std.fmt.allocPrint(
             b.arena,
@@ -387,7 +387,7 @@ test "preload: a JavaScript action, a local one, or an image not in the store se
     for ([_]Case{
         .{ .step = usesStep("j", "o", "js", "v1", &.{}), .why = "o/js@v1 is a JavaScript action" },
         .{ .step = local, .why = "local actions" },
-        .{ .step = usesStep("f", "o", "far", "v1", &.{}), .why = "zr-test/other:1 is not in the native image store" },
+        .{ .step = usesStep("f", "o", "far", "v1", &.{}), .why = "zr-test/other:1 is not in the tests' images directory" },
         .{ .step = usesStep("m", "o", "multi", "v1", &.{}), .why = "line 1: multi-stage" },
         // One that cannot be fetched is not a reason: native "Set up job" fails with it.
         .{ .step = usesStep("n", "o", "nope", "v1", &.{}), .why = null },

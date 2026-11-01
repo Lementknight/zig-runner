@@ -3,8 +3,12 @@ const Config = @import("config.zig").Config;
 const loop = @import("loop.zig");
 const inspect = @import("inspect.zig");
 const dagger = @import("dagger.zig");
+const set_up = @import("dagger/set_up.zig");
 const sandbox = @import("native/sandbox.zig");
 const net = @import("native/net.zig");
+const nft = @import("native/nft.zig");
+
+const forward = @import("native/forward.zig");
 const trust = @import("trust.zig");
 const job_mod = @import("job.zig");
 const db = @import("db.zig");
@@ -22,9 +26,21 @@ const build_version = @import("version.zig");
 comptime {
     _ = @import("sink.zig");
     _ = @import("native/Backend.zig");
+    _ = @import("native/Store.zig");
     _ = @import("native/sandbox.zig");
     _ = @import("native/net.zig");
+    _ = @import("native/seccomp.zig");
+    _ = @import("native/nft.zig");
+    _ = @import("native/oci/layer.zig");
+    _ = @import("native/oci/registry.zig");
+    _ = @import("native/oci/Store.zig");
+    _ = @import("native/oci/image.zig");
+    _ = @import("native/oci/testregistry.zig");
+    _ = @import("native/key_vectors.zig");
+    _ = @import("native/services.zig");
+    _ = @import("native/health.zig");
     _ = @import("native/images.zig");
+    _ = @import("native/forward.zig");
     _ = @import("native/docker_action.zig");
     _ = @import("native/dockerfile.zig");
     _ = @import("native/layers.zig");
@@ -81,9 +97,12 @@ pub fn main(init: std.process.Init) !u8 {
     // A native step's sandbox (`native/sandbox.zig`): before anything else, so nothing has
     // started a thread when it makes its namespaces.
     if (args.len == 2 and std.mem.eql(u8, args[1], sandbox.command)) return sandbox.main(arena);
+    if (args.len == 2 and std.mem.eql(u8, args[1], forward.command)) return forward.main(arena);
     if (args.len == 5 and std.mem.eql(u8, args[1], net.command))
         return net.upMain(arena, args[2], args[3], args[4]);
+    if (args.len >= 3 and std.mem.eql(u8, args[1], nft.command)) return nft.main(args[2..]);
     if (try printVersionIfAsked(io, args)) return @backingInt(Exit.done);
+    if (try printProvisionIfAsked(io, args)) return @backingInt(Exit.done);
 
     var cfg = Config.load(init.environ_map, args) catch |e| {
         try err.print("config error: {s}\n", .{Config.explain(e) orelse @errorName(e)});
@@ -239,6 +258,21 @@ fn printVersionIfAsked(io: std.Io, args: []const [:0]const u8) !bool {
             "zig-runner {s} (runner protocol {s}, Dagger {s})\n",
             .{ build_version.string, broker.version, engine.client_version },
         );
+        try w.interface.flush();
+        return true;
+    };
+    return false;
+}
+
+/// `--provision-script`: the shell script the default image is provisioned with when steps run as
+/// the runner user (`set_up.provision_runner_script`), for making the native backend's rootfs
+/// from `ubuntu:24.04` (docs/native-backend.md, "The rootfs"; .github/scripts/e2e.sh). Answered,
+/// as `--version`, before the configuration is read.
+fn printProvisionIfAsked(io: std.Io, args: []const [:0]const u8) !bool {
+    for (args[1..]) |arg| if (std.mem.eql(u8, arg, "--provision-script")) {
+        var out_buf: [256]u8 = undefined;
+        var w: std.Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
+        try w.interface.print("{s}\n", .{set_up.provision_runner_script});
         try w.interface.flush();
         return true;
     };
