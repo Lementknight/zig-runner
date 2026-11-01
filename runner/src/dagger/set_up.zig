@@ -367,7 +367,7 @@ const tool_trees_env = "ZIG_RUNNER_TOOL_TREES";
 const tool_cache_index = for (package_cache_dirs, 0..) |d, i| {
     if (std.mem.eql(u8, d.name, "toolcache")) break i;
 } else unreachable;
-const tool_cache_dir = package_cache_dirs[tool_cache_index].path;
+pub const tool_cache_dir = package_cache_dirs[tool_cache_index].path;
 /// The check runs with the image's bash and none of the job's environment (a workflow's
 /// `BASH_ENV` or `PATH` must not run in it).
 const tool_trees_argv = [_][]const u8{
