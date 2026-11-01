@@ -1228,7 +1228,7 @@ fn emptySlices(arena: Allocator, comptime T: type, n: usize) ![][]const T {
 }
 
 /// Linux limits one environment string to 128 KiB; larger payloads are written as a file instead.
-const max_event_env = 100 * 1024;
+pub const max_event_env = 100 * 1024;
 
 /// `<run_id>.<run_attempt>`, or the time when the job has no run id (`--exec-job`).
 fn runNonce(arena: Allocator, io: std.Io, ev: *const Evaluator) ![]const u8 {

@@ -86,4 +86,20 @@ theorem fixed : replay (merged written) = live written := rfl
 
 end TwoStreams
 
+/-! **On the native backend** (docs/native-backend.md, P2) the hypothesis this module starts from
+does not hold: the runner records a step's output itself, from one pipe that is both the step's
+stdout and its stderr, in the order the lines arrived, which is the log as it was shown. Then a
+replay is the run whatever the step wrote to which stream, with or without `exec 2>&1`. The script
+keeps it all the same: both backends run the same script, whose text is in the key, and Dagger's
+replays still need it. -/
+
+/-- What the native store records: the lines as they were shown, one stream. -/
+def recordedTogether (ls : List Line) : List Nat := live ls
+
+/-- **A native replay is the run**, with no merging of streams. -/
+theorem native_replay (ls : List Line) : recordedTogether ls = live ls := rfl
+
+/-- And the step that broke the two-stream replay is replayed as it ran, without `exec 2>&1`. -/
+theorem native_needs_no_merge : recordedTogether TwoStreams.written = live TwoStreams.written := rfl
+
 end Runner.Logs

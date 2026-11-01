@@ -2,18 +2,18 @@
 //! (`RUNNER_NATIVE_STORE`): content-addressed blobs, each image flattened once, and keyed
 //! directories made once and published by rename.
 //!
-//! This is the narrow interface P3 needs from P2's layer store, with the simplest implementation:
-//! "the directory under key K, made by `make` if it is not there yet" (`ensure`), a lock per key so
-//! runners sharing the store never make one twice, and a key over a parent, a script and its env
-//! (`layerKey`, the model's `Key = parent · script · stable env`). P2's store replaces `ensure`,
-//! `layerKey` and `flatten` (its layers stack instead of being flattened); the pull's callers do not
-//! change. No eviction yet: P2's LRU under a byte cap covers these directories too.
+//! "The directory under key K, made by `make` if it is not there yet" (`ensure`), with a lock per
+//! key so runners sharing the store never make one twice. Keys are P2's (`Store.KeyHasher`, in
+//! `Backend.provision`). A provisioned rootfs lives under `rootfs/`, apart from P2's `layers/`
+//! (stacked layers with records, which P2's `collect` evicts): it is a whole tree with the image's
+//! ids, flattened because only the lowest lower is idmapped. No eviction yet for `oci/` and
+//! `rootfs/`: P2's LRU under a byte cap should cover them too.
 //!
 //!   <store>/oci/blobs/sha256/<hex>     a blob, written only once its digest checked
 //!   <store>/oci/refs/<hex>.<platform>  a pinned index's manifest for this platform (`image.zig`)
 //!   <store>/oci/images/<hex>/          an image by its manifest's digest: `rootfs/`, `config.json`
 //!                                      (`<hex>.rootless/` for a rootless runner's, all its own)
-//!   <store>/layers/<key>/              a rootfs a native step made (provisioning): `rootfs/`
+//!   <store>/rootfs/<key>/              a rootfs a native step made (provisioning): `rootfs/`
 
 const Store = @This();
 
@@ -22,7 +22,6 @@ const linux = std.os.linux;
 const layer = @import("layer.zig");
 
 const Allocator = std.mem.Allocator;
-const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// The native store's root.
 root: []const u8,
@@ -47,7 +46,7 @@ pub fn refPath(s: Store, arena: Allocator, digest: []const u8, platform: []const
 /// The store's directories, only the runner's: a pulled rootfs holds the image's set-uid files
 /// with the image's owners, root's on a root runner.
 pub fn prepare(s: Store, arena: Allocator, io: std.Io) !void {
-    for ([_][]const u8{ "oci", "oci/blobs/sha256", "oci/refs", "oci/images", "layers" }) |d| {
+    for ([_][]const u8{ "oci", "oci/blobs/sha256", "oci/refs", "oci/images", "rootfs" }) |d| {
         const p = try std.fmt.allocPrint(arena, "{s}/{s}", .{ s.root, d });
         try std.Io.Dir.cwd().createDirPath(io, p);
         _ = linux.chmod(try arena.dupeSentinel(u8, p, 0), 0o700);
@@ -86,33 +85,6 @@ pub fn ensure(
     try make.makeFn(make.ptr, tmp);
     try cwd.rename(tmp, cwd, dir, io);
     return .{ .dir = dir, .made = true };
-}
-
-/// A step's key from its parent's, its script and its env, sorted: P2's
-/// `sha256(parent key, script, stable env)`.
-pub fn layerKey(arena: Allocator, parent: []const u8, script: []const u8, env: []const []const u8) ![]const u8 {
-    const sorted = try arena.dupe([]const u8, env);
-    std.mem.sortUnstable([]const u8, sorted, {}, struct {
-        fn lt(_: void, x: []const u8, y: []const u8) bool {
-            return std.mem.order(u8, x, y) == .lt;
-        }
-    }.lt);
-    var h = Sha256.init(.{});
-    for ([_][]const u8{ "zig-runner native layer v1", parent, script }) |part| {
-        var len: [8]u8 = undefined;
-        std.mem.writeInt(u64, &len, part.len, .little);
-        h.update(&len);
-        h.update(part);
-    }
-    for (sorted) |e| {
-        var len: [8]u8 = undefined;
-        std.mem.writeInt(u64, &len, e.len, .little);
-        h.update(&len);
-        h.update(e);
-    }
-    var sum: [32]u8 = undefined;
-    h.final(&sum);
-    return arena.dupe(u8, &std.fmt.bytesToHex(sum, .lower));
 }
 
 /// Removes a tree, giving directories their permissions back first when that is what stops it
@@ -401,29 +373,16 @@ test "native store: a key's directory is made once and published whole" {
     var ctx: Ctx = .{ .fail = true };
     const maker: Maker = .{ .ptr = &ctx, .makeFn = Ctx.make };
     // A failed make leaves nothing behind, and the next one makes it.
-    try testing.expectError(error.TestFailure, s.ensure(arena, testing.io, "layers", "k1", maker));
-    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "layers/.tmp-k1", .{}));
-    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "layers/k1", .{}));
+    try testing.expectError(error.TestFailure, s.ensure(arena, testing.io, "rootfs", "k1", maker));
+    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "rootfs/.tmp-k1", .{}));
+    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "rootfs/k1", .{}));
     ctx.fail = false;
-    const first = try s.ensure(arena, testing.io, "layers", "k1", maker);
+    const first = try s.ensure(arena, testing.io, "rootfs", "k1", maker);
     try testing.expect(first.made);
-    const again = try s.ensure(arena, testing.io, "layers", "k1", maker);
+    const again = try s.ensure(arena, testing.io, "rootfs", "k1", maker);
     try testing.expect(!again.made);
     try testing.expectEqual(@as(u32, 2), ctx.calls);
     try testing.expectEqualStrings(first.dir, again.dir);
-}
-
-test "native store: a layer's key covers its parent, its script and its env, in any order" {
-    var a: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer a.deinit();
-    const arena = a.allocator();
-    const k = try layerKey(arena, "p", "s", &.{ "A=1", "B=2" });
-    try testing.expectEqualStrings(k, try layerKey(arena, "p", "s", &.{ "B=2", "A=1" }));
-    try testing.expect(!std.mem.eql(u8, k, try layerKey(arena, "q", "s", &.{ "A=1", "B=2" })));
-    try testing.expect(!std.mem.eql(u8, k, try layerKey(arena, "p", "t", &.{ "A=1", "B=2" })));
-    try testing.expect(!std.mem.eql(u8, k, try layerKey(arena, "p", "s", &.{"A=1"})));
-    // Lengths are framed: moving a byte between parts changes the key.
-    try testing.expect(!std.mem.eql(u8, try layerKey(arena, "ab", "c", &.{}), try layerKey(arena, "a", "bc", &.{})));
 }
 
 test "native store: an upper flattened onto its lower, whiteouts and opaque directories as overlay showed them" {

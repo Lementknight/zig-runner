@@ -691,7 +691,8 @@ fn reportCacheAndKeys(
         var it = kept.iterate(c.io, try upload.keptBuffer(c));
         while (it.next() catch null) |l| {
             if (l.step >= 1 and l.step <= job.steps.len and
-                (it.textIs(dagger.reused_note) catch false)) replayed += 1;
+                ((it.textIs(dagger.reused_note) catch false) or
+                    (it.textIs(dagger.native_reused_note) catch false))) replayed += 1;
         }
         if (replayed > 0) if (c.gate) |gate| gate.replayed();
         try c.err.print(
