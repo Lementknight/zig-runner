@@ -1527,7 +1527,7 @@ test "the pool logs what it trusts once at startup, and warns when prod trusts e
 
 /// `dagger.warm` for the Warmer's tests: what it was asked, and the gate as the warm found it.
 const FakeWarm = struct {
-    var calls: u32 = 0;
+    var calls: std.atomic.Value(u32) = .init(0);
     var opts: dagger.Options = .{};
     var memory: ?*admission.Admission = null;
     var during: ?admission.Admission.Slot = null;
@@ -1536,7 +1536,7 @@ const FakeWarm = struct {
     var rose_mb: ?u64 = null;
 
     fn warm(_: Allocator, _: std.Io, o: dagger.Options, ready: dagger.Ready, _: *[]const u8) anyerror!dagger.Warmed {
-        calls += 1;
+        _ = calls.fetchAdd(1, .acq_rel);
         opts = o;
         if (!ready.readyFn(ready.ptr)) return error.Cancelled;
         const w: *Warmer = @ptrCast(@alignCast(ready.ptr));
@@ -1562,7 +1562,7 @@ const FakeWarm = struct {
 fn testWarmer(c: Runner, memory: ?*admission.Admission) !*Warmer {
     const w = (try Warmer.init(c, memory, 1)).?;
     w.calls = FakeWarm.calls_;
-    FakeWarm.calls = 0;
+    FakeWarm.calls.store(0, .release);
     FakeWarm.memory = memory;
     FakeWarm.during = null;
     FakeWarm.took_ms = 0;
@@ -1605,7 +1605,7 @@ test "the pre-warm builds the job's base container and Zig seed through the memo
     // A stop while the gate holds the warm: it gives up there, having taken nothing.
     w.cancel.request(1);
     w.once();
-    try std.testing.expectEqual(@as(u32, 1), FakeWarm.calls);
+    try std.testing.expectEqual(@as(u32, 1), FakeWarm.calls.load(.acquire));
     try std.testing.expect(FakeWarm.during == null);
     try std.testing.expectEqual(@as(u32, 0), memory.polling);
     try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), slots[1].started_ms);
@@ -1740,10 +1740,10 @@ test "two pools on one engine pre-warm one after the other, and a stop ends the 
     const turn = first.engineTurn().?.?;
     const t = try std.Thread.spawn(.{}, Warmer.once, .{second});
     try io.sleep(.fromMilliseconds(600), .awake);
-    try std.testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &FakeWarm.calls, .acquire));
+    try std.testing.expectEqual(@as(u32, 0), FakeWarm.calls.load(.acquire));
     turn.close(io);
     t.join();
-    try std.testing.expectEqual(@as(u32, 1), FakeWarm.calls);
+    try std.testing.expectEqual(@as(u32, 1), FakeWarm.calls.load(.acquire));
     const waiting = "pre-warm waiting for another runner's warm on this engine";
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.buffered(), waiting));
     try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "pre-warm: base container") != null);
@@ -1754,7 +1754,7 @@ test "two pools on one engine pre-warm one after the other, and a stop ends the 
     defer again.close(io);
     second.cancel.request(1);
     second.once();
-    try std.testing.expectEqual(@as(u32, 1), FakeWarm.calls);
+    try std.testing.expectEqual(@as(u32, 1), FakeWarm.calls.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.buffered(), waiting));
     try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "pre-warm:") == null);
 
