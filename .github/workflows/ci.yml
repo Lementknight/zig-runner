@@ -387,13 +387,17 @@ jobs:
           exit "$status"
 
       # The runner masks the jobs' secrets in its own log; any token-shaped string is masked again.
+      # The jobs' own workflow commands in it (`##[error]`, `::add-mask::`) are only text here.
       - name: The runner's log, on a failure
         if: ${{ failure() && steps.go.outputs.run == 'true' }}
         run: |
           for f in "$RUNNER_TEMP"/e2e/engine.log "$RUNNER_TEMP"/e2e/rootfs.log "$RUNNER_TEMP"/e2e/runner-*.log; do
             [ -e "$f" ] || continue
+            stop="e2e-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
             echo "::group::$(basename "$f")"
+            echo "::stop-commands::$stop"
             tail -n 300 "$f" | sed -E 's/(gh[opsu]|github_pat)_[A-Za-z0-9_]{20,}/***/g'
+            echo "::$stop::"
             echo "::endgroup::"
           done
 

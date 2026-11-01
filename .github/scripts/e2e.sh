@@ -7,6 +7,9 @@
 # service, a docker:// step, a JavaScript action, the file commands, a masked secret, a cancelled
 # run, and a rerun replayed from the step cache. Each job's queue and run times go to
 # $E2E_OUT/timings.tsv, with the backend it ran on, so one harness also compares Dagger and native.
+# In CI the Dagger pass comes first, on an engine just started: its times include the pulls and
+# the pre-warm. The native pass's jobs that native hands to Dagger (ran_on dagger) then find the
+# engine warm, so compare them with a Dagger job run again, not with the first pass.
 #
 #   e2e.sh check LABEL [BACKEND]    the suite, on the runners already serving LABEL
 #
@@ -221,8 +224,10 @@ record() {
 	local wf=$1 attempt=$2 jobs=$3 id name conclusion queue run on
 	while IFS=$'\t' read -r id name conclusion queue run; do
 		job_log "$id" >"$out/logs/$backend-$wf-$name-$attempt.log"
-		on=$backend
-		grep -q 'This job runs on Dagger' "$out/logs/$backend-$wf-$name-$attempt.log" && on=dagger
+		# Native only where "Set up job" says so ("Engine: native"); a job native cannot run yet
+		# says "This job runs on Dagger: ..." instead.
+		on=dagger
+		grep -qF 'Engine: native' "$out/logs/$backend-$wf-$name-$attempt.log" && on=native
 		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$backend" "$wf" "$name" "$attempt" \
 			"$conclusion" "$on" "$queue" "$run" >>"$out/timings.tsv"
 	done < <(jq -r 'def secs(a; b): try ((b | fromdateiso8601) - (a | fromdateiso8601)) catch "";
@@ -330,7 +335,8 @@ check() {
 	echo "timings ($backend):"
 	awk -F'\t' -v b="$backend" '$1 == b' "$out/timings.tsv" | cut -f2- | column -t -s $'\t'
 	if ((failures > 0)); then
-		echo "e2e ($backend): $failures failed; job logs in $out/logs" >&2
+		# On stdout, after the table: GitHub merges the two streams out of order.
+		echo "e2e ($backend): $failures failed; job logs in $out/logs"
 		exit 1
 	fi
 	echo "e2e ($backend): every check passed"
