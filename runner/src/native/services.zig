@@ -105,7 +105,7 @@ const Lines = struct {
 /// How long the runner waits for a service whose helper never answers: a health check's own
 /// retries and the ports' timeout end well before.
 const ready_cap_ms = 30 * 60 * 1000;
-const poll_ms = 20;
+const poll_ms = 10;
 
 /// "Initialize containers" on the native backend (`dagger/services.zig`'s `startServices` hands
 /// it here): every service started, then each waited for, then the published ports relayed.
@@ -448,6 +448,7 @@ test "the services' names in the job's hosts file: the loopback, and only names 
 // --- tests ---
 
 const dagger = @import("../dagger.zig");
+const engine = @import("../engine.zig");
 const testStep = @import("../dagger/testing.zig").testStep;
 const testJob = @import("../dagger/testing.zig").testJob;
 
@@ -506,7 +507,7 @@ const greeter =
     \\    c, _ = s.accept(); c.sendall(("hi from " + name + "\n").encode()); c.close()
 ;
 
-/// Whether something accepts a connection at `addr`:`port` within 500 ms.
+/// Whether something accepts a connection at `addr`:`port` within 250 ms.
 fn reachable(addr: [4]u8, port: u16) bool {
     const linux = std.os.linux;
     const kind = linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK;
@@ -522,7 +523,7 @@ fn reachable(addr: [4]u8, port: u16) bool {
     if (linux.errno(c) == .SUCCESS) return true;
     if (linux.errno(c) != .INPROGRESS) return false;
     var fds = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
-    if (linux.poll(&fds, 1, 500) != 1) return false;
+    if (linux.poll(&fds, 1, 250) != 1) return false;
     var err: i32 = 0;
     var len: linux.socklen_t = 4;
     _ = linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.ERROR, std.mem.asBytes(&err), &len);
@@ -684,7 +685,7 @@ test "native services: the host and other jobs cannot reach a job's services (ro
         "python3", "-u", "-c", greeter, "0.0.0.0", "47321", "db",
     });
     var job = testJob(&.{testStep("python3 -c 'import socket; " ++
-        "print(socket.create_connection((\"db\", 47321), 3).recv(100).decode())'; sleep 4")});
+        "print(socket.create_connection((\"db\", 47321), 3).recv(100).decode())'; sleep 6")});
     job.services = &.{.{
         .name = "db",
         .image = .{ .lit = "fixture/db:1" },
@@ -713,13 +714,13 @@ test "native services: the host and other jobs cannot reach a job's services (ro
     var job_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer job_arena.deinit();
     var task = try io.concurrent(Run.one, .{ job_arena.allocator(), cfg, job, &text, &ok });
+    // Once the service is up (it is ready within a second here), a few rounds; a dropped
+    // connection takes its whole timeout.
+    io.sleep(.fromMilliseconds(1500), .awake) catch {};
     var reached = false;
-    var tries: u32 = 0;
-    while (tries < 12) : (tries += 1) {
-        io.sleep(.fromMilliseconds(250), .awake) catch {};
-        for (0..4) |slot|
-            reached = reached or reachable(cfg.subnet.jobAddress(@intCast(slot)), port);
-    }
+    for (0..3) |_| for (0..4) |slot| {
+        reached = reached or reachable(cfg.subnet.jobAddress(@intCast(slot)), port);
+    };
     task.await(io);
     if (!ok) std.debug.print("{s}\n", .{text});
     try std.testing.expect(ok);
@@ -795,4 +796,68 @@ test "native services: postgres and redis from real images (ZIG_RUNNER_SERVICE_I
         "Initialize containers took {d} ms (postgres:17-alpine, redis:7-alpine)\n", .{
         e.completed_ms - e.started_ms,
     });
+}
+
+test "native services: Initialize containers against Dagger's (ZIG_RUNNER_MEASURE_SERVICES)" {
+    // A measurement for docs/native-backend.md, run by hand: the same job, with one service
+    // (traefik/whoami, which listens on WHOAMI_PORT_NUMBER and needs no root of its own) waited
+    // for on its port, through both backends, a warm-up each and then `runs` timed. Needs the
+    // image in the store at $ZIG_RUNNER_MEASURE_SERVICES, and for Dagger a v0.21.10 engine
+    // container, reached directly as the deployed runner reaches it (`engine.zig`), named by
+    // $ZIG_RUNNER_MEASURE_ENGINE (by default `engine.default_container`; "" leaves Dagger out).
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var env = try std.testing.environ.createMap(arena);
+    const dir = env.get("ZIG_RUNNER_MEASURE_SERVICES") orelse return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    cfg.images = dir;
+    cfg.test_rootless_services = true;
+    const port = try freePort();
+    const port_text = try std.fmt.allocPrint(arena, "{d}", .{port});
+    var job = testJob(&.{testStep("true")});
+    job.services = &.{.{
+        .name = "whoami",
+        .image = .{ .lit = "traefik/whoami:v1.10.3" },
+        .env = &.{.{ .name = "WHOAMI_PORT_NUMBER", .value = .{ .lit = port_text } }},
+        .ports = &.{.{ .lit = port_text }},
+    }};
+    const runs = 5;
+    const container = env.get("ZIG_RUNNER_MEASURE_ENGINE") orelse engine.default_container;
+    for ([_]bool{ true, false }) |native| {
+        if (!native and container.len == 0) continue;
+        var ms: [runs]i64 = undefined;
+        for (0..runs + 1) |i| {
+            var w: std.Io.Writer.Allocating = .init(arena);
+            var log: @import("../sink.zig").LogSink = .{ .stdout = .{ .writer = &w.writer } };
+            const res = try dagger.run(arena, io, &env, .{
+                .native = if (native) cfg else null,
+                .engine = if (native) null else .{ .container = container },
+                .step_user = .root,
+                .step_cache = false,
+                .package_caches = false,
+                .gpa = std.testing.allocator,
+            }, job, &log);
+            if (!res.succeeded) {
+                std.debug.print("{s}\n", .{w.written()});
+                return error.TestUnexpectedResult;
+            }
+            if (i == 0) continue;
+            for (res.extra) |e| if (e.kind == .initialize) {
+                ms[i - 1] = e.completed_ms - e.started_ms;
+            };
+        }
+        std.mem.sort(i64, &ms, {}, std.sort.asc(i64));
+        std.debug.print("services: Initialize containers on {s}: median {d} ms, " ++
+            "min {d}, max {d} ({d} runs)\n", .{
+            if (native) "native" else "Dagger",
+            ms[runs / 2],
+            ms[0],
+            ms[runs - 1],
+            runs,
+        });
+    }
 }

@@ -11,7 +11,7 @@
 //!
 //! Docker counts a health check's failure once per interval, after the start period, and calls
 //! the container unhealthy after `retries` of them in a row. The helper keeps that count, but
-//! tries sooner in between (from 100 ms, doubling up to the interval), so a database that is up
+//! tries sooner in between (from 10 ms, doubling up to the interval), so a database that is up
 //! after two seconds is ready after two seconds, not at the first interval's end.
 
 const std = @import("std");
@@ -50,8 +50,9 @@ pub const Health = struct {
 pub const default_interval_ms = 30_000;
 pub const default_retries = 3;
 
-/// The first try's delay, and how often ports are tried.
-const first_delay_ms = 100;
+/// The first try's delay (doubled after each failure, up to the interval), and how often ports
+/// are tried at most.
+const first_delay_ms = 10;
 const ports_delay_ms = 250;
 
 /// The status file, opened for the helper's one write (`report`). It is made, empty, by the
