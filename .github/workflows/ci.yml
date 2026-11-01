@@ -61,6 +61,12 @@ jobs:
       - name: shellcheck
         run: .github/scripts/shellcheck.sh
 
+      # The runner's check of the tool cache's trees (runner/src/dagger/tool_trees.sh), on a small
+      # fake tree: its lists let it skip re-reading unchanged files, never a changed, added or
+      # deleted one, and a list a job writes into the tool cache is never read.
+      - name: Tool cache tree check
+        run: .github/scripts/tool-trees-test.sh
+
       # The changie the release installs, against its pinned checksum: a new version (Renovate's)
       # fails here until the checksum is updated, not at the release, after it was approved.
       - name: changie's checksum

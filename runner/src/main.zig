@@ -422,6 +422,7 @@ fn execJobFile(
         .gpa = init.gpa,
         .nesting = cfg.dagger_nesting,
         .package_caches = cfg.package_caches,
+        .tool_trees = cfg.tool_trees,
         .uv_env_in_cache = cfg.uv_env_in_cache,
         .zig_local_cache = cfg.zig_local_cache,
         .zig_local_cache_max_mb = cfg.zig_local_cache_max_mb,
