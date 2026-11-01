@@ -50,6 +50,12 @@ next_layer: u32 = 0,
 store: ?Store = null,
 /// The store's settings, for `base` to turn it on.
 store_cfg: Store = .{ .root = "" },
+/// `Config.vouched`, and the job's cache scope and repository from it (`base`): a vouched fork's
+/// pull request keys its layers apart from its repository's own jobs, as its package caches are
+/// (`set_up.packageCacheScope`).
+vouched: bool = false,
+scope: []const u8 = "untrusted",
+repository: []const u8 = "",
 /// The store's layers the job uses, held shared until it ends (`Store.Layer`).
 held: std.ArrayList(std.Io.File) = .empty,
 /// Past this many layers, the stack is merged into one (`flatten`).
@@ -473,6 +479,7 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
         .subid_base = cfg.subid_base,
         .subnet = cfg.subnet,
         .store_cfg = .{ .root = cfg.store, .max_bytes = cfg.store_max_bytes },
+        .vouched = cfg.vouched,
         .flatten_at = @max(2, cfg.flatten_at),
     };
     errdefer b.deinit();
@@ -645,9 +652,10 @@ fn sweep(arena: Allocator, io: std.Io, store: []const u8) void {
 
 /// The base every step starts from, as `set_up.baseContainerId` builds Dagger's: the image's
 /// env, the step user and its HOME, the job's workspace and RUNNER_TEMP, the event payload, the
-/// step markers' secret, GitHub's default variables and the job's `env:`. Package caches, uv's
-/// environment in its cache and Zig's local cache are not mounted: they are caches, and the
-/// native backend has no volumes before phase 4. On failure the reason is in `err_msg`.
+/// step markers' secret, GitHub's default variables and the job's `env:`, and the tool cache's
+/// directory. Package caches, uv's environment in its cache and Zig's local cache are not
+/// mounted: they are caches, and the native backend has no volumes before phase 4. On failure the
+/// reason is in `err_msg`.
 ///
 /// Under step caching the store is on for the job, and the base is a layer like a step's: under
 /// a key (`keyFor`), replayed when the store has it. As `set_up.writeRunEnv` does, the event
@@ -662,6 +670,8 @@ pub fn base(
     const arena = b.arena;
     try b.baseEnv(ev, plan);
     if (plan.step_cache) b.store = b.store_cfg;
+    b.repository = ev.job.github.repository;
+    b.scope = try set_up.packageCacheScope(arena, ev, b.repository, b.vouched);
     const event = try ev.eventJson();
     const event_in_env = plan.step_cache and event.len <= set_up.max_event_env;
     if (event_in_env) try b.put(dagger.event_env, event);
@@ -670,11 +680,17 @@ pub fn base(
     // The workspace and RUNNER_TEMP, made as Dagger's base makes them: by root, in the image,
     // owned by the step user when it is not root, from `/` (the workspace is not there yet). The
     // event payload goes in as `withNewFile` does.
+    //
+    // And RUNNER_TOOL_CACHE, which Dagger mounts in every job (`set_up.cachesUsed`) owned by the
+    // step user: the step user cannot make it under /opt, so a step installing into it failed
+    // natively. Until phase 4's volume is bound over it, it is the job's own, in the base layer,
+    // so what a step puts there is in the step's layer and comes back with its replay.
     const chown = if (plan.as_runner) " && chown -R " ++ dagger.runner_user ++ ":" ++
-        dagger.runner_user ++ " " ++ dagger.work_root else "";
-    const mk = try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}", .{
+        dagger.runner_user ++ " " ++ dagger.work_root ++ " " ++ set_up.tool_cache_dir else "";
+    const mk = try std.fmt.allocPrint(arena, "mkdir -p {s} {s} {s}{s}", .{
         ev.workspace,
         ev.temp,
+        set_up.tool_cache_dir,
         chown,
     });
     const event_file = [_]sandbox.Spec.File{.{
@@ -698,7 +714,7 @@ pub fn base(
     if (claim.hit != null) return;
     const ended = try b.exec(mk, try b.envStrings(&.{}), files, 0, 0, out.output());
     if (ended.failure.len == 0 and ended.code == 0) {
-        if (claim.key) |k| b.publishTop(k, .{ .log = "", .fc = "" });
+        if (claim.key) |k| b.publishTop(k, .base, .{ .log = "", .fc = "" });
     } else {
         err_msg.* = try std.fmt.allocPrint(arena, "could not set up the job's base: {s}{s}", .{
             ended.failure,
@@ -835,7 +851,7 @@ pub fn execScript(
     const out = try x.collect(num, data, .{ .doc = "", .at = 0 });
     x.loadPendingMatchers(num);
     if (claim.key) |k| if (ended.code == 0 and out.code == 0) if (live.record) |r|
-        b.publishTop(k, .{ .log = r.items, .fc = all orelse "" });
+        b.publishTop(k, .step, .{ .log = r.items, .fc = all orelse "" });
     return out;
 }
 
@@ -940,7 +956,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
         out.output(),
     );
     if (ended.code == 0 and ended.failure.len == 0 and !ended.killed) {
-        if (claim.key) |k| b.publishTop(k, .{ .log = "", .fc = "" });
+        if (claim.key) |k| b.publishTop(k, .fetch, .{ .log = "", .fc = "" });
         f.result = .{ .dir = "native" };
         return f;
     }
@@ -1100,7 +1116,9 @@ fn keyFor(
 }
 
 /// What a base's layer, and so every layer above it, depends on besides its own script: the
-/// rootfs's fingerprint, how ids are mapped and, on a root runner, the slot's first id (a layer's
+/// store's format (`Store.store_format`), the job's cache scope and repository (a vouched fork's
+/// pull request never replays, or leaves, a layer its repository's own jobs use), the rootfs's
+/// fingerprint, how ids are mapped and, on a root runner, the slot's first id (a layer's
 /// files are owned by its job's range, so a layer is reused only by jobs with the same range: only
 /// misses come of it), and the binds (where, not what: mounts' content is in no key). Null, and the
 /// job uncached, when the rootfs cannot be read.
@@ -1112,12 +1130,41 @@ fn below(b: *Backend) ?Store.Key {
         b.store = null;
         return null;
     };
-    var h: Store.KeyHasher = .plain("below a base");
-    h.field(&fp);
-    h.field(@tagName(b.how.userns));
-    h.int(if (b.how.userns == .mapped) b.idBase() else 0);
-    h.int(b.binds.len);
-    for (b.binds) |bd| {
+    return belowKey(.{
+        .format = Store.store_format,
+        .scope = b.scope,
+        .repository = b.repository,
+        .fingerprint = &fp,
+        .userns = @tagName(b.how.userns),
+        .id_base = if (b.how.userns == .mapped) b.idBase() else 0,
+        .binds = b.binds,
+    }, null);
+}
+
+/// What `below` hashes, as values: the store's format and what it reads from the job.
+pub const Below = struct {
+    format: []const u8,
+    scope: []const u8,
+    repository: []const u8,
+    fingerprint: []const u8,
+    userns: []const u8,
+    id_base: u64,
+    binds: []const sandbox.Spec.Bind,
+};
+
+/// `below`'s digest (`KeyHasher.plain("below a base")`, then each field). `bytes`, when given,
+/// receives the preimage: P8's key vectors (`key_vectors.zig`) check it against the model's.
+pub fn belowKey(in: Below, bytes: ?*std.Io.Writer) Store.Key {
+    var h: Store.KeyHasher = .{ .h = .init(.{}), .bytes = bytes };
+    h.field("below a base");
+    h.field(in.format);
+    h.field(in.scope);
+    h.field(in.repository);
+    h.field(in.fingerprint);
+    h.field(in.userns);
+    h.int(in.id_base);
+    h.int(in.binds.len);
+    for (in.binds) |bd| {
         h.field(bd.host);
         h.field(bd.at);
         h.int(@intFromBool(bd.read_only));
@@ -1167,30 +1214,43 @@ fn claimKey(b: *Backend, key: ?Store.Key) error{ Stopped, OutOfMemory }!Claim {
         return .{};
     };
     b.waiting.store(false, .release);
-    const layer = (s.open(arena, b.io, k) catch null) orelse return .{ .key = k, .lock = lock };
-    const fail: ?[]const u8 = fail: {
-        const rec = s.record(arena, b.io, k) catch |e| break :fail @errorName(e);
-        const name = try b.layerName('l');
-        const link = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, name });
-        std.Io.Dir.cwd().symLink(b.io, layer.fs, link, .{}) catch |e| break :fail @errorName(e);
-        try b.held.append(arena, layer.lock);
-        try b.layers.append(arena, .{ .name = name, .path = layer.fs, .key = k });
-        return .{ .key = k, .lock = lock, .hit = rec };
+    // A stored entry another job holds, but that cannot be replayed: run, and keep nothing.
+    const hit = (s.open(arena, b.io, k) catch |e| {
+        std.log.warn("native: a stored layer cannot be replayed ({s}); the step runs", .{
+            @errorName(e),
+        });
+        lock.close(b.io);
+        return .{};
+    }) orelse return .{ .key = k, .lock = lock };
+    errdefer hit.layer.lock.close(b.io);
+    errdefer lock.close(b.io);
+    try b.layers.ensureUnusedCapacity(arena, 1);
+    try b.held.ensureUnusedCapacity(arena, 1);
+    const name = try b.layerName('l');
+    const link = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, name });
+    std.Io.Dir.cwd().symLink(b.io, hit.layer.fs, link, .{}) catch |e| {
+        std.log.warn("native: a stored layer cannot be linked ({s}); the step runs", .{
+            @errorName(e),
+        });
+        hit.layer.lock.close(b.io);
+        lock.close(b.io);
+        return .{};
     };
-    std.log.warn("native: a stored layer cannot be replayed ({s}); the step runs", .{fail.?});
-    layer.lock.close(b.io);
-    lock.close(b.io);
-    return .{};
+    b.held.appendAssumeCapacity(hit.layer.lock);
+    b.layers.appendAssumeCapacity(.{ .name = name, .path = hit.layer.fs, .key = k });
+    return .{ .key = k, .lock = lock, .hit = hit.rec };
 }
 
 /// The stack's top layer, which an exec under `key` just left, moved into the store
 /// (`Store.publish`) with its record, and the job's stack then links to it. Its parent is in the
 /// store (`keyFor`). A failure leaves the layer the job's own, and is logged: the job goes on,
 /// uncached from here.
-fn publishTop(b: *Backend, key: Store.Key, rec: Store.Record) void {
+fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) void {
     const s = b.store orelse return;
     const arena = b.arena;
     if (rec.log.len > Store.max_record_bytes) return;
+    // Room first: once the layer has moved, the job must hold it and point at it.
+    b.held.ensureUnusedCapacity(arena, 1) catch return;
     const top = &b.layers.items[b.layers.items.len - 1];
     const name = b.layerName('l') catch return;
     const link = std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, name }) catch return;
@@ -1204,15 +1264,12 @@ fn publishTop(b: *Backend, key: Store.Key, rec: Store.Record) void {
         std.log.warn("native: cannot link a layer into the store: {s}", .{@errorName(e)});
         return;
     };
-    const layer = s.publish(arena, b.io, key, top.path, rec) catch |e| {
+    const layer = s.publish(arena, b.io, key, kind, top.path, rec) catch |e| {
         std.log.warn("native: cannot publish a layer to the store: {s}", .{@errorName(e)});
         cwd.deleteFile(b.io, link) catch {};
         return;
     };
-    b.held.append(arena, layer.lock) catch {
-        layer.lock.close(b.io);
-        return;
-    };
+    b.held.appendAssumeCapacity(layer.lock);
     top.* = .{ .name = name, .path = layer.fs, .key = key };
 }
 
@@ -1923,6 +1980,63 @@ test "secrets reach native steps under their aliases, in scripts and in working 
         "script-mount tmpfs",
         "scripts-left=0",
     });
+}
+
+test "a native job's tool cache is the step user's, as on Dagger; a later step finds what one put there" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    // What `install-zig.sh` does (v0.22.0 on Dagger; natively until this was made): make its
+    // tree under RUNNER_TOOL_CACHE, which is under /opt, as the step user. The directory is there
+    // before any step, as Dagger's mount is (root could make it, the runner user could not).
+    const s1 = testStep("set -e; echo cache=$RUNNER_TOOL_CACHE; " ++
+        "test -d \"$RUNNER_TOOL_CACHE\" && echo cache-there; " ++
+        "mkdir -p \"$RUNNER_TOOL_CACHE/zig/0.17.0/x64\"; " ++
+        "echo installed > \"$RUNNER_TOOL_CACHE/zig/0.17.0/x64/zig\"; " ++
+        "stat -c 'owner=%u mode=%a' \"$RUNNER_TOOL_CACHE\" \"$RUNNER_TOOL_CACHE/zig/0.17.0/x64/zig\"");
+    const s2 = testStep("cat \"$RUNNER_TOOL_CACHE/zig/0.17.0/x64/zig\" | sed 's/^/found-/'");
+    // The runner user only on a root runner: a rootless one maps only root.
+    const users: []const config.StepUser = if (std.os.linux.geteuid() == 0)
+        &.{ .root, .runner }
+    else
+        &.{.root};
+    for (users) |user| {
+        // What `set_up.provision_runner_script` gives the runner user: /tmp for all, /github and
+        // its home its own.
+        if (user == .runner) {
+            const rootfs = try std.fmt.allocPrint(arena, "{s}/rootfs", .{
+                try tmp.dir.realPathFileAlloc(io, ".", arena),
+            });
+            const give = "cd \"$0\" && chmod 1777 tmp && mkdir -p github home/runner && " ++
+                "chown 1001:1001 github home/runner";
+            const made = try std.process.run(arena, io, .{
+                .argv = &.{ "sh", "-c", give, rootfs },
+            });
+            try std.testing.expect(made.term == .exited and made.term.exited == 0);
+        }
+        const r = try runNativeJob(arena, cfg, testJob(&.{ s1, s2 }), user);
+        for (r.res.steps) |st| if (st.outcome != .success) {
+            std.debug.print("as {s}: engine {s}\n{s}\n", .{
+                @tagName(user),
+                r.res.engine_error orelse "-",
+                r.text,
+            });
+            return error.TestUnexpectedResult;
+        };
+        const uid: u32 = if (user == .runner) runner_uid else 0;
+        // Its output, not the script's text, which the log has too.
+        try expectLines(r.text, &.{
+            "stdout] cache=" ++ set_up.tool_cache_dir,
+            "stdout] cache-there",
+            try std.fmt.allocPrint(arena, "stdout] owner={d} mode=755", .{uid}),
+            try std.fmt.allocPrint(arena, "stdout] owner={d} mode=644", .{uid}),
+            "stdout] found-installed",
+        });
+    }
 }
 
 test "a native step is contained: pivot_root, masked /proc, Docker's capabilities, no_new_privs" {
@@ -2725,6 +2839,44 @@ test "native step cache: measured, replay per step and the store's size over 50 
     }
     std.debug.print("native bench: store after 50 jobs: {d} layers, {d} KiB\n", .{
         try storeLayers(arena, c.cfg.store),
-        Store.treeBytes(arena, io, layers) / 1024,
+        (try Store.treeBytes(arena, io, layers)) / 1024,
     });
+}
+
+test "native step cache: a fork's pull request keys its layers apart from its repository's jobs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    // Two pull requests, alike but for the head's repository: the repository's own, and a fork's.
+    const pr = struct {
+        fn job(ar: Allocator, head: []const u8) !job_mod.Job {
+            // The steps in the arena: a literal's would not outlive this call.
+            const steps = try ar.dupe(job_mod.Step, &.{testStep("echo x >> /shared/s")});
+            var j = testJob(steps);
+            j.context_data = try std.json.parseFromSliceLeaky(
+                std.json.Value,
+                ar,
+                try std.fmt.allocPrint(ar, "{{\"github\":{{\"t\":2,\"d\":[" ++
+                    "{{\"k\":\"repository\",\"v\":\"o/r\"}},{{\"k\":\"event\",\"v\":{{\"t\":2,\"d\":[" ++
+                    "{{\"k\":\"pull_request\",\"v\":{{\"t\":2,\"d\":[{{\"k\":\"head\",\"v\":{{\"t\":2," ++
+                    "\"d\":[{{\"k\":\"repo\",\"v\":{{\"t\":2,\"d\":[{{\"k\":\"full_name\",\"v\":" ++
+                    "\"{s}\"}}]}}}}]}}}}]}}}}]}}}}]}}}}", .{head}),
+                .{},
+            );
+            return j;
+        }
+    }.job;
+    const own = try pr(arena, "o/r");
+    const fork = try pr(arena, "fork/r");
+    try expectSucceeded(try runCached(arena, c.cfg, own, "j1"));
+    try expectSucceeded(try runCached(arena, c.cfg, own, "j2"));
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "s"));
+    // The fork's does not replay the repository's layer, but replays its own.
+    try expectSucceeded(try runCached(arena, c.cfg, fork, "j3"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "s"));
+    try expectSucceeded(try runCached(arena, c.cfg, fork, "j4"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "s"));
 }

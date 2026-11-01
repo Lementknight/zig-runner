@@ -2,10 +2,12 @@ name: proofs
 
 # The Lean proofs in proofs/ (proofs/README.md): `lake build` checks every theorem, and the hashFiles
 # model is compared with runner/src/glob.zig on random cases (glob-lean-diff.sh), so the proof about
-# the walk holds of the walk that ships. On every pull request, merge group and push to main, and
-# weekly on fresh cases. The seed is the run number, and is printed: a failure reproduces locally
-# with the same seed. A required check: on a pull request or merge group that changes neither side
-# the job skips its steps and still reports (ci-scope.sh proofs), which a path filter would not.
+# the walk holds of the walk that ships; runner/src/native/testdata/step_keys.tsv, which the Zig
+# tests check the native store's key against, is checked to be the model's (key-vectors.sh). On
+# every pull request, merge group and push to main, and weekly on fresh cases. The seed is the run
+# number, and is printed: a failure reproduces locally with the same seed. A required check: on a
+# pull request or merge group that changes neither side the job skips its steps and still reports
+# (ci-scope.sh proofs), which a path filter would not.
 
 on:
   push:
@@ -53,6 +55,10 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         working-directory: proofs
         run: lake build
+
+      - name: The native key's vectors are the model's
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/key-vectors.sh
 
       - name: The hashFiles model against glob.zig
         if: steps.scope.outputs.run == 'true'

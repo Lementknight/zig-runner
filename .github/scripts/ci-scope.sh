@@ -80,13 +80,15 @@ needed() {
 	proofs)
 		# `lake build` reads proofs/ alone (its lakefile, manifest and toolchain included); the
 		# hashFiles model's comparison (glob-lean-diff.sh) builds proofs/Oracle.lean and runs it
-		# against glob.zig, compiled by itself (it imports only std) into globleancorpus.zig. Lean's
+		# against glob.zig, compiled by itself (it imports only std) into globleancorpus.zig; and
+		# key-vectors.sh compares the native key's vectors with `keyoracle`'s output. Lean's
 		# version is install-lean.sh's, checked against proofs/lean-toolchain.
 		case $1 in
 		proofs/* | runner/src/glob.zig | runner/tools/globleancorpus.zig | \
+			runner/src/native/testdata/step_keys.tsv | \
 			.github/workflows/proofs.yml | .github/scripts/ci-scope.sh | \
 			.github/scripts/install-zig.sh | .github/scripts/install-lean.sh | \
-			.github/scripts/glob-lean-diff.sh) return 0 ;;
+			.github/scripts/glob-lean-diff.sh | .github/scripts/key-vectors.sh) return 0 ;;
 		*) return 1 ;;
 		esac
 		;;
