@@ -23,6 +23,7 @@ Each line is tab-separated, every byte string in lowercase hex, numbers in decim
     key    name equal|differ  A B   with A, B: tag parent script env uid gid workdir files preimage
     below  name equal|differ  A B   with A, B: format scope repository fingerprint userns idBase
                                          binds preimage
+    layer  name root|any  entries preimage    (a tree, and `Native.walkPreimage` of it)
 
 An environment is `name=value` pairs joined by `,` in the container's order, volatile names
 included (the preimage has the stable ones); files are `path=contents=mode`, binds
@@ -72,6 +73,18 @@ def atomText : Nat → String
   | 35 => "Open-Blue/zig-runner"
   | 36 => "Open-Blue/other"
   | 32 => "zig-runner native store 1"
+  | 50 => "a.txt"
+  | 51 => "bin"
+  | 52 => "run.sh"
+  | 53 => "link"
+  | 54 => "gone"
+  | 55 => "dir"
+  | 56 => "new"
+  | 57 => "user.note"
+  | 58 => "x"
+  | 59 => "user.overlay.opaque"
+  | 60 => "y"
+  | 61 => "empty"
   | n => s!"atom{n}"
 
 /-- The model's stable-env filter for these atoms, as `Store.stableEnv` has it: `GITHUB_RUN_ID` and
@@ -112,10 +125,28 @@ def baseOf : Nat → BaseSpec
   | 5 => ⟨{ below0 with scope := 34 }, 29, [path, home], asRoot⟩
   | n => ⟨below0, n, [], asRoot⟩
 
+/-- A hex string's bytes. -/
+def unhex (s : String) : Bytes :=
+  let d := fun (c : Char) => if c.isDigit then c.toNat - 48 else c.toNat - 87
+  let rec go : List Char → Bytes
+    | a :: b :: t => (d a * 16 + d b) :: go t
+    | _ => []
+  go s.toList
+
+/-- The sha256 of the fixture files' contents, which P2's walk hashes in place of the bytes
+(`printf ... | sha256sum`): Lean core has no sha256, and the model treats a digest as an atom. -/
+def fileHash : Nat → Option (String × String)
+  | 40 => some ("hello\n", "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03")
+  | 41 => some ("#!/bin/sh\necho hi\n", "299001868fb8c02fd431c336c6d058f5558c5dff5b5af5e6fe04b870a6a9cbba")
+  | 42 => some ("", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+  | _ => none
+
 def fmt : Format where
   word := u64le
   width := 8
-  str n := utf8 (atomText n)
+  str n := match fileHash n with
+    | some (_, h) => unhex h
+    | none => utf8 (atomText n)
   text sc := utf8 (scriptText sc)
   label := utf8 "below a base"
   base := baseOf
@@ -230,6 +261,46 @@ def belowLine (w : Below) : String :=
     hex (fmt.str w.fingerprint), hex (fmt.str w.userns), toString w.idBase,
     bindsField w.binds, hex (belowPreimage fmt w)]
 
+/-! Layer vectors: small trees as P2's walk sees them, owned by ids outside the job's range (so
+65534 in the preimage, whoever runs the test), children in byte order of names. -/
+
+def nobody : Nat := 65534
+
+def file (n mode : Nat) (xs : List (Nat × Nat)) (h : Nat) : Node := .mk n mode nobody nobody xs (.file h)
+def dirN (n mode : Nat) (xs : List (Nat × Nat)) (cs : List Node) : Node :=
+  .mk n mode nobody nobody xs (.dir cs)
+
+/-- Each tree, and whether making it needs root (a whiteout is a device, which needs CAP_MKNOD). -/
+def layerVectors : List (String × Bool × List Node) :=
+  [ ("layer-modes", false,
+      [file 50 0o100644 [] 40, dirN 51 0o040755 [] [file 52 0o100755 [] 41], file 61 0o100600 [] 42]),
+    ("layer-xattr-and-link", false,
+      [file 50 0o100644 [(57, 58)] 40, .mk 53 0o120777 nobody nobody [] (.link 50)]),
+    ("layer-opaque-dir", false, [dirN 55 0o040755 [(59, 60)] [file 56 0o100644 [] 40]]),
+    ("layer-whiteout", true, [file 61 0o100644 [] 42, .mk 54 0o020000 nobody nobody [] (.dev 0 0)]) ]
+
+def xattrsField : List (Nat × Nat) → String := list fun x => hex (fmt.str x.1) ++ "=" ++ hex (fmt.str x.2)
+
+mutual
+/-- The entries in walk order, each `path|kind|perm|xattrs|payload`: a file's contents, a link's
+target, a device's `major:minor`, `-` for a directory. -/
+def entriesOf (rel : String) : Node → List String
+  | .mk n m _ _ xs b =>
+    let path := rel ++ "/" ++ atomText n
+    let perm := toString (m % 4096)
+    let row := fun (k payload : String) =>
+      "|".intercalate [hex (utf8 path), k, perm, xattrsField xs, payload]
+    match b with
+    | .file h => [row "f" (hex (utf8 ((fileHash h).map (·.1) |>.getD "")))]
+    | .link t => [row "l" (hex (utf8 (atomText t)))]
+    | .dev a c => [row "c" s!"{a}:{c}"]
+    | .dir cs => row "d" "-" :: entriesOfList path cs
+    | .other => [row "o" "-"]
+def entriesOfList (rel : String) : List Node → List String
+  | [] => []
+  | c :: cs => entriesOf rel c ++ entriesOfList rel cs
+end
+
 def baseNum : State → Nat
   | .base b => b
   | _ => 0
@@ -261,4 +332,7 @@ def main : IO UInt32 := do
       IO.eprintln s!"{name}: the preimages disagree with the model's"
       ok := false
     IO.println ("\t".intercalate ["below", name, verdict same, belowLine v, belowLine w])
+  for (name, root, tree) in layerVectors do
+    IO.println ("\t".intercalate ["layer", name, if root then "root" else "any",
+      ";".intercalate (entriesOfList "" tree), hex (walkPreimage fmt (utf8 "tree") tree)])
   return if ok then 0 else 1

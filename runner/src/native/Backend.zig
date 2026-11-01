@@ -1123,15 +1123,41 @@ fn below(b: *Backend) ?Store.Key {
         b.store = null;
         return null;
     };
-    var h: Store.KeyHasher = .plain("below a base");
-    h.field(Store.store_format);
-    h.field(b.scope);
-    h.field(b.repository);
-    h.field(&fp);
-    h.field(@tagName(b.how.userns));
-    h.int(if (b.how.userns == .mapped) b.idBase() else 0);
-    h.int(b.binds.len);
-    for (b.binds) |bd| {
+    return belowKey(.{
+        .format = Store.store_format,
+        .scope = b.scope,
+        .repository = b.repository,
+        .fingerprint = &fp,
+        .userns = @tagName(b.how.userns),
+        .id_base = if (b.how.userns == .mapped) b.idBase() else 0,
+        .binds = b.binds,
+    }, null);
+}
+
+/// What `below` hashes, as values: the store's format and what it reads from the job.
+pub const Below = struct {
+    format: []const u8,
+    scope: []const u8,
+    repository: []const u8,
+    fingerprint: []const u8,
+    userns: []const u8,
+    id_base: u64,
+    binds: []const sandbox.Spec.Bind,
+};
+
+/// `below`'s digest (`KeyHasher.plain("below a base")`, then each field). `bytes`, when given,
+/// receives the preimage: P8's key vectors (`key_vectors.zig`) check it against the model's.
+pub fn belowKey(in: Below, bytes: ?*std.Io.Writer) Store.Key {
+    var h: Store.KeyHasher = .{ .h = .init(.{}), .bytes = bytes };
+    h.field("below a base");
+    h.field(in.format);
+    h.field(in.scope);
+    h.field(in.repository);
+    h.field(in.fingerprint);
+    h.field(in.userns);
+    h.int(in.id_base);
+    h.int(in.binds.len);
+    for (in.binds) |bd| {
         h.field(bd.host);
         h.field(bd.at);
         h.int(@intFromBool(bd.read_only));

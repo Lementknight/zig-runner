@@ -95,7 +95,7 @@ All names are under `Runner.`; `Build.`, `OutputKeys.` and so on are the modules
 | a fork's pull request never shares a key with the repository's own jobs | `Native.scope_apart`, `fork_keys_apart` | `Runner/Native.lean` |
 | the native key keeps what `Key` keeps | `Native.encState_injective`, `belowPreimage_inj`, `encKey_injective`, `native_key_iff`, `native_mounts_invisible`, `native_volatile_invisible`, `native_event_invisible`; `Native.Ambiguous` without the lengths | `Runner/Native.lean` |
 | native concurrency and eviction | `Native.ops_keep_honest`, `race_irrelevant`, `readWhole_agrees`, `Native.Torn`; a lost read in `nbuild` | `Runner/Native.lean` |
-| native layer digests | `Native.digest_deterministic`, `digest_injective`, `same_layer_same_container`, `different_layer_different_container` | `Runner/Native.lean` |
+| native layer digests | `Native.walk_injective` (P2's walk as written), `digest_deterministic`, `digest_injective`, `same_layer_same_container`, `different_layer_different_container` | `Runner/Native.lean` |
 | a shared cache is safe | `Build.elsewhere_ahead`: no other job can write under this job's nonce, which is why a pool may share one cache | `Runner/Build.lean` |
 | **the volatile clause, discharged** | `Enforce.input_determined_by_key`, `volatile_clause_discharged`, `nothing_volatile_survives`, `no_payload_survives`, `enforced_disciplined` | `Runner/Enforce.lean` |
 
@@ -284,7 +284,7 @@ key format is the one proved here.
 | no input of its own | `keyFor`'s tail after the core: for a step, the job's uid, gid and workspace (set with the base, `Backend.baseEnv`) and no kept file (`execScript` gives none, and a step with a file to write has no key), so a function of its parent's base (`Format.stepExtra`); for the base, root, `/`, and the event file when the payload is too large for a variable (then the base, and every key above it, is per run: only misses) |
 | `Script` | a `run:` step's script (`scripts.stepScriptFc`), or a checkout's fetch of a commit (tag 1 too; a branch or a tag moves and is never keyed) |
 | `State.afterCopy before digest` | tag 2 (`Store.Tag.output_keyed`), the parent's key and the layer's digest; P2 defines the tag, and output keys come later |
-| `Output.digest` | `Store.layerDigest`, a sorted walk of the layer with ids as the job's namespace sees them (`Store.Ids`); its walk has not yet been compared byte for byte with `Native.layerPreimage` |
+| `Output.digest` | `Store.layerDigest`: `Store.treeDigest`'s walk of the layer, entries in byte order of names, ids as the job's namespace sees them (`Store.Ids`), xattrs counted (P8's addition), content by type, `..` after a directory's entries: `Native.walkPreimage`, byte for byte (the `layer` vectors) |
 | `Output.log`, `Logs` | `layers/<key>/log`, the step's output as the one pipe recorded it, so a replay is the run without `exec 2>&1` (`Logs.native_replay`); the script keeps it, since both backends run one script |
 | `Cache`, `look` | `Store.open`: `layers/<key>` for the key's sha256 (`Native.Store`, `slook`) |
 | `replayable`, `mark st = .everyRun` | `Backend.execScript` publishes (`publishTop`) only a step that exited 0, does not always run, and whose parent is in the store (`keyFor` is null otherwise): `Native.record`, so every hit is a success of an unmarked step (`hit_succeeds`, `marked_misses`) |
@@ -296,14 +296,14 @@ where P2 meets it:
 
 | Obligation | Where in the model | In P2 |
 |---|---|---|
-| The key's bytes are unambiguous: a fixed-width length before every field, counts before lists, a tag per kind of key, the store's format in every key | `Format.Sound`, `encState`, `belowPreimage`; `Native.Ambiguous` is the cost without it | `KeyHasher.field` and `int` (u64 little-endian), `Store.Tag`; the digest below a base is untagged, but only ever a parent field. `Store.store_format` is in every base's parent, so in every key: a change of format, bumped there, makes every key new |
+| The key's bytes are unambiguous: a fixed-width length before every field, counts before lists, a tag per kind of key, the store's format in every key | `Format.Sound`, `encState`, `belowPreimage`, `walkPreimage`; `Native.Ambiguous` is the cost without it | `KeyHasher.field` and `int` (u64 little-endian), `Store.Tag`; the digest below a base is untagged, but only ever a parent field. `Store.store_format` is in every base's parent, so in every key: a change of format, bumped there, makes every key new |
 | The environment is spelt in the container's order, not sorted | `encEnv`, the `env-order` vector | `core` walks `b.env` in order |
 | The script text tells apart the scripts the model tells apart | `Format.Sound.text_inj` | the same hypothesis the Dagger mapping relies on, unstated there |
 | What is hashed beyond the model's key is determined by it | `Format.stepExtra`, `BaseSpec` | above: uid, gid and workspace are the job's, kept files are the base's |
 | Only successes of unmarked steps are published | `record` | `execScript`, `publishTop` |
 | A publish is one rename of a complete entry | `Op`, `publish` | built under `layers/.tmp-<key>-<n>` and renamed |
 | A reader takes an entry whole or misses: a missing or short part is a miss, never empty | `readWhole`, `readWhole_agrees`, `Native.Torn` | `Store.open` takes the entry's lock shared and checks `Store.whole` (`fs`, `log`, `fc`, `size`) |
-| The layer digest hashes the sorted walk of what a later step can see (path, type, mode, ids inside the job's namespace, xattrs, symlink target, whiteouts, content) and nothing else (times, inodes, host ids, readdir order) | `layerPreimage`, `digest_deterministic`, `digest_injective` | `Store.layerDigest` with `Store.Ids` |
+| The layer digest hashes the sorted walk of what a later step can see (path, type, mode, ids inside the job's namespace, xattrs, symlink target, whiteouts, content) and nothing else (times, inodes, host ids, readdir order) | `walkPreimage`, `walk_injective`; `layerPreimage`, `digest_deterministic`, `digest_injective` for the flattened form | `Store.treeDigest` with `Store.Ids`; `Store.listDir` sorts each directory; the xattrs are counted since P8 (without the count the walk was ambiguous) |
 
 The flock per key is not among them: `race_irrelevant` shows two honest entries for an unmarked key
 are equal, so which writer wins does not matter, and the lock only saves running a key twice.
@@ -311,11 +311,13 @@ are equal, so which writer wins does not matter, and the lock only saves running
 `keyoracle` (`KeyOracle.lean`) ties the model to the Zig code as `globoracle` does for
 `hashFiles()`: it writes `runner/src/native/testdata/step_keys.tsv`, pairs of inputs with the
 model's verdict (equal or not: `Build.K` for steps, the `BaseSpec` for bases, the `Below` itself)
-and the preimages (`keyPreimage`, `belowPreimage`; u64 little-endian words, UTF-8).
+and the preimages (`keyPreimage`, `belowPreimage`, `walkPreimage`; u64 little-endian words,
+UTF-8).
 `.github/scripts/key-vectors.sh` checks the file is its output, and
 `runner/src/native/key_vectors.zig` checks the Zig preimages and the relation against it: keys
-through P2's own `Store.KeyHasher` and `Store.stableEnv`, the digest below a base through a reference
-of `Backend.below` until P2's review fixes merge.
+through P2's own `Store.KeyHasher` and `Store.stableEnv`, the digest below a base through
+`Backend.belowKey` (which `below` calls), and layer digests by making each tree and running
+`Store.treeDigestTo` on it.
 
 ## Why the regex matcher terminates
 

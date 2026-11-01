@@ -12,15 +12,17 @@
 //!   holds of any sound spelling (`Native.native_key_iff`), so it applies to the store's key
 //!   whatever bytes it hashes.
 //!
-//! Keys go through P2's own `Store.KeyHasher` (`init`, `core`, its `bytes` writer) and
-//! `Store.stableEnv`; `keyFor`'s tail, which needs a `Backend`, is written out here as `keyFor`
-//! writes it. The digest below a base is still a reference (`belowPreimage`), following P2's
-//! review fixes (#272 at 28a9dd1: `Store.store_format`, the scope and the repository after the label), which
-//! main does not have yet. **When they merge:** write `Backend.below`'s hashing as a function of
-//! its inputs, call it from `storeBelow`, and drop the reference.
+//! Both go through P2's own code: keys through `Store.KeyHasher` (`init`, `core`, its `bytes`
+//! writer) and `Store.stableEnv`, with `keyFor`'s tail, which needs a `Backend`, written out here
+//! as `keyFor` writes it; the digest below a base through `Backend.belowKey`, which `below` calls.
+//!
+//! `layer` lines are small trees (modes, an xattr, a symlink, an opaque directory, a whiteout) and
+//! the model's `walkPreimage` of each: the last test makes each tree and checks
+//! `Store.treeDigestTo`, the walk `Store.layerDigest` hashes, writes the same bytes.
 
 const std = @import("std");
 const Store = @import("Store.zig");
+const Backend = @import("Backend.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
@@ -29,7 +31,7 @@ const vectors = @embedFile("testdata/step_keys.tsv");
 
 pub const Binding = struct { name: []const u8, value: []const u8 };
 pub const File = struct { path: []const u8, contents: []const u8, mode: u64 };
-pub const Bind = struct { host: []const u8, at: []const u8, read_only: bool, optional: bool };
+pub const Bind = @import("sandbox.zig").Spec.Bind;
 
 /// What a key is given (`Backend.keyFor`): the tag (0 a base, 1 a step's exec or a checkout's
 /// fetch), the parent's key (for a base, the digest below it), the script, the whole env in the
@@ -58,23 +60,6 @@ pub const BelowInput = struct {
 
 pub const KeyFn = fn (Allocator, KeyInput) anyerror![32]u8;
 pub const BelowFn = fn (Allocator, BelowInput) anyerror![32]u8;
-
-/// A field and a number as `Store.KeyHasher` writes them, for the digest below a base.
-const Hasher = struct {
-    out: std.ArrayList(u8) = .empty,
-    gpa: Allocator,
-
-    fn int(k: *Hasher, v: u64) !void {
-        var b: [8]u8 = undefined;
-        std.mem.writeInt(u64, &b, v, .little);
-        try k.out.appendSlice(k.gpa, &b);
-    }
-
-    fn field(k: *Hasher, b: []const u8) !void {
-        try k.int(b.len);
-        try k.out.appendSlice(k.gpa, b);
-    }
-};
 
 /// A key's preimage, through P2's `Store.KeyHasher`: the tag, `core` (parent, script, the env
 /// through `Store.stableEnv`), then `Backend.keyFor`'s tail: uid, gid, the working directory, the
@@ -107,27 +92,24 @@ pub fn keyPreimage(gpa: Allocator, in: KeyInput) ![]u8 {
     return bytes;
 }
 
-/// The digest below a base's preimage, as `Backend.below` builds it: untagged
-/// (`KeyHasher.plain("below a base")`), then the store's format (`Store.store_format`), the scope, the repository, the rootfs's
-/// fingerprint, the userns mode, the slot's first id, and the binds, counted.
+/// The digest below a base's preimage, through `Backend.belowKey`.
 pub fn belowPreimage(gpa: Allocator, in: BelowInput) ![]u8 {
-    var h: Hasher = .{ .gpa = gpa };
-    errdefer h.out.deinit(gpa);
-    try h.field("below a base");
-    try h.field(in.format);
-    try h.field(in.scope);
-    try h.field(in.repository);
-    try h.field(in.fingerprint);
-    try h.field(in.userns);
-    try h.int(in.id_base);
-    try h.int(in.binds.len);
-    for (in.binds) |b| {
-        try h.field(b.host);
-        try h.field(b.at);
-        try h.int(@intFromBool(b.read_only));
-        try h.int(@intFromBool(b.optional));
-    }
-    return h.out.toOwnedSlice(gpa);
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    const key = Backend.belowKey(.{
+        .format = in.format,
+        .scope = in.scope,
+        .repository = in.repository,
+        .fingerprint = in.fingerprint,
+        .userns = in.userns,
+        .id_base = in.id_base,
+        .binds = in.binds,
+    }, &w.writer);
+    const bytes = try w.toOwnedSlice();
+    var check: [32]u8 = undefined;
+    Sha256.hash(bytes, &check, .{});
+    std.debug.assert(std.mem.eql(u8, &check, &key));
+    return bytes;
 }
 
 fn sha(gpa: Allocator, bytes: []u8) [32]u8 {
@@ -142,7 +124,8 @@ pub fn storeKey(gpa: Allocator, in: KeyInput) ![32]u8 {
     return sha(gpa, try keyPreimage(gpa, in));
 }
 
-pub fn referenceBelow(gpa: Allocator, in: BelowInput) ![32]u8 {
+/// The digest below a base P2 gives, through `Backend.belowKey`.
+pub fn storeBelow(gpa: Allocator, in: BelowInput) ![32]u8 {
     return sha(gpa, try belowPreimage(gpa, in));
 }
 
@@ -240,6 +223,7 @@ fn parse(arena: Allocator) ![]Vector {
         if (line.len == 0) continue;
         var it = std.mem.splitScalar(u8, line, '\t');
         const kind = it.next().?;
+        if (std.mem.eql(u8, kind, "layer")) continue;
         const name = it.next().?;
         const rel = it.next().?;
         const key = std.mem.eql(u8, kind, "key");
@@ -294,6 +278,96 @@ test "the native key's preimage is the model's" {
 }
 
 test "native keys are equal exactly where the model's are" {
-    try checkRelation(storeKey, referenceBelow);
-    // When P2's review fixes merge: referenceBelow becomes storeBelow, over `Backend.below`'s hashing.
+    try checkRelation(storeKey, storeBelow);
+}
+
+const linux = std.os.linux;
+
+/// Ids outside the job's range: every owner digests as the overflow id, 65534, whoever runs this.
+const outside: Store.Ids = .{ .base = std.math.maxInt(u32) - 15, .count = 1 };
+
+/// Makes a vector's tree under `root`; false when it needs what this process may not do (a
+/// device, without CAP_MKNOD).
+fn makeTree(arena: Allocator, io: std.Io, root: []const u8, entries: []const u8) !bool {
+    var made: std.ArrayList(struct { path: [:0]const u8, kind: u8, perm: u32 }) = .empty;
+    var rows = std.mem.splitScalar(u8, entries, ';');
+    while (rows.next()) |row| {
+        var f = std.mem.splitScalar(u8, row, '|');
+        const rel = try unhex(arena, f.next().?);
+        const kind = f.next().?[0];
+        const perm = try std.fmt.parseInt(u32, f.next().?, 10);
+        const xattrs = try items(arena, f.next().?, 2);
+        const payload = f.next().?;
+        const path = try std.fmt.allocPrintSentinel(arena, "{s}{s}", .{ root, rel }, 0);
+        switch (kind) {
+            'f' => try std.Io.Dir.cwd().writeFile(io, .{
+                .sub_path = path,
+                .data = try unhex(arena, payload),
+            }),
+            'd' => if (linux.errno(linux.mkdir(path, 0o700)) != .SUCCESS) return error.Mkdir,
+            'l' => {
+                const target = try arena.dupeSentinel(u8, try unhex(arena, payload), 0);
+                if (linux.errno(linux.symlink(target, path)) != .SUCCESS) return error.Symlink;
+            },
+            'c' => {
+                const colon = std.mem.indexOfScalar(u8, payload, ':').?;
+                const major = try std.fmt.parseInt(u32, payload[0..colon], 10);
+                const minor = try std.fmt.parseInt(u32, payload[colon + 1 ..], 10);
+                const dev = (@as(u32, major) << 8) | minor;
+                if (linux.errno(linux.mknod(path, linux.S.IFCHR | perm, dev)) != .SUCCESS)
+                    return false;
+            },
+            else => return error.Kind,
+        }
+        for (xattrs) |x| {
+            const xname = try arena.dupeSentinel(u8, try unhex(arena, x[0]), 0);
+            const value = try unhex(arena, x[1]);
+            const rc = linux.lsetxattr(path, xname, value.ptr, value.len, 0);
+            if (linux.errno(rc) != .SUCCESS) return error.SetXattr;
+        }
+        try made.append(arena, .{ .path = path, .kind = kind, .perm = perm });
+    }
+    // The modes last, children first, so a directory's mode cannot stop its children being made.
+    var i = made.items.len;
+    while (i > 0) {
+        i -= 1;
+        const m = made.items[i];
+        if (m.kind == 'l') continue;
+        if (linux.errno(linux.chmod(m.path, m.perm)) != .SUCCESS) return error.Chmod;
+    }
+    return true;
+}
+
+test "native layer digests: P2's walk writes the model's bytes" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var checked: usize = 0;
+    var lines = std.mem.splitScalar(u8, vectors, '\n');
+    while (lines.next()) |line| {
+        var it = std.mem.splitScalar(u8, line, '\t');
+        if (!std.mem.eql(u8, it.next() orelse continue, "layer")) continue;
+        const name = it.next().?;
+        const needs_root = std.mem.eql(u8, it.next().?, "root");
+        const entries = it.next().?;
+        const want = try unhex(arena, it.next().?);
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+        if (!try makeTree(arena, io, root, entries)) {
+            // Only a tree that needs a device may be left out, where devices cannot be made; CI's
+            // root pass of the native tests makes it.
+            try std.testing.expect(needs_root);
+            continue;
+        }
+        var w: std.Io.Writer.Allocating = .init(arena);
+        _ = try Store.treeDigestTo(arena, io, root, .content, outside, &w.writer);
+        std.testing.expectEqualSlices(u8, want, w.written()) catch |err| {
+            std.debug.print("layer vector {s}: P2's walk is not the model's\n", .{name});
+            return err;
+        };
+        checked += 1;
+    }
+    try std.testing.expect(checked >= 3);
 }
