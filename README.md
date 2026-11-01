@@ -144,8 +144,9 @@ repository:
 - **No pull request code with secrets.** The one workflow on `pull_request_target`, `automerge`,
   runs `main`'s copy and checks out and runs nothing of the pull request; its app key only turns on
   auto-merge. The release starts from `version`, `main`'s workflow on a schedule or by hand, and
-  waits for the maintainer's approval. Merges themselves are not reviewed: what reaches `main` is
-  what passed CI, and approving the release is the human check.
+  waits for the maintainer's approval. No person reviews a merge: for now each pull request has an
+  automated review by the assistant, what reaches `main` is what passed CI, and approving the
+  release is the human check (#104).
 
 ### Code style
 

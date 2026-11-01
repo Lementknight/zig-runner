@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A `run:` step''s script file is named as GitHub''s runner names it (#214): `.sh` for `bash` and `sh`, `.py` for `python`, in any case, and no extension for any other program as written, `python3 {0}` and full paths such as `/bin/bash` included. A traceback or `$0` now shows the same file name as on GitHub. This reverses #196''s choice to recognise those by their base name. Steps with such a shell get a new cache key and are not replayed the first time they run after the upgrade.'
-time: 2026-11-01T02:15:07.000000-04:00
