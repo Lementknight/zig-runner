@@ -450,6 +450,7 @@ const stat_mask: linux.STATX = .{
     .GID = true,
     .SIZE = true,
     .MTIME = true,
+    .CTIME = true,
     .INO = true,
     .BLOCKS = true,
     .NLINK = true,
@@ -576,6 +577,13 @@ fn digestIn(
         h.int(ids.inside(n.st.uid));
         h.int(ids.inside(n.st.gid));
         try digestXattrs(arena, h, fd, n);
+        // The rootfs's fingerprint: any write, chmod or touch since moves an entry's ctime,
+        // which no tool can set back (a tar restoring mtimes does not restore it).
+        if (depth == .metadata) {
+            h.int(n.st.ino);
+            h.int(@bitCast(n.st.ctime.sec));
+            h.int(n.st.ctime.nsec);
+        }
         switch (n.kind()) {
             linux.S.IFREG => switch (depth) {
                 .metadata => {
@@ -704,26 +712,62 @@ pub fn layerDigest(s: Store, arena: Allocator, io: std.Io, key: Key, ids: Ids) !
     return d;
 }
 
-/// The rootfs's fingerprint (`treeDigest` of its metadata), for the base's key: a rootfs made
-/// again gives the jobs new keys. Found once per process for each rootfs: overlay does not allow
-/// a layer to change while it is mounted, so the rootfs is not changed under a running runner.
+/// The rootfs's fingerprint, for the base's parent (`Backend.below`): a rootfs made again gives
+/// the jobs new keys. It is `treeDigest` of the metadata (ctimes and inodes among it), which a walk
+/// of a whole image costs, so it is kept per process and checked again for every job against
+/// what changes when the rootfs is replaced or touched: the root's inode and ctime, and the
+/// provisioning stamp's (`rootfs_stamp`, which the recipe touches after changing the rootfs in
+/// place). A change the stamp does not show, under a running runner, is found at its restart.
 pub fn rootfsFingerprint(arena: Allocator, io: std.Io, rootfs: []const u8) !Key {
+    const seen = try rootfsSeen(arena, rootfs);
     fp_mu.lockUncancelable(io);
     defer fp_mu.unlock(io);
-    if (fp_len > 0 and std.mem.eql(u8, fp_path[0..fp_len], rootfs)) return fp_key;
-    const k = try treeDigest(arena, io, rootfs, .metadata, .host);
+    if (fp_len > 0 and std.mem.eql(u8, fp_path[0..fp_len], rootfs) and
+        std.mem.eql(u8, &fp_seen, &seen)) return fp_key;
+    var h: KeyHasher = .plain("rootfs");
+    h.field(&try treeDigest(arena, io, rootfs, .metadata, .host));
+    h.field(&seen);
+    const k = h.final();
     if (rootfs.len <= fp_path.len) {
         @memcpy(fp_path[0..rootfs.len], rootfs);
         fp_len = rootfs.len;
         fp_key = k;
+        fp_seen = seen;
     }
     return k;
+}
+
+/// The file, in the rootfs, that says it was provisioned again: touched after changing it in place
+/// (docs/native-backend.md, "The rootfs").
+pub const rootfs_stamp = ".zig-runner-provisioned";
+
+/// What `rootfsFingerprint` checks for every job: the root's and the stamp's identity and ctime.
+fn rootfsSeen(arena: Allocator, rootfs: []const u8) !Key {
+    var h: KeyHasher = .plain("rootfs seen");
+    for ([_][]const u8{ "", rootfs_stamp }) |name| {
+        const p = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ rootfs, name }, 0);
+        var st: linux.Statx = undefined;
+        const mask: linux.STATX = .{ .INO = true, .CTIME = true };
+        const rc = linux.statx(linux.AT.FDCWD, p, linux.AT.SYMLINK_NOFOLLOW, mask, &st);
+        if (linux.errno(rc) != .SUCCESS) {
+            if (name.len == 0) return error.RootfsUnreadable;
+            h.field("none");
+            continue;
+        }
+        h.int(st.dev_major);
+        h.int(st.dev_minor);
+        h.int(st.ino);
+        h.int(@bitCast(st.ctime.sec));
+        h.int(st.ctime.nsec);
+    }
+    return h.final();
 }
 
 var fp_mu: std.Io.Mutex = .init;
 var fp_path: [std.Io.Dir.max_path_bytes]u8 = undefined;
 var fp_len: usize = 0;
 var fp_key: Key = undefined;
+var fp_seen: Key = undefined;
 
 // --- flattening ---
 
@@ -1083,4 +1127,33 @@ test "native store: a digest sees ids as the job's namespace does, never the hos
     try std.testing.expectEqual(@as(u32, 65534), (Ids{ .base = 1000, .count = 1 }).inside(0));
     try std.testing.expectEqual(@as(u32, 1001), (Ids{ .base = 1_900_000_000, .count = 65536 }).inside(1_900_001_001));
     try std.testing.expectEqual(@as(u32, 65534), (Ids{ .base = 1_900_000_000, .count = 65536 }).inside(1_900_065_536));
+}
+
+test "native store: the rootfs's fingerprint changes when the rootfs is changed in place" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "rootfs/usr/bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "rootfs/usr/bin/tool", .data = "v1" });
+    const rootfs = try tmp.dir.realPathFileAlloc(io, "rootfs", arena);
+    const first = try rootfsFingerprint(arena, io, rootfs);
+    try std.testing.expectEqualSlices(u8, &first, &try rootfsFingerprint(arena, io, rootfs));
+    // Provisioned again in place, as `tar -x` over it does: same size, mtime set back. The ctime
+    // moved, but only a new walk sees it; the stamp, touched after, makes the next job walk.
+    try tmp.dir.writeFile(io, .{ .sub_path = "rootfs/usr/bin/tool", .data = "v2" });
+    const tool = try std.fmt.allocPrintSentinel(arena, "{s}/usr/bin/tool", .{rootfs}, 0);
+    const t = [2]linux.timespec{ .{ .sec = 1, .nsec = 0 }, .{ .sec = 1, .nsec = 0 } };
+    _ = linux.utimensat(linux.AT.FDCWD, tool, &t, 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "rootfs/" ++ rootfs_stamp, .data = "" });
+    const second = try rootfsFingerprint(arena, io, rootfs);
+    try std.testing.expect(!std.mem.eql(u8, &first, &second));
+    // A walk sees an in-place change by its ctime even with the stamp untouched, as at a
+    // restart, when nothing is kept.
+    _ = linux.utimensat(linux.AT.FDCWD, tool, &t, 0);
+    fp_len = 0;
+    const third = try rootfsFingerprint(arena, io, rootfs);
+    try std.testing.expect(!std.mem.eql(u8, &second, &third));
 }
