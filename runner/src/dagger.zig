@@ -881,9 +881,11 @@ pub fn run(
 
 /// The job on the native backend (`native/Backend.zig`): no Dagger session, the same steps code.
 /// The step cache is the native layer store's (`native/Store.zig`). What the native backend has
-/// no counterpart for yet is off for the job: output keys, and the cache volumes (phase 4):
-/// package caches, Zig's local cache and seeds, and the tool cache's checked trees. They are
-/// caches, so a job's results do not depend on them.
+/// no counterpart for yet is off for the job: output keys, and the tool cache's checked trees (a
+/// replayed step that points into the tool cache's volume runs again, `Exec.tool_cache`). They
+/// are caches, so a job's results do not depend on them. The cache volumes, Zig's local cache
+/// and seeds are the backend's own (`native/volumes.zig`): off here for the shared code, which
+/// would ask a Dagger session for them, and handed to the backend as they were.
 fn runNative(
     arena: Allocator,
     io: std.Io,
@@ -914,6 +916,7 @@ fn runNative(
         }),
     );
     defer b.deinit();
+    b.caches = .of(opts_in);
     // Which ids the job's steps have, as "Set up job" says (`Backend.idsNote`).
     opts.backend_note = try b.idsNote(arena);
     return runSteps(arena, io, opts, job, &sh, results, b.transport(), &b);
@@ -1828,6 +1831,9 @@ fn runSteps(
     x.container_path = base.runtime_path;
     x.native = native;
     x.tool_trees = base.tool_trees;
+    // A native job's tool cache is its `toolcache` volume, in no layer, so a replayed step that
+    // points at a tree there runs again (#229): no tree is checked natively (`tool_trees`).
+    if (native) |b| x.tool_cache = b.cache_plan.tool_cache;
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
 
     var watch: Watch = .{ .io = io, .transport = transport, .cancel = opts.cancel };

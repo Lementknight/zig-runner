@@ -24,6 +24,9 @@ const registry = @import("oci/registry.zig");
 const ImageStore = @import("oci/Store.zig");
 const http = @import("../github/http.zig");
 const docker = @import("../dagger/docker.zig");
+const cgroup = @import("cgroup.zig");
+const volumes = @import("volumes.zig");
+const admission = @import("../admission.zig");
 const Exec = @import("../dagger/Exec.zig");
 const Evaluator = @import("../dagger/Evaluator.zig");
 const SpanDemux = @import("../dagger/JobLog.zig").SpanDemux;
@@ -56,7 +59,7 @@ image_uid: u32 = 0,
 image_gid: u32 = 0,
 /// A `container:` job's PATH once its env is set (`dagger.Base.runtime_path`).
 runtime_path: ?[]const u8 = null,
-/// What "Set up job" says of the image and its provisioning.
+/// What "Set up job" says of the image and its provisioning, the job's cgroup and its caches.
 notes: std.ArrayList([]const u8) = .empty,
 binds: []const sandbox.Spec.Bind,
 /// Held while the job runs (`lock`): a directory whose lock is free is stale (`sweep`).
@@ -101,6 +104,21 @@ subid_base: u32 = default_subid_base,
 /// `Config.subnet`: the job's address is its slot's in it.
 subnet: net.Subnet = .default,
 running: sandbox.Running = .{},
+/// The job's cgroup (`cgroup.zig`), when it has one; its events as last seen, so a step is told
+/// of the OOM kills and refused forks that happened while it ran.
+job_cgroup: ?cgroup.Job = null,
+limits: cgroup.Limits = .{ .memory_max = null, .pids_max = null },
+oom_kills: u64 = 0,
+pids_max_hits: u64 = 0,
+/// `Config.gate`: told of the job's cgroup, which it measures the job in.
+gate: ?*admission.Gate = null,
+/// What the job's options say of caches, and what it got of them (`setUpCaches`).
+caches: volumes.Options = .{},
+cache_plan: volumes.Plan = .{},
+/// The Zig cache seeds' layers, between the job's layers and the rootfs.
+seed_layers: std.ArrayList([]const u8) = .empty,
+/// Tests: the Zig cache seed's build, in place of downloading and running a Zig release.
+test_seed_script: ?[]const u8 = null,
 
 /// What the runner configures (`RUNNER_BACKEND=native`).
 pub const Config = struct {
@@ -135,6 +153,13 @@ pub const Config = struct {
     flatten_at: usize = default_flatten_at,
     /// Tests: `init` fails once the job's lock is the Backend's, as a failed network does.
     test_fail_after_lock: bool = false,
+    /// Where the jobs' cgroups go and their limits (`RUNNER_NATIVE_CGROUP`,
+    /// `RUNNER_NATIVE_MEMORY_MAX_MB`, `RUNNER_NATIVE_PIDS_MAX`).
+    cgroup: cgroup.Config = .{},
+    /// The runner's place at the memory gate: told of the job's cgroup (`admission.Gate.native`).
+    gate: ?*admission.Gate = null,
+    /// Tests: see `Backend.test_seed_script`.
+    test_seed_script: ?[]const u8 = null,
 };
 
 /// One layer of the job's overlay.
@@ -159,6 +184,13 @@ pub const min_subid_base: u32 = 100_000;
 /// The ids each job has on a root runner: 0 to 65535, as an image expects.
 pub const ids_per_slot: u32 = 65536;
 
+/// The first on-disk id of the cache volumes' files on a root runner (`volumes.zig`): the range
+/// just past the last slot's, owned by no host user and by no job, which each job sees as its
+/// own ids through an idmapped mount.
+pub fn volumeIdBase(subid_base: u32) u32 {
+    return subid_base + net.max_slots * ids_per_slot;
+}
+
 /// The native backend's settings from the runner's, or null when it runs steps on Dagger alone.
 pub fn configFor(
     arena: Allocator,
@@ -177,6 +209,11 @@ pub fn configFor(
         .subid_base = cfg.native_subid_base,
         .subnet = try net.Subnet.parse(cfg.native_subnet),
         .store_max_bytes = cfg.native_store_max_mb * 1024 * 1024,
+        .cgroup = .{
+            .parent = cfg.native_cgroup,
+            .memory_max_mb = cfg.native_memory_max_mb,
+            .pids_max = cfg.native_pids_max,
+        },
     };
 }
 
@@ -342,7 +379,10 @@ fn probe(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !?[]const u8
         if (try net.subnetClash(arena, io, cfg.subnet)) |why| return why;
         if (try natRulesFor(arena, io, cfg.subnet, true)) |why| return why;
     }
-    var b = try init(arena, io, gpa, cfg);
+    // Not a job: the gate measures none in it.
+    var probing = cfg;
+    probing.gate = null;
+    var b = try init(arena, io, gpa, probing);
     defer b.deinit();
     // Without the operator's rootfs, the default image as pulled: the probe then also says
     // whether this machine can pull.
@@ -412,7 +452,8 @@ pub fn idsClash(arena: Allocator, io: std.Io, first: u32, files: IdFiles) !?[]co
         "RUNNER_NATIVE_SUBID_BASE ({d}) is below {d}, where the host's own users and groups are",
         .{ first, min_subid_base },
     );
-    const end = @as(u64, first) + @as(u64, ids_per_slot) * net.max_slots;
+    // The slots' ranges, and the cache volumes' after them (`volumeIdBase`).
+    const end = @as(u64, first) + @as(u64, ids_per_slot) * (net.max_slots + 1);
     if (end > std.math.maxInt(u32)) return "RUNNER_NATIVE_SUBID_BASE leaves no room for the " ++
         "jobs' ids below 2^32";
     const cwd = std.Io.Dir.cwd();
@@ -480,7 +521,11 @@ fn usernsHere(io: std.Io) sandbox.Userns {
 /// directories (a runner that died) are removed first (`sweep`).
 pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend {
     try Store.prepare(arena, io, cfg.store);
-    sweep(arena, io, cfg.store);
+    const cg_parent = cgroup.parent(arena, io, cfg.cgroup.parent);
+    sweep(arena, io, cfg.store, switch (cg_parent) {
+        .dir => |d| d,
+        .none => null,
+    });
     var raw: [8]u8 = undefined;
     io.random(&raw);
     const id = std.fmt.bytesToHex(raw, .lower);
@@ -518,13 +563,65 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
         .store_cfg = .{ .root = cfg.store, .max_bytes = cfg.store_max_bytes },
         .vouched = cfg.vouched,
         .flatten_at = @max(2, cfg.flatten_at),
+        .gate = cfg.gate,
+        .test_seed_script = cfg.test_seed_script,
     };
     errdefer b.deinit();
     if (cfg.test_fail_after_lock) return error.TestFailure;
+    try b.jobCgroup(cfg, cg_parent, &id);
     b.binds = try b.jobBinds(cfg);
     if (b.how.userns == .mapped) try b.jobNetwork(cfg);
     return b;
 }
+
+/// The job's cgroup under `parent`, named as its directory is, with its limits; or none, and
+/// "Set up job" says why. The gate measures the job in it, or not at all.
+fn jobCgroup(b: *Backend, cfg: Config, parent: cgroup.Parent, name: []const u8) !void {
+    const arena = b.arena;
+    b.limits = cgroup.Limits.of(b.io, cfg.cgroup);
+    const why: []const u8 = switch (parent) {
+        .none => |w| w,
+        .dir => |dir| if (cgroup.Job.make(arena, dir, name, b.limits)) |j| {
+            b.job_cgroup = j;
+            try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: the job's " ++
+                "cgroup is {s}, with memory.max {f} and pids.max {f}.", .{
+                j.dir,
+                Limit.memory(b.limits.memory_max),
+                Limit.count(b.limits.pids_max),
+            }));
+            if (b.gate) |g| g.native(j.dir);
+            return;
+        } else |e| try std.fmt.allocPrint(arena, "it could not be made under {s}: {s}", .{
+            dir,
+            @errorName(e),
+        }),
+    };
+    try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: the job has no " ++
+        "cgroup of its own ({s}), so no memory or process limit of its own, and the memory " ++
+        "gate does not measure it.", .{why}));
+    if (b.gate) |g| g.native(null);
+}
+
+/// A limit for the log: bytes as GB, or a count; `max` for none.
+const Limit = struct {
+    value: ?u64,
+    bytes: bool = false,
+
+    fn memory(v: ?u64) Limit {
+        return .{ .value = v, .bytes = true };
+    }
+
+    fn count(v: ?u32) Limit {
+        return .{ .value = if (v) |c| c else null };
+    }
+
+    pub fn format(l: Limit, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const v = l.value orelse return w.writeAll("max");
+        if (l.bytes and v < 1 << 30) return w.print("{d} MB", .{v >> 20});
+        if (l.bytes) return w.print("{f}", .{admission.gb(v >> 20)});
+        try w.print("{d}", .{v});
+    }
+};
 
 /// The host's resolver and hosts over the image's (over files the image has), and the
 /// configured binds. On a root runner, the job's own network cannot reach a resolver on the
@@ -643,9 +740,14 @@ fn lockFile(arena: Allocator, io: std.Io, path: []const u8, wait: bool) !std.Io.
     return f;
 }
 
-/// The job's network taken down, its layers removed, its slot and lock let go.
+/// The job's network taken down, its layers removed, its volumes, cgroup, slot and lock let go.
 pub fn deinit(b: *Backend) void {
     const arena = b.arena;
+    b.cache_plan.release(b.io);
+    if (b.job_cgroup) |j| {
+        if (b.gate) |g| g.nativeDone();
+        j.remove(arena, b.io);
+    }
     if (b.slot) |s| {
         var sock = net.Socket.open() catch null;
         if (sock) |*so| {
@@ -669,9 +771,10 @@ fn detachNetns(arena: Allocator, path: []const u8) void {
 
 const removeTree = Store.removeTree;
 
-/// Removes the job directories no runner holds (their runner died), and their network
-/// namespaces' mounts. A directory still being made (`.new-`) is left alone.
-fn sweep(arena: Allocator, io: std.Io, store: []const u8) void {
+/// Removes the job directories no runner holds (their runner died), their network namespaces'
+/// mounts, and their cgroups under `cg_parent`. A directory still being made (`.new-`) is left
+/// alone.
+fn sweep(arena: Allocator, io: std.Io, store: []const u8, cg_parent: ?[]const u8) void {
     const jobs = std.fmt.allocPrint(arena, "{s}/jobs", .{store}) catch return;
     var dir = std.Io.Dir.cwd().openDir(io, jobs, .{ .iterate = true }) catch return;
     defer dir.close(io);
@@ -683,16 +786,17 @@ fn sweep(arena: Allocator, io: std.Io, store: []const u8) void {
         const held = lockFile(arena, io, lock, false) catch continue;
         defer held.close(io);
         detachNetns(arena, std.fmt.allocPrint(arena, "{s}/netns", .{path}) catch return);
+        if (cg_parent) |p| (cgroup.Job{
+            .dir = std.fmt.allocPrint(arena, "{s}/{s}", .{ p, e.name }) catch return,
+        }).remove(arena, io);
         removeTree(arena, io, path);
     }
 }
 
 /// The base every step starts from, as `set_up.baseContainerId` builds Dagger's: the image's
 /// env, the step user and its HOME, the job's workspace and RUNNER_TEMP, the event payload, the
-/// step markers' secret, GitHub's default variables and the job's `env:`, and the tool cache's
-/// directory. Package caches, uv's environment in its cache and Zig's local cache are not
-/// mounted: they are caches, and the native backend has no volumes before phase 4. On failure the
-/// reason is in `err_msg`.
+/// step markers' secret, GitHub's default variables and the job's `env:`, and its caches
+/// (`setUpCaches`). On failure the reason is in `err_msg`.
 ///
 /// Under step caching the store is on for the job, and the base is a layer like a step's: under
 /// a key (`keyFor`), replayed when the store has it. As `set_up.writeRunEnv` does, the event
@@ -706,6 +810,8 @@ pub fn base(
 ) !void {
     const arena = b.arena;
     try b.prepareRootfs(ev, plan, err_msg);
+    // On the job's image (the seed's build and the roll run on `b.rootfs`).
+    try b.setUpCaches(ev, plan);
     try b.baseEnv(ev, plan);
     if (plan.step_cache) b.store = b.store_cfg;
     b.repository = ev.job.github.repository;
@@ -721,20 +827,34 @@ pub fn base(
     // event payload goes in as `withNewFile` does.
     //
     // And RUNNER_TOOL_CACHE, which Dagger mounts in every job (`set_up.cachesUsed`) owned by the
-    // step user: the step user cannot make it under /opt, so a step installing into it failed
-    // natively. Until phase 4's volume is bound over it, it is the job's own, in the base layer,
-    // so what a step puts there is in the step's layer and comes back with its replay.
-    const chown = if (plan.as_runner) " && chown -R " ++ dagger.runner_user ++ ":" ++
-        dagger.runner_user ++ " " ++ dagger.work_root ++ " " ++ set_up.tool_cache_dir else "";
-    const mk = if (plan.provision) try std.fmt.allocPrint(arena, "mkdir -p {s} {s} {s}{s}", .{
+    // step user: the job's `toolcache` volume, bound there in every step (`volumes.plan`). A job
+    // with no volumes (package caches off, or no repository to key them by) has it in the base
+    // layer instead, made here: the step user cannot make it under /opt, and what a step puts
+    // there is then in the step's layer and comes back with its replay.
+    const tool_dir = if (b.cache_plan.tool_cache == null) " " ++ set_up.tool_cache_dir else "";
+    const chown = if (plan.as_runner) try std.fmt.allocPrint(arena, " && chown -R {s}:{s} {s}{s}", .{
+        dagger.runner_user,
+        dagger.runner_user,
+        dagger.work_root,
+        tool_dir,
+    }) else "";
+    // With `uv_env_in_cache`, `.venv` in the workspace links to uv's environment in its volume,
+    // as `set_up.writeProvisionAndWorkspace` makes it.
+    const link = if (b.cache_plan.uv_env) |e|
+        try std.fmt.allocPrint(arena, " && ln -sfn {s} {s}/.venv", .{ e, ev.workspace })
+    else
+        "";
+    const mk = if (plan.provision) try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}{s}{s}", .{
         ev.workspace,
         ev.temp,
-        set_up.tool_cache_dir,
+        tool_dir,
+        link,
         chown,
-    }) else try std.fmt.allocPrint(arena, "mkdir -p {s} {s} {s} 2>/dev/null || true", .{
+    }) else try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s} 2>/dev/null{s} || true", .{
         ev.workspace,
         ev.temp,
-        set_up.tool_cache_dir,
+        tool_dir,
+        link,
     });
     const mk_uid: u32 = if (plan.provision) 0 else b.uid;
     const mk_gid: u32 = if (plan.provision) 0 else b.gid;
@@ -780,6 +900,8 @@ fn baseEnv(b: *Backend, ev: *Evaluator, plan: anytype) !void {
         try b.put(kv[0..eq], kv[eq + 1 ..]);
     }
     if (b.envValue("PATH") == null) try b.put("PATH", image_path);
+    // Right after the image's own env, as `set_up.writeFrom` sets it.
+    for (b.cache_plan.early_env.items) |e| try b.put(e.name, e.value);
     // A `container:` job's own env, as `docker create -e` sets it; its PATH is the container's
     // (`Exec.container_path`).
     for (plan.container_env) |e| try b.put(e.name, e.value);
@@ -792,6 +914,7 @@ fn baseEnv(b: *Backend, ev: *Evaluator, plan: anytype) !void {
         try b.put("HOME", dagger.runner_home);
     }
     try b.put(dagger.mark_env, plan.mark);
+    for (b.cache_plan.env.items) |e| try b.put(e.name, e.value);
     for (try ev.defaultEnv()) |e| try b.put(e.name, e.value);
     for (try ev.withoutReapplied(ev.job_env.items)) |e| try b.put(e.name, e.value);
     b.workdir = ev.workspace;
@@ -818,105 +941,122 @@ pub fn execScript(
 ) !Exec.Out {
     const arena = b.arena;
     try b.applyPendingEnv(x);
-    const step_run = try x.resolveRunStep(resolved_in, secret_env_in, null);
-    const resolved = step_run.resolved;
-    const script = try scripts.stepScriptFc(arena, num, fc, resolved, action_name);
+    // Why the step runs again rather than replay its record (`Exec.execScript`'s, #229).
+    var rerun: ?[]const u8 = null;
+    while (true) {
+        const step_run = try x.resolveRunStep(resolved_in, secret_env_in, rerun);
+        const resolved = step_run.resolved;
+        const script = try scripts.stepScriptFc(arena, num, fc, resolved, action_name);
 
-    // Secret variables reach the script under their aliases (`scripts.secretAlias`), as Dagger's
-    // `withSecretVariable` gives them: only the name is in the script, so the value is in no
-    // command line (which any user on the host can read).
-    var extra: std.ArrayList(job_mod.EnvVar) = .empty;
-    for (step_run.secret_env, 0..) |s, i| try extra.append(arena, .{
-        .name = try scripts.secretAlias(arena, i),
-        .value = plaintext(x, s.id),
-    });
-    // A script holding a secret is a file the sandbox writes and removes, as Dagger mounts it.
-    var files: std.ArrayList(sandbox.Spec.File) = .empty;
-    if (step_run.script_secret != null) try files.append(arena, .{
-        .path = try scripts.scriptPath(arena, fc, resolved.run.shell),
-        .contents = resolved.run.script,
-    });
+        // Secret variables reach the script under their aliases (`scripts.secretAlias`), as Dagger's
+        // `withSecretVariable` gives them: only the name is in the script, so the value is in no
+        // command line (which any user on the host can read).
+        var extra: std.ArrayList(job_mod.EnvVar) = .empty;
+        for (step_run.secret_env, 0..) |s, i| try extra.append(arena, .{
+            .name = try scripts.secretAlias(arena, i),
+            .value = plaintext(x, s.id),
+        });
+        // A script holding a secret is a file the sandbox writes and removes, as Dagger mounts it.
+        var files: std.ArrayList(sandbox.Spec.File) = .empty;
+        if (step_run.script_secret != null) try files.append(arena, .{
+            .path = try scripts.scriptPath(arena, fc, resolved.run.shell),
+            .contents = resolved.run.script,
+        });
 
-    const step_env = switch (resolved) {
-        .run => |r| r.env,
-        .checkout => &.{},
-    };
-    x.sh.beginCommands(num, try dagger.envContext(arena, x.ev.job_env.items, step_env));
-    x.beginExec(num);
-    const always_run = switch (resolved) {
-        .run => |r| r.always_run != null,
-        .checkout => false,
-    };
-    // A step with a secret file always runs already; the check keeps any such file out of a key.
-    const key = if (always_run or files.items.len > 0)
-        null
-    else
-        try b.keyFor(.step, script, &.{}, b.uid, b.gid);
-    const claim = b.claimKey(key) catch |e| switch (e) {
-        error.Stopped => {
+        const step_env = switch (resolved) {
+            .run => |r| r.env,
+            .checkout => &.{},
+        };
+        x.sh.beginCommands(num, try dagger.envContext(arena, x.ev.job_env.items, step_env));
+        x.beginExec(num);
+        const always_run = switch (resolved) {
+            .run => |r| r.always_run != null,
+            .checkout => false,
+        };
+        // A step with a secret file always runs already; the check keeps any such file out of a key.
+        const key = if (always_run or files.items.len > 0)
+            null
+        else
+            try b.keyFor(.step, script, &.{}, b.uid, b.gid);
+        const claim = b.claimKey(key) catch |e| switch (e) {
+            error.Stopped => {
+                x.err_msg = "the step was stopped";
+                return error.EngineFailed;
+            },
+            else => return e,
+        };
+        defer claim.release(b.io);
+        if (claim.hit) |rec| {
+            const data = try recordAnswer(arena, rec);
+            // A record that points into the tool cache's volume, which is in no layer: the volume
+            // may have lost the tree since, and no tree is checked natively, so the step runs again.
+            if (rerun == null) if (try x.toolDirNotHeld(data)) |dir| {
+                rerun = try std.fmt.allocPrint(arena, "its record names {s} in the tool cache, " ++
+                    "a volume in no layer", .{dir});
+                continue;
+            };
+            const out = try x.collect(num, data, .{ .doc = "", .at = 0 });
+            x.loadPendingMatchers(num);
+            return out;
+        }
+
+        var demux: SpanDemux = .{ .sh = x.sh, .gpa = b.gpa };
+        defer demux.deinit();
+        var live: Live = .{
+            .demux = &demux,
+            .arena = arena,
+            .record = if (claim.key != null) .empty else null,
+        };
+        const ended = try b.exec(
+            script,
+            try b.envStrings(extra.items),
+            files.items,
+            b.uid,
+            b.gid,
+            live.output(),
+        );
+        const layer = b.layers.items[b.layers.items.len - 1].path;
+        // The helper removes it; when it was stopped before it could, the runner does, so no later
+        // step's layers hold the secret.
+        for (files.items) |f| sandbox.unlinkIn(arena, layer, f.path);
+        // Every line is in: the pipe is closed only once every process of the step has ended.
+        demux.flushPartial();
+        try b.limitsReached(x, num);
+        x.sh.ended[num - 1].store(true, .release);
+        x.sh.flush();
+        if (ended.failure.len > 0) {
+            x.err_msg = ended.failure;
+            return error.EngineFailed;
+        }
+        if (ended.killed) {
             x.err_msg = "the step was stopped";
             return error.EngineFailed;
-        },
-        else => return e,
-    };
-    defer claim.release(b.io);
-    if (claim.hit) |rec| return b.replay(x, num, rec);
-
-    var demux: SpanDemux = .{ .sh = x.sh, .gpa = b.gpa };
-    defer demux.deinit();
-    var live: Live = .{
-        .demux = &demux,
-        .arena = arena,
-        .record = if (claim.key != null) .empty else null,
-    };
-    const ended = try b.exec(
-        script,
-        try b.envStrings(extra.items),
-        files.items,
-        b.uid,
-        b.gid,
-        live.output(),
-    );
-    const layer = b.layers.items[b.layers.items.len - 1].path;
-    // The helper removes it; when it was stopped before it could, the runner does, so no later
-    // step's layers hold the secret.
-    for (files.items) |f| sandbox.unlinkIn(arena, layer, f.path);
-    // Every line is in: the pipe is closed only once every process of the step has ended.
-    demux.flushPartial();
-    x.sh.ended[num - 1].store(true, .release);
-    x.sh.flush();
-    if (ended.failure.len > 0) {
-        x.err_msg = ended.failure;
-        return error.EngineFailed;
+        }
+        const all_path = try scripts.fcPath(arena, "all", fc);
+        const all = switch (try sandbox.readIn(arena, layer, all_path, max_read)) {
+            .text => |t| t,
+            .missing, .whiteout => null,
+        };
+        var answer: std.Io.Writer.Allocating = .init(arena);
+        try std.json.Stringify.value(.{
+            .exitCode = ended.code,
+            .fc_all = if (all) |text| .{ .contents = text } else null,
+        }, .{ .emit_null_optional_fields = false }, &answer.writer);
+        const data = try std.json.parseFromSliceLeaky(std.json.Value, arena, answer.written(), .{});
+        const out = try x.collect(num, data, .{ .doc = "", .at = 0 });
+        x.loadPendingMatchers(num);
+        if (claim.key) |k| if (ended.code == 0 and out.code == 0) if (live.record) |r|
+            b.publishTop(k, .step, .{ .log = r.items, .fc = all orelse "" });
+        return out;
     }
-    if (ended.killed) {
-        x.err_msg = "the step was stopped";
-        return error.EngineFailed;
-    }
-    const all_path = try scripts.fcPath(arena, "all", fc);
-    const all = switch (try sandbox.readIn(arena, layer, all_path, max_read)) {
-        .text => |t| t,
-        .missing, .whiteout => null,
-    };
-    var answer: std.Io.Writer.Allocating = .init(arena);
-    try std.json.Stringify.value(.{
-        .exitCode = ended.code,
-        .fc_all = if (all) |text| .{ .contents = text } else null,
-    }, .{ .emit_null_optional_fields = false }, &answer.writer);
-    const data = try std.json.parseFromSliceLeaky(std.json.Value, arena, answer.written(), .{});
-    const out = try x.collect(num, data, .{ .doc = "", .at = 0 });
-    x.loadPendingMatchers(num);
-    if (claim.key) |k| if (ended.code == 0 and out.code == 0) if (live.record) |r|
-        b.publishTop(k, .step, .{ .log = r.items, .fc = all orelse "" });
-    return out;
 }
 
-/// A stored step's record replayed (`execScript`): its exit code 0, its output and its file
-/// commands as Dagger's answer for an exec served from its cache gives them. Its file commands'
-/// ran marker is the earlier job's, so `Exec.collect` replays the output (`JobLog.replayNotLive`)
-/// and the job's end notes the step as reused (`JobLog.native_reused_note`).
-fn replay(b: *Backend, x: *Exec, num: u32, rec: Store.Record) !Exec.Out {
-    const arena = b.arena;
+/// A stored step's record as Dagger's answer for an exec served from its cache gives it
+/// (`execScript` replays it): its exit code 0, its output and its file commands. Its file
+/// commands' ran marker is the earlier job's, so `Exec.collect` replays the output
+/// (`JobLog.replayNotLive`) and the job's end notes the step as reused
+/// (`JobLog.native_reused_note`).
+fn recordAnswer(arena: Allocator, rec: Store.Record) !std.json.Value {
     // Built as values, not JSON text: a log need not be UTF-8.
     var fc_all: std.json.ObjectMap = .empty;
     try fc_all.put(arena, "contents", .{ .string = rec.fc });
@@ -925,9 +1065,150 @@ fn replay(b: *Backend, x: *Exec, num: u32, rec: Store.Record) !Exec.Out {
     try data.put(arena, "stdout", .{ .string = rec.log });
     try data.put(arena, "stderr", .{ .string = "" });
     try data.put(arena, "fc_all", .{ .object = fc_all });
-    const out = try x.collect(num, .{ .object = data }, .{ .doc = "", .at = 0 });
-    x.loadPendingMatchers(num);
-    return out;
+    return .{ .object = data };
+}
+
+/// Says in the step's log when the job's cgroup killed a process of the step for memory or
+/// refused it a process (`cgroup.Usage`): a step otherwise sees only an exit code 137 or a
+/// failed fork, and the job would not know it hit its own limits.
+fn limitsReached(b: *Backend, x: *Exec, num: u32) !void {
+    const j = b.job_cgroup orelse return;
+    const u = j.usage(b.io);
+    defer {
+        b.oom_kills = u.oom_kills;
+        b.pids_max_hits = u.pids_max_hits;
+    }
+    if (u.oom_kills > b.oom_kills) x.sh.errorLine(num, try std.fmt.allocPrint(
+        b.arena,
+        "The job reached its memory limit ({f}, RUNNER_NATIVE_MEMORY_MAX_MB): the kernel " ++
+            "killed {d} process(es) of this step to stay within it.",
+        .{ Limit.memory(b.limits.memory_max), u.oom_kills - b.oom_kills },
+    ));
+    if (u.pids_max_hits > b.pids_max_hits) x.sh.errorLine(num, try std.fmt.allocPrint(
+        b.arena,
+        "The job reached its process limit ({f}, RUNNER_NATIVE_PIDS_MAX): this step was " ++
+            "refused {d} new process(es) or thread(s).",
+        .{ Limit.count(b.limits.pids_max), u.pids_max_hits - b.pids_max_hits },
+    ));
+}
+
+/// The job's cache volumes, as the Dagger backend gives them (`volumes.plan`): held for the job
+/// and bound into every step, Zig's local cache rolled to its next generation when it is over
+/// its limit, and the Zig cache seeds built when missing and added below the job's layers. A
+/// seed that cannot be built is left out, as on Dagger: caches never fail a job.
+fn setUpCaches(b: *Backend, ev: *Evaluator, plan: anytype) !void {
+    const arena = b.arena;
+    const job = ev.job.*;
+    const scope = try set_up.packageCacheScope(arena, ev, job.github.repository, b.caches.trusted);
+    const owner: ?u32 = if (b.how.userns == .mapped) volumeIdBase(b.subid_base) else null;
+    b.cache_plan = try volumes.plan(
+        arena,
+        b.io,
+        b.store_cfg.root,
+        b.caches,
+        scope,
+        job,
+        plan.job_image,
+        plan.as_runner,
+        plan.step_cache,
+        owner,
+    );
+    try b.notes.appendSlice(arena, b.cache_plan.notes.items);
+    // Before the volumes are bound: nothing a job wrote may reach a seed, which every scope's
+    // jobs run with.
+    if (b.cache_plan.seeds.items.len > 0) try b.seeds(plan.as_runner);
+    b.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ b.binds, b.cache_plan.binds.items });
+    if (b.cache_plan.zig_local_roll != null) b.rollZigLocal(plan.as_runner);
+}
+
+/// `set_up.zig_local_roll_script` on the job's Zig local-cache volume, as root, in a sandbox
+/// whose layer is dropped, as the Dagger backend runs it in a container of its own. Nothing of
+/// it fails the job: a cache that did not roll is only bigger.
+fn rollZigLocal(b: *Backend, as_runner: bool) void {
+    const arena = b.arena;
+    // A nonce for the script's temporary link, as on Dagger.
+    var raw: [8]u8 = undefined;
+    b.io.random(&raw);
+    const script = std.fmt.allocPrint(arena, "set -- {s} {d} '{s}' {s}\n{s}", .{
+        set_up.zigLocalCacheDir(as_runner),
+        @as(u64, b.caches.zig_local_cache_max_mb) * 1024,
+        if (as_runner) "1001:1001" else "",
+        &std.fmt.bytesToHex(raw, .lower),
+        set_up.zig_local_roll_script,
+    }) catch return;
+    var out: Captured = .{ .arena = arena };
+    const ended = b.exec(script, &.{"PATH=" ++ image_path}, &.{}, 0, 0, out.output()) catch |e| {
+        std.log.warn("native: Zig local cache not rolled: {s}", .{@errorName(e)});
+        return;
+    };
+    b.dropLastLayer();
+    if (ended.failure.len > 0 or ended.code != 0)
+        std.log.warn("native: Zig local cache not rolled: {s}{s}", .{ ended.failure, out.tail() });
+}
+
+/// The job's Zig cache seeds, each built once per release, architecture and step user, under a
+/// lock so two jobs do not build one twice (`volumes.adoptSeed`), and stacked below the job's
+/// layers; "Set up job" says which.
+fn seeds(b: *Backend, as_runner: bool) !void {
+    const arena = b.arena;
+    var seeded: std.ArrayList([]const u8) = .empty;
+    var failure: ?[]const u8 = null;
+    for (b.cache_plan.seeds.items) |s| {
+        if (b.seed(s, as_runner)) |why| {
+            failure = why;
+            continue;
+        }
+        try b.seed_layers.append(arena, s.dir);
+        try seeded.append(arena, s.seed.version);
+    }
+    if (try volumes.seedNote(arena, b.caches, seeded.items, failure)) |note|
+        try b.notes.append(arena, note);
+}
+
+/// Builds `seed` unless it is there; null when it is, else why not.
+fn seed(b: *Backend, s: volumes.Seed, as_runner: bool) ?[]const u8 {
+    const arena = b.arena;
+    const cwd = std.Io.Dir.cwd();
+    if (cwd.access(b.io, s.dir, .{})) |_| return null else |_| {}
+    const seeds_dir = std.fs.path.dirname(s.dir).?;
+    cwd.createDirPath(b.io, seeds_dir) catch |e| return @errorName(e);
+    // Only the runner's user may look in, as in the volumes'.
+    const seeds_z = arena.dupeSentinel(u8, seeds_dir, 0) catch return "out of memory";
+    _ = std.os.linux.chmod(seeds_z, 0o700);
+    const lock = lockFile(arena, b.io, std.fmt.allocPrint(arena, "{s}.lock", .{s.dir}) catch
+        return "out of memory", true) catch |e| return @errorName(e);
+    defer lock.close(b.io);
+    if (cwd.access(b.io, s.dir, .{})) |_| return null else |_| {}
+    const script = b.test_seed_script orelse set_up.zigSeedScript(arena, s.seed) catch
+        return "out of memory";
+    const files = [_]sandbox.Spec.File{.{
+        .path = set_up.zig_seed_project ++ "/build.zig",
+        .contents = set_up.zig_seed_build_zig,
+        .mode = 0o644,
+        .keep = true,
+    }};
+    var out: Captured = .{ .arena = arena };
+    const env = [_][]const u8{ "PATH=" ++ image_path, "HOME=/root" };
+    const ended = b.exec(script, &env, &files, 0, 0, out.output()) catch |e| return @errorName(e);
+    defer b.dropLastLayer();
+    if (ended.failure.len > 0) return ended.failure;
+    if (ended.code != 0) return std.fmt.allocPrint(arena, "its build exited {d}: {s}", .{
+        ended.code,
+        out.tail(),
+    }) catch "its build failed";
+    const built = std.fmt.allocPrint(arena, "{s}/{s}", .{
+        b.layers.items[b.layers.items.len - 1].path,
+        std.mem.trimStart(u8, set_up.zig_seed_dir, "/"),
+    }) catch return "out of memory";
+    const user: ?u32 = if (b.how.userns != .mapped) null else if (as_runner) runner_uid else 0;
+    volumes.adoptSeed(arena, b.io, built, s, b.rootfs, user) catch |e| return @errorName(e);
+    return null;
+}
+
+/// The last exec's layer removed: it was not a step's (a seed's build, a roll).
+fn dropLastLayer(b: *Backend) void {
+    removeTree(b.arena, b.io, b.layers.items[b.layers.items.len - 1].path);
+    _ = b.layers.pop();
 }
 
 /// The built-in checkout on this backend: the repository fetched by git in the job's image, as
@@ -1102,9 +1383,12 @@ fn exec(
         _ = std.os.linux.chown(p, base_id, base_id);
         _ = std.os.linux.chmod(p, 0o755);
     }
-    const lowers = try arena.alloc([]const u8, b.layers.items.len + 1);
-    for (b.layers.items, 0..) |l, i| lowers[b.layers.items.len - 1 - i] = l.name;
-    lowers[b.layers.items.len] = b.rootfs;
+    // The job's layers, newest first, then the seeds' and the rootfs: the image's own.
+    const n = b.layers.items.len;
+    const lowers = try arena.alloc([]const u8, n + b.seed_layers.items.len + 1);
+    for (b.layers.items, 0..) |l, i| lowers[n - 1 - i] = l.name;
+    @memcpy(lowers[n .. lowers.len - 1], b.seed_layers.items);
+    lowers[lowers.len - 1] = b.rootfs;
     const ended = try sandbox.run(arena, b.io, b.how.argv_prefix, .{
         .root = b.dir,
         .lowers = lowers,
@@ -1122,6 +1406,9 @@ fn exec(
         .id_base = base_id,
         .id_count = ids_per_slot,
         .netns = b.netns,
+        .cgroup = if (b.job_cgroup) |j| j.dir else null,
+        .image_layers = @intCast(b.seed_layers.items.len + 1),
+        .volume_id_base = volumeIdBase(b.subid_base),
     }, &b.running, out);
     try b.layers.append(arena, .{ .name = upper, .path = upper_path });
     return ended;
@@ -1176,8 +1463,9 @@ fn keyFor(
 /// pull request never replays, or leaves, a layer its repository's own jobs use), the rootfs's
 /// fingerprint, how ids are mapped and, on a root runner, the slot's first id (a layer's
 /// files are owned by its job's range, so a layer is reused only by jobs with the same range: only
-/// misses come of it), and the binds (where, not what: mounts' content is in no key). Null, and the
-/// job uncached, when the rootfs cannot be read.
+/// misses come of it), the binds (where, not what: mounts' content is in no key), and the Zig cache
+/// seeds' layers between the rootfs and the job's (a layer replayed over another seed would show
+/// the wrong files). Null, and the job uncached, when the rootfs cannot be read.
 fn below(b: *Backend) ?Store.Key {
     const fp = Store.rootfsFingerprint(b.arena, b.io, b.rootfs) catch |e| {
         std.log.warn("native: the rootfs's fingerprint: {s}; the job's steps are not cached", .{
@@ -1194,6 +1482,7 @@ fn below(b: *Backend) ?Store.Key {
         .userns = @tagName(b.how.userns),
         .id_base = if (b.how.userns == .mapped) b.idBase() else 0,
         .binds = b.binds,
+        .seeds = b.seed_layers.items,
     }, null);
 }
 
@@ -1206,10 +1495,15 @@ pub const Below = struct {
     userns: []const u8,
     id_base: u64,
     binds: []const sandbox.Spec.Bind,
+    /// The Zig cache seeds' layers (`volumes.Seed`), by path, which names the release,
+    /// architecture and step user each was built for, once.
+    seeds: []const []const u8 = &.{},
 };
 
 /// `below`'s digest (`KeyHasher.plain("below a base")`, then each field). `bytes`, when given,
 /// receives the preimage: P8's key vectors (`key_vectors.zig`) check it against the model's.
+/// The seeds and which binds are cache volumes (`Bind.volume`) come last, and only when the job
+/// has either (the model's `belowTail`): a job with neither hashes what it did before P4.
 pub fn belowKey(in: Below, bytes: ?*std.Io.Writer) Store.Key {
     var h: Store.KeyHasher = .{ .h = .init(.{}), .bytes = bytes };
     h.field("below a base");
@@ -1225,6 +1519,15 @@ pub fn belowKey(in: Below, bytes: ?*std.Io.Writer) Store.Key {
         h.field(bd.at);
         h.int(@intFromBool(bd.read_only));
         h.int(@intFromBool(bd.optional));
+    }
+    var volumes_bound = false;
+    for (in.binds) |bd| volumes_bound = volumes_bound or bd.volume;
+    if (in.seeds.len > 0 or volumes_bound) {
+        h.int(in.seeds.len);
+        for (in.seeds) |l| h.field(l);
+        // Each bind's flag, or none when no bind is a volume (the model's empty `volumes`).
+        h.int(if (volumes_bound) in.binds.len else 0);
+        if (volumes_bound) for (in.binds) |bd| h.int(@intFromBool(bd.volume));
     }
     return h.final();
 }
@@ -2347,25 +2650,53 @@ test "a native job's tool cache is the step user's, as on Dagger; a later step f
             });
             try std.testing.expect(made.term == .exited and made.term.exited == 0);
         }
-        const r = try runNativeJob(arena, cfg, testJob(&.{ s1, s2 }), user);
-        for (r.res.steps) |st| if (st.outcome != .success) {
-            std.debug.print("as {s}: engine {s}\n{s}\n", .{
-                @tagName(user),
-                r.res.engine_error orelse "-",
-                r.text,
+        // Without package caches the base makes it, in the base layer; with them it is the
+        // job's `toolcache` volume (`volumes.plan`), seen as the step user's through the
+        // volumes' idmapped mount on a root runner.
+        for ([_]bool{ false, true }) |caches| {
+            const r = try runCachedJob(arena, cfg, testJob(&.{ s1, s2 }), .{
+                .package_caches = caches,
+                .trusted = true,
+            }, .{ .user = user });
+            const uid: u32 = if (user == .runner) runner_uid else 0;
+            // Its output, not the script's text, which the log has too.
+            try expectLines(r.text, &.{
+                "stdout] cache=" ++ set_up.tool_cache_dir,
+                "stdout] cache-there",
+                try std.fmt.allocPrint(arena, "stdout] owner={d} mode=755", .{uid}),
+                try std.fmt.allocPrint(arena, "stdout] owner={d} mode=644", .{uid}),
+                "stdout] found-installed",
             });
-            return error.TestUnexpectedResult;
-        };
-        const uid: u32 = if (user == .runner) runner_uid else 0;
-        // Its output, not the script's text, which the log has too.
-        try expectLines(r.text, &.{
-            "stdout] cache=" ++ set_up.tool_cache_dir,
-            "stdout] cache-there",
-            try std.fmt.allocPrint(arena, "stdout] owner={d} mode=755", .{uid}),
-            try std.fmt.allocPrint(arena, "stdout] owner={d} mode=644", .{uid}),
-            "stdout] found-installed",
-        });
+        }
     }
+}
+
+test "native tool cache volume: a replayed step that points into it runs again (#229)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    const caches: volumes.Options = .{ .package_caches = true, .trusted = true };
+    // With the volumes bound, a step is replayed as before.
+    const plain = testJob(&.{testStep("echo x >> /shared/plain")});
+    _ = try runCachedJob(arena, c.cfg, plain, caches, .{ .ran = "j1" });
+    _ = try runCachedJob(arena, c.cfg, plain, caches, .{ .ran = "j2" });
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "plain"));
+    // One that installs into the tool cache and puts the tree on PATH: its tree is in the
+    // volume, in no layer, and no tree is checked natively, so its record is not trusted.
+    const install = testJob(&.{testStep("echo x >> /shared/install; " ++
+        "mkdir -p $RUNNER_TOOL_CACHE/t/1 && echo $RUNNER_TOOL_CACHE/t/1 >> $GITHUB_PATH")});
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j3" });
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j4" });
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "install"));
+    // Without the volume, the tree is in the step's layer and comes back with its replay.
+    const in_layer = testJob(&.{testStep("echo x >> /shared/layer; " ++
+        "mkdir -p $RUNNER_TOOL_CACHE/t/2 && echo $RUNNER_TOOL_CACHE/t/2 >> $GITHUB_PATH")});
+    _ = try runCachedJob(arena, c.cfg, in_layer, .{}, .{ .ran = "j5" });
+    _ = try runCachedJob(arena, c.cfg, in_layer, .{}, .{ .ran = "j6" });
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "layer"));
 }
 
 test "a native step is contained: pivot_root, masked /proc, Docker's capabilities, no_new_privs" {
@@ -2714,7 +3045,8 @@ test "the jobs' ids: each range the host already uses, or may, is refused" {
     const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
     const Case = struct { file: []const u8, text: []const u8, reason: []const u8 };
     const first: u32 = 2_000_000;
-    const end = first + ids_per_slot * net.max_slots;
+    // The slots' ranges and the cache volumes' after them.
+    const end = first + ids_per_slot * (net.max_slots + 1);
     const cases = [_]Case{
         .{
             .file = "subuid",
@@ -2752,7 +3084,7 @@ test "the jobs' ids: each range the host already uses, or may, is refused" {
         try expectReason(c.reason, try idsClash(arena, io, first, files));
         try tmp.dir.writeFile(io, .{ .sub_path = c.file, .data = "x:1000:1000\n" });
     }
-    // The id just past the last slot's range is someone else's to have.
+    // The id just past the cache volumes' range is someone else's to have.
     try tmp.dir.writeFile(io, .{
         .sub_path = "passwd",
         .data = try std.fmt.allocPrint(arena, "next:x:{d}:1::/:/bin/sh\n", .{end}),
@@ -2762,7 +3094,7 @@ test "the jobs' ids: each range the host already uses, or may, is refused" {
     try expectReason("2^32", try idsClash(arena, io, std.math.maxInt(u32) - ids_per_slot, files));
     // The default range clears systemd's container and foreign ranges, below 2^31.
     try std.testing.expect(default_subid_base > 1_879_048_191);
-    try std.testing.expect(default_subid_base + ids_per_slot * net.max_slots <= 2_147_352_576);
+    try std.testing.expect(volumeIdBase(default_subid_base) + ids_per_slot <= 2_147_352_576);
 }
 
 test "a failed probe is tried again after its back-off; a success holds" {
@@ -2946,7 +3278,8 @@ test "native provisioning: a step on the pulled image, flattened and kept under 
         std.debug.print("provision: {s}\n", .{err_msg});
         return e;
     };
-    try std.testing.expect(std.mem.indexOf(u8, b.notes.items[0], "Provisioned natively") != null);
+    // The last note: `init`'s about the job's cgroup come first.
+    try std.testing.expect(std.mem.indexOf(u8, b.notes.getLast(), "Provisioned natively") != null);
     var root = try std.Io.Dir.cwd().openDir(std.testing.io, rootfs, .{});
     defer root.close(std.testing.io);
     const io = std.testing.io;
@@ -2961,7 +3294,7 @@ test "native provisioning: a step on the pulled image, flattened and kept under 
     try std.testing.expectEqual(@as(usize, 0), b.layers.items.len);
     // Made once: a second job reuses it.
     _ = try b.provision(pulled, script, &err_msg);
-    try std.testing.expect(std.mem.indexOf(u8, b.notes.items[1], "made before") != null);
+    try std.testing.expect(std.mem.indexOf(u8, b.notes.getLast(), "made before") != null);
     // A failing script fails with its output's last line, and leaves nothing under its key.
     try std.testing.expectError(error.BaseContainerFailed, b.provision(pulled, "echo the reason; exit 7", &err_msg));
     try std.testing.expect(std.mem.indexOf(u8, err_msg, "the reason (exit 7)") != null);
@@ -3410,4 +3743,302 @@ test "native step cache: a fork's pull request keys its layers apart from its re
     try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "s"));
     try expectSucceeded(try runCached(arena, c.cfg, fork, "j4"));
     try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "s"));
+}
+
+/// A native job with the cache options a runner gives it (`volumes.Options`), as `how.user`
+/// (root by default), under step caching as the job whose ran marker is `how.ran` when given.
+fn runCachedJob(
+    arena: Allocator,
+    cfg: Config,
+    job: job_mod.Job,
+    caches: volumes.Options,
+    how: struct { user: config.StepUser = .root, ran: ?[]const u8 = null },
+) !struct { res: dagger.Result, text: []const u8 } {
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = how.user,
+        .step_cache = how.ran != null,
+        .test_ran_marker = how.ran,
+        .gpa = std.testing.allocator,
+        .package_caches = caches.package_caches,
+        .trusted = caches.trusted,
+        .uv_env_in_cache = caches.uv_env_in_cache,
+        .zig_local_cache = caches.zig_local_cache,
+        .zig_local_cache_max_mb = caches.zig_local_cache_max_mb,
+        .zig_seeds = caches.zig_seeds,
+        .zig_seeds_unverified = caches.zig_seeds_unverified,
+    }, job, &log);
+    const text = w.written();
+    for (res.steps) |s| if (s.outcome != .success) {
+        std.debug.print("a step {s}, engine {s}\n{s}\n", .{
+            @tagName(s.outcome),
+            res.engine_error orelse "-",
+            text,
+        });
+        return error.TestUnexpectedResult;
+    };
+    return .{ .res = res, .text = text };
+}
+
+test "native cache volumes: kept between jobs, apart by scope, Zig's local cache rolled, the seed below" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    // The seed's build, without a Zig release to download: a file where Zig's cache would be.
+    cfg.test_seed_script = "mkdir -p /zig-seed/o/s && echo seeded > /zig-seed/o/s/f";
+    const caches: volumes.Options = .{
+        .package_caches = true,
+        .trusted = true,
+        .zig_local_cache = true,
+        .zig_local_cache_max_mb = 1,
+        .zig_seeds = &.{.{ .version = "0.0.1", .sha256 = "00" }},
+    };
+
+    // The first job fills npm's volume, Zig's package volume and its local cache (2 MB, over
+    // its 1 MB limit), and finds the seed under Zig's global cache.
+    const fill = testStep("echo from-the-first > /root/.npm/marker # npm\n" ++
+        "stat -c 'npm owner %u:%g' /root/.npm\n" ++
+        "grep ' /root/.npm ' /proc/self/mountinfo | grep -q 'nosuid,nodev' && echo npm-nosuid\n" ++
+        "echo tarball > /root/.cache/zig/p/t # zig\n" ++
+        "cat /root/.cache/zig/o/s/f; echo own > /root/.cache/zig/o/mine\n" ++
+        "echo ZIG_LOCAL=$ZIG_LOCAL_CACHE_DIR\n" ++
+        "head -c 2000000 /dev/zero > $ZIG_LOCAL_CACHE_DIR/big");
+    const first = try runCachedJob(arena, cfg, testJob(&.{fill}), caches, .{});
+    try expectLines(first.text, &.{
+        "npm owner 0:0",
+        "npm-nosuid",
+        "seeded",
+        "ZIG_LOCAL=/root/.cache/zig-local/current",
+        "Zig global cache seeded from Zig 0.0.1",
+    });
+    const npm = try std.fmt.allocPrint(arena, "{s}/volumes/o/r/repo/npm", .{cfg.store});
+    try std.testing.expectEqualStrings("from-the-first\n", try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        try std.fmt.allocPrint(arena, "{s}/marker", .{npm}),
+        arena,
+        .limited(64),
+    ));
+    if (std.os.linux.geteuid() == 0) {
+        // On disk, the volumes' own range, which no host user and no slot has.
+        var st: std.os.linux.Statx = undefined;
+        const p = try arena.dupeSentinel(u8, npm, 0);
+        _ = std.os.linux.statx(std.os.linux.AT.FDCWD, p, 0, .{ .UID = true }, &st);
+        try std.testing.expectEqual(volumeIdBase(cfg.subid_base), st.uid);
+    }
+
+    // The next job of the repository finds them; what the first added to its global cache was
+    // its own; the local cache rolled to its next generation; the seed was not built again.
+    cfg.test_seed_script = "exit 1";
+    const read = testStep("cat /root/.npm/marker # npm\ncat /root/.cache/zig/p/t # zig\n" ++
+        "test -e /root/.cache/zig/o/mine && echo leaked || echo global-cache-own\n" ++
+        "readlink /root/.cache/zig-local/current");
+    const second = try runCachedJob(arena, cfg, testJob(&.{read}), caches, .{});
+    try expectLines(second.text, &.{
+        "from-the-first",
+        "tarball",
+        "global-cache-own",
+        "gen-1",
+        "Zig global cache seeded from Zig 0.0.1",
+    });
+
+    // A job the runner does not trust with the repository's caches (a fork's pull request) has
+    // its own, empty, and no shared Zig local cache.
+    var untrusted = caches;
+    untrusted.trusted = false;
+    const apart = testStep("test -e /root/.npm/marker && echo leaked || echo npm-own # npm\n" ++
+        "test -e /root/.cache/zig-local/big && echo leaked || echo zig-local-own");
+    const third = try runCachedJob(arena, cfg, testJob(&.{apart}), untrusted, .{});
+    try expectLines(third.text, &.{
+        "npm-own",
+        "zig-local-own",
+        "Zig local cache: this job's own (not kept between untrusted jobs)",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, third.text, "stdout] leaked") == null);
+}
+
+/// The cgroup parent the cgroup tests use: a tree of the tests' own as root (its memory.max is
+/// set by the gate's test), or `ZIG_RUNNER_TEST_CGROUP` (`self` under `systemd-run --user
+/// --scope -p Delegate=yes`) rootless; else the test is skipped.
+fn testCgroup(arena: Allocator, cfg: *Config) !void {
+    var env = try std.testing.environ.createMap(arena);
+    if (std.os.linux.geteuid() == 0) {
+        cfg.cgroup.parent = cgroup.mount_point ++ "/zig-runner-test";
+    } else if (env.get("ZIG_RUNNER_TEST_CGROUP")) |p| {
+        cfg.cgroup.parent = p;
+    } else {
+        std.debug.print("native backend test skipped: it needs root, or a delegated cgroup " ++
+            "(ZIG_RUNNER_TEST_CGROUP=self)\n", .{});
+        return error.SkipZigTest;
+    }
+}
+
+test "root runner: a native job's runaway is OOM-killed in its own cgroup, a fork bomb stops at pids.max" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    try testCgroup(arena, &cfg);
+    var runaway = cfg;
+    // Room for the step's shell and the helper: the kernel kills the largest process first, but
+    // a limit near their own size takes them too (seen on the root pass at 64 MB).
+    runaway.cgroup.memory_max_mb = 256;
+    runaway.cgroup.pids_max = 64;
+
+    // The runaway job holds more and more memory, and a fork bomb after it; its neighbour, at
+    // the same time, holds 200 MB under the default limit and must not notice.
+    const hog = testStep("python3 -c 'x = []\nwhile True: x.append(b\"x\" * (8 << 20))' || " ++
+        "echo exit=$?");
+    // The bomb in a process group of its own (`set -m`), for 2 s of builtins only (nothing else
+    // can fork while it holds every process), then killed, and waited out until no process of
+    // the group is left, so the step's own end (`scripts.stepScriptFc`'s epilogue, whose `sh`
+    // must fork) finds its processes free again. Left running, the bomb still held them there:
+    // the wrapper's `sh` could not fork, and the step failed with exit 2 (#265's CI, once).
+    var bomb = testStep("set -m\n" ++
+        "( set +m; bomb() { bomb | bomb & }; bomb; while :; do :; done ) &\n" ++
+        "pg=$!\nset +m\n" ++
+        "end=$((SECONDS + 2)); while [ $SECONDS -lt $end ]; do :; done\n" ++
+        "kill -9 -- -$pg\n" ++
+        "while kill -0 -- -$pg 2>/dev/null; do :; done\n" ++
+        "echo after-the-bomb");
+    bomb.condition = "always()";
+    var near = testStep("python3 -c 'import time; x = b\"x\" * (200 << 20); time.sleep(6); " ++
+        "print(\"neighbour held\", len(x) >> 20)'");
+    near.name = "neighbour";
+    const Run = struct {
+        fn one(arena_: Allocator, cfg_: Config, job: job_mod.Job, out: *[]const u8, res: *?dagger.Result) void {
+            const r = runNativeJob(arena_, cfg_, job, .root) catch return;
+            out.* = r.text;
+            res.* = r.res;
+        }
+    };
+    var texts: [2][]const u8 = .{ "", "" };
+    var results: [2]?dagger.Result = .{ null, null };
+    var arenas: [2]std.heap.ArenaAllocator = .{
+        .init(std.testing.allocator),
+        .init(std.testing.allocator),
+    };
+    defer for (&arenas) |*x| x.deinit();
+    const started = std.Io.Clock.awake.now(io).toMilliseconds();
+    var neighbour = try io.concurrent(Run.one, .{
+        arenas[1].allocator(),
+        cfg,
+        testJob(&.{near}),
+        &texts[1],
+        &results[1],
+    });
+    Run.one(arenas[0].allocator(), runaway, testJob(&.{ hog, bomb }), &texts[0], &results[0]);
+    neighbour.await(io);
+    const took = std.Io.Clock.awake.now(io).toMilliseconds() - started;
+
+    const r = results[0] orelse return error.TestUnexpectedResult;
+    std.debug.print("runaway job:\n{s}\n", .{texts[0]});
+    try expectLines(texts[0], &.{
+        "The job reached its memory limit (256 MB, RUNNER_NATIVE_MEMORY_MAX_MB): the kernel " ++
+            "killed ",
+        "after-the-bomb",
+        "The job reached its process limit (64, RUNNER_NATIVE_PIDS_MAX)",
+        "with memory.max 256 MB and pids.max 64",
+    });
+    // The hog itself was killed (its step goes on to say so, or ends with it: 137), and the bomb
+    // stopped at the limit and the job went on.
+    try std.testing.expect(std.mem.indexOf(u8, texts[0], "exit=137") != null or
+        r.steps[0].exit_code == 137);
+    // The bomb's step succeeded: once it ended the bomb, its end could fork again.
+    if (r.steps[1].outcome != .success) std.debug.print("bomb step: exit {d}\n", .{r.steps[1].exit_code});
+    try std.testing.expectEqual(dagger.Outcome.success, r.steps[1].outcome);
+    // The neighbour ran through, its 200 MB held, nothing of its own killed or refused.
+    const n = results[1] orelse return error.TestUnexpectedResult;
+    if (n.steps[0].outcome != .success) std.debug.print("neighbour:\n{s}\n", .{texts[1]});
+    try std.testing.expectEqual(dagger.Outcome.success, n.steps[0].outcome);
+    try expectLines(texts[1], &.{"neighbour held 200"});
+    try std.testing.expect(std.mem.indexOf(u8, texts[1], "reached its") == null);
+    try std.testing.expect(took < 60_000);
+}
+
+test "root runner: native gate accuracy, each job's own cgroup against the engine-wide reading" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    try testCgroup(arena, &cfg);
+    const parent = switch (cgroup.parent(arena, io, cfg.cgroup.parent)) {
+        .dir => |d| d,
+        .none => |why| return skip(true, why),
+    };
+    // The jobs' parent stands for the engine's cgroup: one cgroup for every job, as the engine
+    // is, read as the gate reads the engine's (which needs a cap to be read at all).
+    const cap = try std.fmt.allocPrintSentinel(arena, "{s}/memory.max", .{parent}, 0);
+    const fd = std.os.linux.open(cap, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+    if (std.os.linux.errno(fd) != .SUCCESS) return skip(true, "the cgroup parent's memory.max");
+    _ = std.os.linux.write(@intCast(fd), "68719476736", 11);
+    _ = std.os.linux.close(@intCast(fd));
+
+    // Two jobs as on razorbill's soak: the second starts while the first holds its memory.
+    const mb = 300;
+    var slots: [4]admission.Admission.Slot = undefined;
+    var pool: admission.Admission = .init(io, .{}, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    pool.engine.dir = parent;
+    var gates: [4]admission.Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    var sampling = try io.concurrent(admission.Admission.sample, .{&pool});
+    defer sampling.cancel(io);
+    const Run = struct {
+        fn one(arena_: Allocator, cfg_: Config, hold_s: u32, pool_mb: u32, out: *?dagger.Result) void {
+            const script = std.fmt.allocPrint(arena_, "python3 -c 'import time; " ++
+                "x = b\"x\" * ({d} << 20); time.sleep({d})'", .{ pool_mb, hold_s }) catch return;
+            const r = runNativeJob(arena_, cfg_, testJob(&.{testStep(script)}), .root) catch return;
+            out.* = r.res;
+        }
+    };
+    var results: [2]?dagger.Result = .{ null, null };
+    var arenas: [2]std.heap.ArenaAllocator = .{
+        .init(std.testing.allocator),
+        .init(std.testing.allocator),
+    };
+    defer for (&arenas) |*x| x.deinit();
+    // Each job twice at the gate: natively (its cgroup), and as the engine-wide reading saw it
+    // (a slot measured from the parent from the same moment).
+    var first_cfg = cfg;
+    first_cfg.gate = &gates[0];
+    gates[0].leave(true);
+    gates[0].assigned(admission.jobKey("o/r", "ci.yml", "first"));
+    gates[2].leave(true);
+    gates[2].assigned(admission.jobKey("o/r", "ci.yml", "first (engine-wide)"));
+    var first = try io.concurrent(Run.one, .{ arenas[0].allocator(), first_cfg, 8, mb, &results[0] });
+    try io.sleep(.fromSeconds(3), .awake);
+    var second_cfg = cfg;
+    second_cfg.gate = &gates[1];
+    gates[1].leave(true);
+    gates[1].assigned(admission.jobKey("o/r", "ci.yml", "second"));
+    gates[3].leave(true);
+    gates[3].assigned(admission.jobKey("o/r", "ci.yml", "second (engine-wide)"));
+    Run.one(arenas[1].allocator(), second_cfg, 3, mb, &results[1]);
+    first.await(io);
+    for (results) |r| try std.testing.expect(r != null and r.?.steps[0].outcome == .success);
+    var seen: [4]u32 = undefined;
+    for (&gates, &seen) |*g, *s| s.* = (g.ended() orelse return error.TestUnexpectedResult).seen_mb;
+    std.debug.print("native gate accuracy ({d} MB held by each of two overlapping jobs): " ++
+        "first job {d} MB own cgroup, {d} MB engine-wide; second job {d} MB own cgroup, {d} MB " ++
+        "engine-wide\n", .{ mb, seen[0], seen[2], seen[1], seen[3] });
+    // Each job's own reading is its own memory (python's, and the helper's and shell's few MB);
+    // the engine-wide reading charges the first job for both.
+    for ([_]u32{ seen[0], seen[1] }) |own| {
+        try std.testing.expect(own >= mb - 10);
+        try std.testing.expect(own <= mb + 60);
+    }
+    try std.testing.expect(seen[2] >= 2 * mb - 20);
 }
