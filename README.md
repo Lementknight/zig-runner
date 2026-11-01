@@ -83,6 +83,19 @@ tags the release, and the tag runs `release`: the binaries (compiled directly,
 merge queue, `release` builds and scans the same, publishing nothing ("Binaries (check)", "Binaries
 (same as zig build)" and "Image"), when the change touches the packaging. `scorecard` grades the
 repository weekly with [OpenSSF Scorecard](https://scorecard.dev).
+"End to end" (`ci`, `.github/scripts/e2e.sh`) runs the runner built from the pull request for
+real, on GitHub's runner: it starts the pinned Dagger engine as `deploy/compose.yaml` does,
+registers the runner's just-in-time runners on the private `Open-Blue/runner-bench` under a label
+of the run's own, dispatches that repository's `e2e.yml` and `e2e-cancel.yml` at it, and checks the
+jobs, steps and logs through GitHub's API: a script installing into the tool cache, a service, a
+`docker://` step, a JavaScript action, the file commands, a masked secret, a cancelled run, and a
+rerun replayed from the step cache. It does it twice, on Dagger and with `RUNNER_BACKEND=native`,
+and leaves each job's queue and run times for both in the `e2e-timings` artifact. Everything on
+runner-bench is done as the GitHub App `zig-runner-e2e`, whose key is the `e2e` environment's
+secret: a pull request from a fork, which does not get it, skips the job's steps, still reporting.
+It is not a required check yet. Before a release, run the same suite by hand against a pool from
+`main` (the laptop's, or razorbill's when it serves runner-bench, trusting `refs/heads/main`):
+`.github/scripts/e2e.sh check <its label>`, with gh logged in.
 `compare` runs the comparison tools weekly
 (`.github/scripts/*-diff.sh`): the expression evaluator, YAML reader, `hashFiles()`, problem
 matcher regular expressions, HPACK decoder and RS256 signing against the implementations they

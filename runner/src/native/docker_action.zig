@@ -40,16 +40,17 @@ fn shares(arena: Allocator, workspace: []const u8) ![]const sandbox.Spec.Contain
 }
 
 /// Why a job's Docker actions cannot run natively yet, or null: each `docker://` step's image
-/// must be in the native image store (`images.lookup`) and run as root. `Backend.unsupported`
-/// leaves these steps to this, since it needs the store.
+/// must be pulled natively (P3, `find`) and run as root. `Backend.unsupported` leaves these steps
+/// to this, since it needs the image's config.
 pub fn unsupported(
     arena: Allocator,
+    gpa: Allocator,
     io: std.Io,
     job: job_mod.Job,
     cfg: Backend.Config,
 ) !?[]const u8 {
     for (job.steps) |step| switch (step.action) {
-        .docker => |d| switch (try images.lookup(arena, io, cfg.images, d.image)) {
+        .docker => |d| switch (try find(arena, gpa, io, cfg.images, cfg.store, d.image)) {
             .missing => |why| return why,
             // GitHub's documentation asks for root ("Docker actions must be run by the default
             // Docker user"); Dagger's path gives another USER the directories it writes, which
@@ -64,6 +65,27 @@ pub fn unsupported(
         else => {},
     };
     return null;
+}
+
+/// `ref`'s image: pulled natively into the store at `store` (P3, `Backend.pullAt`), or from the
+/// tests' directory when `dir` is set (`images.lookup`). A pull that fails is `missing`, with why.
+pub fn find(
+    arena: Allocator,
+    gpa: Allocator,
+    io: std.Io,
+    dir: []const u8,
+    store: []const u8,
+    ref: []const u8,
+) !images.Found {
+    if (dir.len > 0) return images.lookup(arena, io, dir, ref);
+    var why: []const u8 = "";
+    const owners = std.os.linux.geteuid() == 0;
+    const img = Backend.pullAt(arena, gpa, io, store, owners, ref, null, &why) catch |e|
+        return .{ .missing = try std.fmt.allocPrint(arena, "the image {s} could not be pulled " ++
+            "natively: {s}", .{ ref, if (why.len > 0) why else @errorName(e) }) };
+    return .{ .image = images.fromPulled(arena, io, img.rootfs, img.digest) catch
+        return .{ .missing = try std.fmt.allocPrint(arena, "the image {s} has a config the " ++
+            "runner cannot read", .{ref}) } };
 }
 
 /// `Exec.runContainer` on the native backend: the action's command run as step `num` in its
@@ -87,7 +109,7 @@ pub fn run(
             return null;
         },
     };
-    const img = switch (try images.lookup(arena, b.io, b.images, ref)) {
+    const img = switch (try find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, ref)) {
         .image => |i| i,
         .missing => |why| {
             _ = try x.actionFailed(num, "could not pull {s} for {s}: {s}", .{ ref, dr.label, why });
@@ -144,7 +166,7 @@ pub fn run(
     x.beginExec(num);
     var demux: SpanDemux = .{ .sh = x.sh, .gpa = b.gpa };
     defer demux.deinit();
-    var live: Backend.Live = .{ .demux = &demux };
+    var live: Backend.Live = .{ .demux = &demux, .arena = arena, .record = null };
     const out = live.output();
     // The markers the script would echo (`scripts.writeMarkerEcho`), around the output.
     out.chunkFn(out.ptr, try markerLine(arena, "begin", num, x.sh.mark));
@@ -432,12 +454,12 @@ test "unsupported: a docker:// step needs its image in the native store, run as 
     const Case = struct { image: []const u8, store: []const u8, why: ?[]const u8 };
     for ([_]Case{
         .{ .image = "zr-test/root:1", .store = dir, .why = null },
-        .{ .image = "zr-test/root:1", .store = "", .why = "RUNNER_NATIVE_IMAGES" },
-        .{ .image = "zr-test/other:1", .store = dir, .why = "zr-test/other:1 is not in the native image store" },
+        // Without the tests' directory the image is pulled (P3); not done here (no network).
+        .{ .image = "zr-test/other:1", .store = dir, .why = "zr-test/other:1 is not in the tests' images directory" },
         .{ .image = "zr-test/user:1", .store = dir, .why = "USER actionuser" },
     }) |c| {
         const job = testJob(&.{dockerStep(c.image, &.{})});
-        const why = try unsupported(arena, io, job, .{ .images = c.store });
+        const why = try unsupported(arena, std.testing.allocator, io, job, .{ .images = c.store });
         if (c.why) |want| {
             try std.testing.expect(std.mem.indexOf(u8, why.?, want) != null);
         } else try std.testing.expect(why == null);
