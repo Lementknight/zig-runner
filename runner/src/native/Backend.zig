@@ -50,6 +50,12 @@ next_layer: u32 = 0,
 store: ?Store = null,
 /// The store's settings, for `base` to turn it on.
 store_cfg: Store = .{ .root = "" },
+/// `Config.vouched`, and the job's cache scope and repository from it (`base`): a vouched fork's
+/// pull request keys its layers apart from its repository's own jobs, as its package caches are
+/// (`set_up.packageCacheScope`).
+vouched: bool = false,
+scope: []const u8 = "untrusted",
+repository: []const u8 = "",
 /// The store's layers the job uses, held shared until it ends (`Store.Layer`).
 held: std.ArrayList(std.Io.File) = .empty,
 /// Past this many layers, the stack is merged into one (`flatten`).
@@ -473,6 +479,7 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
         .subid_base = cfg.subid_base,
         .subnet = cfg.subnet,
         .store_cfg = .{ .root = cfg.store, .max_bytes = cfg.store_max_bytes },
+        .vouched = cfg.vouched,
         .flatten_at = @max(2, cfg.flatten_at),
     };
     errdefer b.deinit();
@@ -662,6 +669,8 @@ pub fn base(
     const arena = b.arena;
     try b.baseEnv(ev, plan);
     if (plan.step_cache) b.store = b.store_cfg;
+    b.repository = ev.job.github.repository;
+    b.scope = try set_up.packageCacheScope(arena, ev, b.repository, b.vouched);
     const event = try ev.eventJson();
     const event_in_env = plan.step_cache and event.len <= set_up.max_event_env;
     if (event_in_env) try b.put(dagger.event_env, event);
@@ -1100,7 +1109,9 @@ fn keyFor(
 }
 
 /// What a base's layer, and so every layer above it, depends on besides its own script: the
-/// store's format (`Store.store_format`), the rootfs's fingerprint, how ids are mapped and, on a root runner, the slot's first id (a layer's
+/// store's format (`Store.store_format`), the job's cache scope and repository (a vouched fork's
+/// pull request never replays, or leaves, a layer its repository's own jobs use), the rootfs's
+/// fingerprint, how ids are mapped and, on a root runner, the slot's first id (a layer's
 /// files are owned by its job's range, so a layer is reused only by jobs with the same range: only
 /// misses come of it), and the binds (where, not what: mounts' content is in no key). Null, and the
 /// job uncached, when the rootfs cannot be read.
@@ -1114,6 +1125,8 @@ fn below(b: *Backend) ?Store.Key {
     };
     var h: Store.KeyHasher = .plain("below a base");
     h.field(Store.store_format);
+    h.field(b.scope);
+    h.field(b.repository);
     h.field(&fp);
     h.field(@tagName(b.how.userns));
     h.int(if (b.how.userns == .mapped) b.idBase() else 0);
@@ -2728,4 +2741,42 @@ test "native step cache: measured, replay per step and the store's size over 50 
         try storeLayers(arena, c.cfg.store),
         Store.treeBytes(arena, io, layers) / 1024,
     });
+}
+
+test "native step cache: a fork's pull request keys its layers apart from its repository's jobs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    // Two pull requests, alike but for the head's repository: the repository's own, and a fork's.
+    const pr = struct {
+        fn job(ar: Allocator, head: []const u8) !job_mod.Job {
+            // The steps in the arena: a literal's would not outlive this call.
+            const steps = try ar.dupe(job_mod.Step, &.{testStep("echo x >> /shared/s")});
+            var j = testJob(steps);
+            j.context_data = try std.json.parseFromSliceLeaky(
+                std.json.Value,
+                ar,
+                try std.fmt.allocPrint(ar, "{{\"github\":{{\"t\":2,\"d\":[" ++
+                    "{{\"k\":\"repository\",\"v\":\"o/r\"}},{{\"k\":\"event\",\"v\":{{\"t\":2,\"d\":[" ++
+                    "{{\"k\":\"pull_request\",\"v\":{{\"t\":2,\"d\":[{{\"k\":\"head\",\"v\":{{\"t\":2," ++
+                    "\"d\":[{{\"k\":\"repo\",\"v\":{{\"t\":2,\"d\":[{{\"k\":\"full_name\",\"v\":" ++
+                    "\"{s}\"}}]}}}}]}}}}]}}}}]}}}}]}}}}", .{head}),
+                .{},
+            );
+            return j;
+        }
+    }.job;
+    const own = try pr(arena, "o/r");
+    const fork = try pr(arena, "fork/r");
+    try expectSucceeded(try runCached(arena, c.cfg, own, "j1"));
+    try expectSucceeded(try runCached(arena, c.cfg, own, "j2"));
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "s"));
+    // The fork's does not replay the repository's layer, but replays its own.
+    try expectSucceeded(try runCached(arena, c.cfg, fork, "j3"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "s"));
+    try expectSucceeded(try runCached(arena, c.cfg, fork, "j4"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "s"));
 }
