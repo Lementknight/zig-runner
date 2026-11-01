@@ -27,6 +27,8 @@ const Backend = @import("Backend.zig");
 const sandbox = @import("sandbox.zig");
 const health = @import("health.zig");
 const images = @import("images.zig");
+const registry = @import("oci/registry.zig");
+const docker = @import("../dagger/docker.zig");
 const forward = @import("forward.zig");
 
 const Allocator = std.mem.Allocator;
@@ -130,6 +132,14 @@ pub fn start(b: *Backend, x: *Exec) !bool {
     }) catch {};
     ev.diag = "";
     const sc = try ev.scope(&.{});
+    // A `container:` job's image, pulled for the job's base (P3): said here, as on Dagger.
+    if (x.job.container) |jc| {
+        if (!try x.pullJobContainer(ls, jc)) {
+            ok = false;
+            return false;
+        }
+        if (x.job.services.len == 0) return true;
+    }
     var names: std.ArrayList([]const u8) = .empty;
     for (x.job.services) |svc| try names.append(arena, svc.name);
     // Before any service starts: they reach each other by name too.
@@ -175,23 +185,18 @@ fn startOne(
     const arena = x.arena;
     const io = b.io;
     const spec = (try x.serviceSpec(ls, sc, svc)) orelse return null;
-    // Phase 3's image store answers this by pulling; until then, the operator's directory.
-    const image = images.find(arena, io, b.images_dir, spec.image) catch {
-        x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to read the configuration of " ++
-            "{s} for service {s} in the native image store ({s})", .{
+    x.sh.append(ls, try std.fmt.allocPrint(arena, "Pulling {s}", .{spec.image}));
+    var creds: ?registry.Credentials = null;
+    if (try docker.registryCredentials(x.ev, svc)) |c| creds = .{ .username = c.user, .password = c.pass };
+    var why: []const u8 = "";
+    const image = b.pullImage(spec.image, creds, &why) catch |e| {
+        x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to pull {s} for service {s}: {s}", .{
             spec.image,
             svc.name,
-            b.images_dir,
+            if (why.len > 0) why else @errorName(e),
         }));
         return null;
-    } orelse {
-        x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to find {s} for service {s}: " ++
-            "it is not in the native image store ({s})", .{ spec.image, svc.name, b.images_dir }));
-        return null;
     };
-    x.sh.append(ls, try std.fmt.allocPrint(arena, "Using {s} from the native image store", .{
-        spec.image,
-    }));
     if (image.digest) |d| x.sh.append(ls, try std.fmt.allocPrint(arena, "Digest: {s}", .{d}));
     const argv = try std.mem.concat(arena, []const u8, &.{ image.entrypoint, image.cmd });
     if (argv.len == 0) {
@@ -255,6 +260,9 @@ fn startOne(
         .id_base = b.idBase(),
         .id_count = Backend.ids_per_slot,
         .netns = b.netns,
+        // P4: the service's helper and everything it starts are in the job's cgroup, held to
+        // the job's limits and measured with it.
+        .cgroup = if (b.job_cgroup) |j| j.dir else null,
         .service = .{ .status = dirs.status, .health = check, .ports = ports.items },
     };
     try b.service_set.list.append(arena, s);
@@ -354,6 +362,7 @@ fn startRelay(b: *Backend, x: *Exec, ls: u32) !bool {
         .netns = b.netns,
         // The job's nobody: an id of its range, nothing on the host.
         .id = if (b.how.userns == .mapped) b.idBase() + nobody else null,
+        .cgroup = if (b.job_cgroup) |j| j.dir else null,
         .ports = maps.items,
     }, &why) catch {
         x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to publish the services' " ++
@@ -369,7 +378,7 @@ const nobody = 65534;
 /// "Stop containers" on the native backend, after the post scripts: each service stopped, then
 /// its output printed, as GitHub's runner prints `docker logs` before it removes a container.
 pub fn stop(b: *Backend, x: *Exec) !void {
-    if (x.services.items.len == 0) return;
+    if (x.services.items.len == 0 and x.job.container == null) return;
     const ls = x.next_log_step;
     x.next_log_step += 1;
     const started = std.Io.Clock.real.now(x.io).toMilliseconds();
@@ -391,6 +400,11 @@ pub fn stop(b: *Backend, x: *Exec) !void {
             s.name,
         }));
     }
+    // The job container (P3's pulled image) goes with the job, as on Dagger.
+    if (x.job.container != null) x.sh.append(
+        ls,
+        try std.fmt.allocPrint(x.arena, "Stop and remove container: job ({s})", .{x.job_image}),
+    );
     try x.addExtra(.{
         .kind = .stop,
         .name = "Stop containers",

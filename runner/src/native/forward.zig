@@ -10,7 +10,9 @@
 //! the runner must not change its namespace. Its spec is one line of JSON on stdin, which then
 //! stays open as its lifeline; it prints `ready` once it listens. On a root runner it joins the
 //! job's namespace as the host's root, binds, and then becomes the job's `nobody` (a host id of
-//! the job's range, no capabilities, no_new_privs) before it reads a byte of the job's traffic.
+//! the job's range, no capabilities, no_new_privs, the steps' seccomp filter) before it reads a
+//! byte of the job's traffic. It runs in the host's mount namespace, so the filter keeps a bug in
+//! it to the calls Docker allows a container.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -26,6 +28,9 @@ pub const Spec = struct {
     netns: ?[]const u8 = null,
     /// Root runner: the host id the relay runs as once it listens.
     id: ?u32 = null,
+    /// The job's cgroup (P4), joined first: the relay is held to the job's limits and killed
+    /// with it.
+    cgroup: ?[]const u8 = null,
     ports: []const Map,
 
     pub const Map = struct { host: u16, container: u16 };
@@ -40,6 +45,7 @@ const buf_len = 16 * 1024;
 pub fn main(arena: Allocator) u8 {
     const spec = sandbox.readJsonLine(Spec, arena) catch
         sandbox.fatal("read the relay's spec", @as(u32, 22));
+    if (spec.cgroup) |dir| sandbox.joinCgroup(arena, dir);
     if (spec.netns) |p| {
         const fd = linux.open(sandbox.z(arena, p), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         sandbox.check("open the job's network namespace", fd);
@@ -64,6 +70,9 @@ pub fn main(arena: Allocator) u8 {
         sandbox.check("setresuid", linux.setresuid(id, id, id));
     }
     sandbox.check("no_new_privs", linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0));
+    // Docker's allow list, as each step has it: after no_new_privs, which an unprivileged
+    // filter needs, and before any of the job's traffic.
+    sandbox.installSeccomp();
     _ = linux.write(1, "ready\n", 6);
     relay(arena, listeners.items);
     return 0;

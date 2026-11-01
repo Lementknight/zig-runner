@@ -1,9 +1,8 @@
-//! The images native services start from (docs/native-backend.md, P6), until phase 3's image
-//! store: what a service needs of an image is its filesystem as a directory and its
-//! configuration (`Image`), found by its reference (`find`). That is the whole interface; P3's
-//! store answers the same question by pulling.
+//! The images native services start from (docs/native-backend.md, P6): what a service needs of an
+//! image is its filesystem as a directory and its configuration (`Image`). P3's pull gives them
+//! (`fromPulled`, through `Backend.pullImage`).
 //!
-//! Until then an operator fills a directory (`RUNNER_NATIVE_IMAGES`), as P1's rootfs is made:
+//! Tests (and the real-images root test) can instead fill a directory (`Backend.Config.images`):
 //! one entry per reference, named as the reference is written with each `/` as `+`
 //! (`postgres:17`, `ghcr.io+o+db:1`), holding `rootfs/` (the image's filesystem, as
 //! `docker export` gives it, owned as in the image) and `config.json` (its configuration, as
@@ -87,6 +86,23 @@ pub fn find(arena: Allocator, io: std.Io, dir: []const u8, ref: []const u8) !?Im
         };
     var image = parseConfig(arena, text) catch return error.BadImageConfig;
     image.rootfs = rootfs;
+    return image;
+}
+
+/// An image P3's pull gave (`oci.Image`): its rootfs, and its configuration from the
+/// `config.json` beside it in the store (`oci/images/<manifest>/`), with the digest the reference
+/// resolved to.
+pub fn fromPulled(arena: Allocator, io: std.Io, rootfs: []const u8, digest: []const u8) !Image {
+    const dir = std.fs.path.dirname(rootfs) orelse return error.BadImageConfig;
+    const text = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        try std.fmt.allocPrint(arena, "{s}/config.json", .{dir}),
+        arena,
+        .limited(4 << 20),
+    ) catch return error.BadImageConfig;
+    var image = parseConfig(arena, text) catch return error.BadImageConfig;
+    image.rootfs = rootfs;
+    image.digest = digest;
     return image;
 }
 

@@ -11,7 +11,7 @@ cd proofs && lake build
 ```
 
 That checks two libraries: `Runner` (the step cache and the regex matcher's loops) and `Glob` (the
-`hashFiles()` walk), plus the `globoracle` executable. They use Lean core only — no Mathlib, no
+`hashFiles()` walk), plus the `globoracle` and `keyoracle` executables. They use Lean core only — no Mathlib, no
 Batteries — and the toolchain is pinned by `lean-toolchain`. Nothing in `Runner/` uses `sorry`,
 `axiom`, `native_decide`, `unsafe` or `partial`; `#print axioms` on the main theorems shows at most
 `propext` and `Quot.sound`. A clean build is the whole claim.
@@ -33,6 +33,7 @@ lists where the encoding differs.
 | `Runner/Enforce.lean` | the volatile clause of `Disciplined`, discharged, and P1 under enforcement |
 | `Runner/Counterexamples.lean` | twelve computing jobs |
 | `Runner/Logs.lean` | why a replayed log needs one output stream |
+| `Runner/Native.lean` | the native backend's store as a refinement of the model: the key's bytes, replay, concurrency, eviction, layer digests |
 | `Runner/Regex.lean` | why the regex matcher's loops terminate |
 | `Glob/Match.lean`, `Glob/Walk.lean` | the `hashFiles()` matcher and walk |
 
@@ -90,6 +91,11 @@ All names are under `Runner.`; `Build.`, `OutputKeys.` and so on are the modules
 | **P6** minimality | `Build.hit_keeps_ran`, `warm_runs_nothing`, `recorded_not_run`, `step_runs_at_most_once` | `Runner/Build.lean` |
 | early cutoff | `OutputKeys.cutoff`, `cutoff_needs_only_the_digest` (both for a marked step that succeeded), `no_cutoff_without_keys`, `failure_is_a_wall`, `different_bytes_different_container` | `Runner/OutputKeys.lean` |
 | pruning is safe | `Build.coherent_subset`, `ahead_subset`: both of P1's hypotheses survive dropping entries, so pruning can only cause misses | `Runner/Build.lean` |
+| **P1 on the native backend** | `Native.native_replay_eq_run`, and `native_eq_dagger`: both backends give what the job gives with the cache off | `Runner/Native.lean` |
+| a fork's pull request never shares a key with the repository's own jobs | `Native.scope_apart`, `fork_keys_apart` | `Runner/Native.lean` |
+| the native key keeps what `Key` keeps | `Native.encState_injective`, `belowPreimage_inj` (with `belowTail_inj`), `encKey_injective`, `native_key_iff`, `native_mounts_invisible`, `native_volatile_invisible`, `native_event_invisible`; `Native.Ambiguous` without the lengths | `Runner/Native.lean` |
+| native concurrency and eviction | `Native.ops_keep_honest`, `race_irrelevant`, `readWhole_agrees`, `Native.Torn`; a lost read in `nbuild` | `Runner/Native.lean` |
+| native layer digests | `Native.walk_injective` (P2's walk as written), `digest_deterministic`, `digest_injective`, `same_layer_same_container`, `different_layer_different_container` | `Runner/Native.lean` |
 | a shared cache is safe | `Build.elsewhere_ahead`: no other job can write under this job's nonce, which is why a pool may share one cache | `Runner/Build.lean` |
 | **the volatile clause, discharged** | `Enforce.input_determined_by_key`, `volatile_clause_discharged`, `nothing_volatile_survives`, `no_payload_survives`, `enforced_disciplined` | `Runner/Enforce.lean` |
 
@@ -217,7 +223,9 @@ passing, something has changed.
 
 Not proof of anything about: hash collisions (the key is a projection, so two different recipes never
 collide here); the *interleaving* of concurrent jobs, only the shared cache they end up with
-(`Elsewhere`) — the store's first-writer-wins `mv -T` is not modelled; anything bash does; and every
+(`Elsewhere`), and for the native store whole-entry operations in any order (`Native.Op`), which
+atomic publish is what justifies — Dagger's output store's first-writer-wins `mv -T` is not
+modelled; anything bash does; and every
 question of *cost* — nothing here says a replay is faster, only that it is right. Experiment 5's +28%
 and +85% are why `Runner.Declared`'s mechanism is shelved, and no theorem in it argues otherwise.
 
@@ -249,6 +257,67 @@ does not do what the model assumes:
 
 `Enforce` is composed with `Build` since #89: `Enforce.replay_eq_run_enforced` is P1 for `exec`
 instantiated with the withheld input.
+
+### On the native backend (P8)
+
+The native backend (docs/native-backend.md) keeps its own step store, so the obligations the engine
+discharged under Dagger are the runner's, and `Runner/Native.lean` states and proves each one. The
+model above is unchanged; `Build` and its theorems describe both backends, and `Native` is the
+second refinement of it: `native_replay_eq_run` is P1 against the same `uncached`, and
+`native_eq_dagger` says the two backends give the same answers. The theorems of `OutputKeys` about
+the keys a job asks (`keysFrom`, `cutoff`, `cutoff_needs_only_the_digest`, `nonced_stays`) hold
+natively as they stand, because the native job hands on the same `nextState` and `nextEnv`. Of the
+ones about what a cache can answer (`Clean`, `no_cutoff_without_keys`), only a marked step's own
+miss is proved natively (`Native.marked_misses`). An unmarked step after it, whose parent names the
+job, is still published, though no other job can ask for that key: P2 may skip it, as a saving.
+
+The right-hand column names P2's code (`runner/src/native/`, merged in #268, with its review fixes
+in #272 at `28a9dd1`, which add the store's format, the trust scope and the repository to
+`Backend.below`), whose
+key format is the one proved here.
+
+| In the model | In the native runner (P2) |
+|---|---|
+| `State`: a container *is* the recipe that built it | the key chain: `Backend.keyFor` hashes, through `Store.KeyHasher` (`init(tag)`, `core`), the tag, the parent's key, the script, the stable env, then the uid, gid, working directory and kept files (`Native.keyPreimage`); the key of an exec is the key of the layer it leaves (`encKey`) |
+| `State.base b` | the job's base layer (`Backend.base`): tag 0, with the digest below it (`Backend.below`: the store's format `Store.store_format`, the trust scope (`set_up.packageCacheScope`: `repo`, or `untrusted` for a fork's pull request), the repository, the rootfs's fingerprint (`Store.rootfsFingerprint`, an opaque digest to the model, checked again for every job), the userns mode, the slot's first id on a root runner, the binds, then P4's Zig cache seeds and which binds are cache volumes, only when the job has either (`belowTail`, so a job with neither has the bytes it had before); untagged, `KeyHasher.plain("below a base")`) in the parent's place. `Native.BaseSpec`, `belowPreimage`, and `Format.Sound.base_inj`: the model's base is what P2 hashes for it |
+| `Key = parent · script · stable env` | `KeyHasher.core`, with `Store.stableEnv` as `stable vol`: `dagger.volatile_env`, the runner's own per-job values (`ZIG_RUNNER_EVENT`, `ZIG_RUNNER_RAN`, `ZIG_RUNNER_MARK`) and the secret aliases (`ZIG_SECRET_*`) are dropped. The mounts and the event payload are no argument of it, so `Input.mounts` and `Input.event` absent from the key hold by construction |
+| no input of its own | `keyFor`'s tail after the core: for a step, the job's uid, gid and workspace (set with the base, `Backend.baseEnv`) and no kept file (`execScript` gives none, and a step with a file to write has no key), so a function of its parent's base (`Format.stepExtra`); for the base, root, `/`, and the event file when the payload is too large for a variable (then the base, and every key above it, is per run: only misses) |
+| `Script` | a `run:` step's script (`scripts.stepScriptFc`), or a checkout's fetch of a commit (tag 1 too; a branch or a tag moves and is never keyed) |
+| `State.afterCopy before digest` | tag 2 (`Store.Tag.output_keyed`), the parent's key and the layer's digest; P2 defines the tag, and output keys come later |
+| `Output.digest` | `Store.layerDigest`: `Store.treeDigest`'s walk of the layer, entries in byte order of names, ids as the job's namespace sees them (`Store.Ids`), xattrs counted (P8's addition), content by type, `..` after a directory's entries: `Native.walkPreimage`, byte for byte (the `layer` vectors) |
+| `Output.log`, `Logs` | `layers/<key>/log`, the step's output as the one pipe recorded it, so a replay is the run without `exec 2>&1` (`Logs.native_replay`); the script keeps it, since both backends run one script |
+| `Cache`, `look` | `Store.open`: `layers/<key>` for the key's sha256 (`Native.Store`, `slook`) |
+| `replayable`, `mark st = .everyRun` | `Backend.execScript` publishes (`publishTop`) only a step that exited 0, does not always run, and whose parent is in the store (`keyFor` is null otherwise): `Native.record`, so every hit is a success of an unmarked step (`hit_succeeds`, `marked_misses`) |
+| `Subset` | `Store.collect`, LRU under `max_bytes` (`Native.evict`), and an entry `open` will not take (`lost`) |
+| `Elsewhere` | a store a pool's runners share, `Store.lockKey` per key: what they do between steps is `Native.Op`s (`ops_keep_honest`) |
+
+What the proofs need of the code, each a hypothesis or a definition the code has to match, and
+where P2 meets it:
+
+| Obligation | Where in the model | In P2 |
+|---|---|---|
+| The key's bytes are unambiguous: a fixed-width length before every field, counts before lists, a tag per kind of key, the store's format in every key | `Format.Sound`, `encState`, `belowPreimage`, `walkPreimage`; `Native.Ambiguous` is the cost without it | `KeyHasher.field` and `int` (u64 little-endian), `Store.Tag`; the digest below a base is untagged, but only ever a parent field. `Store.store_format` is in every base's parent, so in every key: a change of format, bumped there, makes every key new |
+| The environment is spelt in the container's order, not sorted | `encEnv`, the `env-order` vector | `core` walks `b.env` in order |
+| The script text tells apart the scripts the model tells apart | `Format.Sound.text_inj` | the same hypothesis the Dagger mapping relies on, unstated there |
+| What is hashed beyond the model's key is determined by it | `Format.stepExtra`, `BaseSpec` | above: uid, gid and workspace are the job's, kept files are the base's |
+| Only successes of unmarked steps are published | `record` | `execScript`, `publishTop` |
+| A publish is one rename of a complete entry | `Op`, `publish` | built under `layers/.tmp-<key>-<n>` and renamed |
+| A reader takes an entry whole or misses: a missing or short part is a miss, never empty | `readWhole`, `readWhole_agrees`, `Native.Torn` | `Store.open` takes the entry's lock shared and checks `Store.whole` (`fs`, `log`, `fc`, `size`) |
+| The layer digest hashes the sorted walk of what a later step can see (path, type, mode, ids inside the job's namespace, xattrs, symlink target, whiteouts, content) and nothing else (times, inodes, host ids, readdir order) | `walkPreimage`, `walk_injective`; `layerPreimage`, `digest_deterministic`, `digest_injective` for the flattened form | `Store.treeDigest` with `Store.Ids`; `Store.listDir` sorts each directory; the xattrs are counted since P8 (without the count the walk was ambiguous) |
+
+The flock per key is not among them: `race_irrelevant` shows two honest entries for an unmarked key
+are equal, so which writer wins does not matter, and the lock only saves running a key twice.
+
+`keyoracle` (`KeyOracle.lean`) ties the model to the Zig code as `globoracle` does for
+`hashFiles()`: it writes `runner/src/native/testdata/step_keys.tsv`, pairs of inputs with the
+model's verdict (equal or not: `Build.K` for steps, the `BaseSpec` for bases, the `Below` itself)
+and the preimages (`keyPreimage`, `belowPreimage`, `walkPreimage`; u64 little-endian words,
+UTF-8).
+`.github/scripts/key-vectors.sh` checks the file is its output, and
+`runner/src/native/key_vectors.zig` checks the Zig preimages and the relation against it: keys
+through P2's own `Store.KeyHasher` and `Store.stableEnv`, the digest below a base through
+`Backend.belowKey` (which `below` calls), and layer digests by making each tree and running
+`Store.treeDigestTo` on it.
 
 ## Why the regex matcher terminates
 
