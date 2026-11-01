@@ -2583,6 +2583,9 @@ test "native step cache: steps with secrets or run-specific values always run, a
 }
 
 test "native step cache: two jobs with one key at once run it once; the other replays it" {
+    // On a root runner two jobs at once have two slots, two ranges of ids, so two keys (a layer
+    // is reused only by jobs with the same range): each runs its own.
+    const shared_key = std.os.linux.geteuid() != 0;
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -2590,7 +2593,8 @@ test "native step cache: two jobs with one key at once run it once; the other re
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const c = try cachedConfig(arena, &tmp);
-    const job = testJob(&.{testStep("sleep 1; echo x >> /shared/slow")});
+    // A file of its own each time: the other job's root may be another host id.
+    const job = testJob(&.{testStep("sleep 1; mktemp /shared/slow.XXXXXX")});
     const Other = struct {
         fn run(cfg: Config, j: job_mod.Job, text: *[]const u8, ok: *bool) void {
             var b: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -2611,10 +2615,15 @@ test "native step cache: two jobs with one key at once run it once; the other re
     defer std.testing.allocator.free(other_text);
     try expectSucceeded(mine);
     try std.testing.expect(other_ok);
-    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "slow"));
+    var made: usize = 0;
+    var dir = try std.Io.Dir.cwd().openDir(io, c.shared, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |e| made += @intFromBool(std.mem.startsWith(u8, e.name, "slow."));
+    try std.testing.expectEqual(@as(usize, if (shared_key) 1 else 2), made);
     const notes = std.mem.count(u8, mine.text, dagger.native_reused_note) +
         std.mem.count(u8, other_text, dagger.native_reused_note);
-    try std.testing.expectEqual(@as(usize, 1), notes);
+    try std.testing.expectEqual(@as(usize, if (shared_key) 1 else 0), notes);
 }
 
 test "native step cache: a long job's layers are flattened, files, deletions and replays intact" {
@@ -2661,4 +2670,61 @@ test "native step cache: past its cap the store lets go of every layer no job ho
     for ([_][]const u8{ "j1", "j2" }) |ran| try expectSucceeded(try runCached(arena, c.cfg, job, ran));
     try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "s"));
     try std.testing.expectEqual(@as(usize, 0), try storeLayers(arena, c.cfg.store));
+}
+
+test "native step cache: measured, replay per step and the store's size over 50 jobs" {
+    // A measurement, not a check: ZIG_RUNNER_NATIVE_BENCH=1 runs it (docs/native-backend.md, P2's
+    // numbers), best under `-Doptimize=ReleaseSafe`.
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var env = try std.testing.environ.createMap(arena);
+    if (!std.mem.eql(u8, env.get("ZIG_RUNNER_NATIVE_BENCH") orelse "", "1"))
+        return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    const now = struct {
+        fn ms() i64 {
+            return std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+        }
+    }.ms;
+    // Per step: (50-step job - 1-step job) / 49, cold (run and published) and replayed.
+    var steps: [50]job_mod.Step = undefined;
+    for (&steps, 0..) |*s, i| s.* = testStep(try std.fmt.allocPrint(arena, "true {d}", .{i}));
+    var t: [2][2]i64 = undefined; // [cold, replayed][1 step, 50 steps]
+    for ([_]usize{ 1, 50 }, 0..) |n, col| {
+        const job = testJob(steps[0..n]);
+        for (0..2) |row| {
+            const ran = try std.fmt.allocPrint(arena, "b{d}{d}", .{ n, row });
+            const started = now();
+            try expectSucceeded(try runCached(arena, c.cfg, job, ran));
+            t[row][col] = now() - started;
+        }
+    }
+    std.debug.print("native bench: cold job 1 step {d} ms, 50 steps {d} ms, per step {d:.1} ms\n", .{
+        t[0][0], t[0][1], @as(f64, @floatFromInt(t[0][1] - t[0][0])) / 49.0,
+    });
+    std.debug.print("native bench: replayed job 1 step {d} ms, 50 steps {d} ms, per step {d:.2} ms\n", .{
+        t[1][0], t[1][1], @as(f64, @floatFromInt(t[1][1] - t[1][0])) / 49.0,
+    });
+
+    // 50 jobs of one workflow, as 50 commits: five steps that never change (one of them writes
+    // 1 MiB), one that does every time, and four after it, which are new with it.
+    const layers = try std.fmt.allocPrint(arena, "{s}/layers", .{c.cfg.store});
+    var job_steps: [10]job_mod.Step = undefined;
+    for (0..50) |j| {
+        for (&job_steps, 0..) |*s, i| s.* = testStep(switch (i) {
+            0 => "head -c 1048576 /dev/zero > /tmp/setup.bin",
+            5 => try std.fmt.allocPrint(arena, "echo commit {d} > /tmp/commit", .{j}),
+            else => try std.fmt.allocPrint(arena, "echo step {d} > /tmp/s{d}", .{ i, i }),
+        });
+        const ran = try std.fmt.allocPrint(arena, "s{d}", .{j});
+        try expectSucceeded(try runCached(arena, c.cfg, testJob(&job_steps), ran));
+    }
+    std.debug.print("native bench: store after 50 jobs: {d} layers, {d} KiB\n", .{
+        try storeLayers(arena, c.cfg.store),
+        Store.treeBytes(arena, io, layers) / 1024,
+    });
 }
