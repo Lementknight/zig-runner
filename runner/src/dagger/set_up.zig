@@ -8,6 +8,7 @@ const job_mod = @import("../job.zig");
 const sink = @import("../sink.zig");
 const expr = @import("../expr.zig");
 const config = @import("../config.zig");
+const zig_release = @import("../zig_release.zig");
 const Query = @import("query.zig").Query;
 const JobLog = @import("JobLog.zig");
 const Evaluator = @import("Evaluator.zig");
@@ -30,6 +31,8 @@ const isVolatile = @import("../dagger.zig").isVolatile;
 const logSteps = @import("../dagger.zig").logSteps;
 const finish = @import("../dagger.zig").finish;
 const default_image = @import("../dagger.zig").default_image;
+const resolveImage = @import("../dagger.zig").resolveImage;
+const imageName = @import("../dagger.zig").imageName;
 const jobWorkspace = @import("../dagger.zig").jobWorkspace;
 const work_root = @import("../dagger.zig").work_root;
 const runner_user = @import("../dagger.zig").runner_user;
@@ -53,12 +56,19 @@ const braceBalanced = @import("testing.zig").braceBalanced;
 
 const Allocator = std.mem.Allocator;
 
-/// What the default image (`ubuntu:24.04`) gets before a job: what workflows written for GitHub's
+/// What the default image (`ubuntu:24.04`, pinned by digest) gets before a job: what workflows written for GitHub's
 /// `ubuntu-latest` most often assume without a setup action. `sudo` (steps run as `runner_user`, as
 /// on GitHub, and many call `sudo apt-get`), compilers and `make`, Python with pip and venv (and
 /// `python`), `psql` for a Postgres service, archive and transfer tools, and what composite actions
 /// often use (`jq`, `curl`). Installed once per engine: Dagger caches this exec, and the pre-warm
 /// (`warm`) builds it before the first job.
+///
+/// The packages are not pinned: they come from the archive on the day the engine builds this exec,
+/// so the seed is "image-pinned, packages from the archive on build date". Pinning `pkg=version`
+/// breaks provisioning within weeks, as noble-updates and noble-security list only their latest
+/// versions; snapshot.ubuntu.com serves amd64 only (not ubuntu-ports, which arm64 installs from).
+/// The pre-warm logs a fingerprint of what got installed (`package_fingerprint_script`), so a
+/// seed is identifiable.
 pub const provision_packages = [_][]const u8{
     "git",            "git-lfs",     "ca-certificates", "curl",              "wget",
     "xz-utils",       "bzip2",       "zstd",            "zip",               "unzip",
@@ -71,6 +81,10 @@ pub const provision_packages = [_][]const u8{
 pub const provision_script = "apt-get update -qq && DEBIAN_FRONTEND=noninteractive " ++
     "apt-get install -y -qq --no-install-recommends " ++ packageList() ++
     " >/dev/null && rm -rf /var/lib/apt/lists/*";
+
+/// Every installed package and version, hashed: the pre-warm's line names the provisioned seed by it.
+pub const package_fingerprint_script =
+    "dpkg-query -W -f '${Package}=${Version}\\n' | sha256sum | cut -c1-12";
 
 const chown_runner = " && chown -R " ++ runner_user ++ ":" ++ runner_user ++ " " ++ work_root;
 
@@ -268,8 +282,16 @@ const BasePlan = struct {
     zig_seed: ?[]const u8 = null,
     /// What "Set up job" says of the seed: applied, or why not.
     zig_seed_note: ?[]const u8 = null,
+    /// What "Set up job" says when `zig_local_cache` is on but the job's scope does not keep it.
+    zig_local_note: ?[]const u8 = null,
     /// The output-key store (`Exec.outputs_volume`), when the job setup's query asked for it.
     outputs_volume: ?[]const u8 = null,
+    /// The volume of the tool cache's lists, when the tool cache's trees are checked
+    /// (`verifyToolTrees`).
+    tool_trees: ?[]const u8 = null,
+    /// Where a `repo` job's checked trees report the Zig versions its tool cache holds, to be
+    /// verified and seeded in later jobs (`zig_release.Registry`).
+    zig_discover: ?*zig_release.Registry = null,
     ran_marker: []const u8,
     /// The job's `mark_env` value (`JobLog.mark`).
     mark: []const u8,
@@ -304,11 +326,147 @@ pub fn baseContainerId(
         err_msg.* = "Dagger returned no container";
         return error.BaseContainerFailed;
     };
-    return .{ .id = id, .runtime_path = jsonFindString(data, "zig_runtime_path") };
+    const runtime_path = jsonFindString(data, "zig_runtime_path");
+    const lists = plan.tool_trees orelse return .{ .id = id, .runtime_path = runtime_path };
+    const checked = try verifyToolTrees(arena, transport, id, lists, plan.ran_marker, err_msg);
+    if (plan.zig_discover) |r| r.discover(tool_cache_dir, checked.env);
+    return .{
+        .id = checked.id,
+        .runtime_path = runtime_path,
+        .tool_trees_note = checked.note,
+        .tool_trees = checked.env,
+    };
 }
 
-/// The base container, and a `container:` job's own PATH (`Exec.container_path`).
-pub const Base = struct { id: []const u8, runtime_path: ?[]const u8 };
+/// The base container, a `container:` job's own PATH (`Exec.container_path`), and what "Set up
+/// job" says of the tool cache's trees (`verifyToolTrees`).
+pub const Base = struct {
+    id: []const u8,
+    runtime_path: ?[]const u8,
+    tool_trees_note: ?[]const u8 = null,
+    /// `tool_trees_env`'s value, when the trees were checked (`Exec.tool_trees`).
+    tool_trees: ?[]const u8 = null,
+};
+
+// The tool cache's trees, checked in "Set up job". A script that pins a tree's digest, as
+// install-zig.sh pins Zig's, would otherwise read the whole tree in every job (19,500 files and
+// 309 MB for Zig: 0.7-1 s on the laptop, 10-19 s on razorbill under load), because the tool cache
+// is shared by every job of its scope and any of them could have changed it. tool_trees.sh reads
+// only the files whose stat changed since a list it keeps; that list is only worth trusting if
+// no job can write it, so it lives in a volume of its own that only this exec mounts, on a branch
+// of the base container that no step starts from. A job that could write the list could record a
+// replaced file's new stat line with its old hash.
+//
+// Never in a job with Dagger nesting: its steps can open any cache volume by its key, and run
+// privileged containers that can set the clock, which the stat lines rely on (#228).
+
+/// The lists' volume, mounted only on the check's own branch.
+const tool_trees_dir = "/zig-runner-tool-trees";
+/// What steps are given: one `DIGEST TREE` line per tree checked, TREE an absolute path.
+const tool_trees_env = "ZIG_RUNNER_TOOL_TREES";
+const tool_cache_index = for (package_cache_dirs, 0..) |d, i| {
+    if (std.mem.eql(u8, d.name, "toolcache")) break i;
+} else unreachable;
+const tool_cache_dir = package_cache_dirs[tool_cache_index].path;
+/// The check runs with the image's bash and none of the job's environment (a workflow's
+/// `BASH_ENV` or `PATH` must not run in it).
+const tool_trees_argv = [_][]const u8{
+    "/usr/bin/env",  "-i",           "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+    "bash",          "-c",           @embedFile("tool_trees.sh"),
+    "tool_trees.sh", tool_cache_dir, tool_trees_dir,
+};
+
+/// Runs tool_trees.sh on a branch of the base container with the lists' volume mounted, as root,
+/// and returns the base container with `tool_trees_env` set from what it printed. `nonce` (the
+/// job's run marker) makes the exec run in every job: the engine would reuse it by its recipe,
+/// in which a volume's content has no part. The variable is set even when the check failed or
+/// found nothing, empty then, so a workflow's own value never stands in for the runner's.
+///
+/// The variable is part of every step's key, which is what keeps replay sound: its value is the
+/// trees' paths and digests, a function of the tool cache's content, so it is the same in every
+/// job until a tree is added, removed or changed, and then every step's key changes once.
+fn verifyToolTrees(
+    arena: Allocator,
+    transport: Transport,
+    base: []const u8,
+    lists: []const u8,
+    nonce: []const u8,
+    err_msg: *[]const u8,
+) !struct { id: []const u8, note: []const u8, env: []const u8 } {
+    var check: Query = .init(arena);
+    try check.call("loadContainerFromID", .{ .id = base });
+    try check.call("withMountedCache", .{ .path = tool_trees_dir, .cache = lists });
+    try check.call("withUser", .{ .name = "root" });
+    try check.call("withEnvVariable", .{ .name = "ZIG_RUNNER_TOOL_TREES_RUN", .value = nonce });
+    try check.call("withExec", .{ .args = &tool_trees_argv });
+    try check.leaf("stdout");
+    var msg: []const u8 = "";
+    const out: ?[]const u8 = if (gql(arena, transport, try check.finish(), &msg)) |data|
+        jsonFindString(data, "stdout")
+    else |_|
+        null;
+    const verdict = try toolTreesVerdict(arena, out orelse "");
+    var set: Query = .init(arena);
+    try set.call("loadContainerFromID", .{ .id = base });
+    try set.call("withEnvVariable", .{ .name = tool_trees_env, .value = verdict.env });
+    try set.leaf("id");
+    const data = gql(arena, transport, try set.finish(), err_msg) catch
+        return error.BaseContainerFailed;
+    const id = jsonFindString(data, "id") orelse {
+        err_msg.* = "Dagger returned no container";
+        return error.BaseContainerFailed;
+    };
+    const note = if (out == null) try std.fmt.allocPrint(
+        arena,
+        "Tool cache: not checked ({s}); steps check what they use themselves",
+        .{msg},
+    ) else verdict.note;
+    return .{ .id = id, .note = note, .env = verdict.env };
+}
+
+/// `tool_trees_env`'s value and "Set up job"'s line, from tool_trees.sh's `DIGEST TREE FILES
+/// REHASHED` lines. A line that does not have that form, or names a tree outside the tool cache
+/// or through a dot-named directory, is left out: a step then checks that tree itself.
+fn toolTreesVerdict(
+    arena: Allocator,
+    out: []const u8,
+) !struct { env: []const u8, note: []const u8 } {
+    var env: std.ArrayList(u8) = .empty;
+    var note: std.ArrayList(u8) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        const digest = fields.next() orelse continue;
+        const tree = fields.next() orelse continue;
+        const files = fields.next() orelse continue;
+        const rehashed = fields.next() orelse continue;
+        if (fields.next() != null) continue;
+        if (digest.len != 64 or std.mem.indexOfNone(u8, digest, "0123456789abcdef") != null)
+            continue;
+        if (!std.mem.startsWith(u8, tree, tool_cache_dir ++ "/") or
+            std.mem.indexOf(u8, tree, "/.") != null or
+            std.mem.indexOfNone(u8, tree, path_chars) != null) continue;
+        if (std.mem.indexOfNone(u8, files, "0123456789") != null or
+            std.mem.indexOfNone(u8, rehashed, "0123456789") != null) continue;
+        try env.print(arena, "{s}{s} {s}", .{ if (env.items.len > 0) "\n" else "", digest, tree });
+        try note.print(arena, "{s}{s} ({s} files, {s} read)", .{
+            if (note.items.len > 0) ", " else "",
+            tree[tool_cache_dir.len + 1 ..],
+            files,
+            rehashed,
+        });
+    }
+    return .{
+        .env = env.items,
+        .note = if (note.items.len == 0)
+            "Tool cache: no trees to check"
+        else
+            try std.fmt.allocPrint(arena, "Tool cache: checked {s}", .{note.items}),
+    };
+}
+
+/// What tool_trees.sh lets into a tree's path: no spaces, quotes or newlines.
+const path_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-/";
 
 /// `from` the job image, behind a private registry's credentials when there are any, with a
 /// container job's cache variables and its own `env:` set on it.
@@ -439,11 +597,12 @@ fn writeProvision(q: *Query, as_runner: bool) !void {
 }
 
 /// One cache volume mount per package manager the job uses (`cachesUsed`), owned by the step user
-/// when steps run as it. With a Zig cache seed, Zig's global cache volume starts as the seed when
-/// it is made (`source:`), and one that is already there gets what it lacks of it
-/// (`writeSeedCopy`).
+/// when steps run as it. Zig's global cache is the job's own, never a volume: Zig trusts the
+/// outputs it finds in `o/` without checking them, so a shared one would let one job plant a binary
+/// every later job runs. It starts as the seed, mounted as a directory whose writes go with the
+/// job's container, or empty in the container without one; only its package tarballs (`p/`, which
+/// Zig hashes again when it unpacks them) are in a volume.
 fn writeCacheMounts(q: *Query, arena: Allocator, plan: BasePlan) !void {
-    var zig_path: ?[]const u8 = null;
     for (plan.cache_ids, 0..) |id, i| {
         if (!plan.cache_used[i]) continue;
         const path = if (plan.as_runner) try runnerCachePath(
@@ -451,17 +610,16 @@ fn writeCacheMounts(q: *Query, arena: Allocator, plan: BasePlan) !void {
             i,
         ) else package_cache_dirs[i].path;
         const owner: ?[]const u8 = if (plan.as_runner) runner_user else null;
-        const zig = std.mem.eql(u8, package_cache_dirs[i].name, "zig");
-        if (zig) zig_path = path;
+        const zig = std.mem.eql(u8, package_cache_dirs[i].name, zig_packages);
+        if (zig) if (plan.zig_seed) |seed|
+            try q.call("withMountedDirectory", .{ .path = path, .source = seed, .owner = owner });
         try q.call("withMountedCache", .{
-            .path = path,
+            .path = if (zig) try std.mem.concat(arena, u8, &.{ path, "/p" }) else path,
             .cache = id,
-            .source = if (zig) plan.zig_seed else null,
             .owner = owner,
         });
     }
     if (plan.zig_local) |id| try writeZigLocalMount(q, id, plan.as_runner);
-    if (plan.zig_seed) |seed| if (zig_path) |path| try writeSeedCopy(q, arena, seed, path);
 }
 
 /// The values that identify this run: the event payload, the ran marker, uv's environment, and the
@@ -546,10 +704,11 @@ pub fn basePlan(
     err_msg: *[]const u8,
 ) !BasePlan {
     // `container:` replaces the image every step runs in.
-    const job_image: []const u8 = if (job.container) |jc| (ev.render(
+    // The default image's bare name (`container: ubuntu:24.04`) is the pinned default.
+    const job_image: []const u8 = resolveImage(if (job.container) |jc| (ev.render(
         jc.image,
         try ev.scope(&.{}),
-    ) catch "") else opts.image;
+    ) catch "") else opts.image);
     if (job_image.len == 0) {
         err_msg.* = try std.fmt.allocPrint(arena, "container: has no image: {s}", .{ev.diag});
         return error.BaseContainerFailed;
@@ -596,13 +755,25 @@ pub fn basePlan(
         .cache_ids = volumes.ids,
         .cache_used = cachesUsed(job),
         .zig_local = volumes.zig_local,
-        .zig_local_env = if (volumes.zig_local != null)
+        .zig_local_env = if (opts.zig_local_cache and opts.package_caches and
+            job.github.repository.len > 0)
             zigLocalCacheEnv(as_runner, opts.zig_local_cache_max_mb)
         else
             null,
         .zig_seed = zig_seed,
         .zig_seed_note = zig_seed_note,
+        .zig_local_note = if (opts.zig_local_cache and volumes.ids.len > 0 and
+            volumes.zig_local == null)
+            "Zig local cache: this job's own (not kept between untrusted jobs)"
+        else
+            null,
         .outputs_volume = volumes.outputs,
+        .tool_trees = volumes.tool_trees,
+        .zig_discover = if (opts.zig_seed_registry) |r| if (std.mem.eql(
+            u8,
+            try packageCacheScope(arena, ev, job.github.repository, opts.trusted),
+            "repo",
+        )) r else null else null,
         .ran_marker = ran_marker,
         .mark = mark,
     };
@@ -644,6 +815,7 @@ const CacheVolumes = struct {
     ids: []const []const u8 = &.{},
     zig_local: ?[]const u8 = null,
     outputs: ?[]const u8 = null,
+    tool_trees: ?[]const u8 = null,
 };
 
 /// Package managers' caches persist across jobs in Dagger cache volumes (see `package_cache_dirs`):
@@ -681,6 +853,10 @@ fn cacheVolumeIds(
         .as_runner = as_runner,
         .caches = caches,
         .outputs_key = try outputKeysKey(arena, ev, job, opts, step_cache),
+        .tool_trees_key = if (caches)
+            try toolTreesKey(arena, ev, job, opts, job_image, as_runner)
+        else
+            null,
     };
     var msg: []const u8 = "";
     if (try set_up.send(arena, transport, secrets, pending, &msg)) |v| return v;
@@ -703,6 +879,7 @@ const SetUpQuery = struct {
     as_runner: bool,
     caches: bool,
     outputs_key: ?[]const u8,
+    tool_trees_key: ?[]const u8,
 
     /// Sends the query with `pending` registered. Null, with the reason in `err_msg`, when it
     /// failed or lacked an answer.
@@ -721,6 +898,11 @@ const SetUpQuery = struct {
             try q.leaf("id");
             try q.close(1);
         }
+        if (u.tool_trees_key) |key| {
+            try q.callAs("ctt", "cacheVolume", .{ .key = key });
+            try q.leaf("id");
+            try q.close(1);
+        }
         if (u.caches) try writeCacheVolumes(&q, arena, u.ev, u.job, u.opts, u.job_image, u.as_runner);
         const data = gql(arena, transport, try q.finish(), err_msg) catch return null;
         if (!try secrets.read(arena, data, pending)) {
@@ -730,6 +912,8 @@ const SetUpQuery = struct {
         var out: CacheVolumes = .{};
         if (u.outputs_key != null)
             out.outputs = if (jsonFind(data, "cout")) |v| jsonFindString(v, "id") else null;
+        if (u.tool_trees_key != null)
+            out.tool_trees = if (jsonFind(data, "ctt")) |v| jsonFindString(v, "id") else null;
         if (!u.caches) return out;
         const no_volume = "Dagger returned no cache volume";
         const ids = try arena.alloc([]const u8, package_cache_dirs.len);
@@ -744,7 +928,7 @@ const SetUpQuery = struct {
             };
         }
         out.ids = ids;
-        if (u.opts.zig_local_cache) {
+        if (try zigLocalShared(arena, u.ev, u.job, u.opts)) {
             const v = jsonFind(data, "czl") orelse {
                 err_msg.* = no_volume;
                 return null;
@@ -758,6 +942,40 @@ const SetUpQuery = struct {
     }
 };
 
+/// Whether the job keeps Zig's local cache in its volume (`zig_local_cache`): only in the `repo`
+/// scope. Zig runs the outputs it finds there without checking them, so in `untrusted`, where every
+/// job is a stranger's, one job could plant what the next one runs; there the cache is the job's
+/// own, in its container at the same path (so the base container's recipe is the pre-warm's), and
+/// "Set up job" says so. In `repo` every job is code the runner vouches for: a shared cache risks
+/// only what a compromised trusted job could do anyway.
+fn zigLocalShared(arena: Allocator, ev: *Evaluator, job: job_mod.Job, opts: Options) !bool {
+    if (!opts.zig_local_cache) return false;
+    const scope = try packageCacheScope(arena, ev, job.github.repository, opts.trusted);
+    return std.mem.eql(u8, scope, "repo");
+}
+
+/// The key of the volume `verifyToolTrees` keeps its lists in, beside the tool cache's own (the
+/// same scope, image and user), or null when the job's trees are not checked: with
+/// `tool_trees` off, and in a job with Dagger nesting, whose steps could open it by its key.
+fn toolTreesKey(
+    arena: Allocator,
+    ev: *Evaluator,
+    job: job_mod.Job,
+    opts: Options,
+    job_image: []const u8,
+    as_runner: bool,
+) !?[]const u8 {
+    const scope = try packageCacheScope(arena, ev, job.github.repository, opts.trusted);
+    if (!opts.tool_trees or (opts.nesting and std.mem.eql(u8, scope, "repo"))) return null;
+    return try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/tool-trees/{s}{s}", .{
+        job.github.repository,
+        scope,
+        // The tool cache's own key drops the digest (`imageName`); its lists follow the same volume.
+        imageName(job_image),
+        if (as_runner) "/" ++ runner_user else "",
+    });
+}
+
 /// One `cacheVolume` per package manager (`c<i>`), and Zig's local cache's (`czl`).
 fn writeCacheVolumes(
     q: *Query,
@@ -770,7 +988,7 @@ fn writeCacheVolumes(
 ) !void {
     const scope = try packageCacheScope(arena, ev, job.github.repository, opts.trusted);
     // Its own volume, so the engine can collect it (it only grows) without the global cache.
-    if (opts.zig_local_cache) {
+    if (try zigLocalShared(arena, ev, job, opts)) {
         const key = try std.fmt.allocPrint(
             arena,
             "zig-runner/{s}/{s}/zig-local{s}",
@@ -782,12 +1000,13 @@ fn writeCacheVolumes(
     }
     for (package_cache_dirs, 0..) |d, i| {
         // The tool cache holds binaries built for one image (glibc or musl, its libraries), so
-        // each image has its own.
+        // each image has its own: by name, as a rebuild of the same release (a new digest) runs
+        // them alike, and a digest update keeps the volume.
         const key = if (std.mem.eql(u8, d.name, "toolcache"))
             try std.fmt.allocPrint(
                 arena,
                 "zig-runner/{s}/{s}/{s}/{s}",
-                .{ job.github.repository, scope, d.name, job_image },
+                .{ job.github.repository, scope, d.name, imageName(job_image) },
             )
         else
             try std.fmt.allocPrint(
@@ -892,6 +1111,9 @@ pub fn execFor(
         .nesting = opts.nesting and vouched,
         .nesting_withheld = opts.nesting and !vouched,
         .step_cache = step_cache,
+        // Mounted at the same path for every step user (`runnerCachePath`).
+        .tool_cache = if (plan.cache_ids.len > tool_cache_index and
+            plan.cache_used[tool_cache_index]) tool_cache_dir else null,
         .enforce_volatile = step_cache and opts.enforce_volatile,
         .output_keys = try outputKeysKey(arena, ev, job.*, opts, step_cache),
         .outputs_volume = plan.outputs_volume,
@@ -1061,8 +1283,14 @@ pub const package_cache_dirs = [_]struct {
         .env = "BUN_INSTALL_CACHE_DIR",
         .tools = &.{ "bun", "bunx" },
     },
-    // Decided by `usesZig`, as the seed is: a seeded job needs its volume.
-    .{ .name = "zig", .path = "/root/.cache/zig", .env = "ZIG_GLOBAL_CACHE_DIR", .tools = &.{} },
+    // Zig's global cache, of which only the package tarballs are in the volume (`writeCacheMounts`).
+    // Decided by `usesZig`, as the seed is.
+    .{
+        .name = zig_packages,
+        .path = "/root/.cache/zig",
+        .env = "ZIG_GLOBAL_CACHE_DIR",
+        .tools = &.{},
+    },
     .{
         .name = "gradle",
         .path = "/root/.gradle/caches",
@@ -1085,6 +1313,7 @@ pub const package_cache_dirs = [_]struct {
     },
     .{ .name = "go-telemetry", .path = "/root/.config/go/telemetry", .tools = &go_tools },
 };
+const zig_packages = "zig-packages";
 const node_tools = [_][]const u8{ "npm", "npx", "node", "nodejs" };
 const go_tools = [_][]const u8{ "go", "golang", "gofmt" };
 const rust_tools = [_][]const u8{ "cargo", "rust", "rustup", "rustc" };
@@ -1106,7 +1335,7 @@ fn cachesUsed(job: job_mod.Job) [package_cache_dirs.len]bool {
         else => {},
     };
     for (package_cache_dirs, &used) |d, *u| {
-        if (std.mem.eql(u8, d.name, "zig")) u.* = usesZig(job);
+        if (std.mem.eql(u8, d.name, zig_packages)) u.* = usesZig(job);
     }
     return used;
 }
@@ -1131,7 +1360,7 @@ fn namesAny(text: []const u8, words: []const []const u8) bool {
 /// Which volumes the job shares: `repo`, the repository's trusted jobs', only for a job the runner
 /// vouches for (`Options.trusted`, `trust.vouches`); every other job gets `untrusted`, so untrusted
 /// code cannot plant content in the caches trusted jobs read (GitHub scopes its cache by branch for
-/// the same reason). Several of them are not checked again on use (Go's module cache, Zig's package
+/// the same reason). Several of them are not checked again on use (Go's module cache, Zig's local
 /// cache, cargo's sources, the tool cache's binaries). It fails closed (#105): it used to give a
 /// separate scope only to a pull request whose head repository was named and was another, so a
 /// same-repository pull request, a `workflow_run` or `issue_comment` a fork triggered, or a fork's
@@ -1153,13 +1382,14 @@ pub fn packageCacheScope(
     return if (head.len > 0 and !std.ascii.eqlIgnoreCase(head, repository)) "untrusted" else "repo";
 }
 
-// The Zig cache seed (`Options.zig_seed`): the global cache `zig build --help` leaves on a trivial
+// The Zig cache seed (`Options.zig_seeds`): the global cache `zig build --help` leaves on a trivial
 // `build.zig`, so no Zig job compiles the build runner (Zig 0.17's "maker") itself: 104 s on one
 // core and about 1 GB; a cold `zig build test` of zig-runner went from 146 s to 49 s (README.md).
 // Zig trusts what it finds in `o/` without checking it, so the seed comes from trusted inputs only:
 // the Zig tarball, checked against the pinned sha256 inside the exec, and a `build.zig` the runner
 // writes. Nothing a job produced or can write goes in, which is why one seed may go to every
-// repository's volumes, `repo` and `untrusted` alike. The engine caches the exec by its recipe, so
+// repository's jobs, `repo` and `untrusted` alike, and what a job adds to it stays in that job
+// (`writeCacheMounts`). The engine caches the exec by its recipe, so
 // it runs once per engine, and Zig builds it bit for bit the same. Zig keys it on its version, the
 // OS and ABI and the CPU model, which the exec's `zig` detects in the default image on the engine's
 // host just as a job's does there.
@@ -1174,12 +1404,15 @@ const zig_seed_build_zig =
     \\}
     \\
 ;
-/// Where the seed is built, and where a Zig job's container has it while it is copied.
+/// Where the seed is built.
 const zig_seed_dir = "/zig-seed";
 
-/// The seed for this job, built or found in the engine's cache, when the runner has one, the job
-/// has cache volumes and it runs Zig (`usesZig`), so no other job's recipe changes. A seed that
-/// cannot be built leaves the job unseeded. `note` says which, for "Set up job".
+/// The seed for this job, built or found in the engine's cache, when the runner has any (one per
+/// verified Zig release, `Options.zig_seeds`), the job has cache volumes and it runs Zig
+/// (`usesZig`), so no other job's recipe changes. With several, one directory holds them all: Zig
+/// keys every entry on its version, so they do not collide. A seed that cannot be built is left
+/// out, and with none the job runs unseeded, its global cache still its own. `note` says which,
+/// for "Set up job".
 fn zigSeedFor(
     arena: Allocator,
     transport: Transport,
@@ -1187,19 +1420,54 @@ fn zigSeedFor(
     opts: Options,
     note: *?[]const u8,
 ) !?[]const u8 {
-    const seed = opts.zig_seed orelse return null;
     if (!opts.package_caches or job.github.repository.len == 0 or !usesZig(job)) return null;
+    const unverified = if (opts.zig_seeds_unverified.len == 0) "" else try std.fmt.allocPrint(
+        arena,
+        "; not seeded from Zig {s}: its tarball's signature was not verified",
+        .{try std.mem.join(arena, ", ", opts.zig_seeds_unverified)},
+    );
+    if (opts.zig_seeds.len == 0) {
+        if (unverified.len > 0) note.* = try std.fmt.allocPrint(
+            arena,
+            "Zig global cache not seeded, this job's own{s}",
+            .{unverified},
+        );
+        return null;
+    }
+    var ids: std.ArrayList([]const u8) = .empty;
+    var seeded: std.ArrayList(u8) = .empty;
     var msg: []const u8 = "";
-    const doc = try zigSeedDocument(arena, seed, opts.step_user == .runner);
-    const id = if (gql(arena, transport, doc, &msg)) |data|
-        jsonFindString(data, "sync")
-    else |_|
-        null;
+    for (opts.zig_seeds) |seed| {
+        const doc = try zigSeedDocument(arena, seed, opts.step_user == .runner);
+        const data = gql(arena, transport, doc, &msg) catch continue;
+        const id = jsonFindString(data, "sync") orelse continue;
+        try ids.append(arena, id);
+        if (seeded.items.len > 0) try seeded.appendSlice(arena, ", ");
+        try seeded.appendSlice(arena, seed.version);
+    }
+    const id = switch (ids.items.len) {
+        0 => null,
+        1 => ids.items[0],
+        else => merged: {
+            var q: Query = .init(arena);
+            try q.call("loadDirectoryFromID", .{ .id = ids.items[0] });
+            for (ids.items[1..]) |more|
+                try q.call("withDirectory", .{ .path = "/", .source = more });
+            try q.leaf("sync");
+            const data = gql(arena, transport, try q.finish(), &msg) catch break :merged null;
+            break :merged jsonFindString(data, "sync");
+        },
+    };
     note.* = if (id != null)
-        try std.fmt.allocPrint(arena, "Zig global cache seeded from Zig {s}", .{seed.version})
+        try std.fmt.allocPrint(
+            arena,
+            "Zig global cache seeded from Zig {s}{s}",
+            .{ seeded.items, unverified },
+        )
     else
-        try std.fmt.allocPrint(arena, "Zig cache seed not built, running unseeded: {s}", .{
+        try std.fmt.allocPrint(arena, "Zig cache seed not built, running unseeded: {s}{s}", .{
             if (msg.len > 0) msg else "Dagger returned no directory",
+            unverified,
         });
     return id;
 }
@@ -1236,10 +1504,17 @@ fn zigSeedScript(arena: Allocator, seed: config.ZigSeed) ![]const u8 {
     return std.fmt.allocPrint(
         arena,
         "set -e; cd /tmp; " ++
-            "curl -fsSL -o zig.tar.xz https://ziglang.org/download/{s}/{s}.tar.xz; " ++
+            "curl -fsSL -o zig.tar.xz {s}; " ++
             "echo '{s}  zig.tar.xz' | sha256sum -c --quiet; tar -xJf zig.tar.xz; cd {s}; " ++
             "ZIG_GLOBAL_CACHE_DIR={s} /tmp/{s}/zig build --help >/dev/null; rm -rf {s}/tmp",
-        .{ seed.version, tree, seed.sha256, zig_seed_project, zig_seed_dir, tree, zig_seed_dir },
+        .{
+            try zig_release.tarballUrl(arena, seed.version),
+            seed.sha256,
+            zig_seed_project,
+            zig_seed_dir,
+            tree,
+            zig_seed_dir,
+        },
     );
 }
 
@@ -1258,23 +1533,6 @@ fn usesZig(job: job_mod.Job) bool {
     return false;
 }
 
-/// What an existing Zig volume lacks of the seed, copied in: `source:` fills only a volume being
-/// made. Nothing is overwritten or deleted, and the manifests (`h/`) go last, so a build running
-/// at the same time never finds a manifest whose outputs are not there yet (an `h/` entry without
-/// its `o/` breaks a Zig cache for good). A copy that fails leaves the job unseeded. The engine
-/// caches this exec as well (a volume is in its key by name only), so it copies once per volume.
-fn writeSeedCopy(q: *Query, arena: Allocator, seed: []const u8, path: []const u8) !void {
-    try q.call("withMountedDirectory", .{ .path = zig_seed_dir, .source = seed });
-    const script = try std.fmt.allocPrint(
-        arena,
-        "s={s}; d={s}; {{ for e in \"$s\"/*; do [ \"$e\" = \"$s/h\" ] || cp -an \"$e\" \"$d\"/; " ++
-            "done; cp -an \"$s/h\" \"$d\"/; }} 2>/dev/null || true",
-        .{ zig_seed_dir, path },
-    );
-    try q.call("withExec", .{ .args = &[_][]const u8{ "sh", "-c", script } });
-    try q.call("withoutMount", .{ .path = zig_seed_dir });
-}
-
 // The pre-warm (`loop.Warmer`): what every job of this runner builds before its first step and
 // that depends on nothing of a job, built with no job at all, at startup and when the engine comes
 // back after a restart, so the first job finds it in the engine's cache. The engine caches by
@@ -1285,38 +1543,57 @@ fn writeSeedCopy(q: *Query, arena: Allocator, seed: []const u8, path: []const u8
 
 /// The pre-warm's documents: the base container's prefix as `basePlan` derives it for a job with
 /// cache volumes, evaluated (`sync`); what its image resolves to; and the Zig seed when a Zig job
-/// would get one.
-pub const WarmDocuments = struct { base: []const u8, image_ref: []const u8, seed: ?[]const u8 };
+/// would get one (one per verified seed); and the provisioned packages' fingerprint, on top of
+/// the base, when provisioned.
+pub const WarmDocuments = struct {
+    base: []const u8,
+    image_ref: []const u8,
+    seeds: []const []const u8,
+    packages: ?[]const u8,
+};
 
 pub fn warmDocuments(arena: Allocator, opts: Options) !WarmDocuments {
-    const provision = opts.provision and std.mem.eql(u8, opts.image, default_image);
+    const image = resolveImage(opts.image);
+    const provision = opts.provision and std.mem.eql(u8, image, default_image);
     const as_runner = provision and opts.step_user == .runner;
-    var q: Query = .init(arena);
-    try q.open("container");
-    try writeFrom(
-        &q,
-        opts.image,
-        if (opts.package_caches and opts.zig_local_cache)
-            zigLocalCacheEnv(as_runner, opts.zig_local_cache_max_mb)
-        else
-            null,
-    );
-    if (provision) try writeProvision(&q, as_runner);
-    try q.leaf("sync");
+    var docs: [2][]const u8 = undefined;
+    for (&docs, [_][]const u8{ "sync", "stdout" }) |*doc, leaf| {
+        var q: Query = .init(arena);
+        try q.open("container");
+        try writeFrom(
+            &q,
+            image,
+            if (opts.package_caches and opts.zig_local_cache)
+                zigLocalCacheEnv(as_runner, opts.zig_local_cache_max_mb)
+            else
+                null,
+        );
+        if (provision) try writeProvision(&q, as_runner);
+        if (std.mem.eql(u8, leaf, "stdout")) try q.call("withExec", .{
+            .args = &[_][]const u8{ "sh", "-c", package_fingerprint_script },
+        });
+        try q.leaf(leaf);
+        doc.* = try q.finish();
+    }
     var ref: Query = .init(arena);
     try ref.open("container");
-    try ref.call("from", .{ .address = opts.image });
+    try ref.call("from", .{ .address = image });
     try ref.leaf("imageRef");
-    var seed: ?[]const u8 = null;
-    if (opts.zig_seed) |z| if (opts.package_caches) {
-        seed = try zigSeedDocument(arena, z, opts.step_user == .runner);
+    const seeds = try arena.alloc([]const u8, if (opts.package_caches) opts.zig_seeds.len else 0);
+    for (seeds, opts.zig_seeds[0..seeds.len]) |*doc, z|
+        doc.* = try zigSeedDocument(arena, z, opts.step_user == .runner);
+    return .{
+        .base = docs[0],
+        .image_ref = try ref.finish(),
+        .seeds = seeds,
+        .packages = if (provision) docs[1] else null,
     };
-    return .{ .base = try q.finish(), .image_ref = try ref.finish(), .seed = seed };
 }
 
 /// What the pre-warm built: the image as the engine resolved it (with its digest when the
-/// registry gave one, as services do for a job's images), and whether the seed was built too.
-pub const Warmed = struct { image: []const u8, seeded: bool };
+/// registry gave one, as services do for a job's images), whether the seed was built too, and the
+/// provisioned packages' fingerprint (`package_fingerprint_script`) when there is one.
+pub const Warmed = struct { image: []const u8, seeded: bool, packages: ?[]const u8 = null };
 
 /// Sends the pre-warm's documents, the base container first. On failure the message is in
 /// `err_msg`.
@@ -1325,10 +1602,18 @@ pub fn warm(arena: Allocator, transport: Transport, opts: Options, err_msg: *[]c
     _ = gql(arena, transport, docs.base, err_msg) catch return error.BaseContainerFailed;
     const ref = gql(arena, transport, docs.image_ref, err_msg) catch
         return error.BaseContainerFailed;
-    const image = jsonFindString(ref, "imageRef") orelse opts.image;
-    const seed = docs.seed orelse return .{ .image = image, .seeded = false };
-    _ = gql(arena, transport, seed, err_msg) catch return error.ZigSeedFailed;
-    return .{ .image = image, .seeded = true };
+    const image = jsonFindString(ref, "imageRef") orelse resolveImage(opts.image);
+    // Only a name for the log: a fingerprint that cannot be read leaves it out.
+    var packages: ?[]const u8 = null;
+    if (docs.packages) |doc| {
+        var ignored: []const u8 = "";
+        if (gql(arena, transport, doc, &ignored)) |r| {
+            if (jsonFindString(r, "stdout")) |out| packages = std.mem.trim(u8, out, " \n");
+        } else |_| {}
+    }
+    for (docs.seeds) |seed| _ = gql(arena, transport, seed, err_msg) catch
+        return error.ZigSeedFailed;
+    return .{ .image = image, .seeded = docs.seeds.len > 0, .packages = packages };
 }
 
 test "the default image is provisioned with git; a custom image is left alone" {
@@ -1351,6 +1636,47 @@ test "the default image is provisioned with git; a custom image is left alone" {
         try std.testing.expect(braceBalanced(base));
         try std.testing.expectEqual(case.expect_provision, std.mem.indexOf(u8, base, "apt-get install") != null);
         try std.testing.expect(std.mem.indexOf(u8, base, case.image) != null);
+    }
+}
+
+test "a job without container:, or with the default's bare name, gets the pinned, provisioned default" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("true")};
+    var vols: std.Io.Writer.Allocating = .init(arena);
+    try vols.writer.writeAll("{\"data\":{");
+    for (package_cache_dirs, 0..) |_, i| try vols.writer.print("{s}\"c{d}\":{{\"id\":\"V{d}\"}}", .{ if (i == 0) "" else ",", i, i });
+    try vols.writer.writeAll("}}");
+    const other_digest = "ubuntu:24.04@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    for ([_]struct { container: ?[]const u8, config: []const u8, image: []const u8, provision: bool }{
+        .{ .container = null, .config = default_image, .image = default_image, .provision = true },
+        // An older config that names the image keeps getting the default.
+        .{ .container = null, .config = "ubuntu:24.04", .image = default_image, .provision = true },
+        .{ .container = "ubuntu:24.04", .config = default_image, .image = default_image, .provision = true },
+        // Another digest is the user's own image: used as is, not provisioned.
+        .{ .container = other_digest, .config = default_image, .image = other_digest, .provision = false },
+    }) |case| {
+        var job = testJob(&steps);
+        if (case.container) |c| job.container = .{ .name = "", .image = .{ .lit = c }, .env = &.{} };
+        const answers = [_][]const u8{ vols.written(), base_answer };
+        var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        // Only the base container matters here: the job stops when the answers run out.
+        _ = try run(arena, std.testing.io, &env, .{ .image = case.config, .package_caches = true, .step_user = .runner, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+        const base = fake.seen.items[1];
+        const from = try std.fmt.allocPrint(arena, "from(address:\"{s}\")", .{case.image});
+        try std.testing.expect(std.mem.indexOf(u8, base, from) != null);
+        // sudo, the runner user and git, as on GitHub (steps run as the runner user, the config's
+        // default).
+        for ([_][]const u8{ "apt-get install", " sudo ", " git ", "useradd", "/etc/sudoers.d/runner" }) |part|
+            try std.testing.expectEqual(case.provision, std.mem.indexOf(u8, base, part) != null);
+        // One tool cache for the release, whichever digest.
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "/toolcache/ubuntu:24.04/runner\")") != null or
+            std.mem.indexOf(u8, fake.seen.items[0], "/toolcache/ubuntu:24.04\")") != null);
     }
 }
 
@@ -1402,7 +1728,7 @@ test "the from and provisioning nodes are a byte prefix of every job's base docu
                 });
                 try std.testing.expect(std.mem.startsWith(u8, warm_docs.base, prefix));
                 try std.testing.expectEqualStrings("sync } } }", warm_docs.base[prefix.len..][0..10]);
-                try std.testing.expect(warm_docs.seed == null);
+                try std.testing.expect(warm_docs.seeds.len == 0);
                 try std.testing.expectEqual(provision, std.mem.indexOf(u8, prefix, "apt-get install") != null);
                 try std.testing.expectEqual(zig_local, std.mem.indexOf(u8, prefix, "ZIG_LOCAL_CACHE_DIR") != null);
                 // Nothing of the job: no volume, mount, secret, file, registry credential, nor the
@@ -1557,9 +1883,11 @@ test "package caches: one volume per tool, keyed by repository, shared only by v
         try std.testing.expect(res.succeeded);
         const scope = case.scope;
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "c1: cacheVolume(key:\"zig-runner/o/r/{s}/npm\")", .{scope})) != null);
-        // The tool cache is also keyed by the job's image (its binaries are built for it).
+        // The tool cache is also keyed by the job's image (its binaries are built for it), by
+        // name: the pinned default's key is the one it had before the pin, and a digest update
+        // keeps it.
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "c0: cacheVolume(key:\"zig-runner/o/r/{s}/toolcache/ubuntu:24.04\")", .{scope})) != null);
-        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "cacheVolume(key:\"zig-runner/o/r/{s}/zig\")", .{scope})) != null);
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "cacheVolume(key:\"zig-runner/o/r/{s}/zig-packages\")", .{scope})) != null);
         // Asked for by key alone: a `source:` seed would put a Directory ID into every step's
         // recipe, so one may only ever be a trusted, pinned input (proofs/README.md, `Key` row).
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "source:") == null);
@@ -1567,7 +1895,7 @@ test "package caches: one volume per tool, keyed by repository, shared only by v
         // Mounted on the base container, so every step has them.
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/opt/hostedtoolcache\",cache:\"V0\")") != null);
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.npm\",cache:\"V1\")") != null);
-        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.cache/zig\",cache:\"V11\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.cache/zig/p\",cache:\"V11\")") != null);
         // Zig's local cache stays in the workspace unless `zig_local_cache` is on.
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "zig-local") == null);
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "ZIG_LOCAL_CACHE_DIR") == null);
@@ -1610,6 +1938,39 @@ test "with zig_local_cache, Zig's local cache gets a volume of its own, outside 
     try std.testing.expect(std.mem.indexOf(u8, keys, "czl: cacheVolume(key:\"zig-runner/o/r/repo/zig-local/runner\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, base, "withEnvVariable(name:\"ZIG_LOCAL_CACHE_DIR\",value:\"/home/runner/.cache/zig-local\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, base, "withMountedCache(path:\"/home/runner/.cache/zig-local\",cache:\"VZL\",owner:\"runner\")") != null);
+}
+
+test "with zig_local_cache, an untrusted job's Zig local cache is its own: no volume, a Set up job note" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("zig build test")};
+    var vols: std.Io.Writer.Allocating = .init(arena);
+    try vols.writer.writeAll("{\"data\":{");
+    for (package_cache_dirs, 0..) |_, i| try vols.writer.print("{s}\"c{d}\":{{\"id\":\"V{d}\"}}", .{ if (i == 0) "" else ",", i, i });
+    try vols.writer.writeAll("}}");
+    const answers = [_][]const u8{ vols.written(), base_answer, try exec(arena, "C1", 0, "") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{
+        .package_caches = true,
+        .trusted = false,
+        .zig_local_cache = true,
+        .zig_local_cache_max_mb = 4096,
+        .step_user = .runner,
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+    }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    // No volume asked for or mounted, and no roll (its own exec, which would be a query of its own).
+    try std.testing.expectEqual(@as(usize, 3), fake.seen.items.len);
+    for (fake.seen.items) |d| try std.testing.expect(std.mem.indexOf(u8, d, "zig-local\",cache:") == null and std.mem.indexOf(u8, d, "czl") == null);
+    // The same variable as a `repo` job's, so the base container is the pre-warm's.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withEnvVariable(name:\"ZIG_LOCAL_CACHE_DIR\",value:\"/home/runner/.cache/zig-local/current\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Zig local cache: this job's own (not kept between untrusted jobs)") != null);
 }
 
 /// The `withMountedCache(...)` call of a document that mounts the volume `cache` (quoted).
@@ -1714,14 +2075,14 @@ const SeedRun = struct {
         return text;
     }
 };
-fn seedRun(arena: Allocator, opts: Options, job: job_mod.Job, seed: ?[]const u8) !SeedRun {
+fn seedRun(arena: Allocator, opts: Options, job: job_mod.Job, seeds: []const []const u8) !SeedRun {
     var env: std.process.Environ.Map = .init(arena);
     var vols: std.Io.Writer.Allocating = .init(arena);
     try vols.writer.writeAll("{\"data\":{");
     for (package_cache_dirs, 0..) |_, i| try vols.writer.print("{s}\"c{d}\":{{\"id\":\"V{d}\"}}", .{ if (i == 0) "" else ",", i, i });
     try vols.writer.writeAll("}}");
     var answers: std.ArrayList([]const u8) = .empty;
-    if (seed) |s| try answers.append(arena, s);
+    try answers.appendSlice(arena, seeds);
     if (opts.package_caches) try answers.append(arena, vols.written());
     try answers.appendSlice(arena, &.{ base_answer, try exec(arena, "C1", 0, "") });
     const fake = try arena.create(FakeSession);
@@ -1752,13 +2113,13 @@ test "the Zig cache seed: built from pinned, runner-written inputs, the same for
         var job = testJob(&steps);
         // Another repository's job gets the same seed too.
         if (case.user == .runner) job.github.repository = "other/repo";
-        const r = try seedRun(arena, .{ .package_caches = true, .trusted = case.trusted, .step_user = case.user, .zig_seed = test_zig_seed }, job, seed_answer);
+        const r = try seedRun(arena, .{ .package_caches = true, .trusted = case.trusted, .step_user = case.user, .zig_seeds = &.{test_zig_seed} }, job, &.{seed_answer});
         const seed_q = r.seen[0];
         try std.testing.expect(braceBalanced(seed_q));
         // The inputs: the default image's provisioning, the tarball by URL and pinned sha256,
         // checked before Zig runs, and the runner's own build.zig.
         const url = "https://ziglang.org/download/0.17.0/zig-" ++ @tagName(builtin.cpu.arch) ++ "-linux-0.17.0.tar.xz";
-        try std.testing.expect(std.mem.startsWith(u8, seed_q, "{ container { from(address:\"ubuntu:24.04\") { withExec(args:[\"sh\",\"-c\",\"apt-get update"));
+        try std.testing.expect(std.mem.startsWith(u8, seed_q, "{ container { from(address:\"" ++ default_image ++ "\") { withExec(args:[\"sh\",\"-c\",\"apt-get update"));
         try std.testing.expect(std.mem.indexOf(u8, seed_q, url) != null);
         const check = std.mem.indexOf(u8, seed_q, "echo '" ++ test_zig_seed.sha256 ++ "  zig.tar.xz' | sha256sum -c --quiet").?;
         const build = std.mem.indexOf(u8, seed_q, "ZIG_GLOBAL_CACHE_DIR=/zig-seed /tmp/zig-").?;
@@ -1776,24 +2137,24 @@ test "the Zig cache seed: built from pinned, runner-written inputs, the same for
         }
         // The volumes are asked for as before: the seed goes on the mount, not into keys.
         const user_suffix: []const u8 = if (case.user == .runner) "/runner" else "";
-        try std.testing.expect(std.mem.indexOf(u8, r.seen[1], try std.fmt.allocPrint(arena, "c11: cacheVolume(key:\"zig-runner/{s}/{s}/zig{s}\")", .{ job.github.repository, case.scope, user_suffix })) != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.seen[1], try std.fmt.allocPrint(arena, "c11: cacheVolume(key:\"zig-runner/{s}/{s}/zig-packages{s}\")", .{ job.github.repository, case.scope, user_suffix })) != null);
         try std.testing.expect(std.mem.indexOf(u8, r.seen[1], "source:") == null);
         const base = r.seen[2];
         try std.testing.expect(braceBalanced(base));
+        // The global cache is the seed as a directory of the job's own container, so what a job
+        // writes there goes with it; only the package tarballs (`p/`, hashed again on unpack) are
+        // in the volume.
         const mount = if (case.user == .runner)
-            "withMountedCache(path:\"/home/runner/.cache/zig\",cache:\"V11\",source:\"SEED\",owner:\"runner\")"
+            "withMountedDirectory(path:\"/home/runner/.cache/zig\",source:\"SEED\",owner:\"runner\") { withMountedCache(path:\"/home/runner/.cache/zig/p\",cache:\"V11\",owner:\"runner\")"
         else
-            "withMountedCache(path:\"/root/.cache/zig\",cache:\"V11\",source:\"SEED\")";
+            "withMountedDirectory(path:\"/root/.cache/zig\",source:\"SEED\") { withMountedCache(path:\"/root/.cache/zig/p\",cache:\"V11\")";
         try std.testing.expect(std.mem.indexOf(u8, base, mount) != null);
-        // `source:` on the Zig volume and nowhere else; the copy into an existing volume, manifests
-        // last, with the seed unmounted after it.
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, base, "withMountedCache(path:\"/root/.cache/zig\",cache:\"V11\",source:") + std.mem.count(u8, base, "withMountedCache(path:\"/home/runner/.cache/zig\",cache:\"V11\",source:"));
-        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, base, "\"SEED\""));
-        const copy = std.mem.indexOf(u8, base, "withMountedDirectory(path:\"/zig-seed\",source:\"SEED\") { withExec(args:[\"sh\",\"-c\",\"s=/zig-seed; d=").?;
-        try std.testing.expect(std.mem.indexOf(u8, base, "do [ \\\"$e\\\" = \\\"$s/h\\\" ] || cp -an \\\"$e\\\" \\\"$d\\\"/; done; cp -an \\\"$s/h\\\" \\\"$d\\\"/; } 2>/dev/null || true\"]) { withoutMount(path:\"/zig-seed\") { ") != null);
-        try std.testing.expect(std.mem.indexOf(u8, base[copy..std.mem.indexOf(u8, base, "withoutMount").?], "rm ") == null);
-        // Before anything run-specific, so the engine keeps the copy for the next job.
-        try std.testing.expect(copy < std.mem.indexOf(u8, base, mark_env).?);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, base, "\"SEED\""));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, base, "cache:\"V11\""));
+        try std.testing.expect(std.mem.indexOf(u8, base, "source:\"SEED\") { withExec") == null);
+        try std.testing.expect(std.mem.indexOf(u8, base, "zig-seed") == null);
+        // Before anything run-specific, so the seed's mount is in no run's key of its own.
+        try std.testing.expect(std.mem.indexOf(u8, base, mount).? < std.mem.indexOf(u8, base, mark_env).?);
         try std.testing.expect(std.mem.indexOf(u8, r.log, "Zig global cache seeded from Zig 0.17.0") != null);
     }
 }
@@ -1809,8 +2170,8 @@ test "the Zig cache seed changes nothing for a job without Zig, without caches, 
         .{ .steps = &zig, .caches = false },
     }) |case| {
         const job = testJob(case.steps);
-        const off = try seedRun(arena, .{ .package_caches = case.caches, .step_cache = true, .test_ran_marker = "j1" }, job, null);
-        const on = try seedRun(arena, .{ .package_caches = case.caches, .step_cache = true, .test_ran_marker = "j1", .zig_seed = test_zig_seed }, job, null);
+        const off = try seedRun(arena, .{ .package_caches = case.caches, .step_cache = true, .test_ran_marker = "j1" }, job, &.{});
+        const on = try seedRun(arena, .{ .package_caches = case.caches, .step_cache = true, .test_ran_marker = "j1", .zig_seeds = &.{test_zig_seed} }, job, &.{});
         // Byte for byte what the runner sends without a seed, so no step key moves.
         try std.testing.expectEqual(off.seen.len, on.seen.len);
         for (off.seen, on.seen) |x, y| try std.testing.expectEqualStrings(try off.masked(arena, x), try on.masked(arena, y));
@@ -1818,10 +2179,45 @@ test "the Zig cache seed changes nothing for a job without Zig, without caches, 
     }
     // With the knob off, a Zig job sends what it always has: no seed query, no `source:`.
     const job = testJob(&zig);
-    const r = try seedRun(arena, .{ .package_caches = true }, job, null);
+    const r = try seedRun(arena, .{ .package_caches = true }, job, &.{});
     try std.testing.expectEqual(@as(usize, 3), r.seen.len);
     for (r.seen) |d| try std.testing.expect(std.mem.indexOf(u8, d, "zig-seed") == null and std.mem.indexOf(u8, d, "source:") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.log, "Zig global cache") == null);
+    // Unseeded, the global cache is in the job's container: only `p/` is in a volume.
+    try std.testing.expect(std.mem.indexOf(u8, r.seen[1], "withMountedCache(path:\"/root/.cache/zig/p\",cache:\"V11\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.seen[1], "path:\"/root/.cache/zig\"") == null);
+}
+
+test "several verified Zig releases seed one directory; one that did not verify is said and left out" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const steps = [_]job_mod.Step{testStep("zig build test")};
+    const older: config.ZigSeed = .{ .version = "0.16.0", .sha256 = test_zig_seed.sha256 };
+    const second = try std.mem.replaceOwned(u8, arena, seed_answer, "SEED", "SEED2");
+    const merged = "{\"data\":{\"loadDirectoryFromID\":{\"withDirectory\":{\"sync\":\"MERGED\"}}}}";
+    const r = try seedRun(arena, .{
+        .package_caches = true,
+        .zig_seeds = &.{ test_zig_seed, older },
+        .zig_seeds_unverified = &.{"0.15.2"},
+    }, testJob(&steps), &.{ seed_answer, second, merged });
+    try std.testing.expect(std.mem.indexOf(u8, r.seen[0], "/download/0.17.0/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.seen[1], "/download/0.16.0/") != null);
+    try std.testing.expectEqualStrings("{ loadDirectoryFromID(id:\"SEED\") { withDirectory(path:\"/\",source:\"SEED2\") { sync } } }", r.seen[2]);
+    try std.testing.expect(std.mem.indexOf(u8, r.seen[4], "withMountedDirectory(path:\"/root/.cache/zig\",source:\"MERGED\") { withMountedCache(path:\"/root/.cache/zig/p\",cache:\"V11\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.log, "Zig global cache seeded from Zig 0.17.0, 0.16.0; not seeded from Zig 0.15.2: its tarball's signature was not verified") != null);
+}
+
+test "a Zig release whose signature did not verify is not seeded: the job's global cache is its own, and it says so" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const steps = [_]job_mod.Step{testStep("zig build test")};
+    const r = try seedRun(arena, .{ .package_caches = true, .zig_seeds_unverified = &.{"0.17.0"} }, testJob(&steps), &.{});
+    try std.testing.expectEqual(@as(usize, 3), r.seen.len);
+    try std.testing.expect(std.mem.indexOf(u8, r.seen[1], "path:\"/root/.cache/zig\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.seen[1], "withMountedCache(path:\"/root/.cache/zig/p\",cache:\"V11\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.log, "Zig global cache not seeded, this job's own; not seeded from Zig 0.17.0: its tarball's signature was not verified") != null);
 }
 
 test "a Zig cache seed that cannot be built leaves the job running, unseeded" {
@@ -1833,10 +2229,11 @@ test "a Zig cache seed that cannot be built leaves the job running, unseeded" {
         "{\"errors\":[{\"message\":\"process \\\"sh -c set -e\\\" did not complete successfully: exit code: 1\"}]}",
         "{\"data\":{}}",
     }) |answer| {
-        const r = try seedRun(arena, .{ .package_caches = true, .zig_seed = test_zig_seed }, testJob(&steps), answer);
+        const r = try seedRun(arena, .{ .package_caches = true, .zig_seeds = &.{test_zig_seed} }, testJob(&steps), &.{answer});
         try std.testing.expectEqual(@as(usize, 4), r.seen.len);
         try std.testing.expect(std.mem.indexOf(u8, r.seen[2], "source:") == null);
         try std.testing.expect(std.mem.indexOf(u8, r.seen[2], "zig-seed") == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.seen[2], "withMountedDirectory(path:\"/root/.cache/zig\"") == null);
         try std.testing.expect(std.mem.indexOf(u8, r.log, "Zig cache seed not built, running unseeded: ") != null);
     }
 }
@@ -1852,7 +2249,7 @@ test "usesZig: a script or an action that names Zig" {
 test "cachesUsed: a job mounts the caches of the tools it names, and Zig's as usesZig decides" {
     const zig_only = cachesUsed(testJob(&.{testStep("zig build test --summary all")}));
     for (package_cache_dirs, zig_only) |d, u| {
-        try std.testing.expectEqual(std.mem.eql(u8, d.name, "zig"), u);
+        try std.testing.expectEqual(std.mem.eql(u8, d.name, zig_packages), u);
     }
     const nothing = cachesUsed(testJob(&.{testStep("echo hi && make check")}));
     for (nothing) |u| try std.testing.expect(!u);
@@ -1980,11 +2377,11 @@ test "the pre-warm sends a Zig job's own seed and base documents, and fails with
     const arena = a.allocator();
     const steps = [_]job_mod.Step{testStep("zig build test")};
     for ([_]config.StepUser{ .runner, .root }) |user| {
-        const opts: Options = .{ .package_caches = true, .step_user = user, .zig_seed = test_zig_seed };
-        const r = try seedRun(arena, opts, testJob(&steps), seed_answer);
+        const opts: Options = .{ .package_caches = true, .step_user = user, .zig_seeds = &.{test_zig_seed} };
+        const r = try seedRun(arena, opts, testJob(&steps), &.{seed_answer});
         const docs = try warmDocuments(arena, opts);
         // Byte for byte the job's seed query, so the engine answers the job from its cache.
-        try std.testing.expectEqualStrings(r.seen[0], docs.seed.?);
+        try std.testing.expectEqualStrings(r.seen[0], docs.seeds[0]);
         const prefix = docs.base[0..std.mem.indexOf(u8, docs.base, "sync ").?];
         try std.testing.expect(std.mem.startsWith(u8, r.seen[2], prefix));
         try std.testing.expect(std.mem.indexOf(u8, prefix, "apt-get install") != null);
@@ -1993,6 +2390,7 @@ test "the pre-warm sends a Zig job's own seed and base documents, and fails with
         const answers = [_][]const u8{
             "{\"data\":{\"container\":{\"from\":{\"withExec\":{\"sync\":\"C0\"}}}}}",
             "{\"data\":{\"container\":{\"from\":{\"imageRef\":\"docker.io/library/ubuntu:24.04@sha256:abc\"}}}}",
+            "{\"data\":{\"container\":{\"from\":{\"withExec\":{\"withExec\":{\"stdout\":\"0123456789ab\\n\"}}}}}}",
             seed_answer,
         };
         var fake: FakeSession = .{ .answers = &answers, .arena = arena };
@@ -2000,15 +2398,249 @@ test "the pre-warm sends a Zig job's own seed and base documents, and fails with
         const w = try warm(arena, fake.transport(), opts, &msg);
         try std.testing.expectEqualStrings("docker.io/library/ubuntu:24.04@sha256:abc", w.image);
         try std.testing.expect(w.seeded);
+        try std.testing.expectEqualStrings("0123456789ab", w.packages.?);
         try std.testing.expectEqualStrings(docs.base, fake.seen.items[0]);
-        try std.testing.expectEqualStrings(docs.seed.?, fake.seen.items[2]);
+        // The fingerprint runs on top of the provisioned base, so the engine reuses it.
+        try std.testing.expectEqualStrings(docs.packages.?, fake.seen.items[2]);
+        try std.testing.expect(std.mem.startsWith(u8, docs.packages.?, prefix));
+        try std.testing.expect(std.mem.indexOf(u8, docs.packages.?, "dpkg-query") != null);
+        try std.testing.expectEqualStrings(docs.seeds[0], fake.seen.items[3]);
     }
     // No seed without package caches, as a job gets none; a pull that fails says why.
-    const off = try warmDocuments(arena, .{ .zig_seed = test_zig_seed });
-    try std.testing.expect(off.seed == null);
+    const off = try warmDocuments(arena, .{ .zig_seeds = &.{test_zig_seed} });
+    try std.testing.expect(off.seeds.len == 0);
+    // A custom image is not provisioned, so it has no fingerprint; the bare default name is the pin.
+    try std.testing.expect((try warmDocuments(arena, .{ .image = "custom/image:1" })).packages == null);
+    const bare = try warmDocuments(arena, .{ .image = "ubuntu:24.04" });
+    try std.testing.expectEqualStrings((try warmDocuments(arena, .{})).base, bare.base);
+    try std.testing.expect(std.mem.indexOf(u8, bare.base, default_image) != null);
     const denied = [_][]const u8{"{\"errors\":[{\"message\":\"pull access denied\"}]}"};
     var fake: FakeSession = .{ .answers = &denied, .arena = arena };
     var msg: []const u8 = "";
     try std.testing.expectError(error.BaseContainerFailed, warm(arena, fake.transport(), .{}, &msg));
     try std.testing.expect(std.mem.indexOf(u8, msg, "pull access denied") != null);
+}
+
+/// A job run with the tool cache's trees checked, `check` the check exec's answer: what each query
+/// asked for, and the job's log.
+fn toolTreesRun(arena: Allocator, opts: Options, check: []const u8) !SeedRun {
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("zig build")};
+    var vols: std.Io.Writer.Allocating = .init(arena);
+    try vols.writer.writeAll("{\"data\":{\"ctt\":{\"id\":\"VT\"}");
+    for (package_cache_dirs, 0..) |_, i| try vols.writer.print(",\"c{d}\":{{\"id\":\"V{d}\"}}", .{ i, i });
+    try vols.writer.writeAll("}}");
+    const set = "{\"data\":{\"loadContainerFromID\":{\"withEnvVariable\":{\"id\":\"C0T\"}}}}";
+    const answers = try arena.dupe([]const u8, &.{ vols.written(), base_answer, check, set, try exec(arena, "C1", 0, "") });
+    const fake = try arena.create(FakeSession);
+    fake.* = .{ .answers = answers, .arena = arena };
+    const w = try arena.create(std.Io.Writer);
+    w.* = .fixed(try arena.alloc(u8, 8192));
+    var log: sink.LogSink = .{ .stdout = .{ .writer = w } };
+    var o = opts;
+    o.package_caches = true;
+    o.tool_trees = true;
+    o.test_session_argv = &.{ "sh", "-c", fake_child };
+    o.test_transport = fake.transport();
+    o.test_ran_marker = "j1";
+    const res = try run(arena, std.testing.io, &env, o, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    return .{ .seen = fake.seen.items, .log = w.buffered() };
+}
+
+const zig_tree = tool_cache_dir ++ "/zig/0.17.0/zig-x86_64-linux-0.17.0";
+const zig_digest = "310d0a4a95f328f94a350c4339226a4796daee589472b23f2a816d18874efaed";
+
+test "a repo job's checked trees tell the seed registry the Zig versions its tool cache holds; an untrusted job's do not" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const older = tool_cache_dir ++ "/zig/0.16.0/zig-x86_64-linux-0.16.0";
+    const check = "{\"data\":{\"loadContainerFromID\":{\"withMountedCache\":{\"withUser\":{\"withEnvVariable\":{\"withExec\":{\"stdout\":\"" ++
+        zig_digest ++ " " ++ zig_tree ++ " 19500 0\\n" ++ zig_digest ++ " " ++ older ++ " 19400 0\\n\"}}}}}}}";
+    for ([_]bool{ true, false }) |trusted| {
+        var reg: zig_release.Registry = .{ .io = std.testing.io, .gpa = arena, .client = null };
+        try reg.add(.{ .seeds = &.{test_zig_seed}, .unverified = &.{} });
+        _ = try toolTreesRun(arena, .{ .trusted = trusted, .nesting = false, .zig_seed_registry = &reg }, check);
+        if (trusted) {
+            try std.testing.expectEqual(@as(usize, 1), reg.pending.items.len);
+            try std.testing.expectEqualStrings("0.16.0", reg.pending.items[0]);
+        } else try std.testing.expectEqual(@as(usize, 0), reg.pending.items.len);
+    }
+}
+
+test "the tool cache's trees are checked on a branch of their own, and steps get only the digests" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const check = "{\"data\":{\"loadContainerFromID\":{\"withMountedCache\":{\"withUser\":" ++
+        "{\"withEnvVariable\":{\"withExec\":{\"stdout\":\"" ++ zig_digest ++ " " ++ zig_tree ++
+        " 19500 3\\n\"}}}}}}}";
+    const r = try toolTreesRun(arena, .{ .trusted = true, .nesting = false }, check);
+    try std.testing.expectEqual(5, r.seen.len);
+    // The lists' volume sits beside the tool cache's, keyed like it.
+    try std.testing.expect(std.mem.indexOf(u8, r.seen[0], "ctt: cacheVolume(key:\"zig-runner/o/r/repo/tool-trees/ubuntu:24.04\")") != null);
+    // The check: on the base container, the lists mounted, as root, run in every job (the nonce),
+    // with none of the job's environment, its stdout read.
+    const c = r.seen[2];
+    try std.testing.expect(braceBalanced(c));
+    try std.testing.expect(std.mem.startsWith(u8, c, "{ loadContainerFromID(id:\"C0\") { withMountedCache(path:\"" ++ tool_trees_dir ++ "\",cache:\"VT\") { withUser(name:\"root\") { withEnvVariable(name:\"ZIG_RUNNER_TOOL_TREES_RUN\",value:\"j1\") { withExec(args:[\"/usr/bin/env\",\"-i\","));
+    try std.testing.expect(std.mem.indexOf(u8, c, "\"tool_trees.sh\",\"/opt/hostedtoolcache\",\"" ++ tool_trees_dir ++ "\"]) { stdout ") != null);
+    // Steps start from the base container with the digests set, not from the check's branch.
+    try std.testing.expectEqualStrings("{ loadContainerFromID(id:\"C0\") { withEnvVariable(name:\"" ++ tool_trees_env ++ "\",value:\"" ++ zig_digest ++ " " ++ zig_tree ++ "\") { id } } }", r.seen[3]);
+    try std.testing.expect(std.mem.indexOf(u8, r.seen[4], "loadContainerFromID(id:\"C0T\")") != null);
+    // The lists' volume is in no query but the check's: not the base container's, not a step's.
+    for (r.seen, 0..) |doc, i| if (i != 0 and i != 2) {
+        try std.testing.expect(std.mem.indexOf(u8, doc, "\"VT\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, doc, tool_trees_dir) == null);
+    };
+    try std.testing.expect(std.mem.indexOf(u8, r.log, "Tool cache: checked zig/0.17.0/zig-x86_64-linux-0.17.0 (19500 files, 3 read)") != null);
+}
+
+test "the tool cache's trees: a failed check sets the variable empty, and nesting means no check" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const failed = try toolTreesRun(arena, .{ .nesting = false }, "{\"errors\":[{\"message\":\"bash: not found\"}]}");
+    try std.testing.expect(std.mem.indexOf(u8, failed.seen[0], "zig-runner/o/r/untrusted/tool-trees/") != null);
+    // Empty, so a workflow's own value does not stand in for the runner's: steps check themselves.
+    try std.testing.expect(std.mem.indexOf(u8, failed.seen[3], "withEnvVariable(name:\"" ++ tool_trees_env ++ "\",value:\"\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed.log, "Tool cache: not checked (bash: not found)") != null);
+
+    // A trusted job with Dagger nesting: its steps could open the lists' volume by its key.
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("zig build")};
+    var vols: std.Io.Writer.Allocating = .init(arena);
+    try vols.writer.writeAll("{\"data\":{");
+    for (package_cache_dirs, 0..) |_, i| try vols.writer.print("{s}\"c{d}\":{{\"id\":\"V{d}\"}}", .{ if (i == 0) "" else ",", i, i });
+    try vols.writer.writeAll("}}");
+    const answers = [_][]const u8{ vols.written(), base_answer, try exec(arena, "C1", 0, "") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .package_caches = true, .tool_trees = true, .trusted = true, .nesting = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    try std.testing.expectEqual(3, fake.seen.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "tool-trees") == null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Tool cache") == null);
+}
+
+test "toolTreesVerdict keeps only well-formed lines for trees in the tool cache" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const node = tool_cache_dir ++ "/node/22.1.0/x64";
+    const out = zig_digest ++ " " ++ zig_tree ++ " 19500 0\n" ++
+        // Outside the tool cache, through a dot-named directory, an odd path, a short digest,
+        // uppercase hex, a missing or an extra field, a count that is not one: all left out.
+        zig_digest ++ " /etc/x/y/z 1 1\n" ++
+        zig_digest ++ " " ++ tool_cache_dir ++ "/zig/../../etc 1 1\n" ++
+        zig_digest ++ " " ++ tool_cache_dir ++ "/a/b/c\"d 1 1\n" ++
+        zig_digest[1..] ++ " " ++ node ++ " 1 1\n" ++
+        "310D0A4A95F328F94A350C4339226A4796DAEE589472B23F2A816D18874EFAED " ++ node ++ " 1 1\n" ++
+        zig_digest ++ " " ++ node ++ " 1\n" ++
+        zig_digest ++ " " ++ node ++ " 1 1 1\n" ++
+        zig_digest ++ " " ++ node ++ " 7 x\n" ++
+        zig_digest ++ " " ++ node ++ " 7 7\n";
+    const v = try toolTreesVerdict(arena, out);
+    try std.testing.expectEqualStrings(zig_digest ++ " " ++ zig_tree ++ "\n" ++ zig_digest ++ " " ++ node, v.env);
+    try std.testing.expectEqualStrings("Tool cache: checked zig/0.17.0/zig-x86_64-linux-0.17.0 (19500 files, 0 read), node/22.1.0/x64 (7 files, 7 read)", v.note);
+    const none = try toolTreesVerdict(arena, "");
+    try std.testing.expectEqualStrings("", none.env);
+    try std.testing.expectEqualStrings("Tool cache: no trees to check", none.note);
+}
+
+/// A job of one step under step caching whose first answer is an earlier job's, with `path` its
+/// $GITHUB_PATH and `env_line` its $GITHUB_ENV, and the tool cache's trees checked when `check`
+/// is given (#229).
+fn replayedToolPathRun(arena: Allocator, opts: Options, check: ?[]const u8, path: []const u8, env_line: []const u8) !SeedRun {
+    var env: std.process.Environ.Map = .init(arena);
+    // Naming it mounts the tool cache (`cachesUsed`).
+    const steps = [_]job_mod.Step{testStep("./install-protoc.sh \"$RUNNER_TOOL_CACHE\"")};
+    var vols: std.Io.Writer.Allocating = .init(arena);
+    try vols.writer.writeAll(if (check != null) "{\"data\":{\"ctt\":{\"id\":\"VT\"}," else "{\"data\":{");
+    for (package_cache_dirs, 0..) |_, i| try vols.writer.print("{s}\"c{d}\":{{\"id\":\"V{d}\"}}", .{ if (i == 0) "" else ",", i, i });
+    try vols.writer.writeAll("}}");
+    const replayed = try std.fmt.allocPrint(arena, "{{\"data\":{{\"loadContainerFromID\":{{\"withExec\":{{" ++
+        "\"id\":\"C1\",\"exitCode\":0,\"stdout\":\"\",\"stderr\":\"\",\"fc_ran\":{{\"contents\":\"earlier-job\"}}," ++
+        "\"fc_path\":{{\"contents\":\"{s}\\n\"}},\"fc_env\":{{\"contents\":\"{s}\\n\"}}}}}}}}}}", .{ path, env_line });
+    const ran = "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"id\":\"C2\",\"exitCode\":0," ++
+        "\"stdout\":\"\",\"stderr\":\"\",\"fc_ran\":{\"contents\":\"j1\"}}}}}";
+    const set = "{\"data\":{\"loadContainerFromID\":{\"withEnvVariable\":{\"id\":\"C0T\"}}}}";
+    const answers = if (check) |c|
+        try arena.dupe([]const u8, &.{ vols.written(), base_answer, c, set, replayed, ran })
+    else if (opts.package_caches)
+        try arena.dupe([]const u8, &.{ vols.written(), base_answer, replayed, ran })
+    else
+        try arena.dupe([]const u8, &.{ base_answer, replayed, ran });
+    const fake = try arena.create(FakeSession);
+    fake.* = .{ .answers = answers, .arena = arena };
+    const w = try arena.create(std.Io.Writer);
+    w.* = .fixed(try arena.alloc(u8, 8192));
+    var log: sink.LogSink = .{ .stdout = .{ .writer = w } };
+    var o = opts;
+    o.step_cache = true;
+    o.tool_trees = check != null;
+    o.test_session_argv = &.{ "sh", "-c", fake_child };
+    o.test_transport = fake.transport();
+    o.test_ran_marker = "j1";
+    const res = try run(arena, std.testing.io, &env, o, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    return .{ .seen = fake.seen.items, .log = w.buffered() };
+}
+
+test "step caching: a replayed step that put a tool cache directory no checked tree holds on PATH runs again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const protoc = tool_cache_dir ++ "/protoc/27.0/x64";
+    const check_of = struct {
+        fn f(comptime trees: []const u8) []const u8 {
+            return "{\"data\":{\"loadContainerFromID\":{\"withMountedCache\":{\"withUser\":" ++
+                "{\"withEnvVariable\":{\"withExec\":{\"stdout\":\"" ++ trees ++ "\"}}}}}}}";
+        }
+    }.f;
+    const reason = "zig-runner runs this step every time: its record names " ++ protoc ++
+        "/bin in the tool cache, where \\\"Set up job\\\" found no tree holding it";
+    const opts: Options = .{ .package_caches = true, .trusted = true, .nesting = false };
+
+    // The volume was pruned since the recorded run: "Set up job" found no protoc tree, as the
+    // cold run that recorded the install found none, so the key matched. It runs again.
+    const zig_only = check_of(zig_digest ++ " " ++ zig_tree ++ " 19500 0\\n");
+    const gone = try replayedToolPathRun(arena, opts, zig_only, protoc ++ "/bin", "MODE=ci");
+    try std.testing.expectEqual(6, gone.seen.len);
+    try std.testing.expect(std.mem.indexOf(u8, gone.seen[4], "runs this step every time") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gone.seen[5], reason) != null);
+    // The earlier run's PATH entry is never applied: the step that ran here sets its own.
+    try std.testing.expect(std.mem.indexOf(u8, gone.seen[5], protoc ++ "/bin:") == null);
+
+    // A $GITHUB_ENV value naming it, alone or in a list, does the same.
+    const in_env = try replayedToolPathRun(arena, opts, zig_only, "/usr/local/bin", "PROTOC_HOME=/x:" ++ protoc ++ "/bin");
+    try std.testing.expectEqual(6, in_env.seen.len);
+    try std.testing.expect(std.mem.indexOf(u8, in_env.seen[5], reason) != null);
+
+    // The tree is there: the replay stands.
+    const protoc_tree = check_of(zig_digest ++ " " ++ protoc ++ " 12 0\\n");
+    const held = try replayedToolPathRun(arena, opts, protoc_tree, protoc ++ "/bin", "PROTOC_HOME=" ++ protoc);
+    try std.testing.expectEqual(5, held.seen.len);
+
+    // A path that climbs out of a checked tree is not held by it, nor is a sibling's prefix.
+    const climbs = try replayedToolPathRun(arena, opts, protoc_tree, protoc ++ "/../../gone/1/x64/bin", "MODE=ci");
+    try std.testing.expectEqual(6, climbs.seen.len);
+    const sibling = try replayedToolPathRun(arena, opts, protoc_tree, protoc ++ "-old/bin", "MODE=ci");
+    try std.testing.expectEqual(6, sibling.seen.len);
+
+    // Trees not checked: nothing says it is there, so it runs again.
+    const unchecked = try replayedToolPathRun(arena, opts, null, protoc ++ "/bin", "MODE=ci");
+    try std.testing.expectEqual(4, unchecked.seen.len);
+    try std.testing.expect(std.mem.indexOf(u8, unchecked.seen[3], reason) != null);
+
+    // Without package caches the tool cache is no volume: it went with the recorded container.
+    const layer = try replayedToolPathRun(arena, .{}, null, protoc ++ "/bin", "MODE=ci");
+    try std.testing.expectEqual(2, layer.seen.len);
+
+    // Outside the tool cache, or the tool cache itself (the mount): the replay stands.
+    const own = try replayedToolPathRun(arena, opts, check_of(""), "/usr/local/protoc/bin", "TOOLS=" ++ tool_cache_dir);
+    try std.testing.expectEqual(5, own.seen.len);
 }

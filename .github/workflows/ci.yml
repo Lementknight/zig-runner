@@ -61,6 +61,12 @@ jobs:
       - name: shellcheck
         run: .github/scripts/shellcheck.sh
 
+      # The runner's check of the tool cache's trees (runner/src/dagger/tool_trees.sh), on a small
+      # fake tree: its lists let it skip re-reading unchanged files, never a changed, added or
+      # deleted one, and a list a job writes into the tool cache is never read.
+      - name: Tool cache tree check
+        run: .github/scripts/tool-trees-test.sh
+
       # The changie the release installs, against its pinned checksum: a new version (Renovate's)
       # fails here until the checksum is updated, not at the release, after it was approved.
       - name: changie's checksum
@@ -78,6 +84,21 @@ jobs:
             .github/scripts/busybox-pin.sh || status=$?
             ((status == 75 && attempt < 3)) || exit "$status"
             echo "::warning::busybox-pin.sh could not reach Docker Hub (attempt $attempt of 3): trying again"
+            sleep $((attempt * 15))
+          done
+
+      # The default job image (runner/src/dagger.zig), the shared base of every job, pinned by
+      # digest: checked to be a multi-arch index (amd64 and arm64) whose bytes hash to the pin, so
+      # a Renovate ubuntu pull request, or a re-wrapped literal, fails here, not on a runner. Asked
+      # of Docker Hub's registry API anonymously, with curl: only a fetch that fails (exit 75) is
+      # tried again, twice, after a pause, as for busybox.
+      - name: ubuntu's pin
+        run: |
+          for attempt in 1 2 3; do
+            status=0
+            .github/scripts/ubuntu-pin.sh || status=$?
+            ((status == 75 && attempt < 3)) || exit "$status"
+            echo "::warning::ubuntu-pin.sh could not reach Docker Hub (attempt $attempt of 3): trying again"
             sleep $((attempt * 15))
           done
 

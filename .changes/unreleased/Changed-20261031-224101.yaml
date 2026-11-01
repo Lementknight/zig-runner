@@ -1,3 +1,0 @@
-kind: Changed
-body: 'CI''s "Format, build and test" job runs `zig build test -j1` on an ARM64 self-hosted runner (the Pi), so Zig compiles the tests and the runner one after the other instead of side by side. Measured on razorbill, the two compiles peak at about 947 MB and 890 MB, so together a job raised the engine by about 1.7 GB, and two jobs (about 4.2 GB) went over its 4 GB cap and ran one at a time. One at a time a job peaks at about 1 GB, so two fit in about 3.5 GB: each takes about 25 s longer (81 s instead of 56 s), and the pool finishes about 38% more. GitHub''s runners and x86_64 self-hosted runners build as before.'
-time: 2026-10-31T22:41:01.000000-04:00

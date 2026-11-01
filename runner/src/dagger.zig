@@ -32,6 +32,7 @@ const expr = @import("expr.zig");
 const context = @import("context.zig");
 const commands = @import("commands.zig");
 const config = @import("config.zig");
+const zig_release = @import("zig_release.zig");
 const engine = @import("engine.zig");
 const Query = @import("dagger/query.zig").Query;
 const basePlan = @import("dagger/set_up.zig").basePlan;
@@ -75,7 +76,29 @@ const expectSecretOnlyInSetSecret = @import("dagger/testing.zig").expectSecretOn
 
 const Allocator = std.mem.Allocator;
 
-pub const default_image = "ubuntu:24.04";
+/// The image a job runs in without `container:`, and the shared base every job's chain starts
+/// from (set_up.zig provisions it). Pinned by its multi-arch index digest, which a moved tag cannot
+/// change: one pin serves amd64 and arm64/v8, as for `busybox_image`. Renovate moves the pin
+/// (renovate.json), and CI checks on every pull request that it is still an index for both
+/// (.github/scripts/ubuntu-pin.sh), which prints the digest too.
+pub const default_image = "ubuntu:24.04" ++
+    "@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852";
+/// The default image's name, which a workflow's `container:` or the config's image may give:
+/// `resolveImage` makes it the pinned image, so it is provisioned and keyed as the default is.
+pub const default_image_name = default_image[0..std.mem.indexOfScalar(u8, default_image, '@').?];
+
+/// `default_image` for its bare name, any other image as given (a custom tag or digest is the
+/// user's choice, used as is and not provisioned).
+pub fn resolveImage(image: []const u8) []const u8 {
+    return if (std.mem.eql(u8, image, default_image_name)) default_image else image;
+}
+
+/// An image without its digest: what binaries built in it depend on (its release), not which
+/// rebuild of it the pin names.
+pub fn imageName(image: []const u8) []const u8 {
+    const at = std.mem.indexOfScalar(u8, image, '@') orelse return image;
+    return image[0..at];
+}
 /// Where a Docker action sees the job's workspace, as on GitHub.
 pub const docker_workspace = "/github/workspace";
 /// GitHub's runner works under /home/runner/work; a `container:` job sees it as /__w.
@@ -483,6 +506,9 @@ pub const Options = struct {
     /// Mount `package_cache_dirs` from persistent cache volumes, scoped to the repository. The
     /// runner turns this on (`RUNNER_PACKAGE_CACHES`, on by default).
     package_caches: bool = false,
+    /// `Config.tool_trees`: "Set up job" checks the tool cache's trees and hands steps their
+    /// digests (`set_up.verifyToolTrees`). Off here, on in the runner.
+    tool_trees: bool = false,
     /// The runner vouches for the job (`trust.vouches`): its package caches and output-key store
     /// are the repository's shared `repo` volumes. Otherwise they are `untrusted` ones (see
     /// `packageCacheScope`).
@@ -512,9 +538,13 @@ pub const Options = struct {
     /// `Config.zig_local_cache_max_mb`: past it, Zig's local cache starts over in a new generation
     /// (`set_up.rollZigLocal`). 0, the default here, keeps it in the volume's root, unbounded.
     zig_local_cache_max_mb: u32 = 0,
-    /// `Config.zig_seed`: the Zig release Zig jobs' global cache is seeded from (see
-    /// `set_up.zigSeedFor`); null for none.
-    zig_seed: ?config.ZigSeed = null,
+    /// `Config.zig_seeds`: the verified Zig releases Zig jobs' global cache is seeded from (see
+    /// `set_up.zigSeedFor`); empty for none.
+    zig_seeds: []const config.ZigSeed = &.{},
+    /// `Config.zig_seeds_unverified`: releases left unseeded because they did not verify.
+    zig_seeds_unverified: []const []const u8 = &.{},
+    /// `Config.zig_seed_registry`: told the Zig versions a `repo` job's tool cache holds.
+    zig_seed_registry: ?*zig_release.Registry = null,
     /// Stored outputs not produced again for this many days are removed
     /// (`RUNNER_OUTPUT_KEYS_DAYS`).
     output_keys_days: u32 = 7,
@@ -850,8 +880,9 @@ pub fn run(
 
 /// The job on the native backend (`native/Backend.zig`): no Dagger session, the same steps code.
 /// What the native backend has no counterpart for yet is off for the job: the step cache and
-/// output keys (phase 2), and the package caches (phase 4), which are caches, so a job's results
-/// do not depend on them.
+/// output keys (phase 2), and the cache volumes (phase 4): package caches, Zig's local cache and
+/// seeds, and the tool cache's checked trees. They are caches, so a job's results do not depend
+/// on them.
 fn runNative(
     arena: Allocator,
     io: std.Io,
@@ -865,7 +896,10 @@ fn runNative(
     opts.output_keys = false;
     opts.package_caches = false;
     opts.zig_local_cache = false;
-    opts.zig_seed = null;
+    opts.zig_seeds = &.{};
+    opts.zig_seeds_unverified = &.{};
+    opts.zig_seed_registry = null;
+    opts.tool_trees = false;
     const results = try arena.alloc(StepResult, job.steps.len);
     @memset(results, .{});
     var sh = try jobLogFor(arena, io, opts, job, log);
@@ -1222,11 +1256,15 @@ fn logRunHeader(
     sh.append(num, "##[endgroup]");
 }
 
-/// What GitHub's runner logs when a script exits non-zero.
-pub fn logExitCode(sh: *JobLog, num: u32, code: i32) void {
+/// What GitHub's runner logs when a script exits non-zero (ScriptHandler.cs ~354). Nothing for a
+/// step a workflow or file command failed: that failure is the step's `CommandResult`, merged in
+/// after the process (StepsRunner.cs ~348), and its own error line already says why.
+pub fn logExitCode(sh: *JobLog, num: u32, out: Exec.Out) void {
+    if (out.code == 0 or out.command_failed) return;
     sh.errorLine(
         num,
-        std.fmt.allocPrint(sh.arena, "Process completed with exit code {d}.", .{code}) catch return,
+        std.fmt.allocPrint(sh.arena, "Process completed with exit code {d}.", .{out.code}) catch
+            return,
     );
 }
 
@@ -1672,7 +1710,7 @@ fn runResolvedStep(
         else => return e,
     };
     if (resolved == .run and out.code != 0) {
-        logExitCode(x.sh, num, out.code);
+        logExitCode(x.sh, num, out);
         x.noteNestingWithheld(num, resolved.run.script);
     }
     // As actions/checkout, a post step once the checkout ran (see `Post.checkout`).
@@ -1697,11 +1735,6 @@ fn runResolvedStep(
 /// A JavaScript action's script as a `run:` step: no shell, no working directory.
 pub fn scriptRun(script: []const u8, env: []const job_mod.EnvVar) Resolved {
     return .{ .run = .{ .script = script, .shell = null, .working_directory = null, .env = env } };
-}
-
-pub fn interpolateOptional(arena: Allocator, s: ?[]const u8, sc: expr.Scope) ?[]const u8 {
-    const d = s orelse return null;
-    return expr.interpolate(arena, d, sc) catch d;
 }
 
 pub fn skippedStep(id: []const u8) StepCtx {
@@ -1792,6 +1825,7 @@ fn runSteps(
     var x = try execFor(arena, io, transport, sh, &ev, &job, opts, plan, base.id, secrets, step_cache);
     x.container_path = base.runtime_path;
     x.native = native;
+    x.tool_trees = base.tool_trees;
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
 
     var watch: Watch = .{ .io = io, .transport = transport, .cancel = opts.cancel };
@@ -1804,6 +1838,8 @@ fn runSteps(
 
     if (try setUpJob(&x, opts, results)) |failed| return failed;
     if (plan.zig_seed_note) |note| x.setUpLine(note);
+    if (plan.zig_local_note) |note| x.setUpLine(note);
+    if (base.tool_trees_note) |note| x.setUpLine(note);
     if (opts.backend_note) |note| x.setUpLine(note);
 
     if (job.container != null or !no_services) {
@@ -2910,6 +2946,8 @@ test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]Unable to process file command 'output' successfully.") != null);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]invalid format 'this is not valid' on line 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]Unable to process file command 'env' successfully.") != null);
+    // Its process exited 0, so no exit code is logged, as on GitHub (#214).
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Process completed with exit code") == null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[4], "withEnvVariable(name:\"BEFORE\",value:\"1\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[4], "AFTER") == null);
     try std.testing.expectEqual(Outcome.success, res.steps[3].outcome);
@@ -3229,7 +3267,7 @@ test "logs read like GitHub's: Set up job, then each step's header with its shel
         "[job 0 step 0 stdout] Runner name: 'zig-1a2b3c4d'",
         "[job 0 step 0 stdout] Runner group name: 'Default'",
         "[job 0 step 0 stdout] ##[group]Runner Image",
-        "[job 0 step 0 stdout] Image: ubuntu:24.04",
+        "[job 0 step 0 stdout] Image: " ++ default_image,
         "[job 0 step 0 stdout] ##[group]GITHUB_TOKEN Permissions",
         "[job 0 step 0 stdout] Contents: read",
         "[job 0 step 0 stdout] PullRequests: write",
@@ -3607,6 +3645,9 @@ test "set-env and add-path fail the step, unless ACTIONS_ALLOW_UNSECURE_COMMANDS
             try std.testing.expect(std.mem.indexOf(u8, got, "##[error]The `set-env` command is disabled.") != null);
             try std.testing.expect(std.mem.indexOf(u8, got, "##[error]Unable to process command '::add-path::/opt/x' successfully.") != null);
             try std.testing.expect(std.mem.indexOf(u8, got, "##[error]The `add-path` command is disabled.") != null);
+            // No exit code is logged: GitHub logs only the process's own, and it exited 0
+            // (#214).
+            try std.testing.expect(std.mem.indexOf(u8, got, "Process completed with exit code") == null);
             try std.testing.expect(std.mem.indexOf(u8, step2, "name:\"X\"") == null);
             try std.testing.expect(std.mem.indexOf(u8, step2, "/opt/x") == null);
         }
@@ -4365,6 +4406,43 @@ test "a step's if: and name see its own env, and an env error fails it whatever 
     try std.testing.expect(!res.succeeded);
 }
 
+test "a step's env cannot change the variables GitHub sets again, though its env context has them" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var step = testStep("");
+    step.action.script.script = .{ .expr = "format('echo ctx={0}', env.RUNNER_TEMP)" };
+    step.env = &.{
+        .{ .name = "RUNNER_TEMP", .value = .{ .lit = "/elsewhere" } },
+        .{ .name = "GITHUB_ACTIONS", .value = .{ .lit = "false" } },
+        .{ .name = "CI", .value = .{ .lit = "false" } },
+        .{ .name = "OWN", .value = .{ .lit = "kept" } },
+    };
+    const steps = [_]job_mod.Step{step};
+    const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, "") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+    }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    const s1 = fake.seen.items[1];
+    // GitHub's handlers set the github and runner contexts' variables (and GITHUB_ACTIONS) over
+    // the step's env (ScriptHandler.cs), so the process keeps the runner's values; CI, which
+    // GitHub sets only when nothing else has, and any other name are the step's.
+    try std.testing.expect(std.mem.indexOf(u8, s1, "'RUNNER_TEMP=/elsewhere'") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s1, "'GITHUB_ACTIONS=false'") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s1, "'CI=false'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s1, "'OWN=kept'") != null);
+    // The env context, and the log header, have what the step wrote.
+    try std.testing.expect(std.mem.indexOf(u8, s1, "echo ctx=/elsewhere") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "  RUNNER_TEMP: /elsewhere") != null);
+}
+
 test "round trips: the job setup's query is sent again without the secrets when it fails with them" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -4711,7 +4789,23 @@ test "busybox is pinned by digest" {
     const name = busybox_image[0..at];
     try std.testing.expect(std.mem.startsWith(u8, name, "busybox:"));
     try std.testing.expect(std.mem.endsWith(u8, name, "-musl"));
-    const digest = busybox_image[at..];
+    try expectDigest(busybox_image[at..]);
+}
+
+test "the default image is pinned by digest, and its bare name resolves to the pin" {
+    // A truncated or upper-case paste fails here, before CI's ubuntu-pin.sh asks Docker Hub.
+    try std.testing.expectEqualStrings("ubuntu:24.04", default_image_name);
+    try expectDigest(default_image[default_image_name.len..]);
+    try std.testing.expectEqualStrings(default_image, resolveImage("ubuntu:24.04"));
+    try std.testing.expectEqualStrings(default_image, resolveImage(default_image));
+    // Another tag, or another digest of the same tag, is the user's image, as given.
+    for ([_][]const u8{ "ubuntu:22.04", "ubuntu:latest", "ubuntu", "ubuntu:24.04@sha256:0000000000000000000000000000000000000000000000000000000000000000" }) |other|
+        try std.testing.expectEqualStrings(other, resolveImage(other));
+    try std.testing.expectEqualStrings("ubuntu:24.04", imageName(default_image));
+    try std.testing.expectEqualStrings("custom/image:1", imageName("custom/image:1"));
+}
+
+fn expectDigest(digest: []const u8) !void {
     try std.testing.expect(std.mem.startsWith(u8, digest, "@sha256:"));
     const hex = digest["@sha256:".len..];
     try std.testing.expectEqual(@as(usize, 64), hex.len);

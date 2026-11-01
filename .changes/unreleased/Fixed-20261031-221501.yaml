@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A job mounts only the package-cache volumes of the tools its `run:` scripts and actions name (npm, pip, uv, cargo, go, Gradle, Maven and the rest), the tool cache when it uses an action, and Zig''s as the Zig cache seed decides, instead of all sixteen. Turning the mounts off measured 24 ms of wall time and 45 ms of engine CPU per step on the laptop, about a quarter of a trivial step''s engine CPU. A tool the heuristic misses only starts with a cold cache; a job that names every tool mounts exactly what it did.'
-time: 2026-10-31T22:15:01.000000-04:00

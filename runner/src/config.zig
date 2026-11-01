@@ -1,5 +1,7 @@
 //! Runner configuration (SPEC §2). Environment variables, overridden by flags.
 const std = @import("std");
+const builtin = @import("builtin");
+const zig_release = @import("zig_release.zig");
 const pg = @import("pg.zig");
 const engine = @import("engine.zig");
 const admission = @import("admission.zig");
@@ -50,6 +52,16 @@ pub const GhApp = struct {
     installation_id: ?u64 = null,
 };
 
+/// A Zig version's characters only: it goes into a URL and a shell script.
+pub fn validZigVersion(v: []const u8) bool {
+    if (v.len == 0 or v.len > 64) return false;
+    for (v) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and std.mem.indexOfScalar(u8, ".+-", ch) == null)
+            return false;
+    }
+    return true;
+}
+
 pub const Config = struct {
     /// "" with a GitHub App (`gh_app`).
     gh_token: []const u8,
@@ -65,9 +77,9 @@ pub const Config = struct {
     /// Absent means "log to stdout only" (StdoutSink).
     database_url: ?[]const u8 = null,
     dagger_cmd: []const u8 = "dagger",
-    /// Base image for jobs. The default gets git, curl and CA certificates installed (cached by
-    /// Dagger); a custom image is used as is.
-    image: []const u8 = "ubuntu:24.04",
+    /// Base image for jobs. The default (pinned by digest; its bare name means the same) gets git,
+    /// curl and CA certificates installed (cached by Dagger); a custom image is used as is.
+    image: []const u8 = @import("dagger.zig").default_image,
     log_flush_lines: u32 = 200,
     log_flush_ms: u32 = 500,
     /// What runs JavaScript actions (`runs.using: node*`). Bun by default; Node for exact Node
@@ -94,6 +106,12 @@ pub const Config = struct {
     dagger_nesting: bool = false,
     /// Mount persistent Dagger cache volumes at package managers' cache directories in every job.
     package_caches: bool = true,
+    /// Check the tool cache's trees in "Set up job", before any step can write there, from lists
+    /// kept in a volume no step mounts, and hand steps their digests (ZIG_RUNNER_TOOL_TREES), so a
+    /// script that pins a tree's digest (install-zig.sh) need not read the tree again: 10-19 s of
+    /// razorbill's Install Zig under load. Only in jobs without `dagger_nesting`, whose steps
+    /// cannot reach the lists' volume (`set_up.verifyToolTrees`).
+    tool_trees: bool = true,
     /// Reuse a step's result from an earlier run when its inputs are unchanged (steps that use
     /// secrets always run). A workflow can opt out with `ZIG_RUNNER_STEP_CACHE: false` in its env.
     step_cache: bool = true,
@@ -147,10 +165,22 @@ pub const Config = struct {
     zig_local_cache_max_mb: u32 = 4096,
     /// Seed Zig jobs' global cache with what every `zig build` compiles before it reads any
     /// project: the build runner, 104 s on one core and about 1 GB on the laptop (`set_up.zig`,
-    /// "The Zig cache seed"). Off when unset: the runner cannot know which Zig its jobs use, and a
-    /// seed for another version costs a seed build per engine and 60 MB in every Zig volume, for
-    /// nothing.
+    /// "The Zig cache seed"). The Zig releases to seed, comma-separated, at most three
+    /// (`zig_release.zig`): each tarball's minisign signature is checked against Zig's pinned key
+    /// when the runner starts, and one that does not verify is not seeded. By default the Zig the
+    /// runner itself is built with; empty seeds nothing.
+    zig_seed_versions: []const u8 = builtin.zig_version_string,
+    /// An explicit seed, `<version>=<sha256>`, used instead of `zig_seed_versions`: the digest is
+    /// the operator's pin, so no signature is checked.
     zig_seed: ?ZigSeed = null,
+    /// The seeds jobs get: `zig_seed`, or the verified `zig_seed_versions` (`zig_release.resolve`,
+    /// set by `main`).
+    zig_seeds: []const ZigSeed = &.{},
+    /// The `zig_seed_versions` that did not verify (`zig_release.resolve`), for "Set up job".
+    zig_seeds_unverified: []const []const u8 = &.{},
+    /// Where the seeds live once the runner runs jobs: the configured ones, and the tool caches'
+    /// Zig versions as they are found and verified (set by `main`; null with `zig_seed`).
+    zig_seed_registry: ?*zig_release.Registry = null,
     /// Build the default image's provisioned base container, and the Zig cache seed, in the
     /// background when the runner starts and when the engine comes back after a restart (its
     /// cache may be wiped then), so the first job does not spend 27-40 s, and the seed's 104 s,
@@ -343,6 +373,7 @@ pub const Config = struct {
         };
         if (environ.get("RUNNER_DAGGER_NESTING")) |v| c.dagger_nesting = try boolean(v);
         if (environ.get("RUNNER_PACKAGE_CACHES")) |v| c.package_caches = try boolean(v);
+        if (environ.get("RUNNER_TOOL_TREES")) |v| c.tool_trees = try boolean(v);
         if (environ.get("RUNNER_STEP_CACHE")) |v| c.step_cache = try boolean(v);
         if (environ.get("RUNNER_STEP_USER")) |v| c.step_user = try stepUser(v);
         if (environ.get("RUNNER_BACKEND")) |v| c.backend = try stepBackend(v);
@@ -358,6 +389,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_ZIG_LOCAL_CACHE_MAX_MB")) |v|
             c.zig_local_cache_max_mb = try num(u32, v);
         if (environ.get("RUNNER_ZIG_SEED")) |v| c.zig_seed = try zigSeed(v);
+        if (environ.get("RUNNER_ZIG_SEED_VERSIONS")) |v| c.zig_seed_versions = v;
         if (environ.get("RUNNER_PREWARM")) |v| c.prewarm = try boolean(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_MAX_MS")) |v| c.output_keys_max_ms = try millis(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_DAYS")) |v| c.output_keys_days = try count(v);
@@ -412,6 +444,7 @@ pub const Config = struct {
         else if (eq(key, "engine-silence-timeout")) c.engine_silence_timeout_secs = try secs(val) //
         else if (eq(key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
         else if (eq(key, "package-caches")) c.package_caches = try boolean(val) //
+        else if (eq(key, "tool-trees")) c.tool_trees = try boolean(val) //
         else if (eq(key, "step-cache")) c.step_cache = try boolean(val) //
         else if (eq(key, "step-user")) c.step_user = try stepUser(val) //
         else if (eq(key, "backend")) c.backend = try stepBackend(val) //
@@ -423,6 +456,7 @@ pub const Config = struct {
         else if (eq(key, "zig-local-cache")) c.zig_local_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache-max-mb")) c.zig_local_cache_max_mb = try num(u32, val) //
         else if (eq(key, "zig-seed")) c.zig_seed = try zigSeed(val) //
+        else if (eq(key, "zig-seed-versions")) c.zig_seed_versions = val //
         else if (eq(key, "prewarm")) c.prewarm = try boolean(val) //
         else if (eq(key, "output-keys-max-ms")) c.output_keys_max_ms = try millis(val) //
         else if (eq(key, "log-spool-dir")) c.log_spool_dir = val //
@@ -499,11 +533,7 @@ pub const Config = struct {
         const at = std.mem.indexOfScalar(u8, s, '=') orelse return error.InvalidZigSeed;
         const version = s[0..at];
         const sha256 = s[at + 1 ..];
-        if (version.len == 0 or sha256.len != 64) return error.InvalidZigSeed;
-        for (version) |ch| {
-            if (!std.ascii.isAlphanumeric(ch) and std.mem.indexOfScalar(u8, ".+-", ch) == null)
-                return error.InvalidZigSeed;
-        }
+        if (!validZigVersion(version) or sha256.len != 64) return error.InvalidZigSeed;
         for (sha256) |ch| {
             if (!std.ascii.isDigit(ch) and !(ch >= 'a' and ch <= 'f')) return error.InvalidZigSeed;
         }
@@ -742,7 +772,18 @@ test "package caches are on by default and can be turned off" {
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).package_caches);
 }
 
-test "the Zig cache seed is off unless RUNNER_ZIG_SEED names a version and a sha256" {
+test "Zig seeding is on by default, for the runner's own Zig; RUNNER_ZIG_SEED_VERSIONS picks others or none" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try std.testing.expectEqualStrings(builtin.zig_version_string, (try Config.load(&env, &.{"runner"})).zig_seed_versions);
+    try env.put("RUNNER_ZIG_SEED_VERSIONS", "0.17.0,0.16.0");
+    try std.testing.expectEqualStrings("0.17.0,0.16.0", (try Config.load(&env, &.{"runner"})).zig_seed_versions);
+    try std.testing.expectEqualStrings("", (try Config.load(&env, &.{ "runner", "--zig-seed-versions=" })).zig_seed_versions);
+}
+
+test "RUNNER_ZIG_SEED, the explicit override, names a version and a sha256" {
     var env: std.process.Environ.Map = .init(std.testing.allocator);
     defer env.deinit();
     try env.put("GH_TOKEN", "t");
@@ -782,6 +823,17 @@ test "Zig's local cache is kept only when asked for, and uv's setting is read" {
     try std.testing.expectEqual(@as(u32, 0), (try Config.load(&env, &.{"runner"})).zig_local_cache_max_mb);
     try env.put("RUNNER_UV_ENV_IN_CACHE", "false");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).uv_env_in_cache);
+}
+
+test "the tool cache's trees are checked in Set up job unless turned off" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try std.testing.expect((try Config.load(&env, &.{"runner"})).tool_trees);
+    try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--tool-trees=false" })).tool_trees);
+    try env.put("RUNNER_TOOL_TREES", "0");
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).tool_trees);
 }
 
 test "step caching is on by default and can be turned off" {

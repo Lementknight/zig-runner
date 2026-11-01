@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A pre-warm that found everything in the engine''s cache (under 3 s) no longer teaches the memory gate its estimate for `zig-runner pre-warm`, as a job that replayed steps does not. On razorbill a warm right after a restart, with the other instance having warmed the shared engine, took 0.4 s and was learned at 0 GB against 1.3 GB cold, so the warm after the next engine wipe would have been admitted with nothing reserved.'
-time: 2026-10-31T21:34:07.000000-04:00

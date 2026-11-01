@@ -137,7 +137,8 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
         "anyway; subordinate ids are phase 5's)";
     if (job.container != null) return "`container:` jobs are not native yet (phase 3)";
     if (job.services.len > 0) return "`services:` are not native yet (phase 6)";
-    if (!std.mem.eql(u8, opts.image, dagger.default_image) or !opts.provision)
+    // The pinned default image (`dagger.resolveImage`), which the rootfs must be made from.
+    if (!std.mem.eql(u8, dagger.resolveImage(opts.image), dagger.default_image) or !opts.provision)
         return "only the default image is native yet (phase 3)";
     if (opts.nesting) return "steps that use the Dagger engine (RUNNER_DAGGER_NESTING) need Dagger";
     if (usesHashFiles(job)) return "`hashFiles()` reads the job's container through Dagger";

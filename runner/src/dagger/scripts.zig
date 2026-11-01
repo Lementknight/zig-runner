@@ -283,13 +283,15 @@ fn shellTemplate(shell: ?[]const u8) job_mod.Shell {
 /// A script's file extension for its shell: `.sh` for bash and sh, `.py` for python, and none for
 /// any other program, as GitHub names it (actions/runner
 /// src/Runner.Worker/Handlers/ScriptHandlerHelpers.cs, `_extensions`). The name reaches the
-/// step's own output — a traceback names the file it came from — so it is not cosmetic. Unlike
-/// GitHub, a path (`/bin/bash`) and `python3` are known by their name, so `python3 {0}` gets `.py`.
+/// step's own output — a traceback names the file it came from — so it is not cosmetic. GitHub
+/// looks the program up as written, in any case (`GetScriptFileExtension(shellCommand)`), so a
+/// path (`/bin/bash`) and `python3` get none. #196 had known them by their name; #214 decided to
+/// match GitHub byte for byte.
 fn shellExtension(shell: ?[]const u8) []const u8 {
     const s = shell orelse return "sh";
-    const prog = std.fs.path.basenamePosix(job_mod.Shell.parse(s).program);
+    const prog = job_mod.Shell.parse(s).program;
     if (std.ascii.eqlIgnoreCase(prog, "bash") or std.ascii.eqlIgnoreCase(prog, "sh")) return "sh";
-    if (std.ascii.eqlIgnoreCase(prog, "python") or std.mem.eql(u8, prog, "python3")) return "py";
+    if (std.ascii.eqlIgnoreCase(prog, "python")) return "py";
     return "";
 }
 
@@ -347,6 +349,26 @@ pub fn secretAlias(arena: Allocator, i: usize) ![]const u8 {
     return std.fmt.allocPrint(arena, "ZIG_SECRET_{d}", .{i});
 }
 
+test "each shell's script extension is GitHub's: the program as written, in any case" {
+    // `_extensions` in actions/runner's ScriptHandlerHelpers.cs, keyed by the first word of
+    // `shell:` (`ParseShellOptionString`); the Windows shells are refused before this.
+    const Case = struct { ?[]const u8, []const u8 };
+    for ([_]Case{
+        .{ null, "sh" },
+        .{ "bash", "sh" },
+        .{ "BASH -e {0}", "sh" },
+        .{ "sh", "sh" },
+        .{ "sh -x {0}", "sh" },
+        .{ "python", "py" },
+        .{ "Python {0}", "py" },
+        .{ "python3 {0}", "" },
+        .{ "/bin/bash --login -e {0}", "" },
+        .{ "/usr/bin/python {0}", "" },
+        .{ "node {0}", "" },
+        .{ "perl {0}", "" },
+    }) |c| try std.testing.expectEqualStrings(c[1], shellExtension(c[0]));
+}
+
 test "script quotes, applies env, shell and working directory, and propagates the exit code" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -379,9 +401,10 @@ test "script quotes, applies env, shell and working directory, and propagates th
     const py = try stepScript(a.allocator(), 5, .{ .run = .{ .script = "print(1)", .shell = "python", .working_directory = null, .env = &.{} } }, "x");
     try std.testing.expect(std.mem.indexOf(u8, py, "'python' '/tmp/zig-runner-step-5.py' )") != null);
     try std.testing.expect(std.mem.indexOf(u8, py, "> /tmp/zig-runner-step-5.py\n") != null);
-    // An image with no `python` can still name one, and that keeps the extension.
+    // An image with no `python` can still name one, and its file has no extension, as GitHub
+    // names it (#214).
     const py3 = try stepScript(a.allocator(), 6, .{ .run = .{ .script = "print(1)", .shell = "python3 {0}", .working_directory = null, .env = &.{} } }, "x");
-    try std.testing.expect(std.mem.indexOf(u8, py3, "'python3' '/tmp/zig-runner-step-6.py' )") != null);
+    try std.testing.expect(std.mem.indexOf(u8, py3, "'python3' '/tmp/zig-runner-step-6' )") != null);
     // A bash step is unaffected: still `.sh`.
     try std.testing.expect(std.mem.indexOf(u8, custom, ".sh' )") != null);
     // Any other program runs the script as GitHub runs it: its file has no extension, and the
