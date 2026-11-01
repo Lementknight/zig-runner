@@ -85,7 +85,7 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
 **Status: landed (behind the knob), reviewed, and hardened.** What it covers, as built:
 
 - `runner/src/native/Backend.zig` is the job side: the fallback decision (`unsupported`), the
-  machine's capability (`usable`, probed once per process), the job's directory, slot, ids and
+  machine's capability (`usable`, probed once, and again five minutes after a failure), the job's directory, slot, ids and
   network, the base, the container's env between steps, `execScript`, and the checkout.
   `runner/src/native/sandbox.zig` is one step's sandbox: the runner's own binary started as
   `zig-runner native-step`, reading the step's spec as one line of JSON on stdin (never on a
@@ -107,48 +107,68 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   rootless runner unless `RUNNER_NATIVE_ROOTLESS=1`, `container:`, `services:`, `uses:` actions,
   `docker://` steps, a custom image, Dagger in steps (`RUNNER_DAGGER_NESTING`), `hashFiles()`
   anywhere in the job (it reads the container through Dagger), a checkout with submodules, and a
-  machine whose probe fails (no user namespaces, `iptables` missing, ids overlapping /etc/subuid).
+  machine whose probe fails (no user namespaces, `iptables` missing, no default route, the jobs'
+  ids taken on the host, the jobs' subnet overlapping a route of the host's). A failed probe is
+  tried again after five minutes, not kept for the process's life.
 - Off on native, as caches: the step cache and output keys (P2), the package caches, uv's
   environment in its cache, and Zig's local cache and seed (P4). Results do not depend on them.
 - "Set up job" says what the job got: "Native steps: ids 0-65535 are host ids N-N+65535, and the
-  job's network is its own (10.88.1.x on zr0)", or the rootless warning.
+  job's network is its own (10.211.1.x on zr0)", or the rootless warning.
 
 #### Isolation: what P1 provides, and what it does not
 
 On a root runner, each step runs:
 
 - in a **user namespace of the job's own**, ids 0-65535 mapped to a range of host ids no host user
-  has (`RUNNER_NATIVE_SUBID_BASE`, by default 1,000,000,000 plus 65,536 per slot, checked
-  against /etc/subuid). The step's root and its uid 1001 are nobody on the host: a breakout,
-  sudo or a setuid program gains no host privilege. A full range is mapped, so apt's `_apt`,
-  `chown` and `tar` with owners work. The rootfs is seen through an idmapped mount (Linux 5.19),
-  not copied per range.
+  has (`RUNNER_NATIVE_SUBID_BASE`, by default 1,900,000,000 plus 65,536 per slot). The default
+  lies past systemd's container range (systemd-nspawn's private users and nsresourced's,
+  524288-1879048191) and the last slot's ids (up to 1,916,383,999) stay below its foreign range
+  (from 2,147,352,576) and below 2^31, which some tools take as signed. The probe refuses a base
+  below 100,000, a range past 2^32, and a range that overlaps one in /etc/subuid or /etc/subgid
+  or holds an id from /etc/passwd or /etc/group (users only a directory service knows are not
+  seen; the 100,000 floor is above their usual ranges). The step's root and its uid 1001 are
+  nobody on the host: a breakout, sudo or a setuid program gains no host privilege. A full range
+  is mapped, so apt's `_apt`, `chown` and `tar` with owners work. The rootfs is seen through an
+  idmapped mount (Linux 5.19), not copied per range.
 - in a **network namespace of the job's own** (all its steps share it): its own `lo` and port
-  space, a veth on the runner's bridge `zr0` (10.88.0.1/16; the job 10.88.1.(slot+2)), a default
-  route out through NAT. Two jobs can both listen on :5432, and no step reaches the host's
-  127.0.0.1. Ports below 1024 and ping work without capabilities on the host's
+  space, a veth on the runner's bridge `zr0` (`RUNNER_NATIVE_SUBNET`, by default 10.211.0.0/16
+  with the bridge at 10.211.0.1 and slot n's job at 10.211.1.(n+2); not podman's 10.88.0.0/16 or
+  Docker's ranges, and refused when it overlaps a route of the host's), a default route out
+  through NAT. Two jobs can both listen on :5432. The job reaches nothing on the host: not its
+  127.0.0.1, and not a service on any of its addresses (the bridge's included), since `INPUT`
+  drops whatever comes from `zr0` and is not a reply. Jobs cannot reach each other: each veth is
+  an isolated bridge port (`IFLA_BRPORT_ISOLATED`), and `FORWARD` drops traffic from `zr0` back
+  to `zr0`. IPv6 is off in the job's namespace and on the bridge, so no link-local address
+  slips past those IPv4 rules. Ports below 1024 and ping work without capabilities on the host's
   (`ip_unprivileged_port_start=0`, `ping_group_range`, set in the job's namespace only).
   Its resolver is the host's upstream servers (`/run/systemd/resolve/resolv.conf`, or the host's
   resolv.conf when it names no loopback server), since systemd-resolved's 127.0.0.53 is the host's
-  loopback.
+  loopback; a resolver on one of the host's own addresses is out of reach too.
 - in **mount, PID, UTS and IPC namespaces** of its own, with the overlay as `/` by `pivot_root`
   and the host's root detached (no chroot to climb out of), a /dev of six nodes plus devpts, shm
-  and mqueue, /proc with runc's masked paths (`kcore`, `keys`, `timer_list`, `sched_debug`, ...)
-  and read-only ones (`/proc/sys`, `sysrq-trigger`, `irq`, `bus`, `fs`), /sys read-only with
-  every mount under it.
+  and mqueue, /proc with runc's masked paths (`kcore`, `keys`, `timer_list`, `sched_debug`,
+  `interrupts`, ...) and read-only ones (`/proc/sys`, `sysrq-trigger`, `irq`, `bus`, `fs`),
+  cloned from the step's own /proc with every mount under them, and /sys read-only with every
+  mount under it. A mask or a read-only path the kernel has but that cannot be applied fails the
+  step's set-up; only a path the kernel does not have is skipped.
 - with **Docker's default capabilities** (the bounding set cut to them, ambient cleared),
   **no_new_privs** for root steps and rootless ones (not for the runner user on a root runner,
   whose sudo works as on GitHub and reaches only the job's own root, within the same capabilities
   and filter), and a **seccomp filter** that refuses Docker's default profile's dangerous
   calls (module loading, kexec, keyrings, bpf, perf, mount and the new mount API, namespaces,
-  clone with namespace flags, the clock, swap, reboot, `open_by_handle_at`).
+  clone with namespace flags, the clock, swap, reboot, `open_by_handle_at`, and io_uring, as
+  Docker has since moby 25), and allows `personality` only with Docker's values (Linux, 32-bit
+  Linux, a 2.6 uname, and the query).
+- with a script that holds a secret written to a **tmpfs of the step's own** and bound at its
+  path over an empty file, so the secret never reaches the store's disk (the empty file goes
+  when the step ends).
 - with every path inside the overlay resolved inside it (`openat2(RESOLVE_IN_ROOT)`), by the
   helper and by the runner, so a symlink a step plants never leads them to the host's files.
 
 What it does not provide yet:
 
-- **Resource limits.** No cgroup per job: a fork bomb or a memory hog reaches the host's limits
-  (phase 4's cgroups, with `pids.max` and `memory.max`).
+- **Resource limits.** No cgroup per job and no pids limit: a fork bomb or a memory hog reaches
+  the host's limits. Debt, recorded under phase 4 beside the gate's cgroup memory accounting.
 - **The seccomp filter is Docker's deny list, not its allow list.** Calls Docker refuses by
   omission are allowed here.
 - **Rootless runners.** Only one id is mapped and steps share the host's network: off unless
@@ -164,7 +184,8 @@ What it does not provide yet:
 RUNNER_BACKEND=native              # default dagger
 RUNNER_NATIVE_ROOTFS=/var/lib/zig-runner/rootfs   # absolute; checked at startup
 RUNNER_NATIVE_STORE=/var/lib/zig-runner/native    # default as root
-RUNNER_NATIVE_SUBID_BASE=1000000000               # default
+RUNNER_NATIVE_SUBID_BASE=1900000000               # default; at least 100000
+RUNNER_NATIVE_SUBNET=10.211.0.0/16                # default; a prefix of 8 to 23 bits
 RUNNER_NATIVE_ROOTLESS=0                          # default; 1 for a rootless runner
 ```
 
@@ -185,23 +206,49 @@ docker export zr-rootfs | tar -x -C /var/lib/zig-runner/rootfs
 **What the runner needs.** As root (the supported mode): `CAP_SYS_ADMIN` (namespaces, mounts,
 idmapped mounts, `pivot_root`), `CAP_NET_ADMIN` (the bridge, veths, addresses, routes, NAT),
 `CAP_SETUID`/`CAP_SETGID` (writing the job's id maps), Linux 5.19 or later (idmapped overlay
-layers), `iptables` on the host (the NAT rules, below), IPv4 forwarding (the runner turns it
-on), and a free 10.88.0.0/16. The runner makes `zr0` and its rules itself on its first native
-job, and removes each job's veth and namespace when the job ends, or at the next start after a crash
-(`sweep`, by the jobs' locks).
+layers), `iptables` on the host (the rules, below), a default route, a free
+`RUNNER_NATIVE_SUBNET`, and a writable `/run/zig-runner`. The runner makes `zr0` and its rules
+itself on its first native job, and removes each job's namespace when the job ends, or at the
+next start after a crash (`sweep`, by the jobs' locks).
+
+What it changes on the host, which is shared by every runner on it:
+
+- **Slots.** A job's slot names the veth `zrh<n>`, its address and its range of ids, all of them
+  the host's, so slots are locked host-wide: an flock on `/run/zig-runner/slots/<n>.lock`, in a
+  directory only root may enter, never under a runner's store. Two runners with different
+  `RUNNER_NATIVE_STORE`s on one host take different slots, and a slot's veth is removed (a dead
+  job's) only by the runner that now holds its lock. Every runner on a host must use the same
+  `RUNNER_NATIVE_SUBNET`, since `zr0` is one bridge.
+- **IPv4 forwarding** (`net.ipv4.ip_forward`) is turned on if it is off, and stays on: other
+  runners' jobs need it, and turning it off under them would cut their network. The runner logs
+  a warning when it turns it on, and another when the FORWARD policy is ACCEPT, since the host
+  would then route for any neighbour; set that policy to DROP (Docker does).
+- **iptables rules**, each added once at the head of its chain: `nat POSTROUTING` masquerades
+  the subnet; `filter INPUT` drops what comes from `zr0` and is not a reply; `filter FORWARD`, and
+  `DOCKER-USER` on a Docker host, drop `zr0` to `zr0`, accept `zr0` out through each uplink (the
+  interfaces of the default routes; a job adds the rules for a new one, a laptop moving from
+  cable to Wi-Fi), and accept replies back to `zr0`. Nothing else from `zr0` is accepted, so
+  Docker's containers and other bridges stay closed to jobs and ufw's forward policy decides the
+  rest. The rules stay when the runner stops.
 
 - Under `deploy/compose.yaml` (not changed by P1): the runner image is `FROM scratch` and runs as
   root. It needs `privileged: true` (as the engine service has), or `cap_add: [SYS_ADMIN,
   NET_ADMIN]` with `security_opt: [seccomp=unconfined, apparmor=unconfined,
   systempaths=unconfined]`, and `network_mode: host` for the bridge to be the host's. The store
   must be a volume, not the container's own overlay filesystem (overlayfs cannot take an upper
-  directory on overlayfs), and the rootfs another volume. The image has no `iptables`, so P1's NAT
-  needs the host's rules made outside it, or P5's netlink rules.
+  directory on overlayfs), and the rootfs another volume. The slots' locks must be the host's:
+  bind `/run/zig-runner:/run/zig-runner` from the host into every runner container (the
+  container's own /run would give each its own slot 0 on the shared bridge). The image has no
+  `iptables`, so P1's NAT needs the host's rules made outside it, or P5's netlink rules.
 - Under `deploy/zig-runner.service` on razorbill (not changed by P1): the unit runs as root with
-  `ProtectSystem=strict`, which makes the store's default read-only. It needs
-  `StateDirectory=zig-runner` (or `ReadWritePaths=/var/lib/zig-runner`). `NoNewPrivileges` and
-  `PrivateTmp` are compatible; a `RestrictNamespaces=`, a capability bounding set without
-  `CAP_SYS_ADMIN` and `CAP_NET_ADMIN`, or `PrivateNetwork=` would not be.
+  `ProtectSystem=strict`, which makes the store's default and `/run` read-only. It needs
+  `StateDirectory=zig-runner` (or `ReadWritePaths=/var/lib/zig-runner`) for the store, and
+  `RuntimeDirectory=zig-runner` with `RuntimeDirectoryPreserve=yes` for the slots' locks.
+  Preserve matters when several units share the directory: without it, systemd removes
+  `/run/zig-runner` when any one of them stops, the others' locks go with their files, and the
+  next runner would take a slot a live job holds. `NoNewPrivileges` and `PrivateTmp` are
+  compatible; a `RestrictNamespaces=`, a capability bounding set without `CAP_SYS_ADMIN` and
+  `CAP_NET_ADMIN`, or `PrivateNetwork=` would not be.
 - Rootless (tests, the laptop): a user namespace mapping the runner's user to root, with overlay's
   `userxattr` (Linux 5.11). Where AppArmor restricts unprivileged user namespaces
   (`kernel.apparmor_restrict_unprivileged_userns=1`), the sandbox is started under util-linux's
@@ -260,6 +307,9 @@ per-job helper makes the namespaces and the static mounts once.
 - A cgroup v2 per job: `memory.max`, `memory.peak`, `memory.events`, `pids.max`. The admission
   gate (`admission.zig`) reads per-job working sets instead of the engine's cgroup. Rootless, this
   needs systemd delegation (`Delegate=yes`, or `systemd-run --user --scope`).
+- **Debt from P1, paid here:** P1 has no per-job cgroup and no pids limit, so one native job's
+  fork bomb or memory hog reaches the host's limits and every other job's. The same cgroup that
+  gives the gate its accounting gives each job its `pids.max` and `memory.max`.
 - Exit: a runaway job is OOM-killed in its own cgroup without touching its neighbours. Measure:
   gate accuracy against the engine-wide reading.
 
@@ -485,3 +535,49 @@ setup that P2's per-job helper does once.
   host's root's mount namespace, is locked in the job's, and `pivot_root` refuses a locked new
   root (EINVAL: it is bound onto itself first, as runc does); and the hosted runner has no `nft`.
   Also a file descriptor closed twice on `init`'s error path, which Zig's I/O caught.
+
+### P1, after the re-review: what is the host's, what the firewall already says, what fails quietly
+
+An independent re-review of the hardened P1 found one major fault and several gaps. What it
+taught:
+
+- **A resource named on the host must be locked on the host.** The slots were locked under the
+  runner's store, but what a slot names is the host's: the veth `zrh<n>`, the address, the range
+  of ids. Two runners with different `RUNNER_NATIVE_STORE`s both took slot 0, and the second's
+  set-up deleted the first's veth as a dead job's, cutting a running job's network; both jobs
+  also got one address and one range of ids. The locks now live at a fixed host path
+  (`/run/zig-runner/slots`), and only the slot's holder removes its veth. The rule for every
+  later phase: before keying anything by the store (the layer store, cache volumes, cgroups),
+  ask whether the kernel object it names is per store or per host. It also reaches the deploy:
+  systemd's `RuntimeDirectory=` removes the directory when any unit sharing it stops unless
+  `RuntimeDirectoryPreserve=yes`, which would quietly free a live job's slot, and a container
+  needs the host's `/run/zig-runner` bound in, not its own.
+- **iptables rules land among others'.** An `ACCEPT` for "anything from `zr0`" at the head of
+  `FORWARD` and `DOCKER-USER` got the jobs out, and also opened Docker's unpublished container
+  ports and every other network the host routes to, and overrode ufw's forward policy: the first
+  matching rule wins whoever wrote it. The rules now say exactly the traffic they are for (from
+  `zr0` out through an uplink, replies back) and leave the rest to the host's policy. `INPUT` was
+  never considered: a job had its own loopback, but the host's services on the bridge's address
+  (and every other address of the host's) were one hop away. Isolation between jobs needed two
+  layers, since one does not imply the other: the bridge forwards between ports unless they are
+  isolated, and the host routes between jobs through the gateway unless `FORWARD` drops it. IPv6
+  link-local addresses come up on every interface by themselves and pass every IPv4 rule; they are
+  now off on the bridge and in the jobs. Host-wide sysctls (`ip_forward`) cannot be restored by one
+  runner of several, so they are checked, logged and documented instead.
+- **A mount that fails quietly is a hole with a passing test.** `/proc/sys` was made read-only by
+  binding the helper's `/proc/sys` (the host's, with `binfmt_misc` mounted under it on GitHub's
+  runner and many hosts) without its submounts, which a user namespace refuses; the call's result
+  was ignored, so steps ran with `/proc/sys` writable and nothing said so. The masks had the same
+  shape. Now each read-only path is cloned from the step's own /proc with its submounts and made
+  read-only in one `mount_setattr`, as /sys already was, and a mask or read-only path the kernel
+  has but cannot apply fails the set-up. The tests check the result from inside the step (a write
+  refused, `ro` in mountinfo), not the call. Same lesson as the remounts in the first review:
+  check every mount's result, and test what the step sees.
+- **Smaller ones.** A script holding a secret was written into the step's layer, on the store's
+  disk, and unlinked afterwards, which leaves it in free blocks: it is now on a tmpfs of the
+  step's own, bound at its path. io_uring bypasses seccomp for the calls it runs and Docker has
+  refused it since moby 25; `personality` can turn off ASLR (`ADDR_NO_RANDOMIZE`) and Docker
+  allows only four values. The default id range sat inside systemd-nspawn's private-users range,
+  and the checks read /etc/subuid only, not /etc/subgid or the host's own users and groups. The
+  default subnet was podman's. A failed capability probe turned native off until the runner
+  restarted; it is now tried again after five minutes.
