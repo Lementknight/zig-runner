@@ -16,11 +16,18 @@ Build and run, with Zig 0.17 and Docker on the machine:
 ```sh
 cd runner
 zig build -Doptimize=ReleaseSafe
-cp ../deploy/runner.env.example /etc/zig-runner.env   # then fill in GH_TOKEN and GH_SCOPE
+cp ../deploy/runner.env.example /etc/zig-runner.env   # then fill in GH_TOKEN (or a GitHub App) and GH_SCOPE
 zig-out/bin/runner
 ```
 
 Or install `deploy/zig-runner.service` and run it under systemd, or `docker compose -f deploy/compose.yaml up`.
+
+Instead of `GH_TOKEN`, the runner can manage its registrations as a GitHub App, which reaches only
+the repositories it is installed on: `GH_APP_ID` (the App's ID or Client ID) and
+`GH_APP_PRIVATE_KEY_FILE` (or `GH_APP_PRIVATE_KEY`), with the permission "Administration: read and
+write" for a repository ("Self-hosted runners: read and write" for an organization). It mints
+installation tokens itself and refreshes them before they expire. `deploy/runner.env.example` has
+the details, including mounting the key under Compose.
 
 ## Versioning
 
@@ -213,7 +220,9 @@ working-set rise per job from 0.98 to 0.55 GB (runner-bench `zig-seed.yml`, `zig
 A seed that cannot be built leaves the job unseeded, and "Set up job" says which happened.
 
 Steps get the Dagger engine (`RUNNER_DAGGER_NESTING`, privileged nesting, for `dagger call` inside
-a step) only in jobs the runner vouches for, the same jobs that get the `repo` volumes. A step's
+a step) only when a pool turns it on (`RUNNER_DAGGER_NESTING=true`; off by default, and the runner
+logs which at startup), and then only in jobs the runner vouches for, the same jobs that get the
+`repo` volumes. A step's
 own Dagger client is in the runner's namespace and can open any cache volume by its key, which is
 no secret, so in any other job it could write what trusted jobs read (#228). A step there that
 names Dagger and fails is told why, and "Set up job" says so (`Dagger in steps: off`). Still, run

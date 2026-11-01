@@ -11,6 +11,7 @@ const sink = @import("sink.zig");
 const http = @import("github/http.zig");
 const broker = @import("github/broker.zig");
 const jitconfig = @import("github/jitconfig.zig");
+const app = @import("github/app.zig");
 const engine = @import("engine.zig");
 const build_version = @import("version.zig");
 
@@ -24,6 +25,7 @@ comptime {
     _ = @import("github/jitconfig.zig");
     _ = @import("github/rsa_sign.zig");
     _ = @import("github/auth.zig");
+    _ = @import("github/app.zig");
     _ = @import("inspect.zig");
     _ = @import("github/broker.zig");
     _ = @import("github/runservice.zig");
@@ -100,6 +102,15 @@ pub fn main(init: std.process.Init) !u8 {
     if (cfg.db_check) return dbCheck(init, pg_cfg, secrets, &stdout.interface, err);
     if (cfg.exec_job) |path| return execJobFile(init, &cfg, path, log, err);
     if (cfg.dry_run) return dryRun(arena, log, name, cfg.labels);
+    var app_auth: app.Auth = undefined;
+    if (cfg.gh_app) |settings| {
+        app_auth = startApp(arena, io, settings, cfg.scope, log, err) catch |e| return switch (e) {
+            error.AppConfig => @backingInt(Exit.config),
+            error.AppRejected => @backingInt(Exit.github),
+            else => e,
+        };
+        cfg.app_auth = &app_auth;
+    }
     if (cfg.inspect) return inspect.run(arena, io, &cfg, name, &stdout.interface);
 
     // One HTTP client for every runner (see `github/http.zig`).
@@ -117,6 +128,49 @@ pub fn main(init: std.process.Init) !u8 {
     sweep.start(stale);
     defer sweep.stop();
     return runPool(init, &cfg, log, err, secrets, name, if (store) |*st| st else null);
+}
+
+/// The GitHub App's installation tokens, with the first one minted now: a key GitHub does not
+/// take, or an App not installed on GH_SCOPE, is said once at startup, not as a registration
+/// failure later. Neither the key nor the token is ever written out.
+fn startApp(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    settings: @import("config.zig").GhApp,
+    scope: @import("config.zig").Scope,
+    log: *sink.LogSink,
+    err: *std.Io.Writer,
+) !app.Auth {
+    var a = app.Auth.init(arena, io, settings, scope) catch |e| {
+        switch (settings.key) {
+            .file => |path| try err.print(
+                "config error: GH_APP_PRIVATE_KEY_FILE {s}: {s}\n",
+                .{ path, @errorName(e) },
+            ),
+            .pem => try err.print("config error: GH_APP_PRIVATE_KEY: {s}\n", .{@errorName(e)}),
+        }
+        return error.AppConfig;
+    };
+    var status: std.http.Status = .ok;
+    var message: []const u8 = "";
+    _ = a.token(arena, io, &status, &message) catch |e| {
+        try err.print("github error: GitHub App {s}: {s} (HTTP {d})", .{
+            settings.id,
+            @errorName(e),
+            @backingInt(status),
+        });
+        if (message.len > 0) try err.print(": {s}", .{message});
+        try err.writeAll("\n  The App must be installed on GH_SCOPE with \"Administration: read " ++
+            "and write\" (a repository) or \"Self-hosted runners: read and write\" (an " ++
+            "organization).\n");
+        return error.AppRejected;
+    };
+    try log.say(try std.fmt.allocPrint(
+        arena,
+        "GitHub App {s}: installation {d}, token refreshed 5 minutes before it expires",
+        .{ settings.id, a.installation_id.? },
+    ));
+    return a;
 }
 
 /// The runners, until a stop signal: `cfg.runners` of them in one process (see `loop.pool`).
@@ -360,6 +414,7 @@ fn execJobFile(
         .tool_trees = cfg.tool_trees,
         .uv_env_in_cache = cfg.uv_env_in_cache,
         .zig_local_cache = cfg.zig_local_cache,
+        .zig_local_cache_max_mb = cfg.zig_local_cache_max_mb,
         .zig_seed = cfg.zig_seed,
         .step_cache = cfg.step_cache,
         .step_user = cfg.step_user,

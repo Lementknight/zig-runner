@@ -532,9 +532,9 @@ pub fn runContainer(
     );
     x.sh.beginCommands(num, env_context);
     x.beginExec(num);
-    const doc = try q.finish();
-    const data = gql(arena, x.transport, doc, &x.err_msg) catch return error.EngineFailed;
-    const out = try x.collect(num, data, .{ .doc = doc, .at = output_at });
+    var recorded: Recorded = .{ .doc = try q.finish(), .at = output_at };
+    const data = try recorded.send(x, x.replayed_last);
+    const out = try x.collect(num, data, recorded);
     try x.takeWorkspaceBack(num, data, out);
     return out;
 }

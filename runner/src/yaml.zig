@@ -1721,18 +1721,27 @@ test "what comparing with Go's YAML turned up: the null words, and explicit keys
 }
 
 test "block collections nested on one line are refused past 1000 deep, not a stack overflow (#98)" {
+    // Both at once: each parse is slow in a debug build, and they share nothing.
+    const io = std.testing.io;
+    var keys = try io.concurrent(refusedDeep, .{"? "});
+    defer keys.cancel(io) catch {};
+    try refusedDeep("- ");
+    try keys.await(io);
+    // Real nesting still reads.
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ok = try parse(a.allocator(), "a:\n  - - - x\n", null);
+    try std.testing.expectEqualStrings("x", ok.get("a").?.seq[0].seq[0].seq[0].string);
+}
+
+fn refusedDeep(indicator: []const u8) !void {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const ar = a.allocator();
-    for ([_][]const u8{ "- ", "? " }) |indicator| {
-        var deep: std.ArrayList(u8) = .empty;
-        for (0..70_000) |_| try deep.appendSlice(ar, indicator);
-        try deep.append(ar, 'x');
-        var diag: Diag = .{};
-        try std.testing.expectError(error.UnsupportedYaml, parse(ar, deep.items, &diag));
-        try std.testing.expectEqualStrings("block collections nested over 1000 deep", diag.message);
-    }
-    // Real nesting still reads.
-    const ok = try parse(ar, "a:\n  - - - x\n", null);
-    try std.testing.expectEqualStrings("x", ok.get("a").?.seq[0].seq[0].seq[0].string);
+    var deep: std.ArrayList(u8) = .empty;
+    for (0..70_000) |_| try deep.appendSlice(ar, indicator);
+    try deep.append(ar, 'x');
+    var diag: Diag = .{};
+    try std.testing.expectError(error.UnsupportedYaml, parse(ar, deep.items, &diag));
+    try std.testing.expectEqualStrings("block collections nested over 1000 deep", diag.message);
 }

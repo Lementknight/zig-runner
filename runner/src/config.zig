@@ -4,6 +4,7 @@ const pg = @import("pg.zig");
 const engine = @import("engine.zig");
 const admission = @import("admission.zig");
 const trust = @import("trust.zig");
+const app = @import("github/app.zig");
 
 pub const Scope = union(enum) {
     repo: struct { owner: []const u8, name: []const u8 },
@@ -34,10 +35,27 @@ pub const EngineMode = enum { direct, cli };
 /// its version and the sha256 of its tarball for the engine host's architecture, from
 /// https://ziglang.org/download/index.json.
 pub const ZigSeed = struct { version: []const u8, sha256: []const u8 };
+/// A GitHub App the runner authenticates as to manage its registrations, in place of `GH_TOKEN`
+/// (`github/app.zig`): `GH_APP_ID`, `GH_APP_PRIVATE_KEY_FILE` or `GH_APP_PRIVATE_KEY`, and
+/// optionally `GH_APP_INSTALLATION_ID`.
+pub const GhApp = struct {
+    /// The App's ID or its Client ID: GitHub takes either as the JWT's issuer.
+    id: []const u8,
+    key: union(enum) { file: []const u8, pem: []const u8 },
+    /// Found from the scope (`GET /repos/{owner}/{repo}/installation`, `/orgs/{org}/installation`)
+    /// when unset.
+    installation_id: ?u64 = null,
+};
 
 pub const Config = struct {
+    /// "" with a GitHub App (`gh_app`).
     gh_token: []const u8,
     scope: Scope,
+    /// A GitHub App to manage registrations as, instead of `gh_token`; the two exclude each other.
+    gh_app: ?GhApp = null,
+    /// The App's installation tokens, set up by `main` from `gh_app`. Every runner-management call
+    /// takes its token from here when set (`jitconfig`).
+    app_auth: ?*app.Auth = null,
     labels: []const u8 = "self-hosted,linux,zig",
     runner_group_id: u64 = 1,
     name_prefix: []const u8 = "zig",
@@ -67,9 +85,10 @@ pub const Config = struct {
     docker_socket: []const u8 = "/var/run/docker.sock",
     /// Give each step's commands access to the job's Dagger engine
     /// (`experimentalPrivilegedNesting`), so `dagger call` inside a job works, as
-    /// dagger/dagger-for-github expects. That access is enough to run privileged containers, so a
-    /// job can control the runner's host: turn it off for untrusted workflows.
-    dagger_nesting: bool = true,
+    /// dagger/dagger-for-github expects, and only in jobs the runner vouches for. That access is
+    /// enough to run privileged containers and open any cache volume by its key, so a job with it
+    /// controls the runner's host: off unless a pool that needs it turns it on.
+    dagger_nesting: bool = false,
     /// Mount persistent Dagger cache volumes at package managers' cache directories in every job.
     package_caches: bool = true,
     /// Check the tool cache's trees in "Set up job", before any step can write there, from lists
@@ -110,6 +129,11 @@ pub const Config = struct {
     /// repository had the same source. Off by default: Zig never removes anything from that cache,
     /// so it grows by about 50 MB for every source version built, until the engine collects it.
     zig_local_cache: bool = false,
+    /// With `zig_local_cache`, the size in MB past which Zig's local cache starts over, whole, in a
+    /// new generation of its volume (`set_up.zig`, `zig_local_roll_script`): Zig grows it by about
+    /// 111 MB for every commit built, and a Zig cache must never lose part of itself. 0 lets it
+    /// grow, in the volume's root as before.
+    zig_local_cache_max_mb: u32 = 4096,
     /// Seed Zig jobs' global cache with what every `zig build` compiles before it reads any
     /// project: the build runner, 104 s on one core and about 1 GB on the laptop (`set_up.zig`,
     /// "The Zig cache seed"). Off when unset: the runner cannot know which Zig its jobs use, and a
@@ -163,6 +187,11 @@ pub const Config = struct {
 
     pub const Error = error{
         MissingGhToken,
+        GhTokenAndApp,
+        MissingGhAppId,
+        MissingGhAppKey,
+        GhAppKeyTwice,
+        InvalidGhAppId,
         MissingGhScope,
         InvalidScope,
         InvalidNumber,
@@ -183,6 +212,19 @@ pub const Config = struct {
                 "not set, so this runner would fail every job. Set it to the refs prod may run " ++
                 "(RUNNER_TRUSTED_REFS=refs/heads/main,refs/tags/v*), or to * to trust every ref " ++
                 "(README, \"Environments\").",
+            error.MissingGhToken => "No GitHub credentials: set GH_TOKEN, or a GitHub App with " ++
+                "GH_APP_ID and GH_APP_PRIVATE_KEY_FILE (or GH_APP_PRIVATE_KEY) " ++
+                "(deploy/runner.env.example).",
+            error.GhTokenAndApp => "Both GH_TOKEN and a GitHub App (GH_APP_*) are set: the " ++
+                "runner uses one or the other. Remove GH_TOKEN to use the App.",
+            error.MissingGhAppId => "GH_APP_* is set but GH_APP_ID is not: set it to the App's " ++
+                "ID or Client ID.",
+            error.MissingGhAppKey => "GH_APP_ID is set but no private key: set " ++
+                "GH_APP_PRIVATE_KEY_FILE to the App's PEM file, or GH_APP_PRIVATE_KEY to the PEM.",
+            error.GhAppKeyTwice => "GH_APP_PRIVATE_KEY_FILE and GH_APP_PRIVATE_KEY are both " ++
+                "set: give the key one way.",
+            error.InvalidGhAppId => "GH_APP_ID is the App's ID (digits) or its Client ID " ++
+                "(letters and digits, Iv23...).",
             error.InvalidZigSeed => "RUNNER_ZIG_SEED is <version>=<sha256>: a Zig version and " ++
                 "the sha256 of its Linux tarball for this machine's architecture, from " ++
                 "https://ziglang.org/download/index.json.",
@@ -193,7 +235,7 @@ pub const Config = struct {
     /// Values are borrowed from `environ` / `args`, which must outlive the Config.
     pub fn load(environ: *const std.process.Environ.Map, args: []const [:0]const u8) Error!Config {
         var creds: Credentials = .{
-            .token = environ.get("GH_TOKEN"),
+            .token = nonEmpty(environ.get("GH_TOKEN")),
             .scope = environ.get("GH_SCOPE"),
         };
         var c: Config = .{ .gh_token = "", .scope = undefined };
@@ -226,9 +268,37 @@ pub const Config = struct {
         // A runner that says it is prod and trusts nothing is a configuration slip (a lost
         // `EnvironmentFile` line, a typo), not a choice: say so now, not in every job's log (#105).
         if (trust.prodLabel(c.labels) and trust.none(c.trusted_refs)) return error.ProdTrustsNoRef;
-        c.gh_token = creds.token orelse return error.MissingGhToken;
+        c.gh_app = try ghApp(environ);
+        if (c.gh_app != null and creds.token != null) return error.GhTokenAndApp;
+        if (c.gh_app == null) c.gh_token = creds.token orelse return error.MissingGhToken;
         c.scope = try Scope.parse(creds.scope orelse return error.MissingGhScope);
         return c;
+    }
+
+    /// The GitHub App from `GH_APP_*`, or null when none of them is set. Empty counts as unset,
+    /// as the example env file leaves the variables it does not use empty (`GH_TOKEN=`).
+    fn ghApp(environ: *const std.process.Environ.Map) Error!?GhApp {
+        const id = nonEmpty(environ.get("GH_APP_ID"));
+        const file = nonEmpty(environ.get("GH_APP_PRIVATE_KEY_FILE"));
+        const pem = nonEmpty(environ.get("GH_APP_PRIVATE_KEY"));
+        const installation = nonEmpty(environ.get("GH_APP_INSTALLATION_ID"));
+        if (id == null and file == null and pem == null and installation == null) return null;
+        const app_id = id orelse return error.MissingGhAppId;
+        // It goes into the JWT's JSON as it is.
+        for (app_id) |ch| if (!std.ascii.isAlphanumeric(ch)) return error.InvalidGhAppId;
+        if (file != null and pem != null) return error.GhAppKeyTwice;
+        return .{
+            .id = app_id,
+            .key = if (file) |f| .{ .file = f } else .{
+                .pem = pem orelse return error.MissingGhAppKey,
+            },
+            .installation_id = if (installation) |v| try num(u64, v) else null,
+        };
+    }
+
+    fn nonEmpty(v: ?[]const u8) ?[]const u8 {
+        const s = v orelse return null;
+        return if (s.len == 0) null else s;
     }
 
     /// `GH_TOKEN` and `GH_SCOPE` as given, by variable or flag, before they are required — a mode
@@ -264,6 +334,8 @@ pub const Config = struct {
         if (environ.get("RUNNER_LOG_SPOOL_DIR")) |v| c.log_spool_dir = v;
         if (environ.get("RUNNER_UV_ENV_IN_CACHE")) |v| c.uv_env_in_cache = try boolean(v);
         if (environ.get("RUNNER_ZIG_LOCAL_CACHE")) |v| c.zig_local_cache = try boolean(v);
+        if (environ.get("RUNNER_ZIG_LOCAL_CACHE_MAX_MB")) |v|
+            c.zig_local_cache_max_mb = try num(u32, v);
         if (environ.get("RUNNER_ZIG_SEED")) |v| c.zig_seed = try zigSeed(v);
         if (environ.get("RUNNER_PREWARM")) |v| c.prewarm = try boolean(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_MAX_MS")) |v| c.output_keys_max_ms = try millis(v);
@@ -324,6 +396,7 @@ pub const Config = struct {
         else if (eq(key, "step-user")) c.step_user = try stepUser(val) //
         else if (eq(key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache")) c.zig_local_cache = try boolean(val) //
+        else if (eq(key, "zig-local-cache-max-mb")) c.zig_local_cache_max_mb = try num(u32, val) //
         else if (eq(key, "zig-seed")) c.zig_seed = try zigSeed(val) //
         else if (eq(key, "prewarm")) c.prewarm = try boolean(val) //
         else if (eq(key, "output-keys-max-ms")) c.output_keys_max_ms = try millis(val) //
@@ -588,15 +661,15 @@ test "the engine silence timeout: ten minutes by default, in seconds, 0 turns it
     try std.testing.expectError(error.InvalidNumber, Config.load(&env, &.{"runner"}));
 }
 
-test "dagger nesting is on by default and can be turned off" {
+test "dagger nesting is off by default and can be turned on" {
     var env: std.process.Environ.Map = .init(std.testing.allocator);
     defer env.deinit();
     try env.put("GH_TOKEN", "t");
     try env.put("GH_SCOPE", "o/r");
-    try std.testing.expect((try Config.load(&env, &.{"runner"})).dagger_nesting);
-    try env.put("RUNNER_DAGGER_NESTING", "false");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).dagger_nesting);
-    try std.testing.expect((try Config.load(&env, &.{ "runner", "--dagger-nesting=true" })).dagger_nesting);
+    try env.put("RUNNER_DAGGER_NESTING", "true");
+    try std.testing.expect((try Config.load(&env, &.{"runner"})).dagger_nesting);
+    try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--dagger-nesting=false" })).dagger_nesting);
     try env.put("RUNNER_DAGGER_NESTING", "maybe");
     try std.testing.expectError(error.InvalidBool, Config.load(&env, &.{"runner"}));
 }
@@ -660,6 +733,9 @@ test "Zig's local cache is kept only when asked for, and uv's setting is read" {
     try std.testing.expect((try Config.load(&env, &.{ "runner", "--zig-local-cache=true" })).zig_local_cache);
     try env.put("RUNNER_ZIG_LOCAL_CACHE", "1");
     try std.testing.expect((try Config.load(&env, &.{"runner"})).zig_local_cache);
+    try std.testing.expectEqual(@as(u32, 4096), (try Config.load(&env, &.{"runner"})).zig_local_cache_max_mb);
+    try env.put("RUNNER_ZIG_LOCAL_CACHE_MAX_MB", "0");
+    try std.testing.expectEqual(@as(u32, 0), (try Config.load(&env, &.{"runner"})).zig_local_cache_max_mb);
     try env.put("RUNNER_UV_ENV_IN_CACHE", "false");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).uv_env_in_cache);
 }
@@ -771,4 +847,42 @@ test "the memory gate is on by default, with limits from the environment or flag
     try env.put("RUNNER_ADMISSION", "false");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).admission);
     try std.testing.expect((try Config.load(&env, &.{ "runner", "--admission=true" })).admission);
+}
+
+test "load: GH_TOKEN or a GitHub App, not both and not neither" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_SCOPE", "o/r");
+    try env.put("GH_TOKEN", "");
+    try std.testing.expectError(error.MissingGhToken, Config.load(&env, &.{"runner"}));
+
+    try env.put("GH_APP_ID", "5561426");
+    try std.testing.expectError(error.MissingGhAppKey, Config.load(&env, &.{"runner"}));
+    try env.put("GH_APP_PRIVATE_KEY_FILE", "/run/secrets/app.pem");
+    const c = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqualStrings("5561426", c.gh_app.?.id);
+    try std.testing.expectEqualStrings("/run/secrets/app.pem", c.gh_app.?.key.file);
+    try std.testing.expectEqual(@as(?u64, null), c.gh_app.?.installation_id);
+    try std.testing.expectEqualStrings("", c.gh_token);
+
+    try env.put("GH_TOKEN", "t");
+    try std.testing.expectError(error.GhTokenAndApp, Config.load(&env, &.{"runner"}));
+    try env.put("GH_TOKEN", "");
+    const flag = [_][:0]const u8{ "runner", "--token=t" };
+    try std.testing.expectError(error.GhTokenAndApp, Config.load(&env, &flag));
+
+    try env.put("GH_APP_PRIVATE_KEY", "-----BEGIN ...");
+    try std.testing.expectError(error.GhAppKeyTwice, Config.load(&env, &.{"runner"}));
+    try env.put("GH_APP_PRIVATE_KEY_FILE", "");
+    try env.put("GH_APP_ID", "Iv23liJ9gsvCyFqhKLrM");
+    try env.put("GH_APP_INSTALLATION_ID", "99");
+    const d = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqualStrings("Iv23liJ9gsvCyFqhKLrM", d.gh_app.?.id);
+    try std.testing.expectEqualStrings("-----BEGIN ...", d.gh_app.?.key.pem);
+    try std.testing.expectEqual(@as(?u64, 99), d.gh_app.?.installation_id);
+
+    try env.put("GH_APP_ID", "1\",\"x");
+    try std.testing.expectError(error.InvalidGhAppId, Config.load(&env, &.{"runner"}));
+    try env.put("GH_APP_ID", "");
+    try std.testing.expectError(error.MissingGhAppId, Config.load(&env, &.{"runner"}));
 }

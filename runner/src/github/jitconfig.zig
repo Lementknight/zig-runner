@@ -4,6 +4,7 @@ const Config = @import("../config.zig").Config;
 const Scope = @import("../config.zig").Scope;
 const broker = @import("broker.zig");
 const http = @import("http.zig");
+const app = @import("app.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -29,7 +30,45 @@ pub const Error = error{
     /// Non-2xx from GitHub. Maps to exit code 2.
     GithubRejected,
     BadResponse,
-} || Allocator.Error || http.FetchError;
+} || Allocator.Error || http.FetchError || app.Error;
+
+/// The token runner management sends: `GH_TOKEN`, or the GitHub App's installation token. When
+/// GitHub will not give the App one, its status and reason go to `status_out` and `message_out`.
+fn token(
+    arena: Allocator,
+    io: std.Io,
+    cfg: *const Config,
+    status_out: *std.http.Status,
+    message_out: *[]const u8,
+) app.Error![]const u8 {
+    const a = cfg.app_auth orelse return cfg.gh_token;
+    return a.token(arena, io, status_out, message_out);
+}
+
+/// A runner-management request with no body, with the configured credentials. With a GitHub App,
+/// a 401 drops the cached installation token (revoked, or the App's permissions changed) and the
+/// request goes once more with a new one: GitHub processed nothing it answered 401.
+fn manage(
+    arena: Allocator,
+    io: std.Io,
+    cfg: *const Config,
+    method: std.http.Method,
+    url: []const u8,
+) !broker.Response {
+    var attempt: u32 = 0;
+    while (true) : (attempt += 1) {
+        var status: std.http.Status = .ok;
+        var message: []const u8 = "";
+        const t = try token(arena, io, cfg, &status, &message);
+        const r = try broker.request(arena, io, method, url, null, .{
+            .token = t,
+            .extra_headers = &.{api_version_header},
+        });
+        if (r.status != .unauthorized or attempt > 0) return r;
+        const a = cfg.app_auth orelse return r;
+        a.invalidate(io, t);
+    }
+}
 
 fn runnersUrl(arena: Allocator, cfg: *const Config) Allocator.Error![]const u8 {
     return switch (cfg.scope) {
@@ -61,10 +100,7 @@ pub fn deleteRunner(
         "{s}/{d}",
         .{ try runnersUrl(arena, cfg), runner_id },
     );
-    const r = try broker.request(arena, io, .DELETE, url, null, .{
-        .token = cfg.gh_token,
-        .extra_headers = &.{api_version_header},
-    });
+    const r = try manage(arena, io, cfg, .DELETE, url);
     return r.status;
 }
 
@@ -96,27 +132,35 @@ pub fn generate(
         .labels = labels.items,
     }, .{}, &body.writer);
 
-    const auth = try std.fmt.allocPrint(arena, "Bearer {s}", .{cfg.gh_token});
-
     var local: std.http.Client = .{ .allocator = arena, .io = io };
     defer local.deinit();
     const client = http.client(&local);
 
     var resp: std.Io.Writer.Allocating = .init(arena);
-    const result = try http.fetch(client, .{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = body.written(),
-        .headers = .{
-            .authorization = .{ .override = auth },
-            .content_type = .{ .override = "application/json" },
-        },
-        .extra_headers = &.{
-            .{ .name = "Accept", .value = "application/vnd.github+json" },
-            api_version_header,
-        },
-        .response_writer = &resp.writer,
-    });
+    // Sent again only after a 401 with a GitHub App, with a new token (see `manage`): a
+    // registration GitHub refused was not made, so the second does not make two.
+    var attempt: u32 = 0;
+    const result = while (true) : (attempt += 1) {
+        const t = try token(arena, io, cfg, status_out, message_out);
+        resp.clearRetainingCapacity();
+        const r = try http.fetch(client, .{
+            .location = .{ .url = url },
+            .method = .POST,
+            .payload = body.written(),
+            .headers = .{
+                .authorization = .{ .override = try std.fmt.allocPrint(arena, "Bearer {s}", .{t}) },
+                .content_type = .{ .override = "application/json" },
+            },
+            .extra_headers = &.{
+                .{ .name = "Accept", .value = "application/vnd.github+json" },
+                api_version_header,
+            },
+            .response_writer = &resp.writer,
+        });
+        if (r.status != .unauthorized or attempt > 0) break r;
+        const a = cfg.app_auth orelse break r;
+        a.invalidate(io, t);
+    };
     status_out.* = result.status;
     if (result.status.class() != .success) {
         message_out.* = errorMessage(arena, resp.written());
@@ -127,7 +171,7 @@ pub fn generate(
 }
 
 /// The `message` of a GitHub API error body; "" when there is none.
-fn errorMessage(arena: Allocator, body: []const u8) []const u8 {
+pub fn errorMessage(arena: Allocator, body: []const u8) []const u8 {
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return "";
     if (v != .object) return "";
     const m = v.object.get("message") orelse return "";
@@ -234,10 +278,7 @@ pub fn movedRepo(arena: Allocator, io: std.Io, cfg: *const Config) ?Scope {
         "https://api.github.com/repos/{s}/{s}",
         .{ r.owner, r.name },
     ) catch return null;
-    const resp = broker.request(arena, io, .GET, url, null, .{
-        .token = cfg.gh_token,
-        .extra_headers = &.{api_version_header},
-    }) catch return null;
+    const resp = manage(arena, io, cfg, .GET, url) catch return null;
     if (resp.status.class() != .success) return null;
     return currentName(arena, cfg.scope, resp.body);
 }
@@ -274,10 +315,7 @@ pub fn staleRegistrations(arena: Allocator, io: std.Io, cfg: *const Config) ![]c
                 "{s}?per_page={d}&page={d}",
                 .{ g.base, per_page, n },
             );
-            const resp = try broker.request(g.arena, g.io, .GET, url, null, .{
-                .token = g.cfg.gh_token,
-                .extra_headers = &.{api_version_header},
-            });
+            const resp = try manage(g.arena, g.io, g.cfg, .GET, url);
             if (resp.status.class() != .success) return error.GithubRejected;
             return resp.body;
         }
@@ -451,4 +489,26 @@ test "stale registrations come from every page" {
     const full = Fake{ .arena = arena, .sizes = &.{ 100, 100 }, .asked = &asked };
     try std.testing.expectEqualSlices(u64, &.{ 1001, 1002 }, try collectStale(arena, "zig-ci", full));
     try std.testing.expectEqual(@as(u32, 3), asked);
+}
+
+test "with a GitHub App, a 401 gets a new installation token and one more try" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: @import("testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    var a = try app.testAuth(arena, server.port);
+    const cfg: Config = .{ .gh_token = "", .scope = a.scope, .app_auth = &a };
+    var buf: [128]u8 = undefined;
+
+    // The server takes only the second token it mints there.
+    const r = try manage(arena, io, &cfg, .GET, server.url(&buf, "127.0.0.1", "/app-token/ghs_2"));
+    try std.testing.expectEqual(std.http.Status.ok, r.status);
+    try std.testing.expectEqual(@as(u32, 2), server.app_tokens.load(.acquire));
+    // Never a third: a second 401 is GitHub's answer.
+    const no = try manage(arena, io, &cfg, .GET, server.url(&buf, "127.0.0.1", "/app-token/x"));
+    try std.testing.expectEqual(std.http.Status.unauthorized, no.status);
+    try std.testing.expectEqual(@as(u32, 3), server.app_tokens.load(.acquire));
 }

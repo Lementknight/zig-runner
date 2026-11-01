@@ -193,13 +193,19 @@ jobs:
 
       # The database tests skip themselves here: the Database tests job runs them. On GitHub's
       # runners, whose cache always starts empty, without `zig build` (zig-test.sh); on the
-      # project's own, whose cache is kept, through it, as developers build.
+      # project's own, whose cache is kept, through it, as developers build. On the Pi (ARM64),
+      # -j1 compiles the tests and the runner one after the other: together they peak at about
+      # 1.7 GB, one at a time about 1 GB, so two jobs fit under the engine's 4 GB cap instead of
+      # queueing behind its memory gate. Each job takes about 25 s longer, and the pool finishes
+      # about 38% more of them.
       - name: Test
         if: steps.scope.outputs.run == 'true'
         working-directory: runner
         run: |
           if [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
             ../.github/scripts/zig-test.sh
+          elif [ "$RUNNER_ARCH" = ARM64 ]; then
+            zig build test -j1 --summary all
           else
             zig build test --summary all
           fi

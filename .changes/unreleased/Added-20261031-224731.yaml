@@ -1,0 +1,3 @@
+kind: Added
+body: 'Zig''s local cache volume (`RUNNER_ZIG_LOCAL_CACHE`) stays under `RUNNER_ZIG_LOCAL_CACHE_MAX_MB` (4096 by default; 0 for no limit). It grew by about 111 MB for every commit built, 5.7 GB after 50 jobs on the laptop. Before each job, a container of its own starts the cache over, whole, in a new generation of the volume once the live one is past the limit, and removes a generation 6 hours after its successor became current; jobs see the live one through one fixed path (`.../zig-local/current`), so no step''s cache key changes. A roll that fails is logged and the job goes on.'
+time: 2026-10-31T22:47:31.000000-04:00

@@ -474,7 +474,7 @@ pub const Options = struct {
     /// Steps may use the job's Dagger engine (`dagger call` inside a step):
     /// `experimentalPrivilegedNesting`. Only in a job the runner vouches for (`trusted`, and not
     /// a fork's pull request): a step's own client could open any cache volume by its key (#228).
-    nesting: bool = true,
+    nesting: bool = false,
     /// Mount `package_cache_dirs` from persistent cache volumes, scoped to the repository. The
     /// runner turns this on (`RUNNER_PACKAGE_CACHES`, on by default).
     package_caches: bool = false,
@@ -507,6 +507,9 @@ pub const Options = struct {
     uv_env_in_cache: bool = true,
     /// `Config.zig_local_cache`: Zig's local cache goes in a cache volume of its own.
     zig_local_cache: bool = false,
+    /// `Config.zig_local_cache_max_mb`: past it, Zig's local cache starts over in a new generation
+    /// (`set_up.rollZigLocal`). 0, the default here, keeps it in the volume's root, unbounded.
+    zig_local_cache_max_mb: u32 = 0,
     /// `Config.zig_seed`: the Zig release Zig jobs' global cache is seeded from (see
     /// `set_up.zigSeedFor`); null for none.
     zig_seed: ?config.ZigSeed = null,
@@ -4104,19 +4107,21 @@ test "an exec's recorded output is asked for only to replay it, and never past m
     defer a.deinit();
     const arena = a.allocator();
     var env: std.process.Environ.Map = .init(arena);
-    const steps = [_]job_mod.Step{ testStep("biglog"), testStep("b") };
+    const steps = [_]job_mod.Step{ testStep("biglog"), testStep("biglog"), testStep("b") };
     // Answers without the output, which the exec's document no longer asks for.
     const lean = "{{\"data\":{{\"loadContainerFromID\":{{\"withExec\":" ++
         "{{\"id\":\"C{d}\",\"exitCode\":0}}}}}}}}";
-    // Step 1 printed more than is read back: the transport stops at the limit.
+    // Steps 1 and 2 printed more than is read back: the transport stops at the limit.
     const big = try arena.alloc(u8, max_recorded_bytes);
     @memset(big, 'x');
     const answers = [_][]const u8{
         base_answer,
         try std.fmt.allocPrint(arena, lean, .{1}),
         try exec(arena, "C1", 0, big),
+        try exec(arena, "C2", 0, big),
         try std.fmt.allocPrint(arena, lean, .{2}),
-        try exec(arena, "C2", 0, "replayed line"),
+        try exec(arena, "C2", 0, big),
+        try exec(arena, "C3", 0, "replayed line"),
     };
     var fake: FakeSession = .{ .answers = &answers, .arena = arena };
     var buf: [8192]u8 = undefined;
@@ -4129,7 +4134,7 @@ test "an exec's recorded output is asked for only to replay it, and never past m
     }, testJob(&steps), &log);
     try std.testing.expect(res.succeeded);
     const seen = fake.seen.items;
-    try std.testing.expectEqual(@as(usize, 5), seen.len);
+    try std.testing.expectEqual(@as(usize, 7), seen.len);
     // The exec asks for no output: asking made the engine log all of it again (verbose).
     try std.testing.expect(std.mem.indexOf(u8, seen[1], "stdout") == null);
     // None of its lines arrived live (there is no stream here) and nothing says it ran, so it was
@@ -4142,12 +4147,53 @@ test "an exec's recorded output is asked for only to replay it, and never past m
     try std.testing.expectEqualStrings(seen[1][at..], seen[2][at + fields.len ..]);
     // Past the limit it is not read on, and the log says why the step shows nothing.
     const note = "could not be read back (it is over the 4 MiB that is replayed)";
-    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), note) != null);
-    // The next step continues from the exec's container; its output, small, is replayed.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, w.buffered(), note));
+    // After a replay the next exec asks for its output in its own query. Past the limit it goes
+    // again without, and the output is asked for on its own as before, and not read either.
     try std.testing.expect(std.mem.indexOf(u8, seen[3], "loadContainerFromID(id:\"C1\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen[4], fields) != null);
-    const replayed = "step 2 stdout] replayed line";
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "exitCode " ++ fields) != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[4], "stdout") == null);
+    try std.testing.expectEqualStrings(seen[3], seen[5]);
+    // The next step's replay is one query: its small output comes with its result.
+    try std.testing.expect(std.mem.indexOf(u8, seen[6], "loadContainerFromID(id:\"C2\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[6], "exitCode " ++ fields) != null);
+    const replayed = "step 3 stdout] replayed line";
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), replayed) != null);
+}
+
+test "after a replay, each replayed step is one query, its output shown once" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{ testStep("a"), testStep("b"), testStep("c"), testStep("d") };
+    const lean = "{{\"data\":{{\"loadContainerFromID\":{{\"withExec\":" ++
+        "{{\"id\":\"C{d}\",\"exitCode\":0}}}}}}}}";
+    const answers = [_][]const u8{
+        base_answer,
+        try std.fmt.allocPrint(arena, lean, .{1}),
+        try exec(arena, "C1", 0, "line 1"),
+        try exec(arena, "C2", 0, "line 2"),
+        try exec(arena, "C3", 0, "line 3"),
+        try exec(arena, "C4", 0, "line 4"),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+        .step_cache = true,
+    }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    // The first replay asks twice; every one after it once.
+    try std.testing.expectEqual(@as(usize, 6), fake.seen.items.len);
+    for (fake.seen.items[3..]) |d| try std.testing.expect(std.mem.indexOf(u8, d, "stdout") != null);
+    for (1..5) |i| {
+        const line = try std.fmt.allocPrint(arena, "step {d} stdout] line {d}", .{ i, i });
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), line));
+    }
 }
 
 test "a step that ran and printed nothing does not ask for its output" {
@@ -4245,7 +4291,7 @@ test "round trips: the job setup's query is sent again without the secrets when 
     defer a.deinit();
     const arena = a.allocator();
     var env: std.process.Environ.Map = .init(arena);
-    const steps = [_]job_mod.Step{testStep("a")};
+    const steps = [_]job_mod.Step{testStep("npm ci")};
     var job = testJob(&steps);
     job.secrets = &.{"s3cr3t-value"};
     job.env = &.{.{ .name = "JOB_SECRET", .value = .{ .lit = "s3cr3t-value" } }};

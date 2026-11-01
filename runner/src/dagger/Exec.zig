@@ -138,6 +138,9 @@ secret_vars: std.StringHashMapUnmanaged(void) = .empty,
 run_nonce: []const u8,
 /// This job's value of `ran_env`.
 ran_marker: []const u8,
+/// Whether the last exec was served from the cache and replayed: the next one asks for its
+/// recorded output in its own query (`Recorded.send`).
+replayed_last: bool = false,
 /// Who owns what the runner copies into the job's container (checkouts, actions, the workspace
 /// a Docker action leaves): `runner_user` when steps run as it, else root (null).
 dir_owner: ?[]const u8 = null,
@@ -328,8 +331,9 @@ pub fn execScript(
         const env_context = try envContext(arena, x.ev.job_env.items, step_env);
         x.sh.beginCommands(num, env_context);
         x.beginExec(num);
-        const doc = try q.finish();
-        const answer = gql(arena, x.transport, doc, &x.err_msg) catch return error.EngineFailed;
+        var recorded: Recorded = .{ .doc = try q.finish(), .at = output_at };
+        // A re-run marked to run every time is not replayed: its output is not asked for.
+        const answer = try recorded.send(x, x.replayed_last and rerun == null);
         // The exec's own answer; with `keyed`, the container before it is beside it.
         const data = if (keyed and answer == .object)
             answer.object.get("loadContainerFromID") orelse answer
@@ -347,7 +351,7 @@ pub fn execScript(
             continue;
         }
         if (jsonFindString(data, "id")) |id| x.container_id = id;
-        const out = try x.collect(num, data, .{ .doc = doc, .at = output_at });
+        const out = try x.collect(num, data, recorded);
         // Any `::add-matcher::` this step emitted: read the files from the container it just
         // produced, which is where the paths it printed are valid.
         x.loadPendingMatchers(num);
@@ -594,11 +598,13 @@ fn writeScriptExec(
 /// log stream as well (a `stdout` field's value is logged, marked verbose): the runner grew by
 /// 1.8 GB. The exec's document is sent again with the fields put in, which the engine answers
 /// from its cache without running the exec again, and an answer past `max_recorded_bytes` is
-/// not read.
+/// not read. After a replayed exec they go in the exec's own query instead (`send`).
 pub const Recorded = struct {
     /// The exec's document, and where in it the fields go (`position`).
     doc: []const u8,
     at: usize,
+    /// Whether `doc` went with the fields in (`send`), so its answer holds the output.
+    in_answer: bool = false,
 
     /// Where the fields would go: the current position, in the exec's selection.
     pub fn position(q: *Query) usize {
@@ -609,25 +615,49 @@ pub const Recorded = struct {
     }
 
     const Output = struct { stdout: []const u8, stderr: []const u8 };
+    const fields = "stdout stderr ";
 
-    /// The output, or why it could not be had.
-    fn read(r: Recorded, x: *Exec) union(enum) { ok: Output, failed: []const u8 } {
+    /// Sends the exec's document, with the fields in when `ask`: an exec after a replayed one is
+    /// most likely replayed too (a re-run job), and then a replay is one round trip instead of
+    /// two. One that runs anyway gets its output back beside its result, which the engine also
+    /// repeats on the log stream as verbose records (`JobLog`, dropped), and only shows it if it
+    /// is replayed after all, as `read` would have. An answer past `max_recorded_bytes` is not
+    /// read: the document goes again without the fields, and a replay asks for them as before.
+    pub fn send(r: *Recorded, x: *Exec, ask: bool) !std.json.Value {
+        if (ask) {
+            const parts = [_][]const u8{ r.doc[0..r.at], fields, r.doc[r.at..] };
+            const doc = try std.mem.concat(x.arena, u8, &parts);
+            if (gqlAtMost(x.arena, x.transport, doc, max_recorded_bytes, &x.err_msg)) |data| {
+                r.in_answer = true;
+                return data;
+            } else |e| if (e != error.ResponseTooLarge) return error.EngineFailed;
+        }
+        return gql(x.arena, x.transport, r.doc, &x.err_msg) catch error.EngineFailed;
+    }
+
+    /// The output, from the exec's answer `data` when it holds it, or why it could not be had.
+    fn read(
+        r: Recorded,
+        x: *Exec,
+        data: std.json.Value,
+    ) union(enum) { ok: Output, failed: []const u8 } {
+        if (r.in_answer) return .{ .ok = .{
+            .stdout = jsonFindString(data, "stdout") orelse "",
+            .stderr = jsonFindString(data, "stderr") orelse "",
+        } };
         const arena = x.arena;
-        const doc = std.mem.concat(arena, u8, &.{
-            r.doc[0..r.at],
-            "stdout stderr ",
-            r.doc[r.at..],
-        }) catch return .{ .failed = "out of memory" };
+        const doc = std.mem.concat(arena, u8, &.{ r.doc[0..r.at], fields, r.doc[r.at..] }) catch
+            return .{ .failed = "out of memory" };
         var err_msg: []const u8 = "";
-        const data = gqlAtMost(arena, x.transport, doc, max_recorded_bytes, &err_msg) catch |e|
+        const answer = gqlAtMost(arena, x.transport, doc, max_recorded_bytes, &err_msg) catch |e|
             return .{ .failed = if (e == error.ResponseTooLarge)
                 std.fmt.comptimePrint("it is over the {d} MiB that is replayed", .{
                     max_recorded_bytes / (1024 * 1024),
                 })
             else if (err_msg.len > 0) err_msg else @errorName(e) };
         return .{ .ok = .{
-            .stdout = jsonFindString(data, "stdout") orelse "",
-            .stderr = jsonFindString(data, "stderr") orelse "",
+            .stdout = jsonFindString(answer, "stdout") orelse "",
+            .stderr = jsonFindString(answer, "stderr") orelse "",
         } };
     }
 };
@@ -754,13 +784,14 @@ pub fn collect(x: *Exec, num: u32, data: std.json.Value, recorded: Recorded) !Ou
     // run-specific values are part of every key.
     var output: Recorded.Output = .{ .stdout = "", .stderr = "" };
     const ran = x.ranThisRun(data);
+    x.replayed_last = false;
     if (!liveThisExec(x.io, x.sh, num, ran)) {
-        // An answer that has it already (a test's) is not asked again; a step that ran here
-        // and printed nothing has nothing to show.
-        if (jsonFind(data, "stdout") != null) output = .{
+        // An answer that has it already unasked (a test's) is not asked again; a step that ran
+        // here and printed nothing has nothing to show.
+        if (!recorded.in_answer and jsonFind(data, "stdout") != null) output = .{
             .stdout = jsonFindString(data, "stdout") orelse "",
             .stderr = jsonFindString(data, "stderr") orelse "",
-        } else if (servedFromCache(x.sh, num, ran)) switch (recorded.read(x)) {
+        } else if (servedFromCache(x.sh, num, ran)) switch (recorded.read(x, data)) {
             .ok => |o| output = o,
             .failed => |why| x.sh.append(num, try std.fmt.allocPrint(
                 arena,
@@ -769,7 +800,7 @@ pub fn collect(x: *Exec, num: u32, data: std.json.Value, recorded: Recorded) !Ou
                 .{why},
             )),
         };
-        _ = replayNotLive(x.sh, num, output.stdout, output.stderr, ran);
+        x.replayed_last = replayNotLive(x.sh, num, output.stdout, output.stderr, ran);
     }
     const stdout = output.stdout;
     const stderr = output.stderr;

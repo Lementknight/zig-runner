@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The runner no longer checks every 10 ms for a step''s end marker: the log reader wakes it when a line, the marker or the end of the stream arrives, which cost a step about 5 ms on average. The waits are bounded as before: 60 ms for a first line, 5 s between lines, 2 minutes in all.'
+time: 2026-10-31T22:45:03.000000-04:00

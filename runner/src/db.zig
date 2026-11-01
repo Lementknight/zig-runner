@@ -444,39 +444,43 @@ test "integration: state upserts are idempotent, keep created_at and started_at,
     try std.testing.expectEqualStrings("2026-10-11 17:00:01+00", try sc.scalar("select started_at::text from steps where number = 1")); // kept
 }
 
-test "with its writer, a row is queued at once though the database does not answer" {
-    const io = std.testing.io;
-    // Connections complete in the listener's backlog and are never answered.
-    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
-    var listener = try addr.listen(io, .{ .reuse_address = true });
-    defer listener.deinit(io);
-    const cfg: pg.Config = .{
-        .host = "127.0.0.1",
-        .port = listener.socket.address.getPort(),
-        .user = "u",
-        .database = "d",
-        .sslmode = .disable,
-    };
-    var store: Store = .init(std.testing.allocator, io, cfg, null);
-    store.close_wait_ms = 300;
-    try store.startWriter();
-    defer store.close();
-
-    // The writer is stuck dialling; each step's start and end would have waited on it.
-    const started = Io.Clock.awake.now(io).toMilliseconds();
-    for (0..20) |i| try store.upsertStep(.{
-        .job_id = 1,
-        .number = @intCast(i),
-        .name = "step",
-        .status = "in_progress",
-    });
-    try std.testing.expect(Io.Clock.awake.now(io).toMilliseconds() - started < 500);
-}
-
 test "a database that accepts and never answers holds up neither the job's end nor the next row" {
     const io = std.testing.io;
     // Connections complete in the listener's backlog and are never answered.
     const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+
+    // With its writer, a row is queued at once though the database does not answer. At the same
+    // time as the rest, which waits out a connect: each has its own store and listener.
+    const Queued = struct {
+        fn run(a: Io.net.IpAddress) !void {
+            var listener = try a.listen(io, .{ .reuse_address = true });
+            defer listener.deinit(io);
+            const cfg: pg.Config = .{
+                .host = "127.0.0.1",
+                .port = listener.socket.address.getPort(),
+                .user = "u",
+                .database = "d",
+                .sslmode = .disable,
+            };
+            var store: Store = .init(std.testing.allocator, io, cfg, null);
+            store.close_wait_ms = 300;
+            try store.startWriter();
+            defer store.close();
+
+            // The writer is stuck dialling; each step's start and end would have waited on it.
+            const started = Io.Clock.awake.now(io).toMilliseconds();
+            for (0..20) |i| try store.upsertStep(.{
+                .job_id = 1,
+                .number = @intCast(i),
+                .name = "step",
+                .status = "in_progress",
+            });
+            try std.testing.expect(Io.Clock.awake.now(io).toMilliseconds() - started < 500);
+        }
+    };
+    var queued = try io.concurrent(Queued.run, .{addr});
+    defer queued.cancel(io) catch {};
+
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
     // Long enough that the question below is asked well within it, even on a busy machine.
@@ -530,4 +534,5 @@ test "a database that accepts and never answers holds up neither the job's end n
     const retry_after = store.retry_after_ms;
     store.mu.unlock(io);
     try std.testing.expect(retry_after >= started + connect_ms + Store.retry_ms);
+    try queued.await(io);
 }

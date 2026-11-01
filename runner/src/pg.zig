@@ -993,14 +993,21 @@ test "a server that accepts and never answers is given up, connecting and in a s
     };
     const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
 
-    // Connected in the listener's backlog and never answered: the startup waited for good.
+    // Connected in the listener's backlog and never answered: the startup waited for good. At the
+    // same time as the statement below: each waits out its own deadline, and they share nothing.
+    const Connecting = struct {
+        fn run(cfg: Config) !void {
+            const started = Io.Clock.awake.now(io);
+            try std.testing.expectError(error.Timeout, Client.connect(gpa, io, cfg));
+            try std.testing.expect(started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 10_000);
+        }
+    };
     var silent = try addr.listen(io, .{ .reuse_address = true });
     defer silent.deinit(io);
     var cfg = quick;
     cfg.port = silent.socket.address.getPort();
-    var started = Io.Clock.awake.now(io);
-    try std.testing.expectError(error.Timeout, Client.connect(gpa, io, cfg));
-    try std.testing.expect(started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 10_000);
+    var connecting = try io.concurrent(Connecting.run, .{cfg});
+    defer connecting.cancel(io) catch {};
 
     // Ready for queries, then silent: a statement is given up too.
     const Server = struct {
@@ -1027,7 +1034,8 @@ test "a server that accepts and never answers is given up, connecting and in a s
     cfg.port = ready.socket.address.getPort();
     const c = try Client.connect(gpa, io, cfg);
     defer c.close();
-    started = Io.Clock.awake.now(io);
+    const started = Io.Clock.awake.now(io);
     try std.testing.expectError(error.Timeout, c.exec("select 1"));
     try std.testing.expect(started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 10_000);
+    try connecting.await(io);
 }
