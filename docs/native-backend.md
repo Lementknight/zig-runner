@@ -947,8 +947,8 @@ without the user (the PR says how to take the figure).
 - Exit: `proofs/README.md` and the Lean files name native functions where they named Dagger's.
 
 **Status: proved of P2's key format as P2 builds it (#268, with its review fixes in #272 at `28a9dd1`); the
-Zig check runs P2's own `Store.KeyHasher` and `Store.stableEnv` for keys, and a reference for the
-digest below a base until the review fixes merge.**
+Zig check runs P2's own code: `Store.KeyHasher` and `Store.stableEnv` for keys, `Backend.belowKey`
+for the digest below a base, and `Store.treeDigestTo` on fixture trees for layer digests.**
 `proofs/Runner/Native.lean` is the native backend's refinement of the model, beside Dagger's rather
 than replacing it, since both backends ship (proofs/README.md, "On the native backend"):
 
@@ -976,25 +976,23 @@ than replacing it, since both backends ship (proofs/README.md, "On the native ba
   which of two racing writers wins does not matter (`race_irrelevant`), so the flock per key is
   about cost; an entry is read whole or is a miss (`readWhole_agrees`, `Torn`).
 - **Layer digests.** A sorted walk of what a later step can see, nothing that differs between runs:
-  `digest_deterministic` and `digest_injective`, which are what output keys need.
+  `digest_deterministic` and `digest_injective`, which are what output keys need. `walk_injective`
+  proves it of P2's walk as written (`Store.treeDigest`: paths, modes, owners, xattrs, a file's
+  sha256, a link's target, a device's numbers, `..` after a directory), given one change P8 made
+  to it: the xattrs are now counted, since without the count the last xattr and the content after
+  it could not be told apart.
 - **Logs.** A store that records the one pipe the step writes to replays the run without
   `exec 2>&1` (`Logs.native_replay`). The scripts keep it: one script for both backends.
 - **The tie to the code.** `keyoracle` (`proofs/KeyOracle.lean`) writes
   `runner/src/native/testdata/step_keys.tsv`, `.github/scripts/key-vectors.sh` checks in the proofs
   workflow that it is the model's, and `runner/src/native/key_vectors.zig` checks the preimages
-  (29 vectors: steps, bases, the digest below a base) and the equal/differ relation against it.
+  (29 key vectors: steps, bases, the digest below a base; 4 layer vectors: modes, an xattr and a
+  symlink, an opaque directory, a whiteout) and the equal/differ relation against it.
 
-**What is left**, in this order:
-
-1. When P2's review fixes (#272: `Store.store_format`, the scope and the repository in
-   `Backend.below`, and the rootfs's fingerprint checked again per job) reach main, write
-   `below`'s hashing as a function of its inputs and call it from `key_vectors.zig` in place of
-   `belowPreimage`, so the `below` vectors run P2's code as the `key` vectors already do.
-2. If P2's format changes, change `Native.encState` (and `keyPreimage`, `belowPreimage`) and
-   `KeyOracle.lean` to match, keep `Format.Sound` proved, and regenerate the vectors
-   (`key-vectors.sh --write`). A format that sorts the environment, or drops a length or a tag,
-   fails the vectors on purpose.
-3. Compare `Store.layerDigest`'s walk with `Native.layerPreimage` (not yet done byte for byte).
+**What is left**: if P2's format changes, change `Native.encState` (and `keyPreimage`,
+`belowPreimage`, `walkPreimage`) and `KeyOracle.lean` to match, keep `Format.Sound` proved, and
+regenerate the vectors (`key-vectors.sh --write`). A format that sorts the environment, or drops a
+length, a count or a tag, fails the vectors on purpose.
 
 ### P9: Pi validation, then the decision
 
@@ -1521,6 +1519,13 @@ specification:
   the store changes by whole entries (one rename) and that a reader treats a missing or short part
   as a miss: either one alone closes torn reads, and an eviction part-way is the same case as a
   write part-way.
+- **Comparing the walk byte for byte found an ambiguity.** P2's layer walk wrote an entry's xattrs
+  with no count before them, so where the last xattr ends and the content begins was not in the
+  bytes: a symlink's target is a field just as an xattr's name is. The proof of `walk_injective`
+  could not go through without it, and two different layers could have shared a digest, which output
+  keys would have taken for early cutoff. The fix was one count. Nothing asked for a layer digest
+  yet, so no stored digest changed meaning; the rootfs's fingerprint, the same walk, changed once,
+  which costs one round of misses.
 - **What P2 hashes beyond the model added no input to it.** P2's key carries the uid, gid, working
   directory and kept files, and the digest below a base (store format, rootfs, id mapping, slot,
   binds). Each is

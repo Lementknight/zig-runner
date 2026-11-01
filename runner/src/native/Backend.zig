@@ -1717,65 +1717,60 @@ fn below(b: *Backend) ?Store.Key {
         b.store = null;
         return null;
     };
-    return belowKey(
-        Store.store_format,
-        b.scope,
-        b.repository,
-        &fp,
-        @tagName(b.how.userns),
-        if (b.how.userns == .mapped) b.idBase() else 0,
-        b.seed_layers.items,
-        b.binds,
-        null,
-    );
+    return belowKey(.{
+        .format = Store.store_format,
+        .scope = b.scope,
+        .repository = b.repository,
+        .fingerprint = &fp,
+        .userns = @tagName(b.how.userns),
+        .id_base = if (b.how.userns == .mapped) b.idBase() else 0,
+        .binds = b.binds,
+        .seed_layers = b.seed_layers.items,
+    }, null);
 }
 
-/// `below` as a function of its inputs (P8 checks it against the model's vectors,
-/// `key_vectors.zig`): P2's fields in the model's order, then, only when there are any, what P4
-/// adds below a base: the Zig cache seeds' layers (by path, which names the release,
-/// architecture and user each was built for, once) and which binds are cache volumes. The
-/// model's preimage is unchanged for a job with neither; the bind list is counted, so the
-/// trailing part is never read as a bind. `bytes`, for tests, gets the preimage.
-pub fn belowKey(
+/// What `below` hashes, as values: the store's format and what it reads from the job.
+pub const Below = struct {
     format: []const u8,
     scope: []const u8,
     repository: []const u8,
     fingerprint: []const u8,
     userns: []const u8,
     id_base: u64,
-    seed_layers: []const []const u8,
-    binds: anytype,
-    bytes: ?*std.Io.Writer,
-) Store.Key {
-    var h: Store.KeyHasher = .plain("below a base");
-    if (bytes) |w| {
-        // `plain` wrote its label before `bytes` was set.
-        var len: [8]u8 = undefined;
-        std.mem.writeInt(u64, &len, "below a base".len, .little);
-        w.writeAll(&len) catch {};
-        w.writeAll("below a base") catch {};
-        h.bytes = w;
-    }
-    h.field(format);
-    h.field(scope);
-    h.field(repository);
-    h.field(fingerprint);
-    h.field(userns);
-    h.int(id_base);
-    h.int(binds.len);
+    binds: []const sandbox.Spec.Bind,
+    /// P4: the Zig cache seeds' layers, between the rootfs and the job's (not in the model yet).
+    seed_layers: []const []const u8 = &.{},
+};
+
+/// `below`'s digest (`KeyHasher.plain("below a base")`, then each field). `bytes`, when given,
+/// receives the preimage: P8's key vectors (`key_vectors.zig`) check it against the model's.
+pub fn belowKey(in: Below, bytes: ?*std.Io.Writer) Store.Key {
+    var h: Store.KeyHasher = .{ .h = .init(.{}), .bytes = bytes };
+    h.field("below a base");
+    h.field(in.format);
+    h.field(in.scope);
+    h.field(in.repository);
+    h.field(in.fingerprint);
+    h.field(in.userns);
+    h.int(in.id_base);
+    h.int(in.binds.len);
     var any_volume = false;
-    for (binds) |bd| {
+    for (in.binds) |bd| {
         h.field(bd.host);
         h.field(bd.at);
         h.int(@intFromBool(bd.read_only));
         h.int(@intFromBool(bd.optional));
-        if (@hasField(@TypeOf(bd), "volume")) any_volume = any_volume or bd.volume;
+        any_volume = any_volume or bd.volume;
     }
-    if (seed_layers.len > 0 or any_volume) {
+    // What P4 adds below a base, after the model's fields and only when a job has any, so the
+    // model's preimage holds for a job with neither (the bind list is counted, so this is never
+    // read as a bind): the Zig cache seeds' layers, by path (which names the release, the
+    // architecture and the user each was built for, once), and which binds are cache volumes.
+    if (in.seed_layers.len > 0 or any_volume) {
         h.field("P4: seeds and volumes");
-        h.int(seed_layers.len);
-        for (seed_layers) |l| h.field(l);
-        for (binds) |bd| h.int(@intFromBool(if (@hasField(@TypeOf(bd), "volume")) bd.volume else false));
+        h.int(in.seed_layers.len);
+        for (in.seed_layers) |l| h.field(l);
+        for (in.binds) |bd| h.int(@intFromBool(bd.volume));
     }
     return h.final();
 }

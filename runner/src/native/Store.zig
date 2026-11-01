@@ -703,9 +703,23 @@ pub const Depth = enum { content, metadata };
 /// whiteout among them). The same tree gives the same digest wherever and whenever it was made:
 /// mtimes (but for `metadata`), inode numbers and link counts are not in it.
 pub fn treeDigest(arena: Allocator, io: std.Io, p: []const u8, depth: Depth, ids: Ids) !Key {
+    return treeDigestTo(arena, io, p, depth, ids, null);
+}
+
+/// `treeDigest`, with its preimage written to `bytes` when given: P8's layer vectors
+/// (`key_vectors.zig`) check it against the model's (proofs/Runner/Native.lean, `walkPreimage`).
+pub fn treeDigestTo(
+    arena: Allocator,
+    io: std.Io,
+    p: []const u8,
+    depth: Depth,
+    ids: Ids,
+    bytes: ?*std.Io.Writer,
+) !Key {
     const fd = try openRoot(arena, p);
     defer _ = linux.close(fd);
-    var h: KeyHasher = .plain("tree");
+    var h: KeyHasher = .{ .h = .init(.{}), .bytes = bytes };
+    h.field("tree");
     try digestIn(arena, io, &h, fd, "", depth, ids, 0);
     return h.final();
 }
@@ -795,9 +809,14 @@ fn digestedXattr(name: []const u8) bool {
     return true;
 }
 
+/// Counted first, so the last xattr and the content after it cannot be told apart otherwise (P8,
+/// `Native.walk_injective`: a symlink's target is a field like an xattr's name).
 fn digestXattrs(arena: Allocator, h: *KeyHasher, dir: linux.fd_t, n: Node) !void {
     const p = try procPath(arena, dir, n.name);
     const names = try xattrNames(arena, p);
+    var count: u64 = 0;
+    for (names) |name| count += @intFromBool(digestedXattr(name));
+    h.int(count);
     for (names) |name| {
         if (!digestedXattr(name)) continue;
         h.field(name);

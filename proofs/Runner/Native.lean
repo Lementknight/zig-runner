@@ -932,4 +932,203 @@ theorem different_layer_different_container (h : f.Sound) (atom : Bytes → Cont
 
 end
 
+/-! ## P2's walk (`Store.treeDigest`)
+
+What P2's store hashes for a layer's digest, as it writes it: under the label `tree`, each entry of
+a directory in the byte order of its name (`Store.listDir` sorts), with its path from the layer's
+root (`/a/b`), its mode, its owner as the job's namespace sees it (`Store.Ids`), the count of its
+xattrs and each one's name and value (sorted, overlay's bookkeeping left out), then by its type: a
+regular file's sha256, a symlink's target, a device's numbers (an overlay whiteout is the device
+0/0), or a directory's entries followed by the field `..`. The model's `Entry` above is the same
+information flattened; this is the byte layout, and `walk_injective` is `digest_injective` for it.
+
+The count before the xattrs is P8's addition to P2's walk: without it the last xattr and the
+content that follows cannot be told apart (a symlink's target is a field like an xattr's name), so
+two different layers could give one preimage. -/
+
+mutual
+/-- An entry of a layer: its name, mode, owner (uid, gid as the job's namespace sees them), xattrs,
+and what its type says it holds. -/
+inductive Node where
+  | mk (name mode uid gid : Nat) (xattrs : List (Nat × Nat)) (body : Body)
+inductive Body where
+  | file (hash : Nat)
+  | link (target : Nat)
+  | dev (major minor : Nat)
+  | dir (children : List Node)
+  | other
+end
+
+def Body.kind : Body → Nat
+  | .file _ => 0
+  | .link _ => 1
+  | .dev _ _ => 2
+  | .dir _ => 3
+  | .other => 4
+
+/-- The `..` that ends a directory's entries. -/
+def dotdot : Bytes := [46, 46]
+
+section
+variable (f : Format)
+
+def encXattr (x : Nat × Nat) : Bytes := lp f (f.str x.1) ++ lp f (f.str x.2)
+
+/-- An entry's path, mode, owner and xattrs: what `digestIn` writes before its content. -/
+def nodeHead (rel : Bytes) (n m u g : Nat) (xs : List (Nat × Nat)) : Bytes :=
+  lp f (rel ++ 47 :: f.str n) ++ (f.word m ++ (f.word u ++ (f.word g ++
+    (f.word xs.length ++ encList (encXattr f) xs))))
+
+mutual
+def encNode (rel : Bytes) : Node → Bytes
+  | .mk n m u g xs b => nodeHead f rel n m u g xs ++ encBody (rel ++ 47 :: f.str n) b
+def encBody (path : Bytes) : Body → Bytes
+  | .file h => lp f (f.str h)
+  | .link t => lp f (f.str t)
+  | .dev a b => f.word a ++ f.word b
+  | .dir cs => encNodes path cs ++ lp f dotdot
+  | .other => []
+def encNodes (rel : Bytes) : List Node → Bytes
+  | [] => []
+  | c :: cs => encNode rel c ++ encNodes rel cs
+end
+
+/-- **A layer's preimage as P2 writes it** (`treeDigest`): the label, then the root's entries. -/
+def walkPreimage (label : Bytes) (cs : List Node) : Bytes := lp f label ++ encNodes f [] cs
+
+end
+
+mutual
+/-- The type the mode says (`S_IFMT`), as P2 dispatches on it, is the type the entry has: a real
+tree's entries always satisfy it. -/
+def WF (kindOf : Nat → Nat) : Node → Prop
+  | .mk _ m _ _ _ b => kindOf m = b.kind ∧ WFBody kindOf b
+def WFBody (kindOf : Nat → Nat) : Body → Prop
+  | .dir cs => WFs kindOf cs
+  | _ => True
+def WFs (kindOf : Nat → Nat) : List Node → Prop
+  | [] => True
+  | c :: cs => WF kindOf c ∧ WFs kindOf cs
+end
+
+/-- A path from the layer's root: empty, or starting with `/`. -/
+def RelPath (rel : Bytes) : Prop := ∀ x t, rel = x :: t → x = 47
+
+theorem relPath_nil : RelPath [] := fun _ _ h => nomatch h
+
+theorem relPath_child {rel : Bytes} (h : RelPath rel) (name : Bytes) : RelPath (rel ++ 47 :: name) := by
+  intro x t e
+  cases rel with
+  | nil => simp only [List.nil_append, List.cons.injEq] at e; exact e.1.symm
+  | cons y r => simp only [List.cons_append, List.cons.injEq] at e; rw [← e.1]; exact h y r rfl
+
+theorem path_ne_dotdot {rel : Bytes} (h : RelPath rel) (name : Bytes) : rel ++ 47 :: name ≠ dotdot := by
+  intro e
+  have := relPath_child h name 46 [46] e
+  exact absurd this (by decide)
+
+/-- Where a list of entries may end: the stream's end, or a directory's `..`. -/
+def Stop (f : Format) (r : Bytes) : Prop := r = [] ∨ ∃ t, r = lp f dotdot ++ t
+
+section
+variable {f : Format} {kindOf : Nat → Nat}
+
+theorem nodeHead_ne_nil (rel : Bytes) (n m u g : Nat) (xs : List (Nat × Nat)) (r : Bytes) :
+    nodeHead f rel n m u g xs ++ r ≠ [] := by
+  simp [nodeHead, lp]
+
+theorem xattr_split (h : f.Sound) {a a' : Nat × Nat} {r s : Bytes}
+    (eq : encXattr f a ++ r = encXattr f a' ++ s) : a = a' ∧ r = s := by
+  obtain ⟨x1, x2⟩ := a
+  obtain ⟨y1, y2⟩ := a'
+  simp only [encXattr, List.append_assoc] at eq
+  obtain ⟨e1, eq⟩ := lp_split h eq
+  obtain ⟨e2, eq⟩ := lp_split h eq
+  exact ⟨by rw [h.str_inj e1, h.str_inj e2], eq⟩
+
+mutual
+theorem node_split (h : f.Sound) {rel : Bytes} (hr : RelPath rel) :
+    ∀ {a a' : Node} {r s : Bytes}, WF kindOf a → WF kindOf a' →
+      encNode f rel a ++ r = encNode f rel a' ++ s → a = a' ∧ r = s
+  | .mk n m u g xs b, .mk n' m' u' g' xs' b', r, s, ⟨hk, hb⟩, ⟨hk', hb'⟩, e => by
+    simp only [encNode, nodeHead, List.append_assoc] at e
+    obtain ⟨hp, e⟩ := lp_split h e
+    have hn : n = n' := h.str_inj (List.cons.inj (List.append_cancel_left hp)).2
+    subst hn
+    obtain ⟨hm, e1⟩ := h.word_split e
+    obtain ⟨hu, e2⟩ := h.word_split e1
+    obtain ⟨hg, e3⟩ := h.word_split e2
+    obtain ⟨hl, e4⟩ := h.word_split e3
+    obtain ⟨hxs, e5⟩ := list_split (xattr_split h) hl e4
+    subst hm hu hg hxs
+    obtain ⟨hbb, hrs⟩ := body_split h (relPath_child hr (f.str n)) (hk.symm.trans hk') hb hb' e5
+    exact ⟨by rw [hbb], hrs⟩
+
+theorem body_split (h : f.Sound) {path : Bytes} (hp : RelPath path) :
+    ∀ {b b' : Body} {r s : Bytes}, b.kind = b'.kind → WFBody kindOf b → WFBody kindOf b' →
+      encBody f path b ++ r = encBody f path b' ++ s → b = b' ∧ r = s
+  | .file x, .file y, _, _, _, _, _, e => by
+    simp only [encBody] at e
+    obtain ⟨hx, hrs⟩ := lp_split h e
+    exact ⟨by rw [h.str_inj hx], hrs⟩
+  | .link x, .link y, _, _, _, _, _, e => by
+    simp only [encBody] at e
+    obtain ⟨hx, hrs⟩ := lp_split h e
+    exact ⟨by rw [h.str_inj hx], hrs⟩
+  | .dev a b, .dev a' b', _, _, _, _, _, e => by
+    simp only [encBody, List.append_assoc] at e
+    obtain ⟨ha, e⟩ := h.word_split e
+    obtain ⟨hb, hrs⟩ := h.word_split e
+    exact ⟨by rw [ha, hb], hrs⟩
+  | .dir cs, .dir cs', r, s, _, hw, hw', e => by
+    simp only [encBody, List.append_assoc] at e
+    obtain ⟨hcs, e⟩ := nodes_split h hp hw hw' (Or.inr ⟨r, rfl⟩) (Or.inr ⟨s, rfl⟩) e
+    exact ⟨by rw [hcs], (lp_split h e).2⟩
+  | .other, .other, _, _, _, _, _, e => ⟨rfl, by simpa [encBody] using e⟩
+  | .file _, .link _, _, _, k, _, _, _ | .file _, .dev _ _, _, _, k, _, _, _
+  | .file _, .dir _, _, _, k, _, _, _ | .file _, .other, _, _, k, _, _, _
+  | .link _, .file _, _, _, k, _, _, _ | .link _, .dev _ _, _, _, k, _, _, _
+  | .link _, .dir _, _, _, k, _, _, _ | .link _, .other, _, _, k, _, _, _
+  | .dev _ _, .file _, _, _, k, _, _, _ | .dev _ _, .link _, _, _, k, _, _, _
+  | .dev _ _, .dir _, _, _, k, _, _, _ | .dev _ _, .other, _, _, k, _, _, _
+  | .dir _, .file _, _, _, k, _, _, _ | .dir _, .link _, _, _, k, _, _, _
+  | .dir _, .dev _ _, _, _, k, _, _, _ | .dir _, .other, _, _, k, _, _, _
+  | .other, .file _, _, _, k, _, _, _ | .other, .link _, _, _, k, _, _, _
+  | .other, .dev _ _, _, _, k, _, _, _ | .other, .dir _, _, _, k, _, _, _ =>
+    absurd k (by simp [Body.kind])
+
+theorem nodes_split (h : f.Sound) {rel : Bytes} (hr : RelPath rel) :
+    ∀ {cs cs' : List Node} {r s : Bytes}, WFs kindOf cs → WFs kindOf cs' → Stop f r → Stop f s →
+      encNodes f rel cs ++ r = encNodes f rel cs' ++ s → cs = cs' ∧ r = s
+  | [], [], _, _, _, _, _, _, e => ⟨rfl, by simpa [encNodes] using e⟩
+  | [], .mk n m u g xs b :: _, r, _, _, _, sr, _, e => by
+    simp only [encNodes, encNode, List.nil_append, List.append_assoc] at e
+    rcases sr with rfl | ⟨t, rfl⟩
+    · exact absurd e.symm (by simp [nodeHead, lp])
+    · simp only [nodeHead, List.append_assoc] at e
+      exact absurd (lp_split h e).1 (Ne.symm (path_ne_dotdot hr _))
+  | .mk n m u g xs b :: _, [], _, s, _, _, _, ss, e => by
+    simp only [encNodes, encNode, List.nil_append, List.append_assoc] at e
+    rcases ss with rfl | ⟨t, rfl⟩
+    · exact absurd e (by simp [nodeHead, lp])
+    · simp only [nodeHead, List.append_assoc] at e
+      exact absurd (lp_split h e).1 (path_ne_dotdot hr _)
+  | c :: cs, c' :: cs', _, _, ⟨hc, hcs⟩, ⟨hc', hcs'⟩, sr, ss, e => by
+    simp only [encNodes, List.append_assoc] at e
+    obtain ⟨hcc, e⟩ := node_split h hr hc hc' e
+    obtain ⟨hl, hrs⟩ := nodes_split h hr hcs hcs' sr ss e
+    exact ⟨by rw [hcc, hl], hrs⟩
+end
+
+/-- **Different layers, different digests, as P2 writes them.** Equal preimages of two real trees
+mean the same entries, path for path: names, modes, owners, xattrs, contents, link targets, device
+numbers (so whiteouts) and the opaque xattr alike. -/
+theorem walk_injective (h : f.Sound) {label : Bytes} {cs cs' : List Node}
+    (w : WFs kindOf cs) (w' : WFs kindOf cs')
+    (e : walkPreimage f label cs = walkPreimage f label cs') : cs = cs' := by
+  have e' : encNodes f [] cs = encNodes f [] cs' := (lp_split h e).2
+  exact (nodes_split h relPath_nil w w' (Or.inl rfl) (Or.inl rfl) (by simpa using e')).1
+
+end
+
 end Runner.Native
