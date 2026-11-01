@@ -398,6 +398,12 @@ warm (the CLI, the session and the exec: 0.41-0.59 s).
 
 About twice as fast cold, and a pinned image already in the store costs no request at all.
 
+The exit, checked on a root runner: in CI (run 41317094266, GitHub's hosted runner as root, a
+debug build) a job with no operator rootfs pulled the default image natively (7.5 s), provisioned
+it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it (git 2.43, Python
+3.12, jq 1.7, Ubuntu 24.04.5), with no Dagger session. That test is opt-in
+(`ZIG_RUNNER_TEST_PULL=1`, root), as it needs Docker Hub and the Ubuntu archive.
+
 ### P4: cache volumes, trust scopes and cgroup memory accounting
 
 - Package cache volumes as host directories bound in, never part of a key (`Input.mounts`). The
