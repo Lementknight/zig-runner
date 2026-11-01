@@ -379,6 +379,10 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
             makePrivate();
             lowers = idmapRootfs(arena, spec.lowers, userns);
             mountOverlay(arena, spec, lowers, false);
+            // The binds, as the host's root: in the job's namespace the helper is nobody on the
+            // host and may not search the directories on the way to a host path. They go on
+            // with the overlay into the step's namespace (its bind onto itself is recursive).
+            bindAll(arena, spec);
             check("enter the job's user namespace", linux.setns(userns, linux.CLONE.NEWUSER));
             _ = linux.close(userns);
             // Joining a user namespace changes no ids: the helper is still the host's root,
@@ -415,10 +419,7 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
     check("open the overlay", root_rc);
     const root: linux.fd_t = @intCast(root_rc);
     // As the namespace's root, so what is made here is the job's root's.
-    for (spec.binds) |bd| {
-        if (!bindIn(arena, root, bd.host, bd.at, !bd.optional)) continue;
-        if (bd.read_only) remountReadOnly(arena, root, bd.at);
-    }
+    if (spec.userns != .mapped) bindAll(arena, spec);
     for (spec.files) |f| writeFileIn(arena, root, f);
 
     // 3. PID 1, told by `alive` whether the helper is still there once it has re-armed its
@@ -443,6 +444,19 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
     if (linux.W.IFEXITED(st)) return linux.W.EXITSTATUS(st);
     if (linux.W.IFSIGNALED(st)) return @truncate(128 + @backingInt(linux.W.TERMSIG(st)));
     return 128;
+}
+
+/// `spec.binds`, at their places in the overlay, read-only where asked.
+fn bindAll(arena: Allocator, spec: Spec) void {
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
+    const rc = linux.open(z(arena, spec.merged), flags, 0);
+    check("open the overlay", rc);
+    const root: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(root);
+    for (spec.binds) |bd| {
+        if (!bindIn(arena, root, bd.host, bd.at, !bd.optional)) continue;
+        if (bd.read_only) remountReadOnly(arena, root, bd.at);
+    }
 }
 
 fn makePrivate() void {
