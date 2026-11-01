@@ -85,11 +85,11 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
 **Status: landed (behind the knob), reviewed, and hardened.** What it covers, as built:
 
 - `runner/src/native/Backend.zig` is the job side: the fallback decision (`unsupported`), the
-  machine's capability (`usable`, probed once, and again five minutes after a failure), the job's directory, slot, ids and
-  network, the base, the container's env between steps, `execScript`, and the checkout.
-  `runner/src/native/sandbox.zig` is one step's sandbox: the runner's own binary started as
-  `zig-runner native-step`, reading the step's spec as one line of JSON on stdin (never on a
-  command line: it holds the step's secrets), with stdin kept open as its lifeline.
+  machine's capability (`usable`, probed once, and again five minutes after a failure), the job's
+  directory, slot, ids and network, the base, the container's env between steps, `execScript`, and
+  the checkout. `runner/src/native/sandbox.zig` is one step's sandbox: the runner's own binary
+  started as `zig-runner native-step`, reading the step's spec as one line of JSON on stdin (never
+  on a command line: it holds the step's secrets), with stdin kept open as its lifeline.
   `runner/src/native/net.zig` is a job's network, over rtnetlink.
 - The boundary in the shared code is three lines: `dagger.run` sends a job native can run to
   `runNative`; `runSteps` asks the native backend for the base instead of `baseContainerId`; and
@@ -130,18 +130,18 @@ On a root runner, each step runs:
   nobody on the host: a breakout, sudo or a setuid program gains no host privilege. A full range
   is mapped, so apt's `_apt`, `chown` and `tar` with owners work. The rootfs is seen through an
   idmapped mount (Linux 5.19), not copied per range.
-- in a **network namespace of the job's own** (all its steps share it): its own `lo` and port
-  space, a veth on the runner's bridge `zr0` (`RUNNER_NATIVE_SUBNET`, by default 10.211.0.0/16
-  with the bridge at 10.211.0.1 and slot n's job at 10.211.1.(n+2); not podman's 10.88.0.0/16 or
-  Docker's ranges, and refused when it overlaps a route of the host's), a default route out
-  through NAT. Two jobs can both listen on :5432. The job reaches nothing on the host: not its
-  127.0.0.1, and not a service on any of its addresses (the bridge's included), since `INPUT`
-  drops whatever comes from `zr0` and is not a reply. Jobs cannot reach each other: each veth is
-  an isolated bridge port (`IFLA_BRPORT_ISOLATED`), and `FORWARD` drops traffic from `zr0` back
-  to `zr0`. IPv6 is off in the job's namespace and on the bridge, so no link-local address
-  slips past those IPv4 rules. Ports below 1024 and ping work without capabilities on the host's
-  (`ip_unprivileged_port_start=0`, `ping_group_range`, set in the job's namespace only).
-  Its resolver is the host's upstream servers (`/run/systemd/resolve/resolv.conf`, or the host's
+- in a **network namespace of the job's own** (all its steps share it): its own `lo` and port space,
+  a veth on the runner's bridge `zr0` (`RUNNER_NATIVE_SUBNET`, by default 10.211.0.0/16 with the
+  bridge at 10.211.0.1 and slot n's job at 10.211.1.(n+2); not podman's 10.88.0.0/16 or Docker's
+  ranges, and refused when it overlaps a route of the host's), a default route out through NAT. Two
+  jobs can both listen on :5432. The job reaches nothing on the host: not its 127.0.0.1, and not a
+  service on any of its addresses (the bridge's included), since `INPUT` drops whatever comes from
+  `zr0` and is not a reply. Jobs cannot reach each other: each veth is an isolated bridge port
+  (`IFLA_BRPORT_ISOLATED`), and `FORWARD` drops traffic from `zr0` back to `zr0`. IPv6 is off on the
+  job's `eth0` and on the bridge, so no link-local address slips past those IPv4 rules (`lo` keeps
+  its ::1). Ports below 1024 and ping work without capabilities on the host's
+  (`ip_unprivileged_port_start=0`, `ping_group_range`, set in the job's namespace only). Its
+  resolver is the host's upstream servers (`/run/systemd/resolve/resolv.conf`, or the host's
   resolv.conf when it names no loopback server), since systemd-resolved's 127.0.0.53 is the host's
   loopback; a resolver on one of the host's own addresses is out of reach too.
 - in **mount, PID, UTS and IPC namespaces** of its own, with the overlay as `/` by `pivot_root`
@@ -553,17 +553,17 @@ taught:
   `RuntimeDirectoryPreserve=yes`, which would quietly free a live job's slot, and a container
   needs the host's `/run/zig-runner` bound in, not its own.
 - **iptables rules land among others'.** An `ACCEPT` for "anything from `zr0`" at the head of
-  `FORWARD` and `DOCKER-USER` got the jobs out, and also opened Docker's unpublished container
-  ports and every other network the host routes to, and overrode ufw's forward policy: the first
-  matching rule wins whoever wrote it. The rules now say exactly the traffic they are for (from
-  `zr0` out through an uplink, replies back) and leave the rest to the host's policy. `INPUT` was
-  never considered: a job had its own loopback, but the host's services on the bridge's address
-  (and every other address of the host's) were one hop away. Isolation between jobs needed two
-  layers, since one does not imply the other: the bridge forwards between ports unless they are
-  isolated, and the host routes between jobs through the gateway unless `FORWARD` drops it. IPv6
-  link-local addresses come up on every interface by themselves and pass every IPv4 rule; they are
-  now off on the bridge and in the jobs. Host-wide sysctls (`ip_forward`) cannot be restored by one
-  runner of several, so they are checked, logged and documented instead.
+  `FORWARD` and `DOCKER-USER` got the jobs out, and also opened Docker's unpublished container ports
+  and every other network the host routes to, and overrode ufw's forward policy: the first matching
+  rule wins whoever wrote it. The rules now say exactly the traffic they are for (from `zr0` out
+  through an uplink, replies back) and leave the rest to the host's policy. `INPUT` was never
+  considered: a job had its own loopback, but the host's services on the bridge's address (and every
+  other address of the host's) were one hop away. Isolation between jobs needed two layers, since
+  one does not imply the other: the bridge forwards between ports unless they are isolated, and the
+  host routes between jobs through the gateway unless `FORWARD` drops it. IPv6 link-local addresses
+  come up on every interface by themselves and pass every IPv4 rule; IPv6 is now off on the bridge
+  and on the jobs' `eth0`. Host-wide sysctls (`ip_forward`) cannot be restored by one runner of
+  several, so they are checked, logged and documented instead.
 - **A mount that fails quietly is a hole with a passing test.** `/proc/sys` was made read-only by
   binding the helper's `/proc/sys` (the host's, with `binfmt_misc` mounted under it on GitHub's
   runner and many hosts) without its submounts, which a user namespace refuses; the call's result

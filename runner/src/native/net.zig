@@ -100,10 +100,11 @@ pub const command = "native-net";
 /// The helper's entry: the bridge (if it is not there), a new network namespace kept by
 /// bind-mounting it over `path`, with what a step needs in it (`lo`, ports below 1024 and ping
 /// without capabilities on the host's, since the namespace's owner is the host's root, not the
-/// job's; no IPv6, whose link-local addresses would reach the host past the IPv4 rules), then the
-/// slot's veth pair, isolated on the bridge, its address and the default route. The runner holds
-/// the slot's lock and removed a dead job's veth of it (`Backend.jobNetwork`). A helper, as a
-/// thread of the runner must not change its namespace. Exits 0, or 1 with why on stderr.
+/// job's; no IPv6 on its `eth0`, whose link-local address would reach the host past the IPv4
+/// rules), then the slot's veth pair, isolated on the bridge, its address and the default route.
+/// The runner holds the slot's lock and removed a dead job's veth of it (`Backend.jobNetwork`).
+/// A helper, as a thread of the runner must not change its namespace. Exits 0, or 1 with why on
+/// stderr.
 pub fn upMain(
     arena: Allocator,
     path: []const u8,
@@ -123,7 +124,7 @@ pub fn upMain(
     const sysctls = [_][2][]const u8{
         .{ "/proc/sys/net/ipv4/ip_unprivileged_port_start", "0" },
         .{ "/proc/sys/net/ipv4/ping_group_range", "0 2147483647" },
-        .{ "/proc/sys/net/ipv6/conf/all/disable_ipv6", "1" },
+        // For the links made from here on: `eth0` gets no IPv6, `lo` keeps its ::1.
         .{ "/proc/sys/net/ipv6/conf/default/disable_ipv6", "1" },
     };
     for (sysctls) |kv| if (!writeSysctl(arena, kv[0], kv[1])) return fail("set a sysctl", .ACCES);
@@ -135,7 +136,7 @@ pub fn upMain(
     if (linux.errno(kept) != .SUCCESS) return fail("keep the namespace", linux.errno(kept));
     const ns = linux.open("/proc/self/ns/net", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(ns) != .SUCCESS) return fail("open the namespace", linux.errno(ns));
-    host.addVeth(arena, slot, @intCast(ns)) catch return fail("make the veth pair", .INVAL);
+    host.addVeth(slot, @intCast(ns)) catch return fail("make the veth pair", .INVAL);
     job.configureJob(subnet, slot) catch return fail("configure the job's network", .INVAL);
     return 0;
 }
@@ -250,8 +251,8 @@ pub const Socket = struct {
     /// Makes the veth pair of slot `n`, its job's end in the namespace `netns` (a file
     /// descriptor) and named `eth0` there, its host's end on the bridge, isolated
     /// (`IFLA_BRPORT_ISOLATED`: the bridge forwards nothing between two isolated ports, so one
-    /// job cannot reach another's address), without IPv6, and up.
-    pub fn addVeth(s: *Socket, arena: Allocator, slot: u32, netns: linux.fd_t) !void {
+    /// job cannot reach another's address), and up.
+    pub fn addVeth(s: *Socket, slot: u32, netns: linux.fd_t) !void {
         var buf: [16]u8 = undefined;
         const host = hostLink(&buf, slot);
         var m: Message = .init(.RTM_NEWLINK, linux.NLM_F_CREATE | linux.NLM_F_EXCL);
@@ -280,10 +281,6 @@ pub const Socket = struct {
         iso.attrBytes(ifla_brport_isolated, &.{1});
         iso.end(protinfo);
         try expect(s.request(&iso), false);
-        const v6 = try std.fmt.allocPrint(arena, "/proc/sys/net/ipv6/conf/{s}/disable_ipv6", .{
-            host,
-        });
-        if (!writeSysctl(arena, v6, "1")) return error.Ipv6;
         try s.up(i);
     }
 
