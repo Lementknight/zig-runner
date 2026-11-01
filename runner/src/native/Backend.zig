@@ -652,9 +652,10 @@ fn sweep(arena: Allocator, io: std.Io, store: []const u8) void {
 
 /// The base every step starts from, as `set_up.baseContainerId` builds Dagger's: the image's
 /// env, the step user and its HOME, the job's workspace and RUNNER_TEMP, the event payload, the
-/// step markers' secret, GitHub's default variables and the job's `env:`. Package caches, uv's
-/// environment in its cache and Zig's local cache are not mounted: they are caches, and the
-/// native backend has no volumes before phase 4. On failure the reason is in `err_msg`.
+/// step markers' secret, GitHub's default variables and the job's `env:`, and the tool cache's
+/// directory. Package caches, uv's environment in its cache and Zig's local cache are not
+/// mounted: they are caches, and the native backend has no volumes before phase 4. On failure the
+/// reason is in `err_msg`.
 ///
 /// Under step caching the store is on for the job, and the base is a layer like a step's: under
 /// a key (`keyFor`), replayed when the store has it. As `set_up.writeRunEnv` does, the event
@@ -679,11 +680,17 @@ pub fn base(
     // The workspace and RUNNER_TEMP, made as Dagger's base makes them: by root, in the image,
     // owned by the step user when it is not root, from `/` (the workspace is not there yet). The
     // event payload goes in as `withNewFile` does.
+    //
+    // And RUNNER_TOOL_CACHE, which Dagger mounts in every job (`set_up.cachesUsed`) owned by the
+    // step user: the step user cannot make it under /opt, so a step installing into it failed
+    // natively. Until phase 4's volume is bound over it, it is the job's own, in the base layer,
+    // so what a step puts there is in the step's layer and comes back with its replay.
     const chown = if (plan.as_runner) " && chown -R " ++ dagger.runner_user ++ ":" ++
-        dagger.runner_user ++ " " ++ dagger.work_root else "";
-    const mk = try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}", .{
+        dagger.runner_user ++ " " ++ dagger.work_root ++ " " ++ set_up.tool_cache_dir else "";
+    const mk = try std.fmt.allocPrint(arena, "mkdir -p {s} {s} {s}{s}", .{
         ev.workspace,
         ev.temp,
+        set_up.tool_cache_dir,
         chown,
     });
     const event_file = [_]sandbox.Spec.File{.{
@@ -1973,6 +1980,63 @@ test "secrets reach native steps under their aliases, in scripts and in working 
         "script-mount tmpfs",
         "scripts-left=0",
     });
+}
+
+test "a native job's tool cache is the step user's, as on Dagger; a later step finds what one put there" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    // What `install-zig.sh` does (v0.22.0 on Dagger; natively until this was made): make its
+    // tree under RUNNER_TOOL_CACHE, which is under /opt, as the step user. The directory is there
+    // before any step, as Dagger's mount is (root could make it, the runner user could not).
+    const s1 = testStep("set -e; echo cache=$RUNNER_TOOL_CACHE; " ++
+        "test -d \"$RUNNER_TOOL_CACHE\" && echo cache-there; " ++
+        "mkdir -p \"$RUNNER_TOOL_CACHE/zig/0.17.0/x64\"; " ++
+        "echo installed > \"$RUNNER_TOOL_CACHE/zig/0.17.0/x64/zig\"; " ++
+        "stat -c 'owner=%u mode=%a' \"$RUNNER_TOOL_CACHE\" \"$RUNNER_TOOL_CACHE/zig/0.17.0/x64/zig\"");
+    const s2 = testStep("cat \"$RUNNER_TOOL_CACHE/zig/0.17.0/x64/zig\" | sed 's/^/found-/'");
+    // The runner user only on a root runner: a rootless one maps only root.
+    const users: []const config.StepUser = if (std.os.linux.geteuid() == 0)
+        &.{ .root, .runner }
+    else
+        &.{.root};
+    for (users) |user| {
+        // What `set_up.provision_runner_script` gives the runner user: /tmp for all, /github and
+        // its home its own.
+        if (user == .runner) {
+            const rootfs = try std.fmt.allocPrint(arena, "{s}/rootfs", .{
+                try tmp.dir.realPathFileAlloc(io, ".", arena),
+            });
+            const give = "cd \"$0\" && chmod 1777 tmp && mkdir -p github home/runner && " ++
+                "chown 1001:1001 github home/runner";
+            const made = try std.process.run(arena, io, .{
+                .argv = &.{ "sh", "-c", give, rootfs },
+            });
+            try std.testing.expect(made.term == .exited and made.term.exited == 0);
+        }
+        const r = try runNativeJob(arena, cfg, testJob(&.{ s1, s2 }), user);
+        for (r.res.steps) |st| if (st.outcome != .success) {
+            std.debug.print("as {s}: engine {s}\n{s}\n", .{
+                @tagName(user),
+                r.res.engine_error orelse "-",
+                r.text,
+            });
+            return error.TestUnexpectedResult;
+        };
+        const uid: u32 = if (user == .runner) runner_uid else 0;
+        // Its output, not the script's text, which the log has too.
+        try expectLines(r.text, &.{
+            "stdout] cache=" ++ set_up.tool_cache_dir,
+            "stdout] cache-there",
+            try std.fmt.allocPrint(arena, "stdout] owner={d} mode=755", .{uid}),
+            try std.fmt.allocPrint(arena, "stdout] owner={d} mode=644", .{uid}),
+            "stdout] found-installed",
+        });
+    }
 }
 
 test "a native step is contained: pivot_root, masked /proc, Docker's capabilities, no_new_privs" {

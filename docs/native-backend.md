@@ -112,7 +112,9 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   tried again after five minutes, not kept for the process's life.
 - Off on native, as caches: output keys, the package caches, uv's environment in its cache, and
   Zig's local cache and seed (P4). Results do not depend on them. (The step cache was off in P1;
-  P2's layer store gives it.)
+  P2's layer store gives it.) The tool cache is not off: a step may install into it, and the step
+  user cannot make it under /opt, so until P4's volume each job's base makes `/opt/hostedtoolcache`
+  owned by the step user, as Dagger mounts it in every job; what a step puts there is in its layer.
 - "Set up job" says what the job got: "Native steps: ids 0-65535 are host ids N-N+65535, and the
   job's network is its own (10.211.1.x on zr0)", or the rootless warning.
 
@@ -408,7 +410,9 @@ directories and the step's file-command files at a 4 KiB block each.
 
 - Package cache volumes as host directories bound in, never part of a key (`Input.mounts`). The
   `repo` and `untrusted` scopes of `packageCacheScope` become separate directory trees. Dagger's
-  sharing modes are reimplemented with flock; the default stays shared.
+  sharing modes are reimplemented with flock; the default stays shared. The tool cache's volume
+  takes the place of the directory the base makes (`Backend.base`); what a step installs there is
+  then in no layer, so replay needs Dagger's check of the trees it found (#229, `Exec.tool_cache`).
 - Zig's local cache generations and the cache seed move over.
 - A cgroup v2 per job: `memory.max`, `memory.peak`, `memory.events`, `pids.max`. The admission
   gate (`admission.zig`) reads per-job working sets instead of the engine's cgroup. Rootless, this
