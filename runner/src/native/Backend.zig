@@ -1979,13 +1979,16 @@ test "a native job's tool cache is the step user's, as on Dagger; a later step f
     else
         &.{.root};
     for (users) |user| {
-        // The runner user's home, as `set_up.provision_runner_script` makes it.
+        // What `set_up.provision_runner_script` gives the runner user: /tmp for all, /github and
+        // its home its own.
         if (user == .runner) {
-            const home = try std.fmt.allocPrint(arena, "{s}/rootfs/home/runner", .{
+            const rootfs = try std.fmt.allocPrint(arena, "{s}/rootfs", .{
                 try tmp.dir.realPathFileAlloc(io, ".", arena),
             });
+            const give = "cd \"$0\" && chmod 1777 tmp && mkdir -p github home/runner && " ++
+                "chown 1001:1001 github home/runner";
             const made = try std.process.run(arena, io, .{
-                .argv = &.{ "sh", "-c", "mkdir -p \"$0\" && chown 1001:1001 \"$0\"", home },
+                .argv = &.{ "sh", "-c", give, rootfs },
             });
             try std.testing.expect(made.term == .exited and made.term.exited == 0);
         }
