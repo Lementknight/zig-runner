@@ -100,7 +100,8 @@ make_rootfs() {
 	sudo mkdir -p "$rootfs"
 	if docker run --name zig-runner-e2e-rootfs "$image" sh -c "$script" &&
 		docker export zig-runner-e2e-rootfs | sudo tar -x -C "$rootfs"; then
-		sudo touch "$rootfs.ok"
+		# The provisioning stamp, as the recipe makes it (docs/native-backend.md, "The rootfs").
+		sudo touch "$rootfs/.zig-runner-provisioned" "$rootfs.ok"
 		echo "rootfs: $image, provisioned, in $rootfs"
 	else
 		sudo touch "$rootfs.failed"
@@ -235,7 +236,33 @@ record() {
 		secs(.started_at; .completed_at)] | @tsv' <<<"$jobs")
 }
 
-# The suite's runs, cancelled if still going, when it ends early.
+# rerun_cache ATTEMPT: reruns the `cache` job of the e2e run, as that attempt, and records it.
+rerun_cache() {
+	local job
+	job=$(jobs_of "$main" $(($1 - 1)) | jq -r '[.jobs[] | select(.name == "cache")] | max_by(.id) | .id')
+	if [[ -z $job ]] || ! api -X POST "repos/$repo/actions/jobs/$job/rerun" >/dev/null; then
+		fail "e2e/cache: could not rerun it"
+		return 0
+	fi
+	wait_run "$main" "$1" || { fail "e2e/cache, attempt $1: not done within $timeout s" && return 0; }
+	# The attempt's own `cache` job: the newest of that name.
+	record e2e "$1" "$(jobs_of "$main" "$1" | jq '{jobs: [[.jobs[] | select(.name == "cache")] | max_by(.id)]}')"
+}
+
+# check_replay ATTEMPT: that attempt of `cache` succeeded with its steps replayed.
+check_replay() {
+	local log=$out/logs/$backend-e2e-cache-$1.log state
+	state=$(awk -F'\t' -v b="$backend" -v a="$1" '$1 == b && $3 == "cache" && $4 == a { print $5 }' "$out/timings.tsv")
+	[[ $state == success ]] || fail "e2e/cache, attempt $1: ${state:-missing}, not success"
+	expect "$log" "Reused from" "e2e/cache, attempt $1"
+	echo "rerun (attempt $1): $(grep -cF 'Reused from' "$log" || true) steps replayed"
+}
+
+# slot_of ATTEMPT: the host ids that attempt of `cache` ran in natively ("Native steps: ids 0-65535
+# are host ids ..." in "Set up job").
+slot_of() { grep -oE 'are host ids [0-9]+' "$out/logs/$backend-e2e-cache-$1.log" | head -n1 | grep -oE '[0-9]+$' || true; }
+
+# The suite's runs, cancelled if still going# The suite's runs, cancelled if still going, when it ends early.
 cancel_runs() {
 	local r
 	for r in ${main:-} ${cancel:-}; do
@@ -314,21 +341,19 @@ check() {
 
 	# The rerun of `cache`: the same steps with the same nonce, so the step cache replays them, and
 	# the runner notes each one "Reused from Dagger's cache" or "... the native step store".
-	job=$(jq -r '.jobs[] | select(.name == "cache") | .id' <<<"$(jobs_of "$main")")
-	if [[ -n $job ]] && api -X POST "repos/$repo/actions/jobs/$job/rerun" >/dev/null; then
-		if wait_run "$main" 2; then
-			# The attempt's own `cache` job: the newest of that name.
-			jobs=$(jobs_of "$main" 2 | jq '{jobs: [[.jobs[] | select(.name == "cache")] | max_by(.id)]}')
-			record e2e 2 "$jobs"
-			state=$(jq -r '.jobs[0].conclusion' <<<"$jobs")
-			[[ $state == success ]] || fail "e2e/cache, rerun: $state, not success"
-			expect "$out/logs/$backend-e2e-cache-2.log" "Reused from" "e2e/cache, rerun"
-			echo "rerun: $(grep -cF 'Reused from' "$out/logs/$backend-e2e-cache-2.log") steps replayed"
-		else
-			fail "e2e/cache, rerun: not done within $timeout s"
-		fi
+	# Natively a stored layer belongs to the slot (the range of host ids) its job ran in, and only a
+	# job in the same slot reuses it (docs/native-backend.md, "A layer belongs to an id range"). A
+	# job alone takes the first free slot, but the first run shared the pool with the whole suite:
+	# when the rerun landed in another slot, its miss is expected, and the job is rerun once more,
+	# in the slot the rerun just filled, where it must replay.
+	rerun_cache 2
+	if [[ $backend == native ]] && ! grep -qF 'Reused from' "$out/logs/$backend-e2e-cache-2.log" &&
+		[[ $(slot_of 1) != "$(slot_of 2)" ]]; then
+		echo "rerun: in host ids $(slot_of 2), not $(slot_of 1) as the first run: a miss, by design; once more"
+		rerun_cache 3
+		check_replay 3
 	else
-		fail "e2e/cache: could not rerun it"
+		check_replay 2
 	fi
 
 	trap - EXIT
