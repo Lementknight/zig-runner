@@ -123,8 +123,9 @@ pub const Config = struct {
     /// What runs steps (`RUNNER_BACKEND`): Dagger, or the native backend with Dagger for the jobs
     /// it cannot run yet.
     backend: StepBackend = .dagger,
-    /// The native backend's rootfs, the default image provisioned (`RUNNER_NATIVE_ROOTFS`), and
-    /// where jobs' layers go while they run (`RUNNER_NATIVE_STORE`; "" for the default,
+    /// The native backend's rootfs, the default image provisioned, used instead of pulling and
+    /// provisioning it natively (`RUNNER_NATIVE_ROOTFS`; "" to pull it), and where jobs' layers,
+    /// pulled images and provisioned rootfs go (`RUNNER_NATIVE_STORE`; "" for the default,
     /// `nativeStore`).
     native_rootfs: []const u8 = "",
     native_store: []const u8 = "",
