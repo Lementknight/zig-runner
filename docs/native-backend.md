@@ -580,4 +580,7 @@ taught:
   allows only four values. The default id range sat inside systemd-nspawn's private-users range,
   and the checks read /etc/subuid only, not /etc/subgid or the host's own users and groups. The
   default subnet was podman's. A failed capability probe turned native off until the runner
-  restarted; it is now tried again after five minutes.
+  restarted; it is now tried again after five minutes. And one the root pass found at once: /proc
+  reports its files' sizes as 0, so a read sized by `stat` (Zig's `readFileAlloc`) returns
+  nothing, and `/proc/net/route` looked like a host with no default route; /proc files are now
+  read to their end (`net.readProc`).
