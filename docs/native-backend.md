@@ -400,22 +400,36 @@ What it covers, as built:
   out), and its content (a file's bytes, a link's target, a device's numbers, so whiteouts too).
   No times, inodes, link counts or host ids. Nothing asks for them yet: output keys stay off on
   native. A layer's digest is the same before and after its ids are shifted (`Store.unshift`
-  maps ids as the digest does), but for a file capability's root id, which the digest reads as
-  the host's: before the shift it named the slot, so such a digest was never a slot's either.
+  maps owners as the digest does), but for the ids inside xattrs, which the digest hashes raw: a
+  file capability's root id and ACL entries' named users and groups are host ids, shifted with the
+  layer, so a layer with either digests differently after. Before the shift they named the slot,
+  so such a digest was never the same across slots either.
 - **The canonical ids (layers shared across slots).** On a root runner each job has a slot, its
   own 65536 host ids, and a step's upper is written in them. A layer is published with the ids
   the job's namespace saw (`Store.unshift`, as `ImageStore.flatten` shifts a provisioned rootfs):
   the slot's host ids become 0 to 65535, any other host id the overflow id (65534, as the digest
   maps it), set-id bits (which `chown` clears) put back, file capabilities put back with their
   root's id shifted (dropped when it is outside the range), ACL entries' ids shifted; through no
-  symlink, with no depth limit, each inode once, and a failure fails the job rather than leave a
-  layer half one range's. Each step mounts every lower with the canonical ids (the rootfs, the
+  symlink (directories opened with `openat2`'s `RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`, each entry
+  changed through an `O_PATH` descriptor checked against the walk's inode), with no depth limit,
+  each inode once. It relies on nothing writing the tree meanwhile (the step's processes are gone)
+  but does not trust it. A failure ends the job, and the layer is never shifted again, rather than
+  leave a layer half one range's or shift it twice. Each step mounts every lower with the canonical ids (the rootfs, the
   seeds, the stored layers, a flattened stack) idmapped onto its job's range
   (`sandbox.idmapLowers`, `Spec.canonical`), read-only, nosuid and nodev; the step's upper is
   not idmapped (an idmapped upper is newer and unverified here, and not needed), so what a step
   writes, copy-ups included, has its slot's ids until it is published. A job's own unpublished
   uppers keep the slot's ids; flattening gives them the canonical ids first, so the merged layer
   is one tree with one set of ids. Rootless runners have no slots and shift nothing.
+- **The store is a security boundary, so the runner checks it.** With the canonical ids, a
+  job's set-uid-root file or file capability is the host's root's on disk. Whoever can reach the
+  store, or replace it or a directory on the way to it, has the host's root. So every start
+  (`Store.prepare`, and the probe, which keeps native off and says why) makes the store directory
+  the runner's own (root on a root runner, set through a descriptor opened `O_NOFOLLOW`) and mode
+  0700. It refuses a store it cannot make so, a store that is a symlink, and one under any
+  directory (along the path as given and as it resolves) that another user owns or that others (or
+  a group other than root) can write without the sticky bit. A rootless runner's store must be its own user's,
+  under directories that are root's or its own.
 
 #### Measured (laptop "cowbird", balanced profile, 2026-11-01, load about 5.5)
 

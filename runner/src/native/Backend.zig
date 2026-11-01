@@ -160,6 +160,9 @@ pub const Config = struct {
     gate: ?*admission.Gate = null,
     /// Tests: see `Backend.test_seed_script`.
     test_seed_script: ?[]const u8 = null,
+    /// Tests: off, as their stores are under a checkout a non-root user owns
+    /// (`Store.Prepare.check_parents`).
+    check_store_parents: bool = true,
 };
 
 /// One layer of the job's overlay.
@@ -177,6 +180,8 @@ pub const Layer = struct {
     /// idmapped mount (`Spec.canonical`). A stored layer has, and so does a flattened one; the
     /// job's own uppers, not published, keep its slot's host ids. Rootless, ids are never shifted.
     canonical: bool = false,
+    /// Its shift to the canonical ids failed part way (`canonicalize`): never shifted again.
+    poisoned: bool = false,
 };
 
 /// Past systemd's ranges: its containers' (systemd-nspawn's private users and nsresourced's,
@@ -384,6 +389,10 @@ fn probe(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !?[]const u8
         if (try net.subnetClash(arena, io, cfg.subnet)) |why| return why;
         if (try natRulesFor(arena, io, cfg.subnet, true)) |why| return why;
     }
+    // A store another user could reach or replace would hand them the host's root (its layers'
+    // set-uid files and capabilities are the host's on disk): native stays off, saying why.
+    if (try Store.secure(arena, io, cfg.store, .{ .check_parents = cfg.check_store_parents })) |why|
+        return why;
     // Not a job: the gate measures none in it.
     var probing = cfg;
     probing.gate = null;
@@ -525,7 +534,7 @@ fn usernsHere(io: std.Io) sandbox.Userns {
 /// A job's directory in the store, locked, and on a root runner its slot and network. Stale
 /// directories (a runner that died) are removed first (`sweep`).
 pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend {
-    try Store.prepare(arena, io, cfg.store);
+    try Store.prepare(arena, io, cfg.store, .{ .check_parents = cfg.check_store_parents });
     const cg_parent = cgroup.parent(arena, io, cfg.cgroup.parent);
     sweep(arena, io, cfg.store, switch (cg_parent) {
         .dir => |d| d,
@@ -1372,7 +1381,7 @@ fn exec(
     out: sandbox.Output,
 ) !sandbox.Ended {
     const arena = b.arena;
-    if (b.layers.items.len >= b.flatten_at) b.flatten() catch |e| return .{
+    if (b.layers.items.len >= b.flatten_at) b.flatten() catch |e| return if (e == error.LayerNotShifted) e else .{
         .code = 1,
         .failure = try std.fmt.allocPrint(arena, "could not flatten the job's {d} layers " ++
             "into one: {s}", .{ b.layers.items.len, @errorName(e) }),
@@ -1557,10 +1566,17 @@ fn slotIds(b: *const Backend) Store.Ids {
 }
 
 /// The job's own upper `l` given the canonical ids (`Store.unshift`), on a root runner, before it
-/// is published or flattened; each step then sees it through the job's ids.
-fn canonicalize(b: *Backend, l: *Layer) !void {
+/// is published or flattened; each step then sees it through the job's ids. A failure ends the
+/// job (`error.LayerNotShifted`, which no step's `if: always()` survives) and poisons the layer:
+/// half shifted, it is never shifted again, which would take its canonical ids for outsiders.
+fn canonicalize(b: *Backend, l: *Layer) error{LayerNotShifted}!void {
     if (b.how.userns != .mapped or l.canonical) return;
-    try Store.unshift(b.arena, b.io, l.path, b.slotIds());
+    if (l.poisoned) return error.LayerNotShifted;
+    Store.unshift(b.arena, b.io, l.path, b.slotIds()) catch |e| {
+        l.poisoned = true;
+        std.log.err("native: a step's layer could not be given the canonical ids: {s}", .{@errorName(e)});
+        return error.LayerNotShifted;
+    };
     l.canonical = true;
 }
 
@@ -1641,10 +1657,7 @@ fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) 
     // Room first: once the layer has moved, the job must hold it and point at it.
     b.held.ensureUnusedCapacity(arena, 1) catch return;
     const top = &b.layers.items[b.layers.items.len - 1];
-    b.canonicalize(top) catch |e| {
-        std.log.err("native: a step's layer could not be given the canonical ids: {s}", .{@errorName(e)});
-        return error.LayerNotShifted;
-    };
+    try b.canonicalize(top);
     const name = b.layerName('l') catch return;
     const link = std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, name }) catch return;
     const layer_fs = std.fmt.allocPrint(arena, "{s}/layers/{s}/fs", .{
@@ -2109,6 +2122,7 @@ fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
         .self_exe = exe,
         .vouched = true,
         .rootless = true,
+        .check_store_parents = false,
         .binds = &.{
             .{ .host = "/usr", .at = "/usr" },
             .{ .host = "/etc/ld.so.cache", .at = "/etc/ld.so.cache" },
@@ -2868,20 +2882,11 @@ fn requireRoot() !void {
     }
 }
 
-test "root runner: a job's own ids, its runner user, and sudo gaining nothing" {
-    try requireRoot();
-    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer a.deinit();
-    const arena = a.allocator();
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var cfg = try testConfig(arena, &tmp);
-    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
-    // What `set_up.provision_runner_script` gives the runner user (/tmp for all, /github and its
-    // home its own), a sudo the job's root owns, as the provisioned image has (the host's, in the
-    // bound /usr, is owned by an id the job does not map), with its sudoers and PAM
-    // configuration; and a file only the host's root may read, bound in.
+/// What `set_up.provision_runner_script` gives the runner user (/tmp for all, /github and its home
+/// its own), and a sudo the job's root owns at /opt/sudo, as the provisioned image has (the
+/// host's, in the bound /usr, is owned by an id the job does not map), with its sudoers and PAM
+/// configuration, in the tests' rootfs under `root`.
+fn sudoRootfs(arena: Allocator, root: []const u8) !void {
     const setup = try std.fmt.allocPrint(arena,
         \\set -e
         \\cd '{s}'
@@ -2903,6 +2908,26 @@ test "root runner: a job's own ids, its runner user, and sudo gaining nothing" {
         \\chmod 0440 rootfs/etc/sudoers
         \\printf 'root:*:19000:0:99999:7:::\nrunner:*:19000:0:99999:7:::\n' > rootfs/etc/shadow
         \\chmod 0640 rootfs/etc/shadow
+    , .{root});
+    const made = try std.process.run(arena, std.testing.io, .{ .argv = &.{ "sh", "-c", setup } });
+    try std.testing.expect(made.term == .exited and made.term.exited == 0);
+}
+
+test "root runner: a job's own ids, its runner user, and sudo gaining nothing" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try sudoRootfs(arena, root);
+    // A file only the host's root may read, bound in.
+    const setup = try std.fmt.allocPrint(arena,
+        \\set -e
+        \\cd '{s}'
         \\echo host-only > host-secret && chmod 0600 host-secret
         \\: > rootfs/opt/host-secret
     , .{root});
@@ -2912,7 +2937,6 @@ test "root runner: a job's own ids, its runner user, and sudo gaining nothing" {
         .host = try std.fmt.allocPrint(arena, "{s}/host-secret", .{root}),
         .at = "/opt/host-secret",
     }} });
-
     const script = "id -u; echo HOME=$HOME; cat /proc/self/uid_map; " ++
         "touch \"$GITHUB_WORKSPACE/mine\" && stat -c owner=%u \"$GITHUB_WORKSPACE/mine\"\n" ++
         "echo sudo-uid=$(/opt/sudo -n id -u)\n" ++
@@ -3195,6 +3219,7 @@ test "a job's directory and lock are let go once, when its set-up fails after th
         .store = try std.fmt.allocPrint(arena, "{s}/store", .{root}),
         .self_exe = "/bin/true",
         .test_fail_after_lock = true,
+        .check_store_parents = false,
     };
     // Closing an fd twice would panic here (Zig's own check for a file closed twice).
     try std.testing.expectError(error.TestFailure, init(arena, io, std.testing.allocator, cfg));
@@ -3437,13 +3462,25 @@ fn runCached(
     cfg: Config,
     job: job_mod.Job,
     ran: []const u8,
-) !struct { res: dagger.Result, text: []const u8 } {
+) !CachedRun {
+    return runCachedAs(arena, cfg, job, ran, .root);
+}
+
+const CachedRun = struct { res: dagger.Result, text: []const u8 };
+
+fn runCachedAs(
+    arena: Allocator,
+    cfg: Config,
+    job: job_mod.Job,
+    ran: []const u8,
+    user: config.StepUser,
+) !CachedRun {
     var env: std.process.Environ.Map = .init(arena);
     var w: std.Io.Writer.Allocating = .init(arena);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
     const res = try dagger.run(arena, std.testing.io, &env, .{
         .native = cfg,
-        .step_user = .root,
+        .step_user = user,
         .step_cache = true,
         .test_ran_marker = ran,
         .gpa = std.testing.allocator,
@@ -3665,10 +3702,15 @@ test "root runner: jobs in different slots share a stored layer, its owners thei
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const c = try cachedConfig(arena, &tmp);
-    // A file of the job's runner user, and a set-uid file of the job's root.
-    const make = testStep("echo x >> /shared/made; mkdir -p /w && echo mine > /w/mine && " ++
-        "chown 1001:1001 /w/mine && cp /bin/true /w/suid && chmod 4755 /w/suid");
-    const look = testStep("stat -c 'seen %n %u:%g %a' /w/mine /w/suid; " ++
+    try sudoRootfs(arena, try tmp.dir.realPathFileAlloc(io, ".", arena));
+    // Steps as the runner user, whose sudo reaches the job's root: a file of its own, and a
+    // set-uid copy of `id` owned by the job's root.
+    const make = testStep("echo x >> /shared/made; /opt/sudo -n mkdir -p /w && " ++
+        "/opt/sudo -n chown 1001:1001 /w && echo mine > /w/mine && " ++
+        "/opt/sudo -n cp /usr/bin/id /w/suid && /opt/sudo -n chmod 4755 /w/suid");
+    // Run as the runner user, the set-uid file works through the stored layer (euid 0), and
+    // that 0 is the second job's root: its own range of host ids.
+    const look = testStep("stat -c 'seen %n %u:%g %a' /w/mine /w/suid; echo suid-euid=$(/w/suid -u); " ++
         "head -n1 /proc/self/uid_map | tr -s ' ' | sed 's/^ //; s/^/map /'; " ++
         "echo more >> /w/mine && stat -c 'copied up %u:%g' /w/mine");
     // The first job in another slot than the first free one, which a second runner holds.
@@ -3676,10 +3718,10 @@ test "root runner: jobs in different slots share a stored layer, its owners thei
     try tmp.dir.createDirPath(io, "store-2");
     other.store = try std.fmt.allocPrint(arena, "{s}/store-2", .{try tmp.dir.realPathFileAlloc(io, ".", arena)});
     var holder = try init(arena, io, std.testing.allocator, other);
-    const first = try runCached(arena, c.cfg, testJob(&.{make}), "j1");
+    const first = try runCachedAs(arena, c.cfg, testJob(&.{make}), "j1", .runner);
     holder.deinit();
     try expectSucceeded(first);
-    const second = try runCached(arena, c.cfg, testJob(&.{ make, look }), "j2");
+    const second = try runCachedAs(arena, c.cfg, testJob(&.{ make, look }), "j2", .runner);
     try expectSucceeded(second);
     const first_ids = hostIdsOf(first.text).?;
     const second_ids = hostIdsOf(second.text).?;
@@ -3691,6 +3733,7 @@ test "root runner: jobs in different slots share a stored layer, its owners thei
     try expectLines(second.text, &.{
         "seen /w/mine 1001:1001 644",
         "seen /w/suid 0:0 4755",
+        "suid-euid=0",
         try std.fmt.allocPrint(arena, "map 0 {d} 65536", .{second_ids}),
         // Copied up from the stored layer into the step's own, as the job's runner user still.
         "copied up 1001:1001",
