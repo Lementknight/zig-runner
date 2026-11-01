@@ -21,7 +21,8 @@ a sha256, which the model does not compute: the vectors' parents are given as 32
 Each line is tab-separated, every byte string in lowercase hex, numbers in decimal:
 
     key    name equal|differ  A B   with A, B: tag parent script env uid gid workdir files preimage
-    below  name equal|differ  A B   with A, B: format fingerprint userns idBase binds preimage
+    below  name equal|differ  A B   with A, B: format scope repository fingerprint userns idBase
+                                         binds preimage
 
 An environment is `name=value` pairs joined by `,` in the container's order, volatile names
 included (the preimage has the stable ones); files are `path=contents=mode`, binds
@@ -66,6 +67,10 @@ def atomText : Nat → String
   | 28 => "/etc/resolv.conf"
   | 29 => "mkdir -p /home/runner/work/r/r /home/runner/work/_temp"
   | 31 => "zig-runner native store 2"
+  | 33 => "repo"
+  | 34 => "untrusted"
+  | 35 => "Open-Blue/zig-runner"
+  | 36 => "Open-Blue/other"
   | 32 => "zig-runner native store 1"
   | n => s!"atom{n}"
 
@@ -92,7 +97,7 @@ def scriptText : Script → String
 
 def path : Binding := (0, 10)
 def home : Binding := (2, 14)
-def below0 : Below := ⟨31, 23, 25, 1900000000, [⟨27, 28, true, true⟩]⟩
+def below0 : Below := ⟨31, 33, 35, 23, 25, 1900000000, [⟨27, 28, true, true⟩]⟩
 def asRoot : Extra := ⟨0, 0, 20, []⟩
 def eventFile (c : Nat) : Kept := ⟨22, c, 0o644⟩
 
@@ -104,6 +109,7 @@ def baseOf : Nat → BaseSpec
   | 2 => ⟨below0, 29, [path, home], ⟨0, 0, 20, [eventFile 18]⟩⟩
   | 3 => ⟨below0, 29, [path, home], ⟨0, 0, 20, [eventFile 19]⟩⟩
   | 4 => ⟨{ below0 with idBase := 1900065536 }, 29, [path, home], asRoot⟩
+  | 5 => ⟨{ below0 with scope := 34 }, 29, [path, home], asRoot⟩
   | n => ⟨below0, n, [], asRoot⟩
 
 def fmt : Format where
@@ -120,7 +126,7 @@ def fmt : Format where
 /-- Equality of the model's values, by their fields: the derived `DecidableEq` of a structure with a
 `Bool` field does not compile to code. -/
 def bindT (b : Bind) := (b.host, b.place, b.readOnly, b.optional)
-def belowT (w : Below) := (w.format, w.fingerprint, w.userns, w.idBase, w.binds.map bindT)
+def belowT (w : Below) := (w.format, w.scope, w.repository, w.fingerprint, w.userns, w.idBase, w.binds.map bindT)
 def extraT (x : Extra) := (x.uid, x.gid, x.workdir, x.files.map fun k => (k.path, k.contents, k.mode))
 def baseT (b : BaseSpec) := (belowT b.below, b.script, b.env, extraT b.extra)
 
@@ -169,7 +175,8 @@ def stepSide (b : Nat) (sc : Script) (e : Env) : KeySide :=
 /-- A base's side, with the env as the job has it (`full`), whose stable part is the base's. Its
 parent is the digest below it, given as 32 bytes of 176 for `below0` and 177 for another. -/
 def baseSide (b : Nat) (full : Env) : KeySide :=
-  ⟨0, parentKey (if belowT (baseOf b).below == belowT below0 then 176 else 177), fmt.str (baseOf b).script, full,
+  ⟨0, parentKey (if belowT (baseOf b).below == belowT below0 then 176 else 177),
+    fmt.str (baseOf b).script, full,
     (baseOf b).extra⟩
 
 def input (b : Nat) (sc : Script) (e : Env) (ev : Content := 0) (m : Mounts := []) : Input :=
@@ -191,6 +198,7 @@ def stepVectors : List (String × Input × Input) :=
     ("position", input 0 (.body 0 1) [path], input 0 (.body 0 2) [path]),
     ("parent", input 0 (.body 0 1) [path], input 2 (.body 0 1) [path]),
     ("parent-and-user", input 0 (.body 0 1) [path], input 1 (.body 0 1) [path]),
+    ("fork", input 0 (.body 0 1) [path], input 5 (.body 0 1) [path]),
     ("stamped", input 0 (.body 0 1) [path], input 0 (.stamped 42 (.body 0 1)) [path]),
     ("env-order", input 0 (.body 0 1) [path, home], input 0 (.body 0 1) [home, path]),
     ("ambiguous", input 0 (.body 2 1) [(4, 15)], input 0 (.body 3 1) []),
@@ -203,11 +211,14 @@ def baseVectors : List (String × (Nat × Env) × (Nat × Env)) :=
     ("base-env", (0, [path, home]), (1, [path])),
     ("base-event-file", (2, [path, home]), (3, [path, home])),
     ("base-file-or-none", (0, [path, home]), (2, [path, home])),
-    ("base-slot", (0, [path, home]), (4, [path, home])) ]
+    ("base-slot", (0, [path, home]), (4, [path, home])),
+    ("base-fork", (0, [path, home]), (5, [path, home])) ]
 
 def belowVectors : List (String × Below × Below) :=
   [ ("below-same", below0, below0),
     ("below-store-format", below0, { below0 with format := 32 }),
+    ("below-fork", below0, { below0 with scope := 34 }),
+    ("below-repository", below0, { below0 with repository := 36 }),
     ("below-rootfs", below0, { below0 with fingerprint := 24 }),
     ("below-userns", below0, { below0 with userns := 26, idBase := 0 }),
     ("below-slot", below0, { below0 with idBase := 1900065536 }),
@@ -215,7 +226,8 @@ def belowVectors : List (String × Below × Below) :=
     ("below-no-binds", below0, { below0 with binds := [] }) ]
 
 def belowLine (w : Below) : String :=
-  "\t".intercalate [hex (fmt.str w.format), hex (fmt.str w.fingerprint), hex (fmt.str w.userns), toString w.idBase,
+  "\t".intercalate [hex (fmt.str w.format), hex (fmt.str w.scope), hex (fmt.str w.repository),
+    hex (fmt.str w.fingerprint), hex (fmt.str w.userns), toString w.idBase,
     bindsField w.binds, hex (belowPreimage fmt w)]
 
 def baseNum : State → Nat

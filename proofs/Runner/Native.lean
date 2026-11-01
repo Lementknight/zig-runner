@@ -12,8 +12,9 @@ engine discharged becomes the runner's obligation, and each one is stated and pr
 * **The key is computed from exactly what the model says.** `keyPreimage` is what P2's store hashes
   (`Store.KeyHasher`, `Backend.keyFor`): a tag, the parent's key, the script text, the stable
   environment, then the uid, gid, working directory and kept files, each length-prefixed. A base has
-  the digest below it (`Backend.below`: store format, rootfs, id mapping, slot, binds) in its parent's
-  place. The
+  the digest below it (`Backend.below`: store format, trust scope, repository, rootfs, id mapping,
+  slot, binds) in its parent's place. `fork_keys_apart`: a fork's pull request and the repository's
+  own jobs never share a key. The
   extras are no new input: a base's are part of what the model's base is (`BaseSpec`), and a step's
   are its base's (`Format.stepExtra`), so determined by its key's parent. `encKey_injective` says no
   two model keys share bytes, so sha256 of them collides only when sha256 does (`native_key_iff`);
@@ -88,11 +89,15 @@ structure Bind where
   deriving DecidableEq, Repr
 
 /-- What every layer of a job depends on below its base (`Backend.below`): the store's format
-(`Store.store_format`, bumped when what a layer or its record means changes), the rootfs's
-fingerprint (`Store.rootfsFingerprint`), how ids are mapped (the userns mode's name), the slot's
-first id on a root runner (0 otherwise), and the binds. -/
+(`Store.store_format`, bumped when what a layer or its record means changes), the trust scope
+(`set_up.packageCacheScope`: `repo`, or `untrusted` for a fork's pull request or a job the runner
+does not vouch for), the repository, the rootfs's fingerprint (`Store.rootfsFingerprint`), how ids
+are mapped (the userns mode's name), the slot's first id on a root runner (0 otherwise), and the
+binds. -/
 structure Below where
   format : Nat
+  scope : Nat
+  repository : Nat
   fingerprint : Nat
   userns : Nat
   idBase : Nat
@@ -178,11 +183,12 @@ def encBind (b : Bind) : Bytes :=
   lp f (f.str b.host) ++ (lp f (f.str b.place) ++ (encBool f b.readOnly ++ encBool f b.optional))
 
 /-- **The digest below a base** (`Backend.below`), untagged (`KeyHasher.plain`): the label, the
-store's format, the rootfs's fingerprint, the userns mode, the slot's first id, and the binds,
-counted. -/
+store's format, the scope, the repository, the rootfs's fingerprint, the userns mode, the slot's
+first id, and the binds, counted. -/
 def belowPreimage (w : Below) : Bytes :=
-  lp f f.label ++ (lp f (f.str w.format) ++ (lp f (f.str w.fingerprint) ++ (lp f (f.str w.userns) ++
-    (f.word w.idBase ++ (f.word w.binds.length ++ encList (encBind f) w.binds)))))
+  lp f f.label ++ (lp f (f.str w.format) ++ (lp f (f.str w.scope) ++ (lp f (f.str w.repository) ++
+    (lp f (f.str w.fingerprint) ++ (lp f (f.str w.userns) ++
+    (f.word w.idBase ++ (f.word w.binds.length ++ encList (encBind f) w.binds)))))))
 
 /-- **What the store hashes for a key** (`KeyHasher.init(tag)`, `core`, then `keyFor`'s tail): the
 tag, the parent's key, the script's text, the stable environment, then the `Extra`. -/
@@ -308,21 +314,23 @@ theorem encExtra_inj (h : f.Sound) {x x' : Extra} (e : encExtra f x = encExtra f
   obtain ⟨hfs, _⟩ := list_split (kept_split h) hl (r := []) (s := []) (by simpa using e)
   rw [hu, hg, h.str_inj hw, hfs]
 
-/-- **The digest below a base is unambiguous**: equal preimages, the same store format, rootfs,
-mapping, slot and binds. -/
+/-- **The digest below a base is unambiguous**: equal preimages, the same store format, scope,
+repository, rootfs, mapping, slot and binds. -/
 theorem belowPreimage_inj (h : f.Sound) {w w' : Below} (e : belowPreimage f w = belowPreimage f w') :
     w = w' := by
-  obtain ⟨fm, fp, u, i, bs⟩ := w
-  obtain ⟨fm', fp', u', i', bs'⟩ := w'
+  obtain ⟨fm, sc, rp, fp, u, i, bs⟩ := w
+  obtain ⟨fm', sc', rp', fp', u', i', bs'⟩ := w'
   simp only [belowPreimage] at e
   obtain ⟨_, e⟩ := lp_split h e
   obtain ⟨hfm, e⟩ := lp_split h e
+  obtain ⟨hsc, e⟩ := lp_split h e
+  obtain ⟨hrp, e⟩ := lp_split h e
   obtain ⟨hfp, e⟩ := lp_split h e
   obtain ⟨hu, e⟩ := lp_split h e
   obtain ⟨hi, e⟩ := h.word_split e
   obtain ⟨hl, e⟩ := h.word_split e
   obtain ⟨hbs, _⟩ := list_split (bind_split h) hl (r := []) (s := []) (by simpa using e)
-  rw [h.str_inj hfm, h.str_inj hfp, h.str_inj hu, hi, hbs]
+  rw [h.str_inj hfm, h.str_inj hsc, h.str_inj hrp, h.str_inj hfp, h.str_inj hu, hi, hbs]
 
 theorem tag_ne (h : f.Sound) {n m : Nat} {r s : Bytes} (ne : n ≠ m) : f.word n ++ r ≠ f.word m ++ s :=
   fun e => ne (h.word_split e).1
@@ -373,6 +381,24 @@ theorem encKey_injective (h : f.Sound) {k k' : Key} (e : encKey f k = encKey f k
   simp only [stateOf, State.afterExec.injEq] at hs
   obtain ⟨rfl, rfl, rfl⟩ := hs
   rfl
+
+/-- **Scopes never share a container.** Two containers whose bases are in different trust scopes
+have different keys, however alike everything else is: the scope is below every base, so in every
+key above it. -/
+theorem scope_apart (h : f.Sound) {s s' : State}
+    (ne : (f.base (root s)).below.scope ≠ (f.base (root s')).below.scope) :
+    encState f s ≠ encState f s' :=
+  fun e => ne (by rw [encState_injective h e])
+
+/-- **A fork's pull request keys its layers apart.** A step of a job in the `untrusted` scope (a
+fork's pull request, or a job the runner does not vouch for) and one in `repo` never ask the same
+key, so neither ever replays what the other stored: a fork cannot plant a layer, a log or file
+commands that the repository's own jobs then replay, and the repository's layers are never handed
+to a fork. -/
+theorem fork_keys_apart (h : f.Sound) (vol : Volatile) {i j : Input}
+    (ne : (f.base (root i.parent)).below.scope ≠ (f.base (root j.parent)).below.scope) :
+    encKey f (keyOf vol i) ≠ encKey f (keyOf vol j) :=
+  scope_apart h ne
 
 /-! ## P2 and P3 for the native key -/
 
@@ -437,7 +463,7 @@ def f : Format where
     | .body b _ => [b]
     | .stamped t _ => [t]
   label := []
-  base _ := ⟨⟨0, 0, 0, 0, []⟩, 0, [], ⟨0, 0, 0, []⟩⟩
+  base _ := ⟨⟨0, 0, 0, 0, 0, 0, []⟩, 0, [], ⟨0, 0, 0, []⟩⟩
   stepExtra _ := ⟨0, 0, 0, []⟩
 
 theorem apart :

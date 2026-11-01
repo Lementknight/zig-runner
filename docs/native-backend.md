@@ -435,7 +435,7 @@ remains before native steps may run jobs the runner does not vouch for:
 - `Input.mounts` absent from the key holds by construction.
 - Exit: `proofs/README.md` and the Lean files name native functions where they named Dagger's.
 
-**Status: proved of P2's key format as P2 builds it (#268, with its review fixes at `ede9244`); the
+**Status: proved of P2's key format as P2 builds it (#268, with its review fixes in #272 at `28a9dd1`); the
 Zig check runs P2's own `Store.KeyHasher` and `Store.stableEnv` for keys, and a reference for the
 digest below a base until the review fixes merge.**
 `proofs/Runner/Native.lean` is the native backend's refinement of the model, beside Dagger's rather
@@ -448,7 +448,10 @@ than replacing it, since both backends ship (proofs/README.md, "On the native ba
   `ZIG_RUNNER_RAN`, `ZIG_RUNNER_MARK` and `ZIG_SECRET_*` dropped), then the uid, gid, working
   directory and kept files, each field prefixed with its length as a u64 little-endian. A base has
   no parent: in its place is the untagged digest below it (`Backend.below`: the store's format
-  `Store.store_format`, the rootfs's fingerprint, the userns mode, the slot's first id, the binds).
+  `Store.store_format`, the trust scope, the repository, the rootfs's fingerprint, the userns mode,
+  the slot's first id, the binds). `fork_keys_apart`: a fork's pull request (scope `untrusted`) and
+  the repository's own jobs (`repo`) never ask the same key, so neither replays what the other
+  stored.
   The extras are not new inputs: a step's are its job's, fixed with the base (`Format.stepExtra`), and a base's are part of what the
   model's base is (`BaseSpec`). `encState_injective`, `belowPreimage_inj`, `encKey_injective` and
   `native_key_iff`: the format keeps exactly what the model's key keeps, so P2 and P3 hold of it;
@@ -468,11 +471,11 @@ than replacing it, since both backends ship (proofs/README.md, "On the native ba
 - **The tie to the code.** `keyoracle` (`proofs/KeyOracle.lean`) writes
   `runner/src/native/testdata/step_keys.tsv`, `.github/scripts/key-vectors.sh` checks in the proofs
   workflow that it is the model's, and `runner/src/native/key_vectors.zig` checks the preimages
-  (25 vectors: steps, bases, the digest below a base) and the equal/differ relation against it.
+  (29 vectors: steps, bases, the digest below a base) and the equal/differ relation against it.
 
 **What is left**, in this order:
 
-1. When P2's review fixes (feature/native-backend-p2 after #268: `Store.store_format` in
+1. When P2's review fixes (#272: `Store.store_format`, the scope and the repository in
    `Backend.below`, and the rootfs's fingerprint checked again per job) reach main, write
    `below`'s hashing as a function of its inputs and call it from `key_vectors.zig` in place of
    `belowPreimage`, so the `below` vectors run P2's code as the `key` vectors already do.

@@ -15,7 +15,7 @@
 //! Keys go through P2's own `Store.KeyHasher` (`init`, `core`, its `bytes` writer) and
 //! `Store.stableEnv`; `keyFor`'s tail, which needs a `Backend`, is written out here as `keyFor`
 //! writes it. The digest below a base is still a reference (`belowPreimage`), following P2's
-//! review fixes (feature/native-backend-p2 at ede9244: `Store.store_format` after the label), which
+//! review fixes (#272 at 28a9dd1: `Store.store_format`, the scope and the repository after the label), which
 //! main does not have yet. **When they merge:** write `Backend.below`'s hashing as a function of
 //! its inputs, call it from `storeBelow`, and drop the reference.
 
@@ -48,6 +48,8 @@ pub const KeyInput = struct {
 /// What the digest below a base is of (`Backend.below`).
 pub const BelowInput = struct {
     format: []const u8,
+    scope: []const u8,
+    repository: []const u8,
     fingerprint: []const u8,
     userns: []const u8,
     id_base: u64,
@@ -106,13 +108,15 @@ pub fn keyPreimage(gpa: Allocator, in: KeyInput) ![]u8 {
 }
 
 /// The digest below a base's preimage, as `Backend.below` builds it: untagged
-/// (`KeyHasher.plain("below a base")`), then the store's format (`Store.store_format`), the rootfs's
+/// (`KeyHasher.plain("below a base")`), then the store's format (`Store.store_format`), the scope, the repository, the rootfs's
 /// fingerprint, the userns mode, the slot's first id, and the binds, counted.
 pub fn belowPreimage(gpa: Allocator, in: BelowInput) ![]u8 {
     var h: Hasher = .{ .gpa = gpa };
     errdefer h.out.deinit(gpa);
     try h.field("below a base");
     try h.field(in.format);
+    try h.field(in.scope);
+    try h.field(in.repository);
     try h.field(in.fingerprint);
     try h.field(in.userns);
     try h.int(in.id_base);
@@ -211,6 +215,8 @@ fn keySide(arena: Allocator, it: *Fields) !Side {
 
 fn belowSide(arena: Allocator, it: *Fields) !Side {
     const format = try unhex(arena, it.next().?);
+    const scope = try unhex(arena, it.next().?);
+    const repository = try unhex(arena, it.next().?);
     const fingerprint = try unhex(arena, it.next().?);
     const userns = try unhex(arena, it.next().?);
     const id_base = try num(it.next().?);
@@ -222,7 +228,7 @@ fn belowSide(arena: Allocator, it: *Fields) !Side {
         .optional = std.mem.eql(u8, p[3], "1"),
     });
     return .{ .below = .{
-        .in = .{ .format = format, .fingerprint = fingerprint, .userns = userns, .id_base = id_base, .binds = binds.items },
+        .in = .{ .format = format, .scope = scope, .repository = repository, .fingerprint = fingerprint, .userns = userns, .id_base = id_base, .binds = binds.items },
         .preimage = try unhex(arena, it.next().?),
     } };
 }
