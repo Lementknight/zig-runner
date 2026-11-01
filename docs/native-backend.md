@@ -702,6 +702,9 @@ Measured (laptop "cowbird", rootless in a delegated `systemd-run --user --scope`
 native jobs each holding 300 MB, the second starting 3 s into the first. The gate learned **304
 MB and 305 MB** from each job's own cgroup; the engine-wide reading (the jobs' parent cgroup, read
 as the engine's is) charged the first job **610 MB**, both jobs' memory, and the second 306 MB. That
-is razorbill's soak in miniature (1.7 GB learned for a job that takes about 0.9 GB alone). A runaway
-job capped at 64 MB was OOM-killed (exit 137) in its own cgroup while its neighbour held 200 MB
-untouched, and a fork bomb capped at 64 processes stopped there and the job went on.
+is razorbill's soak in miniature (1.7 GB learned for a job that takes about 0.9 GB alone). CI's
+root pass (GitHub's hosted runner, `/sys/fs/cgroup/zig-runner-test`) measured the same: 304 and 304
+MB own, 609 and 304 MB engine-wide. A runaway job capped at 256 MB was OOM-killed (exit 137) in its
+own cgroup while its neighbour held 200 MB untouched, and a fork bomb capped at 64 processes was
+refused 125 forks there and the job went on. A cap near the size of the step's own shell and helper
+is a trap: at 64 MB the root pass's kernel killed the shell with the hog.
