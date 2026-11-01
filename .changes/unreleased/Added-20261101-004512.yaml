@@ -1,0 +1,3 @@
+kind: Added
+body: 'The runner can register and remove its self-hosted runners as a GitHub App instead of with GH_TOKEN: GH_APP_ID (the App ID or Client ID), GH_APP_PRIVATE_KEY_FILE or GH_APP_PRIVATE_KEY (PKCS#1 or PKCS#8 PEM), and optionally GH_APP_INSTALLATION_ID, else looked up from GH_SCOPE. It signs the App JWT natively, caches the hour-long installation token, and mints a new one 5 minutes before expiry or after a 401. GH_TOKEN and the App exclude each other; the runner refuses to start with both or neither.'
+time: 2026-11-01T00:45:12.000000-04:00
