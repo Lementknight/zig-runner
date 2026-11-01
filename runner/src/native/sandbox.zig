@@ -68,6 +68,16 @@ pub const Spec = struct {
     id_count: u32 = 0,
     /// The job's network namespace (a bind-mounted namespace file), when it has one.
     netns: ?[]const u8 = null,
+    /// The job's cgroup (`cgroup.zig`), which the helper joins before anything else, so every
+    /// process of the step is born in it and held to its limits.
+    cgroup: ?[]const u8 = null,
+    /// How many of `lowers`, counted from the last (the rootfs), are the image's: owned on disk
+    /// by ids 0 to 65535 and, on a root runner, seen through the job's ids (`idmapLowers`). The
+    /// Zig cache seeds' layers sit just above the rootfs (`volumes.zig`).
+    image_layers: u32 = 1,
+    /// `mapped`: the first on-disk id of the cache volumes' range (`Bind.volume`), which the job
+    /// sees as its 0 onwards.
+    volume_id_base: u32 = 0,
 
     pub const Bind = struct {
         host: []const u8,
@@ -75,6 +85,13 @@ pub const Spec = struct {
         read_only: bool = true,
         /// Only over a file or directory the image has: making one would put it in the layer.
         optional: bool = false,
+        /// A cache volume (`volumes.zig`): nosuid and nodev, and on a root runner its files'
+        /// on-disk ids are the volumes' range (`Spec.volume_id_base`), seen as the job's own
+        /// through an idmapped mount, so a volume filled in one slot is the next slot's too.
+        volume: bool = false,
+        /// Its mount point is made when the overlay has none, owned by the job's root, as Dagger
+        /// makes a cache mount's missing parents.
+        make: bool = false,
     };
 
     pub const File = struct {
@@ -370,6 +387,8 @@ fn readSpec(arena: Allocator) !Spec {
 }
 
 fn runStep(arena: Allocator, spec: Spec) u8 {
+    // First, so every process the step makes, and this helper, is held to the job's limits.
+    if (spec.cgroup) |dir| joinCgroup(arena, dir);
     // Files a step creates get the modes they get under runc.
     _ = linux.syscall1(.umask, 0o022);
     check("chdir to the job directory", linux.chdir(z(arena, spec.root)));
@@ -382,15 +401,23 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
             // rootfs seen through it (an idmapped mount, so its root's files are the job's
             // root's), the overlay mounted, and only then into the namespace.
             if (spec.netns) |p| joinNetns(arena, p);
-            const userns = mappedUserns(spec.id_base, spec.id_count);
+            const userns = mappedUserns(0, spec.id_base, spec.id_count);
+            // The cache volumes' on-disk ids, seen as the job's.
+            var volumes = false;
+            for (spec.binds) |bd| volumes = volumes or bd.volume;
+            const volume_ns: ?linux.fd_t = if (volumes)
+                mappedUserns(spec.volume_id_base, spec.id_base, spec.id_count)
+            else
+                null;
             check("unshare(mount)", linux.unshare(linux.CLONE.NEWNS));
             makePrivate();
-            lowers = idmapRootfs(arena, spec.lowers, userns);
+            lowers = idmapLowers(arena, spec.lowers, spec.image_layers, userns);
             mountOverlay(arena, spec, lowers, false);
             // The binds, as the host's root: in the job's namespace the helper is nobody on the
             // host and may not search the directories on the way to a host path. They go on
             // with the overlay into the step's namespace (its bind onto itself is recursive).
-            bindAll(arena, spec);
+            bindAll(arena, spec, volume_ns);
+            if (volume_ns) |fd| _ = linux.close(fd);
             check("enter the job's user namespace", linux.setns(userns, linux.CLONE.NEWUSER));
             _ = linux.close(userns);
             // Joining a user namespace changes no ids: the helper is still the host's root,
@@ -427,7 +454,7 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
     check("open the overlay", root_rc);
     const root: linux.fd_t = @intCast(root_rc);
     // As the namespace's root, so what is made here is the job's root's.
-    if (spec.userns != .mapped) bindAll(arena, spec);
+    if (spec.userns != .mapped) bindAll(arena, spec, null);
     var secrets = false;
     for (spec.files) |f| secrets = secrets or !f.keep;
     if (secrets) check("mount the tmpfs for secret files", linux.mount(
@@ -472,17 +499,102 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
     return 128;
 }
 
-/// `spec.binds`, at their places in the overlay, read-only where asked.
-fn bindAll(arena: Allocator, spec: Spec) void {
+/// `spec.binds`, at their places in the overlay, read-only where asked. On a root runner a cache
+/// volume is seen through `volume_ns` (`Bind.volume`), and a mount point made here is the job's
+/// root's.
+fn bindAll(arena: Allocator, spec: Spec, volume_ns: ?linux.fd_t) void {
     const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
     const rc = linux.open(z(arena, spec.merged), flags, 0);
     check("open the overlay", rc);
     const root: linux.fd_t = @intCast(rc);
     defer _ = linux.close(root);
+    const owner: ?u32 = if (spec.userns == .mapped) spec.id_base else null;
     for (spec.binds) |bd| {
+        if (bd.make) makeDirsIn(arena, root, bd.at, owner);
+        if (bd.volume) {
+            bindVolumeIn(arena, root, bd.host, bd.at, volume_ns);
+            continue;
+        }
         if (!bindIn(arena, root, bd.host, bd.at, !bd.optional)) continue;
         if (bd.read_only) remountReadOnly(arena, root, bd.at);
     }
+}
+
+/// A cache volume at `at`, writable, nosuid and nodev, and idmapped through `userns` when given:
+/// a detached clone of the host's directory, its attributes set in one `mount_setattr`, then
+/// moved into place. Fails the step when it cannot.
+fn bindVolumeIn(
+    arena: Allocator,
+    root: linux.fd_t,
+    host: []const u8,
+    at: []const u8,
+    userns: ?linux.fd_t,
+) void {
+    const open_tree_clone = 1;
+    const tree = linux.syscall3(
+        .open_tree,
+        @as(usize, @bitCast(@as(isize, linux.AT.FDCWD))),
+        @intFromPtr(z(arena, host)),
+        open_tree_clone | linux.SOCK.CLOEXEC,
+    );
+    check(about(arena, "open the cache volume for", at), tree);
+    defer _ = linux.close(@intCast(tree));
+    const nosuid = 0x2;
+    const nodev = 0x4;
+    const idmap = 0x00100000;
+    var attr: MountAttr = .{ .set = nosuid | nodev };
+    if (userns) |ns| {
+        attr.set |= idmap;
+        attr.userns_fd = @intCast(ns);
+    }
+    check(about(arena, "set up the cache volume for", at), linux.syscall5(
+        .mount_setattr,
+        tree,
+        @intFromPtr(""),
+        linux.AT.EMPTY_PATH,
+        @intFromPtr(&attr),
+        @sizeOf(MountAttr),
+    ));
+    const target = targetIn(arena, root, at, true) orelse
+        fatal(about(arena, "find", at), @as(u32, 2));
+    defer _ = linux.close(target);
+    const move_mount_f_empty_path = 0x4;
+    const move_mount_t_empty_path = 0x40;
+    check(about(arena, "mount the cache volume at", at), linux.syscall5(
+        .move_mount,
+        @as(usize, @intCast(tree)),
+        @intFromPtr(""),
+        @as(usize, @intCast(target)),
+        @intFromPtr(""),
+        move_mount_f_empty_path | move_mount_t_empty_path,
+    ));
+}
+
+/// The directory `path` in the overlay, its missing parts made (mode 0755) inside it, each one
+/// made owned by host id `owner` when given (the job's root on a root runner, which the helper,
+/// still the host's root here, is not).
+fn makeDirsIn(arena: Allocator, root: linux.fd_t, path: []const u8, owner: ?u32) void {
+    const rel = std.mem.trim(u8, path, "/");
+    var i: usize = 0;
+    while (i <= rel.len) {
+        const end = std.mem.indexOfScalarPos(u8, rel, i, '/') orelse rel.len;
+        const parent = dirIn(arena, root, rel[0..i]) orelse return;
+        defer _ = linux.close(parent);
+        const name = z(arena, rel[i..end]);
+        if (linux.errno(linux.mkdirat(parent, name, 0o755)) == .SUCCESS) if (owner) |o| {
+            _ = linux.fchownat(parent, name, o, o, linux.AT.SYMLINK_NOFOLLOW);
+        };
+        i = end + 1;
+    }
+}
+
+/// Moves the helper into the job's cgroup: `0` written to its `cgroup.procs`.
+fn joinCgroup(arena: Allocator, dir: []const u8) void {
+    const path = z(arena, std.fmt.allocPrint(arena, "{s}/cgroup.procs", .{dir}) catch oom());
+    const fd = linux.open(path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+    check("open the job's cgroup", fd);
+    defer _ = linux.close(@intCast(fd));
+    check("join the job's cgroup", linux.write(@intCast(fd), "0", 1));
 }
 
 fn makePrivate() void {
@@ -527,10 +639,10 @@ fn joinNetns(arena: Allocator, path: []const u8) void {
     check("enter the job's network namespace", linux.setns(@intCast(fd), linux.CLONE.NEWNET));
 }
 
-/// A user namespace with host ids `base` to `base + count - 1` as 0 to `count - 1`: made by a
-/// child, since only a process outside it may map more than its own id, and kept by its file
-/// descriptor once the child is gone.
-fn mappedUserns(base: u32, count: u32) linux.fd_t {
+/// A user namespace with host ids `base` to `base + count - 1` as `inside` onwards (0 for the
+/// job's own): made by a child, since only a process outside it may map more than its own id,
+/// and kept by its file descriptor once the child is gone.
+fn mappedUserns(inside: u32, base: u32, count: u32) linux.fd_t {
     var ready: [2]linux.fd_t = undefined;
     var hold: [2]linux.fd_t = undefined;
     check("make a pipe", linux.pipe2(&ready, .{ .CLOEXEC = true }));
@@ -554,7 +666,11 @@ fn mappedUserns(base: u32, count: u32) linux.fd_t {
         const path = std.fmt.bufPrintSentinel(&buf, "/proc/{d}/{s}", .{ pid, m }, 0) catch
             unreachable;
         var line: [64]u8 = undefined;
-        writeProc(path, std.fmt.bufPrint(&line, "0 {d} {d}", .{ base, count }) catch unreachable);
+        writeProc(path, std.fmt.bufPrint(&line, "{d} {d} {d}", .{
+            inside,
+            base,
+            count,
+        }) catch unreachable);
     }
     const path = std.fmt.bufPrintSentinel(&buf, "/proc/{d}/ns/user", .{pid}, 0) catch unreachable;
     const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
@@ -565,16 +681,29 @@ fn mappedUserns(base: u32, count: u32) linux.fd_t {
     return @intCast(fd);
 }
 
-/// The lower layers with the rootfs (the last) replaced by `R`, the rootfs mounted there
-/// idmapped through `userns`: the host's root's files are the job's root's, its uid 1001's the
-/// job's 1001's, without a copy of the rootfs per range. Linux 5.19 lets overlay take an
-/// idmapped layer.
-fn idmapRootfs(
+/// The lower layers with the image's (the last `image_layers`: the rootfs, and the Zig cache
+/// seeds above it) replaced by `R`, `R1`, ..., each mounted there idmapped through `userns`: the
+/// host's root's files are the job's root's, its uid 1001's the job's 1001's, without a copy of
+/// a layer per range. Linux 5.19 lets overlay take an idmapped layer.
+fn idmapLowers(
     arena: Allocator,
     lowers: []const []const u8,
+    image_layers: u32,
     userns: linux.fd_t,
 ) []const []const u8 {
-    const rootfs = lowers[lowers.len - 1];
+    const out = arena.dupe([]const u8, lowers) catch oom();
+    const n = @min(@max(image_layers, 1), lowers.len);
+    for (0..n) |k| {
+        const at = if (k == 0) "R" else std.fmt.allocPrint(arena, "R{d}", .{k}) catch oom();
+        idmapLayer(arena, lowers[lowers.len - 1 - k], at, userns);
+        out[out.len - 1 - k] = at;
+    }
+    return out;
+}
+
+/// One image layer `layer` mounted at `at` (in the job's directory) idmapped through `userns`.
+fn idmapLayer(arena: Allocator, layer: []const u8, at: []const u8, userns: linux.fd_t) void {
+    const rootfs = layer;
     const open_tree_clone = 1;
     const at_recursive = 0x8000;
     const tree = linux.syscall3(
@@ -594,20 +723,18 @@ fn idmapRootfs(
         @intFromPtr(&attr),
         @sizeOf(MountAttr),
     ));
-    _ = linux.mkdir("R", 0o755);
+    const at_z = z(arena, at);
+    _ = linux.mkdir(at_z, 0o755);
     const move_mount_f_empty_path = 4;
     check("mount the idmapped rootfs", linux.syscall5(
         .move_mount,
         tree,
         @intFromPtr(""),
         @as(usize, @bitCast(@as(isize, linux.AT.FDCWD))),
-        @intFromPtr("R"),
+        @intFromPtr(at_z),
         move_mount_f_empty_path,
     ));
     _ = linux.close(@intCast(tree));
-    const out = arena.dupe([]const u8, lowers) catch oom();
-    out[out.len - 1] = "R";
-    return out;
 }
 
 /// Waits for the step's PID 1, killing it when the lifeline (stdin) closes or says anything: the

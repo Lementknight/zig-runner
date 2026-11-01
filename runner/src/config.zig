@@ -9,6 +9,8 @@ const trust = @import("trust.zig");
 const app = @import("github/app.zig");
 const NativeBackend = @import("native/Backend.zig");
 const native_net = @import("native/net.zig");
+const NativeStore = @import("native/Store.zig");
+const native_cgroup = @import("native/cgroup.zig");
 
 pub const Scope = union(enum) {
     repo: struct { owner: []const u8, name: []const u8 },
@@ -122,8 +124,9 @@ pub const Config = struct {
     /// What runs steps (`RUNNER_BACKEND`): Dagger, or the native backend with Dagger for the jobs
     /// it cannot run yet.
     backend: StepBackend = .dagger,
-    /// The native backend's rootfs, the default image provisioned (`RUNNER_NATIVE_ROOTFS`), and
-    /// where jobs' layers go while they run (`RUNNER_NATIVE_STORE`; "" for the default,
+    /// The native backend's rootfs, the default image provisioned, used instead of pulling and
+    /// provisioning it natively (`RUNNER_NATIVE_ROOTFS`; "" to pull it), and where jobs' layers,
+    /// pulled images and provisioned rootfs go (`RUNNER_NATIVE_STORE`; "" for the default,
     /// `nativeStore`).
     native_rootfs: []const u8 = "",
     native_store: []const u8 = "",
@@ -136,6 +139,16 @@ pub const Config = struct {
     native_subid_base: u32 = NativeBackend.default_subid_base,
     /// The native jobs' network on a root runner (`RUNNER_NATIVE_SUBNET`, `net.Subnet.parse`).
     native_subnet: []const u8 = native_net.Subnet.default_text,
+    /// Past this many MiB, the native step store's least recently used layers go
+    /// (`RUNNER_NATIVE_STORE_MAX_MB`, `native/Store.zig`).
+    native_store_max_mb: u64 = NativeStore.default_max_bytes / (1024 * 1024),
+    /// Where native jobs' cgroups go (`RUNNER_NATIVE_CGROUP`: "", `self`, `none` or a cgroup's
+    /// path), and each job's limits (`RUNNER_NATIVE_MEMORY_MAX_MB`, null for three quarters of
+    /// the machine's memory and 0 for none; `RUNNER_NATIVE_PIDS_MAX`, 0 for none). See
+    /// `native/cgroup.zig`.
+    native_cgroup: []const u8 = "",
+    native_memory_max_mb: ?u32 = null,
+    native_pids_max: u32 = native_cgroup.default_pids_max,
     /// Experimental: key the steps after one that always runs on what it produced rather than on
     /// the step itself (see `dagger.Options.output_keys`).
     output_keys: bool = false,
@@ -247,6 +260,7 @@ pub const Config = struct {
         InvalidNativeRootfs,
         InvalidNativeSubnet,
         InvalidNativeSubidBase,
+        InvalidNativeCgroup,
         InvalidEngine,
         InvalidBool,
         InvalidZigSeed,
@@ -269,6 +283,8 @@ pub const Config = struct {
                 "address), by default " ++ native_net.Subnet.default_text ++ ".",
             error.InvalidNativeSubidBase => "RUNNER_NATIVE_SUBID_BASE is at least 100000, " ++
                 "above every id a host's users and groups have.",
+            error.InvalidNativeCgroup => "RUNNER_NATIVE_CGROUP is `self` (the runner's own " ++
+                "cgroup, delegated to it), `none`, or a cgroup's path under /sys/fs/cgroup.",
             error.MissingGhToken => "No GitHub credentials: set GH_TOKEN, or a GitHub App with " ++
                 "GH_APP_ID and GH_APP_PRIVATE_KEY_FILE (or GH_APP_PRIVATE_KEY) " ++
                 "(deploy/runner.env.example).",
@@ -319,6 +335,9 @@ pub const Config = struct {
             return error.InvalidNativeRootfs;
         _ = try native_net.Subnet.parse(c.native_subnet);
         if (c.native_subid_base < NativeBackend.min_subid_base) return error.InvalidNativeSubidBase;
+        if (c.native_cgroup.len > 0 and !std.mem.eql(u8, c.native_cgroup, "self") and
+            !std.mem.eql(u8, c.native_cgroup, "none") and !native_cgroup.within(c.native_cgroup))
+            return error.InvalidNativeCgroup;
 
         if (c.exec_job != null or c.db_check) {
             // Offline mode: no GitHub credentials needed.
@@ -396,6 +415,10 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_ROOTLESS")) |v| c.native_rootless = try boolean(v);
         if (environ.get("RUNNER_NATIVE_SUBID_BASE")) |v| c.native_subid_base = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_SUBNET")) |v| c.native_subnet = v;
+        if (environ.get("RUNNER_NATIVE_STORE_MAX_MB")) |v| c.native_store_max_mb = try num(u64, v);
+        if (environ.get("RUNNER_NATIVE_CGROUP")) |v| c.native_cgroup = v;
+        if (environ.get("RUNNER_NATIVE_MEMORY_MAX_MB")) |v| c.native_memory_max_mb = try num(u32, v);
+        if (environ.get("RUNNER_NATIVE_PIDS_MAX")) |v| c.native_pids_max = try num(u32, v);
         if (environ.get("RUNNER_OUTPUT_KEYS")) |v| c.output_keys = try boolean(v);
         if (environ.get("RUNNER_ENFORCE_VOLATILE")) |v| c.enforce_volatile = try boolean(v);
         if (environ.get("RUNNER_LOG_SPOOL_DIR")) |v| c.log_spool_dir = v;
@@ -468,6 +491,10 @@ pub const Config = struct {
         else if (eq(key, "native-rootless")) c.native_rootless = try boolean(val) //
         else if (eq(key, "native-subid-base")) c.native_subid_base = try num(u32, val) //
         else if (eq(key, "native-subnet")) c.native_subnet = val //
+        else if (eq(key, "native-store-max-mb")) c.native_store_max_mb = try num(u64, val) //
+        else if (eq(key, "native-cgroup")) c.native_cgroup = val //
+        else if (eq(key, "native-memory-max-mb")) c.native_memory_max_mb = try num(u32, val) //
+        else if (eq(key, "native-pids-max")) c.native_pids_max = try num(u32, val) //
         else if (eq(key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache")) c.zig_local_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache-max-mb")) c.zig_local_cache_max_mb = try num(u32, val) //
@@ -762,6 +789,32 @@ test "dagger nesting is off by default and can be turned on" {
     try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--dagger-nesting=false" })).dagger_nesting);
     try env.put("RUNNER_DAGGER_NESTING", "maybe");
     try std.testing.expectError(error.InvalidBool, Config.load(&env, &.{"runner"}));
+}
+
+test "the native jobs' cgroups and limits: defaults, settings, and parents that are refused" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    const c = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqualStrings("", c.native_cgroup);
+    try std.testing.expectEqual(@as(?u32, null), c.native_memory_max_mb);
+    try std.testing.expectEqual(native_cgroup.default_pids_max, c.native_pids_max);
+    try env.put("RUNNER_NATIVE_CGROUP", "self");
+    try env.put("RUNNER_NATIVE_MEMORY_MAX_MB", "0");
+    try env.put("RUNNER_NATIVE_PIDS_MAX", "512");
+    const set = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqualStrings("self", set.native_cgroup);
+    try std.testing.expectEqual(@as(?u32, 0), set.native_memory_max_mb);
+    try std.testing.expectEqual(@as(u32, 512), set.native_pids_max);
+    try std.testing.expectEqualStrings("/sys/fs/cgroup/zr.slice", (try Config.load(&env, &.{
+        "runner",
+        "--native-cgroup=/sys/fs/cgroup/zr.slice",
+    })).native_cgroup);
+    for ([_][]const u8{ "/tmp/x", "/sys/fs/cgroup/../x", "/sys/fs/cgroup", "selfish" }) |bad| {
+        try env.put("RUNNER_NATIVE_CGROUP", bad);
+        try std.testing.expectError(error.InvalidNativeCgroup, Config.load(&env, &.{"runner"}));
+    }
 }
 
 test "the native subnet and ids: defaults, and values that are refused" {

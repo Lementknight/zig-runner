@@ -943,7 +943,7 @@ pub const nesting_withheld_note = "This step names Dagger, but steps do not get 
 /// The first directory of the tool cache that an answer's $GITHUB_PATH entries or $GITHUB_ENV
 /// values name and no tree "Set up job" checked holds (`tool_trees`); null when the tool cache
 /// is not a volume, whose content then goes with the container like any other (#229).
-fn toolDirNotHeld(x: *Exec, data: std.json.Value) !?[]const u8 {
+pub fn toolDirNotHeld(x: *Exec, data: std.json.Value) !?[]const u8 {
     const cache = x.tool_cache orelse return null;
     const arena = x.arena;
     var dirs: std.ArrayList([]const u8) = .empty;

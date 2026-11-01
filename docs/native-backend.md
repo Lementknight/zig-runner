@@ -102,16 +102,22 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   `id-token: write`, secrets in env, in scripts and in working directories, and the built-in
   checkout without submodules (git in the job's image, then the same step script Dagger's
   checkout runs).
-- Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": no rootfs
-  configured, a job the runner does not vouch for (`trust.vouches`, for `--exec-job` too), a
-  rootless runner unless `RUNNER_NATIVE_ROOTLESS=1`, `container:`, `services:`, `uses:` actions,
-  `docker://` steps, a custom image, Dagger in steps (`RUNNER_DAGGER_NESTING`), `hashFiles()`
+- Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": a job the runner
+  does not vouch for (`trust.vouches`, for `--exec-job` too), a rootless runner unless
+  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:` or `options:`, `services:`,
+  `uses:` actions, `docker://` steps, Dagger in steps (`RUNNER_DAGGER_NESTING`), `hashFiles()`
   anywhere in the job (it reads the container through Dagger), a checkout with submodules, and a
   machine whose probe fails (no user namespaces, nftables refusing the jobs' rules, no default
   route, the jobs' ids taken on the host, the jobs' subnet overlapping a route of the host's). A
-  failed probe is tried again after five minutes, not kept for the process's life.
-- Off on native, as caches: the step cache and output keys (P2), the package caches, uv's
-  environment in its cache, and Zig's local cache and seed (P4). Results do not depend on them.
+  failed probe is tried again after five minutes, not kept for the process's life. (Until P3
+  also: no rootfs configured, `container:` and a custom image.)
+- Off on native, as caches: output keys. Results do not depend on them. (The step cache was off
+  in P1; P2's layer store gives it. The package caches, uv's environment in its cache, and Zig's
+  local cache and seed came with P4.) The tool cache is never off: a step may install into it, and
+  the step user cannot make it under /opt. It is the job's `toolcache` volume (P4), bound at
+  `/opt/hostedtoolcache` and owned by the step user as Dagger mounts it in every job; a job with no
+  volumes (package caches off, or no repository) has the base make it instead (#274), and what a
+  step puts there is then in its layer.
 - "Set up job" says what the job got: "Native steps: ids 0-65535 are host ids N-N+65535, and the
   job's network is its own (10.211.1.x on zr0)", or the rootless warning.
 
@@ -122,8 +128,9 @@ On a root runner, each step runs:
 - in a **user namespace of the job's own**, ids 0-65535 mapped to a range of host ids no host user
   has (`RUNNER_NATIVE_SUBID_BASE`, by default 1,900,000,000 plus 65,536 per slot). The default
   lies past systemd's container range (systemd-nspawn's private users and nsresourced's,
-  524288-1879048191) and the last slot's ids (up to 1,916,383,999) stay below its foreign range
-  (from 2,147,352,576) and below 2^31, which some tools take as signed. The probe refuses a base
+  524288-1879048191) and the last slot's ids (up to 1,916,383,999), and the cache volumes' range
+  after them (P4, up to 1,916,449,535), stay below its foreign range (from 2,147,352,576) and
+  below 2^31, which some tools take as signed. The probe refuses a base
   below 100,000, a range past 2^32, and a range that overlaps one in /etc/subuid or /etc/subgid
   or holds an id from /etc/passwd or /etc/group (users only a directory service knows are not
   seen; the 100,000 floor is above their usual ranges). The step's root and its uid 1001 are
@@ -162,11 +169,14 @@ On a root runner, each step runs:
 - with every path inside the overlay resolved inside it (`openat2(RESOLVE_IN_ROOT)`), by the
   helper and by the runner, so a symlink a step plants never leads them to the host's files.
 
+- in a **cgroup v2 of the job's own** (since P4) with `memory.max` and `pids.max`, where the runner
+  is root or has a cgroup delegated to it ("P4" below).
+
 What it does not provide yet:
 
-- **Resource limits.** No cgroup per job and no pids limit: a fork bomb or a memory hog reaches
-  the host's limits. Debt, recorded under phase 4 beside the gate's cgroup memory accounting.
-- **The seccomp filter is Docker's deny list, not its allow list.** Paid in P5.
+- **Resource limits on a rootless runner without delegation.** P4's cgroup needs root or a
+  delegated cgroup (`RUNNER_NATIVE_CGROUP=self`); without one a job runs as P1 did, and "Set up
+  job" says so. A job the runner does not vouch for never runs without one (P5).
 - **Rootless runners.** Only one id is mapped and steps share the host's network: off unless
   `RUNNER_NATIVE_ROOTLESS=1`, for tests and the laptop. A rootless job network needs a userspace
   stack (a Zig port of the parts of pasta or slirp4netns it needs), and full ids need
@@ -178,26 +188,41 @@ What it does not provide yet:
 
 ```
 RUNNER_BACKEND=native              # default dagger
-RUNNER_NATIVE_ROOTFS=/var/lib/zig-runner/rootfs   # absolute; checked at startup
+RUNNER_NATIVE_ROOTFS=/var/lib/zig-runner/rootfs   # optional since P3; absolute
 RUNNER_NATIVE_STORE=/var/lib/zig-runner/native    # default as root
 RUNNER_NATIVE_SUBID_BASE=1900000000               # default; at least 100000
 RUNNER_NATIVE_SUBNET=10.211.0.0/16                # default; a prefix of 8 to 23 bits
+RUNNER_NATIVE_STORE_MAX_MB=10240                  # default; the layer store's cap (P2)
 RUNNER_NATIVE_ROOTLESS=0                          # default; 1 for a rootless runner
+RUNNER_NATIVE_CGROUP=                             # default: /sys/fs/cgroup/zig-runner as root,
+                                                  # none rootless; `self`, `none`, or a path
+RUNNER_NATIVE_MEMORY_MAX_MB=                      # default 3/4 of MemTotal; 0 for no limit
+RUNNER_NATIVE_PIDS_MAX=8192                       # default; 0 for no limit
 ```
 
-**The rootfs.** P1 takes a directory holding `ubuntu:24.04` with the runner's provisioning applied
+**The rootfs.** Since P3 the runner pulls and provisions the image itself (see P3), and this
+directory is an optional override for the provisioned default image. P1 took a directory holding
+`ubuntu:24.04` with the runner's provisioning applied
 (`set_up.provision_script`, or `provision_runner_script` when steps run as the runner user), owned
 as the image has it (root's files root's). It is not yet exported by the runner through Dagger at
 startup: the direct engine session (`engine.zig`) implements the client's side of file sync for
 reads only, and an export needs its receiving side, which is as much work as P3's pull it would be
 thrown away for. Until P3, an operator makes it once, for example with Docker on a machine that may
-use it:
+use it (`zig-runner --provision-script` prints the script; CI's end-to-end job does this,
+`.github/scripts/e2e.sh rootfs`):
 
 ```
-docker run --name zr-rootfs ubuntu:24.04 sh -c '<set_up.provision_runner_script>'
+docker run --name zr-rootfs ubuntu:24.04 sh -c "$(zig-runner --provision-script)"
 mkdir -p /var/lib/zig-runner/rootfs
 docker export zr-rootfs | tar -x -C /var/lib/zig-runner/rootfs
+touch /var/lib/zig-runner/rootfs/.zig-runner-provisioned
 ```
+
+To provision it again, make a new directory and rename it over the old one between jobs, or, if
+it is changed in place, touch `.zig-runner-provisioned` in it afterwards. The step store's layers
+were made over the old rootfs: every job checks the rootfs's root and that stamp before it trusts
+the fingerprint it found once (`Store.rootfsFingerprint`), and a change neither shows (an
+in-place change, the stamp not touched) is found when the runner restarts, by the walk's ctimes.
 
 **What the runner needs.** As root (the supported mode): `CAP_SYS_ADMIN` (namespaces, mounts,
 idmapped mounts, `pivot_root`), `CAP_NET_ADMIN` (the bridge, veths, addresses, routes, NAT),
@@ -216,6 +241,11 @@ What it changes on the host, which is shared by every runner on it:
   `RUNNER_NATIVE_STORE`s on one host take different slots, and a slot's veth is removed (a dead
   job's) only by the runner that now holds its lock. Every runner on a host must use the same
   `RUNNER_NATIVE_SUBNET`, since `zr0` is one bridge.
+- **Cgroups.** As root, by default, the jobs' cgroups go under `/sys/fs/cgroup/zig-runner` (made
+  on the first job, with the memory and pids controllers for its children, as Docker's cgroupfs
+  driver makes `/sys/fs/cgroup/docker`). It is the host's, like the slots: each job's cgroup is
+  named by its directory, and only the runner holding a job's lock removes it. Under a unit with
+  `Delegate=yes`, `RUNNER_NATIVE_CGROUP=self` keeps them in the unit's own tree instead.
 - **IPv4 forwarding** (`net.ipv4.ip_forward`) is turned on if it is off, and stays on: other
   runners' jobs need it, and turning it off under them would cut their network. The runner logs
   a warning when it turns it on, and another when the FORWARD policy is ACCEPT, since the host
@@ -241,7 +271,9 @@ What it changes on the host, which is shared by every runner on it:
   directory on overlayfs), and the rootfs another volume. The slots' locks must be the host's:
   bind `/run/zig-runner:/run/zig-runner` from the host into every runner container (the
   container's own /run would give each its own slot 0 on the shared bridge). The image has no
-  `iptables`, and needs none since P5: the rules are made over netlink.
+  `iptables`, and needs none since P5: the rules are made over netlink. For the jobs' cgroups,
+  `cgroup: private` (the default on cgroup v2) with `RUNNER_NATIVE_CGROUP=self`: the container's
+  root is then its own cgroup, and the runner moves itself into a leaf of it.
 - Under `deploy/zig-runner.service` on razorbill (not changed by P1): the unit runs as root with
   `ProtectSystem=strict`, which makes the store's default and `/run` read-only. It needs
   `StateDirectory=zig-runner` (or `ReadWritePaths=/var/lib/zig-runner`) for the store, and
@@ -250,9 +282,11 @@ What it changes on the host, which is shared by every runner on it:
   `/run/zig-runner` when any one of them stops, the others' locks go with their files, and the
   next runner would take a slot a live job holds. `NoNewPrivileges` and `PrivateTmp` are
   compatible; a `RestrictNamespaces=`, a capability bounding set without `CAP_SYS_ADMIN` and
-  `CAP_NET_ADMIN`, or `PrivateNetwork=` would not be.
+  `CAP_NET_ADMIN`, or `PrivateNetwork=` would not be. The jobs' cgroups need `/sys/fs/cgroup`
+  writable (`ProtectControlGroups=` off), or `Delegate=yes` with `RUNNER_NATIVE_CGROUP=self`.
 - Rootless (tests, the laptop): a user namespace mapping the runner's user to root, with overlay's
-  `userxattr` (Linux 5.11). Where AppArmor restricts unprivileged user namespaces
+  `userxattr` (Linux 5.11). Per-job cgroups need the runner started in a delegated cgroup:
+  `systemd-run --user --scope -p Delegate=yes zig-runner ...` with `RUNNER_NATIVE_CGROUP=self`. Where AppArmor restricts unprivileged user namespaces
   (`kernel.apparmor_restrict_unprivileged_userns=1`), the sandbox is started under util-linux's
   `unshare` where its profile allows it (the laptop), and needs the restriction lifted where it
   does not (GitHub's hosted runner).
@@ -277,8 +311,11 @@ per-job helper makes the namespaces and the static mounts once.
 
 ### P2: the layer store, cache, replay and GC
 
-- First, from P1: one sandbox helper per job instead of per step. The helper makes the namespaces,
-  /dev, /proc and its masks once and takes steps over a pipe: about 15 ms a step on the laptop.
+- ~~First, from P1: one sandbox helper per job instead of per step.~~ **Deferred, by the user's
+  decision, to a follow-up of its own**: the store is built on P1's per-step sandbox, whose
+  in-namespace code P2 does not change. The per-job helper (namespaces, /dev, /proc and its masks
+  made once, steps over a pipe, about 15 ms a step on the laptop) is a speed-up of cold steps
+  only; replays never start a sandbox.
 - A content-addressed layer store: key `sha256(parent key, script, stable env)`, the model's
   `Key = parent · script · stable env`, without `volatile_env`.
 - Replay of stored logs and file commands, so a replayed step costs well under a millisecond.
@@ -290,6 +327,100 @@ per-job helper makes the namespaces and the static mounts once.
 - Exit: the step-cache tests that run through `dagger.run` pass on native too; replays are
   byte-identical to the live log. Measure: replay per step against ~95 ms; store size over 50 jobs.
 
+**Status: the store, replay and GC landed (behind the knob); the per-job helper is deferred.**
+What it covers, as built:
+
+- `runner/src/native/Store.zig` is the store, under `RUNNER_NATIVE_STORE` (mode 0700):
+  `layers/<key>/{fs,log,fc,meta,lock,digest}`, `keys/<key>.lock`, and the running jobs' `jobs/`.
+  `meta` holds the store's format, the entry's kind (base, step, fetch), its bytes on disk, and
+  its log's and file commands' lengths and sha256s.
+  `Backend.zig` keys each exec (`keyFor`), claims the key (`claimKey`), replays a hit (`replay`)
+  and publishes a success (`publishTop`).
+- **Keys** are P8's preimage format (proofs/Runner/Native.lean, `stepPreimage`): a u64 tag (0 a
+  base, 1 a step's container, 2 output-keyed), the parent's key, the script, the count of stable
+  bindings and each name and value in the container's order, every field length-prefixed as a
+  u64 little-endian (`Store.KeyHasher.core`). Stable means not in `volatile_env`, not the event,
+  the ran marker or the markers' secret (volatile under Dagger too), and no secret alias
+  (`Store.stableEnv`). After the core come what P8's model does not have yet: the step's uid,
+  gid and working directory, and the files written for it that stay (the event file when it is
+  not a variable). A base has no parent; in its place goes a digest of what every layer depends
+  on (`Backend.below`): the store's format (`Store.store_format`), the job's cache scope and
+  repository, the rootfs's fingerprint (a walk of its metadata, ctimes and inodes among it, kept
+  per process and checked again for every job against the root's and the provisioning stamp's
+  identity and ctime), how ids are mapped, on a root runner the slot's first id (a layer's files are owned by its job's
+  range, so it is reused only by jobs with the same range: only misses come of it), and the binds'
+  places (never their content). Under step caching the event payload is a variable each step
+  writes to the file, as `set_up.writeRunEnv` gives it, so the base is the same for every run.
+- **The store's format** (`Store.store_format`) is bumped with any change to what a layer or its
+  record means: the sandbox's trees, the record's files and how they replay, the key's extras.
+  A runner upgraded across a bump finds none of the older runner's layers; they age out under
+  the cap.
+- **Forks**: a fork's pull request that `trust.vouches` accepts still runs natively, with caching,
+  in a key space of its own: the scope is `set_up.packageCacheScope`'s (`untrusted` when the
+  pull request's head repository is another), the same test that keeps its package cache volumes
+  apart on Dagger. It never replays or leaves a layer its repository's own jobs use. It does
+  share the store's disk and its cap.
+- **Publish**: only a step that exited 0 with its file commands taken, that does not always run
+  (no secret, no OIDC token, no run-specific value) and whose parent is in the store. So a failure
+  is never replayed (#69), nothing after an always-run step is kept (its parent is not stored, as
+  under Dagger its new parent makes every later key new), and no layer or log holds a secret. A
+  step that printed more than `dagger.max_recorded_bytes` is not kept, nor a record its kind may
+  not have (a step's file commands without their ran marker, a base's or a fetch's not empty),
+  nor a layer whose size cannot be counted whole (a directory it cannot read). A commit's checkout
+  (a fetch of a full SHA) is a layer like a step's, keyed on its script and never on the token;
+  a branch or tag moves, so its fetch always runs. The upper is moved under `layers/.tmp-<key>-<n>`
+  with its record, held, written to disk (`syncfs`), and published by one
+  `renameat2(RENAME_NOREPLACE)`. An upper that cannot be put back after a failure is left there
+  and logged, never deleted.
+- **Replay**: the stored raw output (markers and all) and combined file commands go through
+  `Exec.collect` as Dagger's answer for a cached exec does, with the earlier job's ran marker, so
+  the log is `JobLog.replayNotLive`'s, byte-identical by construction, and outputs, env, PATH,
+  summaries and state are applied again. The step's log ends with "Reused from the native step
+  store", which the runner counts as it counts Dagger's note. Every hit is checked whole first
+  (`meta`'s lengths and sha256s, and the record its kind may have): one that is not is evicted
+  under its exclusive lock and is a miss, so the step runs and is published again; its last use
+  is touched only once it passed.
+- **Locks**: one flock per key while its exec runs (polled, so a cancel or a timeout ends the
+  wait), so two jobs sharing the store do not run one key at once: the second replays the
+  first's. On a root runner two jobs at once take two slots, so their keys differ anyway. A job
+  holds a shared flock on each store layer it uses until it ends.
+- **GC** (`Store.collect`, after each job): past `RUNNER_NATIVE_STORE_MAX_MB` (default 10240),
+  the layers no job holds go, least recently used first (the lock file's mtime is the last use),
+  each renamed away under its lock taken exclusively, then deleted. Half-built and half-evicted
+  entries of dead runners, idle key locks, and entries that are not whole (by `meta` and their
+  files' lengths, without reading them) go too.
+- **Flattening**: before a step on a stack of 100 layers (`default_flatten_at`), the stack is
+  merged into one (`Store.flatten`): later entries win, whiteouts are kept (they hide the
+  rootfs), opaque directories stay opaque, files are hard links and directories are made with
+  their owner, mode, xattrs and times. The merged layer stands for the top: its key is the top's.
+  Overlay's redirects and metacopy, off by default and never turned on here, are refused.
+- **Digests** (`Store.treeDigest`, `layerDigest`, kept beside the layer once computed): sha256 over
+  a walk in byte order of each entry's path, type, mode, owner as the job's namespace sees it
+  (other host ids as the overflow id), the xattrs that say what it is (overlay's bookkeeping left
+  out), and its content (a file's bytes, a link's target, a device's numbers, so whiteouts too).
+  No times, inodes, link counts or host ids. Nothing asks for them yet: output keys stay off on
+  native.
+
+#### Measured (laptop "cowbird", balanced profile, 2026-11-01, load about 5.5)
+
+`ZIG_RUNNER_NATIVE_BENCH=1 zig build test -Doptimize=ReleaseSafe` (the test "native step cache:
+measured"), rootless, on the tests' rootfs (a few directories with the host's `/usr` bound in).
+Per step is (50-step job − 1-step job) / 49.
+
+| | native | Dagger |
+|---|---|---|
+| replayed trivial step | **0.37 ms** | ~95 ms |
+| replayed 50-step job, whole (base, 50 replays, log) | 20 ms | |
+| cold trivial step, with its layer published | 68 ms | ~224 ms |
+
+The cold figure is P1's per-step sandbox (32.7 ms on a quieter laptop) plus publishing, under
+twice P1's load; the per-job helper is what would cut it.
+
+Store size over 50 jobs of one workflow, as 50 commits: ten steps, five that never change (one
+writes 1 MiB), one that changes every job and four after it. 306 layers (with the benchmark's
+own) in 15.1 MiB: the 1 MiB file once, and about 48 KiB per small layer, which is the
+directories and the step's file-command files at a 4 KiB block each.
+
 ### P3: the OCI image pull, a native port
 
 - Registry protocol with token auth and private-registry credentials, manifest lists and the
@@ -300,11 +431,121 @@ per-job helper makes the namespaces and the static mounts once.
 - Exit: no Dagger session is needed to make the rootfs. Measure: cold pull of `ubuntu:24.04`
   against Dagger's.
 
+**Status: landed (behind the knob).** What it covers, as built:
+
+- `runner/src/native/oci/registry.zig`: image references normalized as Docker's (`ubuntu:24.04` is
+  `docker.io/library/ubuntu:24.04` at `registry-1.docker.io`; anything that is not a reference is
+  refused, since its parts go into URLs); manifests and blobs over the distribution API; token
+  auth answered once per pull (a `401` naming a Bearer realm, or Basic), with a `container:` job's
+  `credentials:` (`docker.registryCredentials`, as the Dagger path hands them to
+  `withRegistryAuth`). Plain HTTP only to a registry on the loopback, as Docker allows; a token
+  realm elsewhere must be HTTPS. The token goes to the registry's own origin only, never where a
+  redirect leads (a blob's CDN).
+- `runner/src/native/oci/image.zig`: an index narrowed to linux/amd64, or linux/arm64 (`v8` first,
+  then no variant) on the Pi; attestations never match. The platform's manifest and config, each
+  blob checked against its digest and size as it arrives, then kept content-addressed; the
+  layers applied in order into one directory, flattened, kept under the manifest's digest. A
+  digest-pinned reference seen before (the default image) needs no request at all; a tag is
+  resolved at the registry each time, as Dagger does.
+- `runner/src/native/oci/layer.zig`: one layer applied safely (gzip, zstd or plain by the blob's
+  first bytes; ustar, GNU long names, PAX; whiteouts and opaque directories; the diff id
+  checked). See its comment for the rules: no `..`, parents resolved inside the rootfs
+  (`openat2(RESOLVE_IN_ROOT)`, so `/bin -> usr/bin` works and `etc -> /etc` stays inside), the last
+  component never followed, hard links from a descriptor and never to a directory, device nodes
+  left out, xattrs only `security.capability` (root) and non-overlay `user.*`, size and entry caps.
+- `runner/src/native/oci/Store.zig`: blobs, images, `ensure` (a keyed directory made once) and
+  `flatten`, beside P2's layer store (below).
+- `runner/src/native/Backend.zig`: `prepareRootfs` pulls the job's image, or takes the operator's
+  rootfs for the provisioned default image (`RUNNER_NATIVE_ROOTFS`, now optional). `provision`
+  runs `set_up.provision_script` (or `provision_runner_script`) as a native step on the pulled
+  image, in the job's sandbox and network, its layer keyed by P2's `Store.KeyHasher` (the
+  image's manifest as the parent, the script, the env in the container's order) and flattened
+  onto a hard-linked clone of the image, so it runs once per store and a later job starts from
+  it at once. `container:` jobs are native, with the image's env and
+  `USER` (looked up in the image's own `/etc/passwd` and `/etc/group`), the container's `env:`
+  over it, its PATH as `Exec.container_path`, and "Initialize containers" showing the digest. Any
+  image may be native. Without the operator's rootfs, the probe pulls the default image (so it
+  also says whether this machine can pull).
+- "Set up job" says what the job got: "Image: pulled natively in N ms (L layers, K KB fetched)" or
+  "Image: from the native store", and "Provisioned natively in N ms (layer <key>)" or "...made
+  before".
+- Falls back to Dagger: a job container's `ports:`, `volumes:` and `options:` (phase 6 brings the
+  network that ports and volumes need), and on a rootless runner without `RUNNER_NATIVE_ROOTFS`
+  the provisioned default image (below).
+
+The store, under `RUNNER_NATIVE_STORE`, each directory only the runner's (mode 0700: a rootfs
+holds the image's set-uid files with the image's owners, the host's root's on a root runner):
+
+```
+oci/blobs/sha256/<hex>                a blob, renamed into place once its digest checked
+oci/refs/<hex>.<platform>             which manifest a pinned index gives this platform
+oci/images/<hex>[.rootless]/          rootfs/ and config.json, by the manifest's digest
+rootfs/<key>/rootfs/                  a rootfs a native step made (provisioning; apart from P2's layers/)
+```
+
+A rootless runner's images are kept apart (`.rootless`, and `:rootless` in a layer's parent key):
+its files are all its own, not the image's owners'.
+
+**On P2: what was swapped, and what stays.** P3 was written against a stand-in for P2's store;
+on top of P2 the provisioning key is P2's (`Store.KeyHasher`, P8's preimage: the image's manifest
+and whether its files are a rootless runner's as the parent, the script, the stable env in the
+container's order), and P3's own `layerKey` is gone. `ImageStore.ensure` ("the directory under
+key K, made by `make` once, under K's lock, published by rename") and `ImageStore.flatten` (an
+upper merged onto a hard-linked clone of its lower) stay: a provisioned rootfs is one whole tree
+with the image's ids, shared by every slot, while P2's layers belong to one slot's range of ids
+and stack as lowers, of which the sandbox idmaps only the lowest (the rootfs). It lives under
+`rootfs/`, not P2's `layers/`: there P2's `collect`, seeing a `.tmp-<key>` whose
+`keys/<key>.lock` nobody held, removed a provisioning under way. Provisioning becomes an
+ordinary keyed step once the sandbox can idmap more than one lower.
+
+What it does not do yet (debt, with the phase that pays it):
+
+- **No eviction.** Blobs, images and provisioned rootfs are kept for ever: P2's LRU under a byte
+  cap (`collect`) sees only `layers/`, and should cover `oci/` and `rootfs/` too.
+- **Each image is flattened whole.** Two images that share layers share their blobs on disk but
+  not their unpacked files. P2's stacked layers could keep layers apart.
+- **Layers are fetched one at a time**, and a broken download starts over. Parallel fetches are a
+  measured optimisation for later (P9's real workloads); ubuntu has one layer.
+- **zstd frame checksums are not checked** (std's streaming zstd cannot yet); the blob's digest is
+  checked before and the diff id after, which covers it.
+- **Rootless** (tests, the laptop): only root is mapped, so every file is the runner's,
+  directories keep their owner's write bit, an image whose `USER` is not root cannot run, and the
+  default image cannot be provisioned (dpkg gives files to other ids, `root:adm`, which fails with
+  `EINVAL`): such a job goes to Dagger unless `RUNNER_NATIVE_ROOTFS` is set. Phase 5's
+  subordinate ids pay this.
+- **The image's `WorkingDir` and `Entrypoint`** are not used: steps start in the workspace, as on
+  Dagger. Docker actions (phase 7) need the entrypoint.
+
+#### Measured (laptop "cowbird", balanced profile, 2026-11-01)
+
+A cold pull of the pinned `ubuntu:24.04` (one layer, 29.8 MB), ReleaseSafe, into an empty store,
+from Docker Hub over the same connection, three runs each. Native is `image.pull` (the opt-in test
+`ZIG_RUNNER_TEST_PULL=1`): the token, the index, the manifest, the config, the blob and unpacking.
+Dagger is a fresh engine container (v1.0.0-beta.21, empty cache, warmed with an unrelated
+`alpine` exec) timing `from(ubuntu:24.04@sha256:...) | withExec(true)` cold, less the same query
+warm (the CLI, the session and the exec: 0.41-0.59 s).
+
+| | native | Dagger |
+|---|---|---|
+| cold pull, whole | **2.10-2.46 s** | 4.45-4.70 s |
+| of which fetch and unpack | 1.59-1.96 s | |
+| warm (pinned, in the store) | 0-1 ms | |
+
+About twice as fast cold, and a pinned image already in the store costs no request at all.
+
+The exit, checked on a root runner: in CI (run 41317094266, GitHub's hosted runner as root, a
+debug build) a job with no operator rootfs pulled the default image natively (7.5 s), provisioned
+it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it (git 2.43, Python
+3.12, jq 1.7, Ubuntu 24.04.5), with no Dagger session. That test is opt-in
+(`ZIG_RUNNER_TEST_PULL=1`, root), as it needs Docker Hub and the Ubuntu archive.
+
 ### P4: cache volumes, trust scopes and cgroup memory accounting
 
 - Package cache volumes as host directories bound in, never part of a key (`Input.mounts`). The
   `repo` and `untrusted` scopes of `packageCacheScope` become separate directory trees. Dagger's
-  sharing modes are reimplemented with flock; the default stays shared.
+  sharing modes are reimplemented with flock; the default stays shared. The tool cache's volume
+  takes the place of the directory the base makes (`Backend.base`); what a step installs there is
+  then in no layer, so replay needs Dagger's check of the trees it found (#229, `Exec.tool_cache`).
 - Zig's local cache generations and the cache seed move over.
 - A cgroup v2 per job: `memory.max`, `memory.peak`, `memory.events`, `pids.max`. The admission
   gate (`admission.zig`) reads per-job working sets instead of the engine's cgroup. Rootless, this
@@ -315,13 +556,81 @@ per-job helper makes the namespaces and the static mounts once.
 - Exit: a runaway job is OOM-killed in its own cgroup without touching its neighbours. Measure:
   gate accuracy against the engine-wide reading.
 
+**Status: landed (behind the knob).** What it covers, as built:
+
+- `runner/src/native/volumes.zig` is the job's caches. The volumes are the Dagger backend's by
+  name, path and rule (`set_up.cachesUsed`: one per package manager the job names, the tool cache
+  always, Zig's package tarballs as `p/` under its global cache, Zig's local cache in `repo` only,
+  uv's environment inside uv's volume), as directories under the store at
+  `volumes/<owner>/<repository>/<scope>/<name>[/<image>][/runner]`, each part sanitized to a name
+  of its own. They are bound into every step and are never in a layer. The `repo` and `untrusted`
+  scopes (`set_up.packageCacheScope`) are separate trees. Each volume has an flock beside it
+  (`<volume>.lock`), held for the job: shared (Dagger's default, every volume's here), locked
+  (exclusive, jobs take turns) or private (exclusive when free, else a fresh copy of the job's
+  own, removed after it).
+- On a root runner a volume's files are owned on disk by a range of ids of their own, the one just
+  past the last slot's (`Backend.volumeIdBase`, which `idsClash` checks with the slots'), and each
+  step sees them as its own ids through an idmapped mount (`sandbox.bindVolumeIn`, a userns
+  mapping that range onto the job's), nosuid and nodev. A volume filled by one slot's job is the
+  next slot's, and a setuid file a job leaves in one is nobody's on the host. A missing mount point
+  is made owned by the job's root, as Dagger makes a cache mount's missing parents.
+- Zig's local cache rolls its generations with the Dagger backend's own script
+  (`set_up.zig_local_roll_script`), run in a sandbox of its own whose layer is dropped.
+- The Zig cache seed (minisign-verified releases, `Options.zig_seeds`) is built once per release,
+  architecture and step user, with the Dagger backend's script (the tarball checked against its
+  pinned sha256 before it runs), under a lock, in a sandbox without the job's volumes; its cache
+  is moved into `seeds/<arch>-<version>-<user>` with the directories above it as the rootfs has
+  them, its files owned as the image's files are and no setuid bit, and published by rename. It is an image layer
+  between the rootfs and the job's layers, seen through the job's ids as the rootfs is
+  (`sandbox.idmapLowers`), so a job's own writes to its global cache stay in its layers.
+- `runner/src/native/cgroup.zig` is the job's cgroup: `memory.max` (`RUNNER_NATIVE_MEMORY_MAX_MB`,
+  three quarters of `MemTotal` by default), `pids.max` (`RUNNER_NATIVE_PIDS_MAX`, 8192), and
+  `memory.peak`, `memory.events` and `pids.events` read back. Each step's helper joins it before
+  anything else (`sandbox.joinCgroup`), so every process of the step is born in it and the runner
+  never is. It is kept, empty, between steps, and killed (`cgroup.kill`) and removed when the job
+  ends, or by the sweep after a crash. When a step's processes were OOM-killed or refused a fork,
+  its log says so in an error line. Where it goes: `/sys/fs/cgroup/zig-runner` as root; the
+  runner's own delegated cgroup with `self` (the runner moves its processes into a `runner` leaf and
+  makes the jobs' under `jobs`, systemd's rule for delegation); a path; or none, rootless without
+  `self`, where the job runs as in P1 and "Set up job" says why.
+- The memory gate (`admission.zig`) is told of a native job's cgroup (`Gate.native`) and measures
+  the job there, from nothing, with the engine's own definition of a working set
+  (`workingSetMb`: `memory.current` less `inactive_file` and `slab_reclaimable`), so what it
+  learns of a job means the same on either backend. A native job is never measured beside another
+  (its cgroup is its own), its last sample is taken just before its cgroup goes
+  (`Gate.nativeDone`), and its reservation is left out of the engine's cap
+  (`Reservation.native_mb`). A native job without a cgroup is not measured, as a job without an
+  engine signal is not.
+- On P2's step store: the digest below a base (`Backend.belowKey`) holds the seeds' layers and
+  which binds are cache volumes, after the model's fields and only when the job has either, so a
+  stored layer is never replayed over a different seed and a job with neither keys as before (the
+  model's `belowTail`; P8's vectors gained `below-seed` and friends, the old ones unchanged). The
+  tool cache is the `toolcache` volume, keyed by the job's image as on Dagger; the base makes
+  `/opt/hostedtoolcache` only for a job with no volumes (#274). What a step installs there is in no
+  layer, so a stored step whose `$GITHUB_PATH` or `$GITHUB_ENV` points into it runs again instead
+  of replaying (`Exec.tool_cache`, `toolDirNotHeld`, #229): natively no tree is checked, so every
+  such record does.
+- Debt: volumes and seeds are never evicted (the engine's GC prunes Dagger's). P2's `collect`
+  walks only `layers/`, whose entries carry their size in `meta`; a volume has no size record, and
+  walking every volume at each job's end to learn one would cost more than the eviction saves. The
+  fix: a size written beside each volume when its job releases it (`<volume>.size`), a cap of its
+  own (`RUNNER_NATIVE_VOLUMES_MAX_MB`; the layers' 10 GiB would be gone in one Zig job), and
+  eviction least recently used first under the volume's lock taken exclusively and non-blocking, as
+  `evict` does for a layer. The tool cache's checked trees (`set_up.verifyToolTrees`) and the seed
+  registry's discovery from them are off natively: steps check the trees they use themselves, as on
+  Dagger without the check. A Dagger job that overlapped only native jobs is still learned as "beside
+  others", an upper bound (small; the gate's overlap marks are set before a job is known to be
+  native). Rootless runners without delegation have no limits (P5 must refuse untrusted jobs
+  there).
+
 ### P5: isolation for untrusted jobs
 
 P1 already gives each job on a root runner its own ids, its own network, pivot_root, masked
 /proc, Docker's capabilities, no_new_privs and a seccomp deny list ("Isolation" under P1). What
 remains before native steps may run jobs the runner does not vouch for:
 
-- Resource limits come with phase 4's cgroups; until then, no untrusted job.
+- Resource limits came with phase 4's cgroups; P5 must refuse an untrusted job on a runner where
+  the job would get no cgroup (a rootless runner without delegation, `RUNNER_NATIVE_CGROUP=none`).
 - Seccomp as Docker's allow list rather than its deny list.
 - The NAT and forwarding rules over nftables netlink instead of `iptables` (P1's debt).
 - Rootless: a userspace network stack for the job's network (the parts of pasta or slirp4netns it
@@ -381,6 +690,54 @@ untrusted job natively.
   the native store records the interleaved stream; `exec 2>&1` may become optional.
 - `Input.mounts` absent from the key holds by construction.
 - Exit: `proofs/README.md` and the Lean files name native functions where they named Dagger's.
+
+**Status: proved of P2's key format as P2 builds it (#268, with its review fixes in #272 at `28a9dd1`); the
+Zig check runs P2's own code: `Store.KeyHasher` and `Store.stableEnv` for keys, `Backend.belowKey`
+for the digest below a base, and `Store.treeDigestTo` on fixture trees for layer digests.**
+`proofs/Runner/Native.lean` is the native backend's refinement of the model, beside Dagger's rather
+than replacing it, since both backends ship (proofs/README.md, "On the native backend"):
+
+- **The key.** A key is sha256 of `keyPreimage`, as P2's `Store.KeyHasher` and `Backend.keyFor`
+  build it: a u64 tag (1 for a step's exec or a checkout's fetch, 0 for a base, 2 for an
+  output-keyed container), the parent's key, the script's text, the count and bindings of the stable
+  environment in the container's order (`Store.stableEnv`: the volatile names, `ZIG_RUNNER_EVENT`,
+  `ZIG_RUNNER_RAN`, `ZIG_RUNNER_MARK` and `ZIG_SECRET_*` dropped), then the uid, gid, working
+  directory and kept files, each field prefixed with its length as a u64 little-endian. A base has
+  no parent: in its place is the untagged digest below it (`Backend.below`: the store's format
+  `Store.store_format`, the trust scope, the repository, the rootfs's fingerprint, the userns mode,
+  the slot's first id, the binds). `fork_keys_apart`: a fork's pull request (scope `untrusted`) and
+  the repository's own jobs (`repo`) never ask the same key, so neither replays what the other
+  stored.
+  The extras are not new inputs: a step's are its job's, fixed with the base (`Format.stepExtra`), and a base's are part of what the
+  model's base is (`BaseSpec`). `encState_injective`, `belowPreimage_inj`, `encKey_injective` and
+  `native_key_iff`: the format keeps exactly what the model's key keeps, so P2 and P3 hold of it;
+  mounts and the event payload are no argument of it. `Ambiguous` is what plain concatenation would
+  cost.
+- **Replay.** The store records a success of an unmarked step and nothing else. Then every hit is
+  honest, succeeded and unmarked by construction, and `native_replay_eq_run` is P1 under
+  `Disciplined` alone: no `Numbered`, no `Ahead`, whatever other runners publish or evict between
+  steps, and whichever reads fail. `native_eq_dagger`: the two backends give the same answers.
+- **Concurrency.** Whole-entry operations in any order keep the store honest (`ops_keep_honest`);
+  which of two racing writers wins does not matter (`race_irrelevant`), so the flock per key is
+  about cost; an entry is read whole or is a miss (`readWhole_agrees`, `Torn`).
+- **Layer digests.** A sorted walk of what a later step can see, nothing that differs between runs:
+  `digest_deterministic` and `digest_injective`, which are what output keys need. `walk_injective`
+  proves it of P2's walk as written (`Store.treeDigest`: paths, modes, owners, xattrs, a file's
+  sha256, a link's target, a device's numbers, `..` after a directory), given one change P8 made
+  to it: the xattrs are now counted, since without the count the last xattr and the content after
+  it could not be told apart.
+- **Logs.** A store that records the one pipe the step writes to replays the run without
+  `exec 2>&1` (`Logs.native_replay`). The scripts keep it: one script for both backends.
+- **The tie to the code.** `keyoracle` (`proofs/KeyOracle.lean`) writes
+  `runner/src/native/testdata/step_keys.tsv`, `.github/scripts/key-vectors.sh` checks in the proofs
+  workflow that it is the model's, and `runner/src/native/key_vectors.zig` checks the preimages
+  (29 key vectors: steps, bases, the digest below a base; 4 layer vectors: modes, an xattr and a
+  symlink, an opaque directory, a whiteout) and the equal/differ relation against it.
+
+**What is left**: if P2's format changes, change `Native.encState` (and `keyPreimage`,
+`belowPreimage`, `walkPreimage`) and `KeyOracle.lean` to match, keep `Format.Sound` proved, and
+regenerate the vectors (`key-vectors.sh --write`). A format that sorts the environment, or drops a
+length, a count or a tag, fails the vectors on purpose.
 
 ### P9: Pi validation, then the decision
 
@@ -610,6 +967,216 @@ taught:
   reports its files' sizes as 0, so a read sized by `stat` (Zig's `readFileAlloc`) returns
   nothing, and `/proc/net/route` looked like a host with no default route; /proc files are now
   read to their end (`net.readProc`).
+
+### P2: the layer store, replay and GC
+
+What BuildKit's cache did implicitly, now explicit in `native/Store.zig`:
+
+- **The key is the runner's to get right.** BuildKit keyed an exec on its recipe; natively the
+  runner computes it, so the model's `Key` is now code (`KeyHasher.core`, in P8's format) and what
+  the model does not have (uid, working directory, kept files, the rootfs, the id range, the
+  binds' places) is listed beside it for P8 to add. The ran marker, the markers' secret and the
+  event were volatile variables under Dagger; natively they are plain variables, so the key must
+  leave them out by name, or every job would miss.
+- **A layer belongs to an id range.** On a root runner a layer's files are owned by its job's
+  host ids. Unlike the rootfs, which an idmapped mount shifts per slot, a stored layer is not
+  shifted: it is keyed by the slot's first id, which costs misses across slots (a pool's
+  concurrent jobs do not share layers) and keeps a job's files from appearing under another
+  range. An idmapped mount per stored layer would lift that; it is the helper's work.
+- **Masks are secrets for the cache.** A step that names a value an earlier step masked always
+  runs (`holdsSecret` counts masks), on native as on Dagger; the first replay test tripped on it.
+- **Publish must never replace, and a reader must never trust a half.** `RENAME_NOREPLACE` keeps a
+  concurrent or broken entry; an entry missing a part, or whose file commands lack their ran
+  marker, is a miss. Holding the new layer's shared lock before it is visible keeps an eviction
+  from taking it between the rename and the job's use.
+- **The store's mode is a security boundary.** Its layers hold job-written files owned by the
+  jobs' ids, setuid ones among them: at 0755 a host user could run one as the job's root's host id.
+  The store is 0700 (P1's job directories, under it, were exposed the same way).
+- **What the review found (after merge, fixed in a follow-up).** A fingerprint kept per process
+  by path missed a rootfs provisioned again in place: `tar -x` restores mtimes, so size and mtime
+  match; ctimes do not, and every job now checks the root and a stamp. Layers outlived runner
+  upgrades that change their meaning: the store's format is now in every key. A record that
+  could not be replayed was still published and then shadowed its key forever, every lookup
+  keeping it fresh: records are now checked at publish and on every hit, with sha256s in a
+  `meta`, and a broken entry is evicted. Nothing was synced before the rename that publishes,
+  so a crash could leave a whole-looking empty entry: `syncfs` first. A vouched fork's pull
+  request shared the trusted jobs' key space: its cache scope is now in the key. And walks that
+  stopped at depth 256 or skipped unreadable directories undercounted a layer: they now have no
+  depth limit and fail closed. Lesson: an entry in a cache shared between jobs is input the next
+  job trusts, so every way it can be partial, stale or someone else's has to be in its key or
+  checked on read.
+- **Dagger's replay limit is not ours.** Dagger replays a step past 4 MiB of output with a warning
+  instead of its log; natively such a step is not published and runs again.
+
+Surprises:
+
+- The boundary held: replay is one `Exec.collect` call with an answer built as values (a log need
+  not be UTF-8, so no JSON round trip), and the shared code cannot tell it from Dagger's.
+- `lgetxattr` on `/proc/self/fd/N` reads the magic link's xattrs, not the directory's; through
+  `/proc/self/fd/N/.` it reads the directory's.
+- Flattening needs no copies and no `mknod`: whiteouts are hard-linked from the layer that has
+  them, which also works rootless.
+
+Measured against Dagger: a replayed step 0.37 ms against ~95 ms, about 250 times faster.
+
+### P3: the image pull
+
+What Dagger (BuildKit and containerd under it) did implicitly, now explicit in `native/oci/`:
+
+- **The platform.** BuildKit picks the image of an index for the engine's platform without being
+  asked. Natively the pick is ours, and an index lists attestations as manifests of platform
+  `unknown/unknown`, which a careless "first linux one" could have taken for the image.
+- **Where an extracted path may land.** containerd's archive code walks every path inside the
+  rootfs. A plain tar extractor writing as root would follow `etc -> /etc` planted by one entry
+  when writing the next, and a hard link to `../../etc/shadow` would link the host's file in.
+  `RESOLVE_IN_ROOT` gave the right semantics in one flag: absolute symlinks inside the image
+  (usrmerge's `/bin -> usr/bin`) work, and nothing reaches out.
+- **Overlay's metadata in a layer used as a lower.** BuildKit's snapshotter keeps layers apart.
+  Flattening an overlay upper (provisioning) meant reading overlay's own records: whiteouts as
+  0/0 character devices, opaque directories as `trusted.overlay.opaque` (root) or
+  `user.overlay.opaque` (`userxattr`), and overlay's xattrs left on files that would mislead
+  overlay when the result is a lower. An image's own `trusted.*` and `user.overlay.*` xattrs are
+  refused for the same reason.
+- **Owners per range.** Dagger's layers belong to the engine. A root runner's provisioning layer
+  belongs to the job's range of host ids; it is shifted back to the image's ids before it is
+  shared, or the next job (another slot, another range) would see every file owned by nobody.
+
+Surprises:
+
+- **std 0.17's HTTP client never sends `privileged_headers`**, the headers meant to be dropped on
+  a redirect to another host, and keeps `headers.authorization` across such a redirect. The first
+  test against a token-auth registry failed because the token never left; using
+  `headers.authorization` instead would have sent it to the blob's CDN. Redirects are followed by
+  hand, and the token goes to the registry's own origin only; a test registry's CDN route refuses
+  any request that carries one.
+- **std's zstd decoder panics when asked to verify a frame checksum while streaming** ("TODO all
+  those bytes written needed to go through the hasher too"). The digests cover it.
+- **Zig 0.17 removed `**` array repetition**; `@splat` in a container's constant does the same at
+  compile time.
+- **Rootless provisioning cannot work with one id.** apt cannot drop to `_apt` to download (its
+  methods exit 112), and once told to download as root, dpkg's `chown root:adm` fails. A rootless
+  runner without the operator's rootfs sends default-image jobs to Dagger, rather than failing
+  them where P1 sent them to Dagger. And apt's own last line ("dpkg returned an error code") says
+  nothing: a failed provisioning now reports its last eight lines.
+- The pull is not where the time goes: cold, about 0.5 s of auth and manifests and 1.6-2 s of
+  fetch and unpack for ubuntu, against Dagger's 4.5 s. Provisioning (apt) is the minute, and it
+  now runs once per store, as Dagger's cached exec did once per engine.
+- **Two stores in one directory need one owner per subdirectory.** On top of P2, provisioning
+  under `layers/` was P2's to collect: its `.tmp-<key>`, with no `keys/<key>.lock` held, looked
+  like a dead publisher's and was removed while apt ran. Provisioned rootfs now live under
+  `rootfs/`, which P2's GC never walks.
+
+Measured against Dagger: a cold pull of `ubuntu:24.04` 2.1-2.5 s against 4.5-4.7 s, about twice as
+fast; warm, a pinned image costs nothing.
+
+### P4: cache volumes, trust scopes and cgroup memory accounting
+
+What Dagger did implicitly, now explicit in `native/`:
+
+- **A cache volume is not the job's ids.** The engine owned its volumes and gave each mount the
+  owner it was asked for; natively, each job's ids are its slot's, so a directory filled by slot 0
+  is nobody's to slot 1. The volumes are owned by a range of their own and seen through an
+  idmapped mount per step, the same mechanism as the rootfs with a different map (`inside` ids
+  starting at the volumes' range, outside the job's). Host ids would have been simpler and wrong:
+  a setuid-root file a job left in a volume would have been a real one on the host.
+- **The seed's isolation came from the engine's recipe cache.** Dagger built the seed by its recipe
+  and mounted it as a directory whose writes went with the container. Natively that is a layer:
+  built by trusted inputs only, its owners rewritten to the image's and setuid bits cleared before
+  it is published, and stacked under the job's layers so the job's writes copy up into its own.
+- **Dagger's mount points.** BuildKit makes a cache mount's missing parents as root. The sandbox
+  does the same, owned by the job's root (the helper is still the host's root when it binds, so it
+  chowns what it makes).
+- **The engine's one cgroup was the gate's only view.** It charged every job running for all of
+  them; per-job cgroups give each job its own working set, and the gate reads a native job's with
+  the same definition, so learned estimates mean the same across backends.
+
+Surprises:
+
+- **The cgroup is the host's, like the slots.** P1's rule ("ask whether the kernel object is per
+  store or per host") applied at once: the jobs' cgroups live in one host-wide tree, named by the
+  job's random directory, and removed only by the runner that holds the job's lock.
+- **Delegation cannot be detected reliably.** systemd marks delegated cgroups with a
+  `trusted.delegate` xattr, but the user manager does not (Ubuntu 24.04's systemd: no xattr on a
+  `Delegate=yes` user scope), and a rootless runner can write its whole user@ subtree whether it
+  was delegated or not. So delegation is opt-in (`RUNNER_NATIVE_CGROUP=self`), not guessed:
+  guessing would have moved, for example, an editor's every process into a leaf of its scope.
+- **A cgroup that gives its children controllers holds no process.** `self` has to move the
+  runner (and whatever else shares its cgroup) into a leaf before enabling the memory and pids
+  controllers: the same dance systemd documents and Docker-in-Docker does at a container's root.
+- **`zig build test` does not pass the environment to the tests.** A variable the tests read
+  (`ZIG_RUNNER_TEST_CGROUP`) reaches them through `.github/scripts/zig-test.sh` (the compiler
+  directly), not through the build system, which is how CI already runs them.
+- **Bash's `-e`** ends a step at the OOM-killed command, so a test that wants to see the exit code
+  says `|| echo exit=$?`; the step's log carries the runner's own line about the limit either way.
+
+Measured (laptop "cowbird", rootless in a delegated `systemd-run --user --scope`): two overlapping
+native jobs each holding 300 MB, the second starting 3 s into the first. The gate learned **304
+MB and 305 MB** from each job's own cgroup; the engine-wide reading (the jobs' parent cgroup, read
+as the engine's is) charged the first job **610 MB**, both jobs' memory, and the second 306 MB. That
+is razorbill's soak in miniature (1.7 GB learned for a job that takes about 0.9 GB alone). CI's
+root pass (GitHub's hosted runner, `/sys/fs/cgroup/zig-runner-test`) measured the same: 304 and 304
+MB own, 609 and 304 MB engine-wide. A runaway job capped at 256 MB was OOM-killed (exit 137) in its
+own cgroup while its neighbour held 200 MB untouched, and a fork bomb capped at 64 processes was
+refused 125 forks there and the job went on. A cap near the size of the step's own shell and helper
+is a trap: at 64 MB the root pass's kernel killed the shell with the hog.
+
+### P8: remapping the proofs
+
+Written against P2's specification while P2 was being built, so what it taught is about the
+specification:
+
+- **What BuildKit discharged is three obligations, not one.** "The key is computed from exactly
+  what the model says" splits into: the preimage is unambiguous (every field length-prefixed, a
+  count before the environment, a tag per kind of container), the environment keeps the order the
+  step sees, and the script text tells apart the scripts the model does. The last was always
+  assumed under Dagger too, and unstated; the first is new, and plain concatenation fails it with a
+  four-byte example (`Ambiguous`: script `x` with `Y=1`, and script `xY=1` with nothing).
+- **Not storing what cannot be replayed removes the model's bookkeeping.** `Build` needs `Numbered`
+  and `Ahead` because the engine records marked steps and failures, and the proof has to show
+  nothing ever finds them. A store that publishes only successes of unmarked steps never holds
+  them, so native P1 needs `Disciplined` and nothing else. It also keeps a marked step's log, which
+  may hold a secret, off the store's disk, which P0 asked for.
+- **The flock is for cost, not correctness.** Two honest entries for one unmarked key are equal
+  under `Disciplined`, so which racing writer wins does not matter. What correctness needs is that
+  the store changes by whole entries (one rename) and that a reader treats a missing or short part
+  as a miss: either one alone closes torn reads, and an eviction part-way is the same case as a
+  write part-way.
+- **Comparing the walk byte for byte found an ambiguity.** P2's layer walk wrote an entry's xattrs
+  with no count before them, so where the last xattr ends and the content begins was not in the
+  bytes: a symlink's target is a field just as an xattr's name is. The proof of `walk_injective`
+  could not go through without it, and two different layers could have shared a digest, which output
+  keys would have taken for early cutoff. The fix was one count. Nothing asked for a layer digest
+  yet, so no stored digest changed meaning; the rootfs's fingerprint, the same walk, changed once,
+  which costs one round of misses.
+- **What P2 hashes beyond the model added no input to it.** P2's key carries the uid, gid, working
+  directory and kept files, and the digest below a base (store format, rootfs, id mapping, slot,
+  binds). Each is
+  either part of what the model's base is or fixed with it for every step of the job, so the proof
+  needed a richer `Format`, not a richer model: the base became a `BaseSpec` and a step's extras its
+  base's (`stepExtra`). One consequence worth knowing: when the event payload is too large for a
+  variable, P2 writes it as a kept file of the base, so the base and every key above it are per run.
+  That costs only misses. The store's format, which P2 put below every base after review, is the
+  format version P8 asked for: it makes every key new when what a layer means changes, and the
+  rootfs's fingerprint is an opaque atom to the model however P2 computes it.
+- **The stable environment is a predicate, and the model never needed it to be `volatile_env`.**
+  P2 also drops the runner's own per-job variables and the secret aliases (`Store.stableEnv`); the
+  model's `vol` is any predicate, so nothing changed but the vectors.
+- **Some entries no one can ask for.** With output keys off for a marked step, every step after it
+  starts from a container whose key names the job, so its entry, though honest, can only ever be
+  found by that job. Publishing it is safe and useless; P2 may skip it.
+- **A miss is always safe, and the proof says why in one line**: every invariant is "every entry
+  that is there is honest", which removing entries or failing a read cannot break. LRU eviction and
+  a read cut short need no argument of their own.
+- **The layer digest must hash namespace ids, not host ids.** P1 gives each slot its own range of
+  host ids, so the same layer written in two slots has different owners on the host. Hashing those
+  would make the digest, which is part of a step's output, differ between runs: no early cutoff,
+  and `Disciplined` false in letter. The same holds of times and inodes, and of the order readdir
+  returns. Whiteouts must be in the walk, or a layer that deletes a file has the digest of one that
+  does not.
+- **`exec 2>&1` is now Dagger's need only.** The native helper already gives the step one pipe for
+  both streams (`dup2(1, 2)` before `execve` in `sandbox.zig`), so a store that records that pipe
+  replays the run without merging. The script keeps the line because both backends run the same
+  script, and its text is in the key.
 
 ### P5: Docker's allow list, the rules over netlink
 
