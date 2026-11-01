@@ -368,7 +368,7 @@ pub fn publish(
     }
     var m: Meta = .{
         .kind = kind,
-        .bytes = treeBytes(arena, io, upper),
+        .bytes = try treeBytes(arena, io, upper),
         .log_len = rec.log.len,
         .fc_len = rec.fc.len,
         .log_sha = undefined,
@@ -530,24 +530,56 @@ pub fn sameFile(arena: Allocator, f: std.Io.File, p: []const u8) bool {
 pub fn removeTree(arena: Allocator, io: std.Io, p: []const u8) void {
     const cwd = std.Io.Dir.cwd();
     cwd.deleteTree(io, p) catch {
-        chmodDirs(arena, io, p, 0);
+        chmodDirs(arena, io, p);
         cwd.deleteTree(io, p) catch |e|
             std.log.warn("native: cannot remove {s}: {s}", .{ p, @errorName(e) });
     };
 }
 
-fn chmodDirs(arena: Allocator, io: std.Io, p: []const u8, depth: u32) void {
-    if (depth > max_depth) return;
+/// Every directory under `p` given its owner's permissions, top down, with no limit on depth: a
+/// directory is opened only once the ones above it are searchable again.
+fn chmodDirs(arena: Allocator, io: std.Io, p: []const u8) void {
     const z = arena.dupeSentinel(u8, p, 0) catch return;
     _ = linux.chmod(z, 0o700);
-    var dir = std.Io.Dir.cwd().openDir(io, p, .{ .iterate = true, .follow_symlinks = false }) catch
-        return;
-    defer dir.close(io);
-    var it = dir.iterate();
-    while (it.next(io) catch null) |e| {
-        if (e.kind != .directory) continue;
-        chmodDirs(arena, io, join(arena, p, e.name) catch return, depth + 1);
+    const root = openRoot(arena, p) catch return;
+    defer _ = linux.close(root);
+    var stack: std.ArrayList([]const u8) = .empty;
+    stack.append(arena, "") catch return;
+    while (stack.pop()) |rel| {
+        const fd = if (rel.len == 0) root else openRel(arena, root, rel) catch continue;
+        defer if (fd != root) {
+            _ = linux.close(fd);
+        };
+        const nodes = listDir(arena, io, fd) catch continue;
+        for (nodes) |n| {
+            if (n.kind() != linux.S.IFDIR) continue;
+            _ = linux.fchmodat(fd, n.name, 0o700);
+            const sub = if (rel.len == 0)
+                arena.dupe(u8, n.name) catch return
+            else
+                std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, n.name }) catch return;
+            stack.append(arena, sub) catch return;
+        }
     }
+}
+
+/// The directory `rel` under `root`, through no symlink: in one call, or a component at a time when
+/// the path is past the kernel's limit (a step can nest directories deeper than PATH_MAX).
+fn openRel(arena: Allocator, root: linux.fd_t, rel: []const u8) !linux.fd_t {
+    if (rel.len < linux.PATH_MAX) {
+        if (openDirAt(root, try arena.dupeSentinel(u8, rel, 0))) |fd| return fd else |_| {}
+    }
+    var fd = root;
+    var parts = std.mem.splitScalar(u8, rel, '/');
+    while (parts.next()) |part| {
+        const next = openDirAt(fd, try arena.dupeSentinel(u8, part, 0)) catch |e| {
+            if (fd != root) _ = linux.close(fd);
+            return e;
+        };
+        if (fd != root) _ = linux.close(fd);
+        fd = next;
+    }
+    return fd;
 }
 
 const max_depth = 256;
@@ -614,34 +646,32 @@ fn openRoot(arena: Allocator, p: []const u8) !linux.fd_t {
     return openDirAt(linux.AT.FDCWD, try arena.dupeSentinel(u8, p, 0));
 }
 
-/// The bytes a tree takes on disk, each inode counted once.
-pub fn treeBytes(arena: Allocator, io: std.Io, p: []const u8) u64 {
-    const fd = openRoot(arena, p) catch return 0;
-    defer _ = linux.close(fd);
+/// The bytes a tree takes on disk, each inode counted once, with no limit on depth. An error when
+/// any directory of it cannot be read: a count that left part out would let the store pass its
+/// cap, so such a layer is not published.
+pub fn treeBytes(arena: Allocator, io: std.Io, p: []const u8) !u64 {
+    const root = try openRoot(arena, p);
+    defer _ = linux.close(root);
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-    return bytesIn(arena, io, fd, &seen, 0);
-}
-
-fn bytesIn(
-    arena: Allocator,
-    io: std.Io,
-    fd: linux.fd_t,
-    seen: *std.AutoHashMapUnmanaged(u64, void),
-    depth: u32,
-) u64 {
-    if (depth > max_depth) return 0;
+    var stack: std.ArrayList([]const u8) = .empty;
+    try stack.append(arena, "");
     var total: u64 = 0;
-    const nodes = listDir(arena, io, fd) catch return 0;
-    for (nodes) |n| {
-        if (n.st.nlink > 1) {
-            const got = seen.getOrPut(arena, n.st.ino) catch continue;
-            if (got.found_existing) continue;
+    while (stack.pop()) |rel| {
+        const fd = if (rel.len == 0) root else try openRel(arena, root, rel);
+        defer if (fd != root) {
+            _ = linux.close(fd);
+        };
+        for (try listDir(arena, io, fd)) |n| {
+            if (n.st.nlink > 1 and n.kind() != linux.S.IFDIR) {
+                if ((try seen.getOrPut(arena, n.st.ino)).found_existing) continue;
+            }
+            total += n.st.blocks * 512;
+            if (n.kind() != linux.S.IFDIR) continue;
+            try stack.append(arena, if (rel.len == 0)
+                try arena.dupe(u8, n.name)
+            else
+                try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, n.name }));
         }
-        total += n.st.blocks * 512;
-        if (n.kind() != linux.S.IFDIR) continue;
-        const sub = openDirAt(fd, n.name) catch continue;
-        defer _ = linux.close(sub);
-        total += bytesIn(arena, io, sub, seen, depth + 1);
     }
     return total;
 }
@@ -1333,4 +1363,35 @@ test "native store: a record that cannot be replayed is refused, and a broken en
     try tmp.dir.writeFile(io, .{ .sub_path = log_path, .data = "a who" });
     s.collect(arena, io);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, log_path, .{}));
+}
+
+test "native store: a tree's walk has no depth limit, and fails closed on what it cannot read" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // 300 levels, past the old limit of 256, with a file at the bottom and the deepest
+    // directories taken every permission from.
+    var rel: std.ArrayList(u8) = .empty;
+    try rel.appendSlice(arena, "deep");
+    for (0..300) |_| try rel.appendSlice(arena, "/d");
+    try tmp.dir.createDirPath(io, rel.items);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(arena, "{s}/f", .{rel.items}),
+        .data = &@as([8192]u8, @splat('x')),
+    });
+    const deep = try tmp.dir.realPathFileAlloc(io, "deep", arena);
+    try std.testing.expect(try treeBytes(arena, io, deep) >= 8192);
+    // Rootless, a directory it cannot open fails the count (root reads it anyway).
+    const bottom = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{
+        try tmp.dir.realPathFileAlloc(io, ".", arena),
+        rel.items,
+    }, 0);
+    _ = linux.chmod(bottom, 0);
+    if (linux.geteuid() != 0) try std.testing.expect(std.meta.isError(treeBytes(arena, io, deep)));
+    // Removed whole all the same.
+    removeTree(arena, io, deep);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "deep", .{}));
 }

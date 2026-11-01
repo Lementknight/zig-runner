@@ -2749,7 +2749,7 @@ test "native step cache: measured, replay per step and the store's size over 50 
     }
     std.debug.print("native bench: store after 50 jobs: {d} layers, {d} KiB\n", .{
         try storeLayers(arena, c.cfg.store),
-        Store.treeBytes(arena, io, layers) / 1024,
+        (try Store.treeBytes(arena, io, layers)) / 1024,
     });
 }
 
