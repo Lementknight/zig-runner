@@ -36,7 +36,7 @@ pub fn isSha(s: []const u8) bool {
 /// secret holding the job's GITHUB_TOKEN, sent as GitHub expects a token over HTTPS (user
 /// `x-access-token`), so private repositories can be checked out, as actions/checkout does. The
 /// time checked-out files get: 2000-01-01 00:00 UTC (see `query`).
-const mtime: i64 = 946684800;
+pub const mtime: i64 = 946684800;
 
 pub fn query(
     arena: Allocator,
@@ -138,8 +138,8 @@ pub fn log(arena: Allocator, f: Fetched) ![]const []const u8 {
     try out.append(arena, "##[group]Fetching the repository");
     try out.append(
         arena,
-        try std.fmt.allocPrint(arena, "Fetched {s} with Dagger's git support (the runner's " ++
-            "built-in checkout replaces actions/checkout)", .{f.url}),
+        try std.fmt.allocPrint(arena, "Fetched {s} with {s} (the runner's " ++
+            "built-in checkout replaces actions/checkout)", .{ f.url, f.fetched_with }),
     );
     const kind: []const u8 = if (isSha(f.want)) "Commit" else "Ref";
     try out.append(arena, try std.fmt.allocPrint(arena, "{s}: {s}", .{ kind, f.want }));
@@ -258,30 +258,9 @@ pub fn fetch(
     co: job_mod.Checkout,
     auth: ?[]const u8,
 ) !Fetched {
-    const repo = co.repository orelse job.github.repository;
-    const ws = try jobWorkspace(arena, job);
-    const mount = if (co.path) |pth|
-        try std.fmt.allocPrint(arena, "{s}/{s}", .{ ws, std.mem.trim(u8, pth, "/") })
-    else
-        ws;
-    const want = co.ref orelse (if (co.repository == null) job.github.sha else "HEAD");
-    const label = if (isSha(want)) want[0..7] else want;
-    const git_ref = gitRef(co, job);
-    var f: Fetched = .{
-        .result = .{ .failed = "" },
-        .repo = repo,
-        .ref_label = label,
-        .mount = mount,
-        .git_ref = git_ref,
-        .url = try std.fmt.allocPrint(
-            arena,
-            "{s}/{s}",
-            .{ std.mem.trimEnd(u8, job.github.server_url, "/"), repo },
-        ),
-        .want = want,
-        .depth = co.fetch_depth,
-        .tags = co.fetch_tags,
-    };
+    var f = try describe(arena, job, co);
+    const repo = f.repo;
+    const label = f.ref_label;
 
     const doc = switch (try query(arena, job, co, auth)) {
         .err => |msg| {
@@ -304,6 +283,35 @@ pub fn fetch(
             "the job's own repository; another private one cannot be checked out)" else "",
     }) };
     return f;
+}
+
+/// What a checkout fetches and where it goes, before anything is fetched: the `Fetched` with its
+/// result still to be set. Shared with the native backend's checkout (`Backend.fetchCheckout`).
+pub fn describe(arena: Allocator, job: job_mod.Job, co: job_mod.Checkout) !Fetched {
+    const repo = co.repository orelse job.github.repository;
+    const ws = try jobWorkspace(arena, job);
+    const mount = if (co.path) |pth|
+        try std.fmt.allocPrint(arena, "{s}/{s}", .{ ws, std.mem.trim(u8, pth, "/") })
+    else
+        ws;
+    const want = co.ref orelse (if (co.repository == null) job.github.sha else "HEAD");
+    const label = if (isSha(want)) want[0..7] else want;
+    const git_ref = gitRef(co, job);
+    return .{
+        .result = .{ .failed = "" },
+        .repo = repo,
+        .ref_label = label,
+        .mount = mount,
+        .git_ref = git_ref,
+        .url = try std.fmt.allocPrint(
+            arena,
+            "{s}/{s}",
+            .{ std.mem.trimEnd(u8, job.github.server_url, "/"), repo },
+        ),
+        .want = want,
+        .depth = co.fetch_depth,
+        .tags = co.fetch_tags,
+    };
 }
 
 /// The ref the checkout is named by (`git_ref`): the one asked for unless it is a commit, else for

@@ -30,6 +30,9 @@ pub const JsRuntime = enum { bun, node };
 pub const StepUser = enum { runner, root };
 /// How jobs reach the Dagger engine: directly (`engine.zig`), or through a `dagger run` child.
 pub const EngineMode = enum { direct, cli };
+/// What runs a job's steps: the Dagger engine, or the runner itself where it can
+/// (docs/native-backend.md), each job it cannot run going to Dagger.
+pub const StepBackend = enum { dagger, native };
 /// The Zig release a Zig global-cache seed is built with (`RUNNER_ZIG_SEED=<version>=<sha256>`):
 /// its version and the sha256 of its tarball for the engine host's architecture, from
 /// https://ziglang.org/download/index.json.
@@ -78,6 +81,14 @@ pub const Config = struct {
     step_cache: bool = true,
     /// Who steps run as in the default image (`RUNNER_STEP_USER`).
     step_user: StepUser = .runner,
+    /// What runs steps (`RUNNER_BACKEND`): Dagger, or the native backend with Dagger for the jobs
+    /// it cannot run yet.
+    backend: StepBackend = .dagger,
+    /// The native backend's rootfs, the default image provisioned (`RUNNER_NATIVE_ROOTFS`), and
+    /// where jobs' layers go while they run (`RUNNER_NATIVE_STORE`; "" for the default,
+    /// `nativeStore`).
+    native_rootfs: []const u8 = "",
+    native_store: []const u8 = "",
     /// Experimental: key the steps after one that always runs on what it produced rather than on
     /// the step itself (see `dagger.Options.output_keys`).
     output_keys: bool = false,
@@ -168,6 +179,7 @@ pub const Config = struct {
         InvalidNumber,
         InvalidJsRuntime,
         InvalidStepUser,
+        InvalidBackend,
         InvalidEngine,
         InvalidBool,
         InvalidZigSeed,
@@ -258,6 +270,9 @@ pub const Config = struct {
         if (environ.get("RUNNER_PACKAGE_CACHES")) |v| c.package_caches = try boolean(v);
         if (environ.get("RUNNER_STEP_CACHE")) |v| c.step_cache = try boolean(v);
         if (environ.get("RUNNER_STEP_USER")) |v| c.step_user = try stepUser(v);
+        if (environ.get("RUNNER_BACKEND")) |v| c.backend = try stepBackend(v);
+        if (environ.get("RUNNER_NATIVE_ROOTFS")) |v| c.native_rootfs = v;
+        if (environ.get("RUNNER_NATIVE_STORE")) |v| c.native_store = v;
         if (environ.get("RUNNER_OUTPUT_KEYS")) |v| c.output_keys = try boolean(v);
         if (environ.get("RUNNER_ENFORCE_VOLATILE")) |v| c.enforce_volatile = try boolean(v);
         if (environ.get("RUNNER_LOG_SPOOL_DIR")) |v| c.log_spool_dir = v;
@@ -322,6 +337,9 @@ pub const Config = struct {
         else if (eq(key, "package-caches")) c.package_caches = try boolean(val) //
         else if (eq(key, "step-cache")) c.step_cache = try boolean(val) //
         else if (eq(key, "step-user")) c.step_user = try stepUser(val) //
+        else if (eq(key, "backend")) c.backend = try stepBackend(val) //
+        else if (eq(key, "native-rootfs")) c.native_rootfs = val //
+        else if (eq(key, "native-store")) c.native_store = val //
         else if (eq(key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache")) c.zig_local_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache-max-mb")) c.zig_local_cache_max_mb = try num(u32, val) //
@@ -374,6 +392,25 @@ pub const Config = struct {
 
     fn stepUser(s: []const u8) error{InvalidStepUser}!StepUser {
         return std.meta.stringToEnum(StepUser, s) orelse error.InvalidStepUser;
+    }
+
+    fn stepBackend(s: []const u8) error{InvalidBackend}!StepBackend {
+        return std.meta.stringToEnum(StepBackend, s) orelse error.InvalidBackend;
+    }
+
+    /// Where the native backend keeps jobs' layers: `native_store`, else under /var/lib for root
+    /// and the user's cache directory otherwise.
+    pub fn nativeStore(
+        c: *const Config,
+        arena: std.mem.Allocator,
+        environ: *const std.process.Environ.Map,
+    ) ![]const u8 {
+        if (c.native_store.len > 0) return c.native_store;
+        if (std.os.linux.geteuid() == 0) return "/var/lib/zig-runner/native";
+        if (environ.get("XDG_CACHE_HOME")) |d| if (d.len > 0)
+            return std.fmt.allocPrint(arena, "{s}/zig-runner/native", .{d});
+        const home = environ.get("HOME") orelse "/tmp";
+        return std.fmt.allocPrint(arena, "{s}/.cache/zig-runner/native", .{home});
     }
 
     /// `<version>=<sha256>`, or empty for none. Both go into a URL and a shell script, so only a

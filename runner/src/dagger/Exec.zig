@@ -49,6 +49,7 @@ const bun_load_errors = @import("../dagger.zig").bun_load_errors;
 const busybox_image = @import("../dagger.zig").busybox_image;
 const default_image = @import("../dagger.zig").default_image;
 const max_recorded_bytes = @import("../dagger.zig").max_recorded_bytes;
+const Backend = @import("../native/Backend.zig");
 
 const Exec = @This();
 
@@ -170,6 +171,9 @@ forward_prelude: []const u8 = "",
 /// the job's own `run:` steps use them, not a composite action's.
 default_shell: ?[]const u8 = null,
 default_working_directory: ?[]const u8 = null,
+/// The job runs on the native backend: each exec goes there instead of to Dagger
+/// (`Backend.execScript`), and so do reads of the container's files.
+native: ?*Backend = null,
 
 pub const RunningService = struct {
     name: []const u8,
@@ -269,6 +273,8 @@ pub fn execScript(
     secret_env_in: []const SecretRef,
     mounts: []const Mount,
 ) !Out {
+    // A checkout's tree is already in the native layers (`Backend.fetchCheckout`): no mounts.
+    if (x.native) |b| return b.execScript(x, num, fc, resolved_in, action_name, secret_env_in);
     const arena = x.arena;
     // What the runner adds for the step, apart from its secrets: the variables earlier steps
     // set, which the container before this step lacks, and the mounts. `outputKeyed` reuses
@@ -379,7 +385,7 @@ const ScriptRun = struct {
 /// Secret variables are for scripts only; they reach them through aliases (`secretAlias`). With
 /// `id-token: write`, every step can request OIDC tokens, as on GitHub (`curl
 /// "$ACTIONS_ID_TOKEN_REQUEST_URL"` in a script, `core.getIDToken()` in an action).
-fn resolveRunStep(
+pub fn resolveRunStep(
     x: *Exec,
     resolved_in: Resolved,
     secret_env_in: []const SecretRef,
@@ -644,7 +650,7 @@ fn warnMatcher(x: *Exec, num: u32, comptime fmt: []const u8, args: anytype) void
     x.sh.warnUnlocked(num, text);
 }
 
-fn loadPendingMatchers(x: *Exec, num: u32) void {
+pub fn loadPendingMatchers(x: *Exec, num: u32) void {
     const pending = x.sh.takePendingMatchers();
     if (pending.len == 0) return;
     // All the files in one query. One that cannot be read fails it all; each is then read on
@@ -672,7 +678,7 @@ fn loadPendingMatchers(x: *Exec, num: u32) void {
 /// The contents of each of `paths` in the job's container, in one query; null when that
 /// failed, and for a single path (`readMatcherFile` reads it).
 fn readMatcherFiles(x: *Exec, paths: []const []const u8) ?[]const []const u8 {
-    if (paths.len < 2) return null;
+    if (paths.len < 2 or x.native != null) return null;
     const arena = x.arena;
     var q: Query = .init(arena);
     q.call("loadContainerFromID", .{ .id = x.container_id }) catch return null;
@@ -696,6 +702,7 @@ fn readMatcherFiles(x: *Exec, paths: []const []const u8) ?[]const []const u8 {
 
 /// The contents of `path` in the job's container; null when it could not be read.
 fn readMatcherFile(x: *Exec, path: []const u8) ?[]const u8 {
+    if (x.native) |b| return b.readFile(path);
     var q: Query = .init(x.arena);
     q.call("loadContainerFromID", .{ .id = x.container_id }) catch return null;
     q.call("file", .{ .path = path }) catch return null;
@@ -1047,7 +1054,9 @@ pub fn logSetUp(x: *Exec, opts: Options) !void {
     } else |_| {}
     x.setUpLine("##[group]Runner Image");
     x.setUpLine(try std.fmt.allocPrint(arena, "Image: {s}", .{x.job_image}));
-    x.setUpLine(if (opts.engine) |ep|
+    x.setUpLine(if (x.native != null)
+        "Engine: native (namespaces, overlayfs and chroot in the runner)"
+    else if (opts.engine) |ep|
         try std.fmt.allocPrint(
             arena,
             "Engine: Dagger {s}, direct session ({s})",
