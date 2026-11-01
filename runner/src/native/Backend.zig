@@ -34,6 +34,8 @@ gpa: Allocator,
 /// mount points, its lock and its network namespace. Removed when the job ends.
 dir: []const u8,
 rootfs: []const u8,
+/// `Config.images`: Docker actions' images (`docker_action.zig`).
+images: []const u8 = "",
 binds: []const sandbox.Spec.Bind,
 /// Held while the job runs (`lock`): a directory whose lock is free is stale (`sweep`).
 lock: std.Io.File,
@@ -64,6 +66,9 @@ pub const Config = struct {
     rootfs: []const u8 = "",
     /// Where jobs' layers live while they run (`RUNNER_NATIVE_STORE`).
     store: []const u8 = "",
+    /// Docker actions' images, one directory per reference (`RUNNER_NATIVE_IMAGES`,
+    /// `images.zig`); "" for none, which sends `docker://` steps to Dagger.
+    images: []const u8 = "",
     /// This binary, which runs each step's sandbox (`sandbox.command`).
     self_exe: []const u8 = "",
     /// The runner vouches for the job (`trust.vouches`): native steps run only in such jobs.
@@ -107,6 +112,7 @@ pub fn configFor(
     return .{
         .rootfs = cfg.native_rootfs,
         .store = try cfg.nativeStore(arena, environ),
+        .images = cfg.native_images,
         .self_exe = std.process.executablePathAlloc(io, arena) catch "",
         .vouched = vouched,
         .rootless = cfg.native_rootless,
@@ -160,7 +166,8 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
         "runner)";
     for (job.steps) |step| switch (step.action) {
         .uses => return "`uses:` actions are not native yet (phase 7)",
-        .docker => return "`docker://` steps are not native yet (phase 7)",
+        // Native when their image is in the native store (`docker_action.unsupported`).
+        .docker => {},
         .checkout => |inputs| for (inputs) |in| {
             if (!std.mem.eql(u8, in.name, "submodules")) continue;
             const lit = switch (in.value) {
@@ -429,6 +436,7 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
         .gpa = gpa,
         .dir = dir,
         .rootfs = cfg.rootfs,
+        .images = cfg.images,
         .binds = cfg.binds,
         .lock = lock,
         .how = how,
@@ -553,7 +561,7 @@ pub fn idsNote(b: *const Backend, arena: Allocator) ![]const u8 {
 }
 
 /// The first of the 65536 host ids the job's slot maps.
-fn idBase(b: *const Backend) u32 {
+pub fn idBase(b: *const Backend) u32 {
     return b.subid_base + (if (b.slot) |s| s.n else 0) * ids_per_slot;
 }
 
@@ -595,7 +603,7 @@ fn detachNetns(arena: Allocator, path: []const u8) void {
 /// Removes a tree a job left, even one with directories a step took every permission from (or
 /// overlay's work directory, which it leaves at mode 0): on a failure, every directory is given
 /// its owner's permissions back and it is tried again. What still fails is logged.
-fn removeTree(arena: Allocator, io: std.Io, path: []const u8) void {
+pub fn removeTree(arena: Allocator, io: std.Io, path: []const u8) void {
     const cwd = std.Io.Dir.cwd();
     cwd.deleteTree(io, path) catch {
         chmodDirs(arena, io, path, 0);
@@ -882,9 +890,9 @@ pub fn readFile(b: *Backend, path: []const u8) ?[]const u8 {
     };
 }
 
-const max_read = 16 * 1024 * 1024;
+pub const max_read = 16 * 1024 * 1024;
 
-fn layerPath(b: *Backend, i: usize) ![]const u8 {
+pub fn layerPath(b: *Backend, i: usize) ![]const u8 {
     return std.fmt.allocPrint(b.arena, "{s}/{s}", .{ b.dir, b.layers.items[i] });
 }
 
@@ -915,6 +923,21 @@ fn exec(
     gid: u32,
     out: sandbox.Output,
 ) !sandbox.Ended {
+    return b.execOn(&.{ "sh", "-c", script }, env, files, uid, gid, out, null);
+}
+
+/// `exec` of `argv`, in a Docker action's `container` when it has one (`docker_action.zig`):
+/// the new layer is then where what it writes into the job's shared directories lands.
+pub fn execOn(
+    b: *Backend,
+    argv: []const []const u8,
+    env: []const []const u8,
+    files: []const sandbox.Spec.File,
+    uid: u32,
+    gid: u32,
+    out: sandbox.Output,
+    container: ?sandbox.Spec.Container,
+) !sandbox.Ended {
     const arena = b.arena;
     if (b.layers.items.len >= max_layers) return .{
         .code = 1,
@@ -943,7 +966,7 @@ fn exec(
         .workdir = b.workdir,
         .uid = uid,
         .gid = gid,
-        .argv = &.{ "sh", "-c", script },
+        .argv = argv,
         .env = env,
         .files = files,
         .binds = b.binds,
@@ -951,6 +974,7 @@ fn exec(
         .id_base = base_id,
         .id_count = ids_per_slot,
         .netns = b.netns,
+        .container = container,
     }, &b.running, out);
     try b.layers.append(arena, upper);
     return ended;
@@ -1003,17 +1027,17 @@ fn envStrings(b: *Backend, extra: []const job_mod.EnvVar) ![]const []const u8 {
 
 /// A secret's value from its id. On this backend `Secrets` registers values without a session
 /// (`Secrets.local`), so the id is only a name for the value.
-fn plaintext(x: *Exec, id: []const u8) []const u8 {
+pub fn plaintext(x: *Exec, id: []const u8) []const u8 {
     var it = x.secrets.ids.iterator();
     while (it.next()) |e| if (std.mem.eql(u8, e.value_ptr.*, id)) return e.key_ptr.*;
     return "";
 }
 
 /// A step's output fed to the job's log as Dagger's log stream feeds it: one span per exec.
-const Live = struct {
+pub const Live = struct {
     demux: *SpanDemux,
 
-    fn output(l: *Live) sandbox.Output {
+    pub fn output(l: *Live) sandbox.Output {
         return .{ .ptr = l, .chunkFn = chunk };
     }
 
@@ -1064,7 +1088,7 @@ const execAnswer = @import("../dagger/testing.zig").exec;
 /// must run): a rootfs of a few directories with the host's /usr bound over it, in the
 /// test's directory, and the runner binary the build copied for the tests (`ZIG_RUNNER_TEST_EXE`).
 /// Rootless unless the tests run as root, where the job gets its range of ids and its network.
-fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
+pub fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
     const io = std.testing.io;
     var env = try std.testing.environ.createMap(arena);
     const required = std.mem.eql(u8, env.get("ZIG_RUNNER_REQUIRE_NATIVE") orelse "", "1");

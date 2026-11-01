@@ -68,6 +68,11 @@ pub const Spec = struct {
     id_count: u32 = 0,
     /// The job's network namespace (a bind-mounted namespace file), when it has one.
     netns: ?[]const u8 = null,
+    /// A Docker action's container: the step runs in its image instead of the job's overlay,
+    /// with directories of the job's overlay bound in (`Container`). `argv` is then the action's
+    /// command, its first word found through the env's PATH as `docker run` finds it; otherwise
+    /// `argv` runs under `/bin/sh`.
+    container: ?Container = null,
 
     pub const Bind = struct {
         host: []const u8,
@@ -75,6 +80,24 @@ pub const Spec = struct {
         read_only: bool = true,
         /// Only over a file or directory the image has: making one would put it in the layer.
         optional: bool = false,
+    };
+
+    /// The job's overlay (`lowers`, `upper`) is still mounted, and this step's layer is where
+    /// what the action writes into the shared directories lands, as GitHub's `docker run` writes
+    /// into the host's workspace through its bind. `files` go into the job's overlay too.
+    pub const Container = struct {
+        /// The image's filesystem, absolute: the container's only lower layer.
+        rootfs: []const u8,
+        /// The container's own layer (thrown away when the step ends, as `docker run --rm`
+        /// does), its work directory and its mount point, relative to `root`.
+        upper: []const u8,
+        work: []const u8,
+        merged: []const u8,
+        /// Directories of the job's overlay bound into the container: made in the job's overlay
+        /// when missing, resolved inside each overlay.
+        shares: []const Share = &.{},
+
+        pub const Share = struct { from: []const u8, at: []const u8 };
     };
 
     pub const File = struct {
@@ -387,6 +410,8 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
             makePrivate();
             lowers = idmapRootfs(arena, spec.lowers, userns);
             mountOverlay(arena, spec, lowers, false);
+            if (spec.container) |c|
+                mountContainer(arena, c, idmapped(arena, c.rootfs, userns, "I"), false);
             // The binds, as the host's root: in the job's namespace the helper is nobody on the
             // host and may not search the directories on the way to a host path. They go on
             // with the overlay into the step's namespace (its bind onto itself is recursive).
@@ -404,6 +429,7 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
             if (spec.userns == .self) enterUserns();
             makePrivate();
             mountOverlay(arena, spec, lowers, true);
+            if (spec.container) |c| mountContainer(arena, c, c.rootfs, true);
         },
     }
 
@@ -411,7 +437,7 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
     check("unshare(mount, pid, uts, ipc)", linux.unshare(linux.CLONE.NEWNS | linux.CLONE.NEWPID |
         linux.CLONE.NEWUTS | linux.CLONE.NEWIPC));
     makePrivate();
-    const merged = z(arena, spec.merged);
+    const merged = z(arena, topOf(spec));
     // The overlay bound onto itself, a mount of this namespace's own: on a root runner it was
     // mounted in the host's root's namespace, so here it is locked, and `pivot_root` refuses a
     // locked mount as the new root (runc binds its rootfs so for the same reason).
@@ -437,9 +463,12 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
         linux.MS.NOSUID | linux.MS.NODEV,
         @intFromPtr("mode=0700,size=16m"),
     ));
+    // A container's files go into the job's overlay, under the directories it shares.
+    const files_root = if (spec.container) |c| shareJobDirs(arena, spec, c, root) else root;
     for (spec.files, 0..) |f, i| {
-        if (f.keep) writeFileIn(arena, root, f) else bindSecretIn(arena, root, f, i);
+        if (f.keep) writeFileIn(arena, files_root, f) else bindSecretIn(arena, files_root, f, i);
     }
+    if (files_root != root) _ = linux.close(files_root);
 
     // 3. PID 1, told by `alive` whether the helper is still there once it has re-armed its
     // parent-death signal; then until the step ends or the lifeline closes.
@@ -455,7 +484,8 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
         // no_new_privs for every step but the runner user's on a root runner: its sudo can
         // reach only the job's own root, bounded still by the capabilities and seccomp below.
         const nnp = spec.userns != .mapped or spec.uid == 0;
-        stepInit(arena, root, workdir, spec.uid, spec.gid, nnp, alive[0], argv, envp);
+        const in_image = spec.container != null;
+        stepInit(arena, root, workdir, spec.uid, spec.gid, nnp, alive[0], in_image, argv, envp);
     }
     _ = linux.close(alive[0]);
     const st = superviseStep(@intCast(pid));
@@ -472,10 +502,15 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
     return 128;
 }
 
-/// `spec.binds`, at their places in the overlay, read-only where asked.
+/// Where the step's `/` is mounted: the container's overlay for a Docker action, else the job's.
+fn topOf(spec: Spec) []const u8 {
+    return if (spec.container) |c| c.merged else spec.merged;
+}
+
+/// `spec.binds`, at their places in the step's root, read-only where asked.
 fn bindAll(arena: Allocator, spec: Spec) void {
     const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
-    const rc = linux.open(z(arena, spec.merged), flags, 0);
+    const rc = linux.open(z(arena, topOf(spec)), flags, 0);
     check("open the overlay", rc);
     const root: linux.fd_t = @intCast(rc);
     defer _ = linux.close(root);
@@ -574,7 +609,19 @@ fn idmapRootfs(
     lowers: []const []const u8,
     userns: linux.fd_t,
 ) []const []const u8 {
-    const rootfs = lowers[lowers.len - 1];
+    const out = arena.dupe([]const u8, lowers) catch oom();
+    out[out.len - 1] = idmapped(arena, lowers[lowers.len - 1], userns, "R");
+    return out;
+}
+
+/// `rootfs` mounted idmapped through `userns` at `at` in the job's directory, for an overlay's
+/// lower layer; `at`, as overlay takes it.
+fn idmapped(
+    arena: Allocator,
+    rootfs: []const u8,
+    userns: linux.fd_t,
+    comptime at: [:0]const u8,
+) []const u8 {
     const open_tree_clone = 1;
     const at_recursive = 0x8000;
     const tree = linux.syscall3(
@@ -594,20 +641,77 @@ fn idmapRootfs(
         @intFromPtr(&attr),
         @sizeOf(MountAttr),
     ));
-    _ = linux.mkdir("R", 0o755);
+    _ = linux.mkdir(at, 0o755);
     const move_mount_f_empty_path = 4;
     check("mount the idmapped rootfs", linux.syscall5(
         .move_mount,
         tree,
         @intFromPtr(""),
         @as(usize, @bitCast(@as(isize, linux.AT.FDCWD))),
-        @intFromPtr("R"),
+        @intFromPtr(at.ptr),
         move_mount_f_empty_path,
     ));
     _ = linux.close(@intCast(tree));
-    const out = arena.dupe([]const u8, lowers) catch oom();
-    out[out.len - 1] = "R";
-    return out;
+    return at;
+}
+
+/// A Docker action's overlay: the image's filesystem (`lower`, idmapped on a root runner) under
+/// the container's own layer.
+fn mountContainer(arena: Allocator, c: Spec.Container, lower: []const u8, userxattr: bool) void {
+    const opts = std.fmt.allocPrint(arena, "lowerdir={s},upperdir={s},workdir={s}{s}", .{
+        lower,
+        c.upper,
+        c.work,
+        if (userxattr) ",userxattr" else "",
+    }) catch oom();
+    check("mount the container's overlay", linux.mount(
+        "overlay",
+        z(arena, c.merged),
+        "overlay",
+        0,
+        @intFromPtr(z(arena, opts)),
+    ));
+}
+
+/// Binds each of the container's shares from the job's overlay into the container (`root`), as
+/// the step's root: each made where missing (in the job's overlay, so in this step's layer, as
+/// GitHub's runner makes them on the host; in the container's own layer for the mount point),
+/// and bound with whatever is mounted under it. The job's overlay, opened, for `files`.
+fn shareJobDirs(arena: Allocator, spec: Spec, c: Spec.Container, root: linux.fd_t) linux.fd_t {
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
+    const rc = linux.open(z(arena, spec.merged), flags, 0);
+    check("open the job's overlay", rc);
+    const job: linux.fd_t = @intCast(rc);
+    for (c.shares) |sh| {
+        const from = makeDirsIn(arena, job, sh.from);
+        defer _ = linux.close(from);
+        const at = makeDirsIn(arena, root, sh.at);
+        defer _ = linux.close(at);
+        check(about(arena, "share", sh.at), linux.mount(
+            procFd(arena, from),
+            procFd(arena, at),
+            null,
+            linux.MS.BIND | linux.MS.REC,
+            0,
+        ));
+    }
+    return job;
+}
+
+/// `path` under `root` made as `mkdir -p` makes it (root's, 0755), resolved inside it, and opened
+/// for a mount; a failure fails the step.
+fn makeDirsIn(arena: Allocator, root: linux.fd_t, path: []const u8) linux.fd_t {
+    const rel = std.mem.trim(u8, path, "/");
+    var i: usize = 0;
+    while (i <= rel.len) {
+        const end = std.mem.indexOfScalarPos(u8, rel, i, '/') orelse rel.len;
+        const parent = dirIn(arena, root, rel[0..i]) orelse
+            fatal(about(arena, "make", path), @as(u32, 2));
+        _ = linux.mkdirat(parent, z(arena, rel[i..end]), 0o755);
+        _ = linux.close(parent);
+        i = end + 1;
+    }
+    return dirIn(arena, root, rel) orelse fatal(about(arena, "make", path), @as(u32, 2));
 }
 
 /// Waits for the step's PID 1, killing it when the lifeline (stdin) closes or says anything: the
@@ -658,6 +762,7 @@ fn stepInit(
     gid: u32,
     no_new_privs: bool,
     alive: linux.fd_t,
+    in_image: bool,
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
 ) noreturn {
@@ -706,8 +811,46 @@ fn stepInit(
     // From here the helper's failures would be the step's output; the step's stderr is its
     // stdout, as the script's `exec 2>&1` would make it anyway.
     _ = linux.dup2(1, 2);
+    if (in_image) execCommand(argv, envp);
     const rc = linux.execve("/bin/sh", argv, envp);
     fatal("exec /bin/sh", @backingInt(linux.errno(rc)));
+}
+
+/// Runs a Docker action's command as `docker run` does: its first word as a path when it has a
+/// slash, else found in the env's PATH (runc's default PATH when it has none). What cannot be run
+/// is the step's failure, on its output, with the shell's codes: 126 when a file was found but
+/// could not be run, 127 when none was.
+fn execCommand(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) noreturn {
+    const name = std.mem.span(argv[0].?);
+    var denied = false;
+    if (std.mem.indexOfScalar(u8, name, '/') != null) {
+        const e = linux.errno(linux.execve(argv[0].?, argv, envp));
+        denied = e != .NOENT and e != .NOTDIR;
+    } else if (name.len > 0) {
+        var path: []const u8 = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+        var i: usize = 0;
+        while (envp[i]) |e| : (i += 1) {
+            const kv = std.mem.span(e);
+            if (std.mem.startsWith(u8, kv, "PATH=")) path = kv["PATH=".len..];
+        }
+        var dirs = std.mem.splitScalar(u8, path, ':');
+        var buf: [4096]u8 = undefined;
+        while (dirs.next()) |dir| {
+            const full = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{
+                if (dir.len == 0) "." else dir,
+                name,
+            }, 0) catch continue;
+            const e = linux.errno(linux.execve(full.ptr, argv, envp));
+            if (e != .NOENT and e != .NOTDIR) denied = true;
+        }
+    }
+    var msg: [512]u8 = undefined;
+    const text = std.fmt.bufPrint(&msg, "exec: \"{s}\": {s}\n", .{
+        name,
+        if (denied) "permission denied" else "executable file not found in $PATH",
+    }) catch "exec failed\n";
+    _ = linux.write(1, text.ptr, text.len);
+    linux.exit_group(if (denied) 126 else 127);
 }
 
 /// No supplementary groups at all: `setgroups(0, NULL)`.

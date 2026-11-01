@@ -127,6 +127,10 @@ pub const Config = struct {
     /// `nativeStore`).
     native_rootfs: []const u8 = "",
     native_store: []const u8 = "",
+    /// Docker actions' images for the native backend, one directory per reference
+    /// (`RUNNER_NATIVE_IMAGES`, `native/images.zig`); "" for none, which sends `docker://` steps
+    /// to Dagger. Phase 3's pull fills it instead of the operator.
+    native_images: []const u8 = "",
     /// Native steps on a runner that is not root (`RUNNER_NATIVE_ROOTLESS`), with only root
     /// mapped inside (`Backend.Config.rootless`); off, such a runner sends every job to Dagger.
     native_rootless: bool = false,
@@ -245,6 +249,7 @@ pub const Config = struct {
         InvalidStepUser,
         InvalidBackend,
         InvalidNativeRootfs,
+        InvalidNativeImages,
         InvalidNativeSubnet,
         InvalidNativeSubidBase,
         InvalidEngine,
@@ -264,6 +269,8 @@ pub const Config = struct {
                 "(README, \"Environments\").",
             error.InvalidNativeRootfs => "RUNNER_NATIVE_ROOTFS is a directory's absolute path: " ++
                 "overlay takes it as a layer from the job's directory.",
+            error.InvalidNativeImages => "RUNNER_NATIVE_IMAGES is a directory's absolute path: " ++
+                "each image's rootfs in it is a layer of its Docker action's overlay.",
             error.InvalidNativeSubnet => "RUNNER_NATIVE_SUBNET is an IPv4 network a.b.c.d/p " ++
                 "with no host bits set and a prefix of 8 to 23 bits (room for every job's " ++
                 "address), by default " ++ native_net.Subnet.default_text ++ ".",
@@ -317,6 +324,8 @@ pub const Config = struct {
         }
         if (c.native_rootfs.len > 0 and !std.fs.path.isAbsolutePosix(c.native_rootfs))
             return error.InvalidNativeRootfs;
+        if (c.native_images.len > 0 and !std.fs.path.isAbsolutePosix(c.native_images))
+            return error.InvalidNativeImages;
         _ = try native_net.Subnet.parse(c.native_subnet);
         if (c.native_subid_base < NativeBackend.min_subid_base) return error.InvalidNativeSubidBase;
 
@@ -393,6 +402,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_BACKEND")) |v| c.backend = try stepBackend(v);
         if (environ.get("RUNNER_NATIVE_ROOTFS")) |v| c.native_rootfs = v;
         if (environ.get("RUNNER_NATIVE_STORE")) |v| c.native_store = v;
+        if (environ.get("RUNNER_NATIVE_IMAGES")) |v| c.native_images = v;
         if (environ.get("RUNNER_NATIVE_ROOTLESS")) |v| c.native_rootless = try boolean(v);
         if (environ.get("RUNNER_NATIVE_SUBID_BASE")) |v| c.native_subid_base = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_SUBNET")) |v| c.native_subnet = v;
@@ -465,6 +475,7 @@ pub const Config = struct {
         else if (eq(key, "backend")) c.backend = try stepBackend(val) //
         else if (eq(key, "native-rootfs")) c.native_rootfs = val //
         else if (eq(key, "native-store")) c.native_store = val //
+        else if (eq(key, "native-images")) c.native_images = val //
         else if (eq(key, "native-rootless")) c.native_rootless = try boolean(val) //
         else if (eq(key, "native-subid-base")) c.native_subid_base = try num(u32, val) //
         else if (eq(key, "native-subnet")) c.native_subnet = val //
