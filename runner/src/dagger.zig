@@ -52,6 +52,7 @@ const readLogs = @import("dagger/JobLog.zig").readLogs;
 const SpanDemux = @import("dagger/JobLog.zig").SpanDemux;
 const awaitLiveOrReplay = @import("dagger/JobLog.zig").awaitLiveOrReplay;
 pub const reused_note = @import("dagger/JobLog.zig").reused_note;
+pub const native_reused_note = @import("dagger/JobLog.zig").native_reused_note;
 const noteReusedSteps = @import("dagger/JobLog.zig").noteReusedSteps;
 const Evaluator = @import("dagger/Evaluator.zig");
 const StepCtx = @import("dagger/Evaluator.zig").StepCtx;
@@ -865,7 +866,7 @@ pub fn run(
         reader.await(io);
         stderr.close(io);
         _ = child.wait(io) catch {};
-        noteReusedSteps(&sh);
+        noteReusedSteps(&sh, reused_note);
         sh.flush();
     }
 
@@ -879,10 +880,10 @@ pub fn run(
 }
 
 /// The job on the native backend (`native/Backend.zig`): no Dagger session, the same steps code.
-/// What the native backend has no counterpart for yet is off for the job: the step cache and
-/// output keys (phase 2), and the cache volumes (phase 4): package caches, Zig's local cache and
-/// seeds, and the tool cache's checked trees. They are caches, so a job's results do not depend
-/// on them.
+/// The step cache is the native layer store's (`native/Store.zig`). What the native backend has
+/// no counterpart for yet is off for the job: output keys, and the cache volumes (phase 4):
+/// package caches, Zig's local cache and seeds, and the tool cache's checked trees. They are
+/// caches, so a job's results do not depend on them.
 fn runNative(
     arena: Allocator,
     io: std.Io,
@@ -892,7 +893,6 @@ fn runNative(
     log: *sink.LogSink,
 ) !Result {
     var opts = opts_in;
-    opts.step_cache = false;
     opts.output_keys = false;
     opts.package_caches = false;
     opts.zig_local_cache = false;
@@ -904,6 +904,8 @@ fn runNative(
     @memset(results, .{});
     var sh = try jobLogFor(arena, io, opts, job, log);
     defer sh.flush();
+    // After the last step, as for a Dagger session: each replayed step's log ends with the note.
+    defer noteReusedSteps(&sh, native_reused_note);
     var b = Backend.init(arena, io, opts.gpa, cfg) catch |e| return fail(
         &sh,
         results,
@@ -1029,7 +1031,7 @@ fn runDirect(
     defer {
         sess.close();
         demux.flushPartial();
-        noteReusedSteps(sh);
+        noteReusedSteps(sh, reused_note);
         sh.flush();
     }
     var st: SessionTransport = .{ .s = &sess };
