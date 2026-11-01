@@ -13,7 +13,7 @@
 //!   whatever bytes it hashes.
 //!
 //! P2's store (draft #268) is not on this branch, so both run against the reference here, which
-//! follows P2's code at 8b54d2a line for line (`KeyHasher`, `stableEnv`, `keyFor`, `below`).
+//! follows P2's code at ede9244 line for line (`KeyHasher`, `stableEnv`, `keyFor`, `below`).
 //! **When P2 merges:** point `stableEnv` at `Store.stableEnv`, and replace `Hasher` with
 //! `Store.KeyHasher`, whose `bytes` writer gives the preimage: `referenceKey` and `referenceBelow`
 //! become thin adapters over P2's, and the first test then checks P2's bytes.
@@ -46,6 +46,7 @@ pub const KeyInput = struct {
 
 /// What the digest below a base is of (`Backend.below`).
 pub const BelowInput = struct {
+    format: []const u8,
     fingerprint: []const u8,
     userns: []const u8,
     id_base: u64,
@@ -55,7 +56,7 @@ pub const BelowInput = struct {
 pub const KeyFn = fn (Allocator, KeyInput) anyerror![32]u8;
 pub const BelowFn = fn (Allocator, BelowInput) anyerror![32]u8;
 
-/// `Store.stableEnv` at P2's 8b54d2a: not the volatile names, nor the runner's own per-job values,
+/// `Store.stableEnv` at P2's ede9244: not the volatile names, nor the runner's own per-job values,
 /// nor the secret aliases.
 fn stableEnv(name: []const u8) bool {
     if (dagger.isVolatile(name)) return false;
@@ -64,7 +65,7 @@ fn stableEnv(name: []const u8) bool {
     return !std.mem.startsWith(u8, name, "ZIG_SECRET_");
 }
 
-/// `Store.KeyHasher` at P2's 8b54d2a, keeping the preimage.
+/// `Store.KeyHasher` at P2's ede9244, keeping the preimage.
 const Hasher = struct {
     out: std.ArrayList(u8) = .empty,
     gpa: Allocator,
@@ -113,12 +114,13 @@ pub fn keyPreimage(gpa: Allocator, in: KeyInput) ![]u8 {
 }
 
 /// The digest below a base's preimage, as `Backend.below` builds it: untagged
-/// (`KeyHasher.plain("below a base")`), then the rootfs's fingerprint, the userns mode, the slot's
-/// first id, and the binds, counted.
+/// (`KeyHasher.plain("below a base")`), then the store's format (`Store.store_format`), the rootfs's
+/// fingerprint, the userns mode, the slot's first id, and the binds, counted.
 pub fn belowPreimage(gpa: Allocator, in: BelowInput) ![]u8 {
     var h: Hasher = .{ .gpa = gpa };
     errdefer h.out.deinit(gpa);
     try h.field("below a base");
+    try h.field(in.format);
     try h.field(in.fingerprint);
     try h.field(in.userns);
     try h.int(in.id_base);
@@ -215,6 +217,7 @@ fn keySide(arena: Allocator, it: *Fields) !Side {
 }
 
 fn belowSide(arena: Allocator, it: *Fields) !Side {
+    const format = try unhex(arena, it.next().?);
     const fingerprint = try unhex(arena, it.next().?);
     const userns = try unhex(arena, it.next().?);
     const id_base = try num(it.next().?);
@@ -226,7 +229,7 @@ fn belowSide(arena: Allocator, it: *Fields) !Side {
         .optional = std.mem.eql(u8, p[3], "1"),
     });
     return .{ .below = .{
-        .in = .{ .fingerprint = fingerprint, .userns = userns, .id_base = id_base, .binds = binds.items },
+        .in = .{ .format = format, .fingerprint = fingerprint, .userns = userns, .id_base = id_base, .binds = binds.items },
         .preimage = try unhex(arena, it.next().?),
     } };
 }

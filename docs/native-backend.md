@@ -356,7 +356,7 @@ remains before native steps may run jobs the runner does not vouch for:
 - `Input.mounts` absent from the key holds by construction.
 - Exit: `proofs/README.md` and the Lean files name native functions where they named Dagger's.
 
-**Status: proved of P2's key format as P2 builds it (draft #268, `8b54d2a`); the Zig check is wired
+**Status: proved of P2's key format as P2 builds it (draft #268, `ede9244`); the Zig check is wired
 to a line-for-line reference of P2's code until P2 merges.**
 `proofs/Runner/Native.lean` is the native backend's refinement of the model, beside Dagger's rather
 than replacing it, since both backends ship (proofs/README.md, "On the native backend"):
@@ -367,8 +367,8 @@ than replacing it, since both backends ship (proofs/README.md, "On the native ba
   environment in the container's order (`Store.stableEnv`: the volatile names, `ZIG_RUNNER_EVENT`,
   `ZIG_RUNNER_RAN`, `ZIG_RUNNER_MARK` and `ZIG_SECRET_*` dropped), then the uid, gid, working
   directory and kept files, each field prefixed with its length as a u64 little-endian. A base has
-  no parent: in its place is the untagged digest below it (`Backend.below`: the rootfs's
-  fingerprint, the userns mode, the slot's first id, the binds). The extras are not new inputs: a
+  no parent: in its place is the untagged digest below it (`Backend.below`: the store's format
+  `Store.store_format`, the rootfs's fingerprint, the userns mode, the slot's first id, the binds). The extras are not new inputs: a
   step's are its job's, fixed with the base (`Format.stepExtra`), and a base's are part of what the
   model's base is (`BaseSpec`). `encState_injective`, `belowPreimage_inj`, `encKey_injective` and
   `native_key_iff`: the format keeps exactly what the model's key keeps, so P2 and P3 hold of it;
@@ -388,7 +388,7 @@ than replacing it, since both backends ship (proofs/README.md, "On the native ba
 - **The tie to the code.** `keyoracle` (`proofs/KeyOracle.lean`) writes
   `runner/src/native/testdata/step_keys.tsv`, `.github/scripts/key-vectors.sh` checks in the proofs
   workflow that it is the model's, and `runner/src/native/key_vectors.zig` checks the preimages
-  (24 vectors: steps, bases, the digest below a base) and the equal/differ relation against it.
+  (25 vectors: steps, bases, the digest below a base) and the equal/differ relation against it.
 
 **When P2 merges**, in this order:
 
@@ -654,12 +654,15 @@ specification:
   as a miss: either one alone closes torn reads, and an eviction part-way is the same case as a
   write part-way.
 - **What P2 hashes beyond the model added no input to it.** P2's key carries the uid, gid, working
-  directory and kept files, and the digest below a base (rootfs, id mapping, slot, binds). Each is
+  directory and kept files, and the digest below a base (store format, rootfs, id mapping, slot,
+  binds). Each is
   either part of what the model's base is or fixed with it for every step of the job, so the proof
   needed a richer `Format`, not a richer model: the base became a `BaseSpec` and a step's extras its
   base's (`stepExtra`). One consequence worth knowing: when the event payload is too large for a
   variable, P2 writes it as a kept file of the base, so the base and every key above it are per run.
-  That costs only misses.
+  That costs only misses. The store's format, which P2 put below every base after review, is the
+  format version P8 asked for: it makes every key new when what a layer means changes, and the
+  rootfs's fingerprint is an opaque atom to the model however P2 computes it.
 - **The stable environment is a predicate, and the model never needed it to be `volatile_env`.**
   P2 also drops the runner's own per-job variables and the secret aliases (`Store.stableEnv`); the
   model's `vol` is any predicate, so nothing changed but the vectors.

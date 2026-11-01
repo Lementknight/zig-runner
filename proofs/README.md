@@ -270,14 +270,14 @@ ones about what a cache can answer (`Clean`, `no_cutoff_without_keys`), only a m
 miss is proved natively (`Native.marked_misses`). An unmarked step after it, whose parent names the
 job, is still published, though no other job can ask for that key: P2 may skip it, as a saving.
 
-The right-hand column names P2's code as of draft #268 (commit `8b54d2a`, `runner/src/native/`),
+The right-hand column names P2's code as of draft #268 (commit `ede9244`, `runner/src/native/`),
 whose key format is the one proved here; P2 is not merged yet, so the names are checked again when
 it is.
 
 | In the model | In the native runner (P2) |
 |---|---|
 | `State`: a container *is* the recipe that built it | the key chain: `Backend.keyFor` hashes, through `Store.KeyHasher` (`init(tag)`, `core`), the tag, the parent's key, the script, the stable env, then the uid, gid, working directory and kept files (`Native.keyPreimage`); the key of an exec is the key of the layer it leaves (`encKey`) |
-| `State.base b` | the job's base layer (`Backend.base`): tag 0, with the digest below it (`Backend.below`: the rootfs's fingerprint, the userns mode, the slot's first id on a root runner, the binds; untagged, `KeyHasher.plain("below a base")`) in the parent's place. `Native.BaseSpec`, `belowPreimage`, and `Format.Sound.base_inj`: the model's base is what P2 hashes for it |
+| `State.base b` | the job's base layer (`Backend.base`): tag 0, with the digest below it (`Backend.below`: the store's format `Store.store_format`, the rootfs's fingerprint (`Store.rootfsFingerprint`, an opaque digest to the model, checked again for every job), the userns mode, the slot's first id on a root runner, the binds; untagged, `KeyHasher.plain("below a base")`) in the parent's place. `Native.BaseSpec`, `belowPreimage`, and `Format.Sound.base_inj`: the model's base is what P2 hashes for it |
 | `Key = parent · script · stable env` | `KeyHasher.core`, with `Store.stableEnv` as `stable vol`: `dagger.volatile_env`, the runner's own per-job values (`ZIG_RUNNER_EVENT`, `ZIG_RUNNER_RAN`, `ZIG_RUNNER_MARK`) and the secret aliases (`ZIG_SECRET_*`) are dropped. The mounts and the event payload are no argument of it, so `Input.mounts` and `Input.event` absent from the key hold by construction |
 | no input of its own | `keyFor`'s tail after the core: for a step, the job's uid, gid and workspace (set with the base, `Backend.baseEnv`) and no kept file (`execScript` gives none, and a step with a file to write has no key), so a function of its parent's base (`Format.stepExtra`); for the base, root, `/`, and the event file when the payload is too large for a variable (then the base, and every key above it, is per run: only misses) |
 | `Script` | a `run:` step's script (`scripts.stepScriptFc`), or a checkout's fetch of a commit (tag 1 too; a branch or a tag moves and is never keyed) |
@@ -294,7 +294,7 @@ where P2 meets it:
 
 | Obligation | Where in the model | In P2 |
 |---|---|---|
-| The key's bytes are unambiguous: a fixed-width length before every field, counts before lists, a tag per kind of key | `Format.Sound`, `encState`, `belowPreimage`; `Native.Ambiguous` is the cost without it | `KeyHasher.field` and `int` (u64 little-endian), `Store.Tag`; the digest below a base is untagged, but only ever a parent field. There is no format version in the bytes: a later change of format must change a tag or the store's directory |
+| The key's bytes are unambiguous: a fixed-width length before every field, counts before lists, a tag per kind of key, the store's format in every key | `Format.Sound`, `encState`, `belowPreimage`; `Native.Ambiguous` is the cost without it | `KeyHasher.field` and `int` (u64 little-endian), `Store.Tag`; the digest below a base is untagged, but only ever a parent field. `Store.store_format` is in every base's parent, so in every key: a change of format, bumped there, makes every key new |
 | The environment is spelt in the container's order, not sorted | `encEnv`, the `env-order` vector | `core` walks `b.env` in order |
 | The script text tells apart the scripts the model tells apart | `Format.Sound.text_inj` | the same hypothesis the Dagger mapping relies on, unstated there |
 | What is hashed beyond the model's key is determined by it | `Format.stepExtra`, `BaseSpec` | above: uid, gid and workspace are the job's, kept files are the base's |

@@ -12,7 +12,8 @@ engine discharged becomes the runner's obligation, and each one is stated and pr
 * **The key is computed from exactly what the model says.** `keyPreimage` is what P2's store hashes
   (`Store.KeyHasher`, `Backend.keyFor`): a tag, the parent's key, the script text, the stable
   environment, then the uid, gid, working directory and kept files, each length-prefixed. A base has
-  the digest below it (`Backend.below`: rootfs, id mapping, slot, binds) in its parent's place. The
+  the digest below it (`Backend.below`: store format, rootfs, id mapping, slot, binds) in its parent's
+  place. The
   extras are no new input: a base's are part of what the model's base is (`BaseSpec`), and a step's
   are its base's (`Format.stepExtra`), so determined by its key's parent. `encKey_injective` says no
   two model keys share bytes, so sha256 of them collides only when sha256 does (`native_key_iff`);
@@ -86,10 +87,12 @@ structure Bind where
   optional : Bool
   deriving DecidableEq, Repr
 
-/-- What every layer of a job depends on below its base (`Backend.below`): the rootfs's fingerprint
-(`Store.rootfsFingerprint`), how ids are mapped (the userns mode's name), the slot's first id on a
-root runner (0 otherwise), and the binds. -/
+/-- What every layer of a job depends on below its base (`Backend.below`): the store's format
+(`Store.store_format`, bumped when what a layer or its record means changes), the rootfs's
+fingerprint (`Store.rootfsFingerprint`), how ids are mapped (the userns mode's name), the slot's
+first id on a root runner (0 otherwise), and the binds. -/
 structure Below where
+  format : Nat
   fingerprint : Nat
   userns : Nat
   idBase : Nat
@@ -175,10 +178,11 @@ def encBind (b : Bind) : Bytes :=
   lp f (f.str b.host) ++ (lp f (f.str b.place) ++ (encBool f b.readOnly ++ encBool f b.optional))
 
 /-- **The digest below a base** (`Backend.below`), untagged (`KeyHasher.plain`): the label, the
-rootfs's fingerprint, the userns mode, the slot's first id, and the binds, counted. -/
+store's format, the rootfs's fingerprint, the userns mode, the slot's first id, and the binds,
+counted. -/
 def belowPreimage (w : Below) : Bytes :=
-  lp f f.label ++ (lp f (f.str w.fingerprint) ++ (lp f (f.str w.userns) ++
-    (f.word w.idBase ++ (f.word w.binds.length ++ encList (encBind f) w.binds))))
+  lp f f.label ++ (lp f (f.str w.format) ++ (lp f (f.str w.fingerprint) ++ (lp f (f.str w.userns) ++
+    (f.word w.idBase ++ (f.word w.binds.length ++ encList (encBind f) w.binds)))))
 
 /-- **What the store hashes for a key** (`KeyHasher.init(tag)`, `core`, then `keyFor`'s tail): the
 tag, the parent's key, the script's text, the stable environment, then the `Extra`. -/
@@ -304,20 +308,21 @@ theorem encExtra_inj (h : f.Sound) {x x' : Extra} (e : encExtra f x = encExtra f
   obtain ⟨hfs, _⟩ := list_split (kept_split h) hl (r := []) (s := []) (by simpa using e)
   rw [hu, hg, h.str_inj hw, hfs]
 
-/-- **The digest below a base is unambiguous**: equal preimages, the same rootfs, mapping, slot and
-binds. -/
+/-- **The digest below a base is unambiguous**: equal preimages, the same store format, rootfs,
+mapping, slot and binds. -/
 theorem belowPreimage_inj (h : f.Sound) {w w' : Below} (e : belowPreimage f w = belowPreimage f w') :
     w = w' := by
-  obtain ⟨fp, u, i, bs⟩ := w
-  obtain ⟨fp', u', i', bs'⟩ := w'
+  obtain ⟨fm, fp, u, i, bs⟩ := w
+  obtain ⟨fm', fp', u', i', bs'⟩ := w'
   simp only [belowPreimage] at e
   obtain ⟨_, e⟩ := lp_split h e
+  obtain ⟨hfm, e⟩ := lp_split h e
   obtain ⟨hfp, e⟩ := lp_split h e
   obtain ⟨hu, e⟩ := lp_split h e
   obtain ⟨hi, e⟩ := h.word_split e
   obtain ⟨hl, e⟩ := h.word_split e
   obtain ⟨hbs, _⟩ := list_split (bind_split h) hl (r := []) (s := []) (by simpa using e)
-  rw [h.str_inj hfp, h.str_inj hu, hi, hbs]
+  rw [h.str_inj hfm, h.str_inj hfp, h.str_inj hu, hi, hbs]
 
 theorem tag_ne (h : f.Sound) {n m : Nat} {r s : Bytes} (ne : n ≠ m) : f.word n ++ r ≠ f.word m ++ s :=
   fun e => ne (h.word_split e).1
@@ -432,7 +437,7 @@ def f : Format where
     | .body b _ => [b]
     | .stamped t _ => [t]
   label := []
-  base _ := ⟨⟨0, 0, 0, []⟩, 0, [], ⟨0, 0, 0, []⟩⟩
+  base _ := ⟨⟨0, 0, 0, 0, []⟩, 0, [], ⟨0, 0, 0, []⟩⟩
   stepExtra _ := ⟨0, 0, 0, []⟩
 
 theorem apart :

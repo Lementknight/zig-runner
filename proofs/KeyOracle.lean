@@ -21,7 +21,7 @@ a sha256, which the model does not compute: the vectors' parents are given as 32
 Each line is tab-separated, every byte string in lowercase hex, numbers in decimal:
 
     key    name equal|differ  A B   with A, B: tag parent script env uid gid workdir files preimage
-    below  name equal|differ  A B   with A, B: fingerprint userns idBase binds preimage
+    below  name equal|differ  A B   with A, B: format fingerprint userns idBase binds preimage
 
 An environment is `name=value` pairs joined by `,` in the container's order, volatile names
 included (the preimage has the stable ones); files are `path=contents=mode`, binds
@@ -65,6 +65,8 @@ def atomText : Nat → String
   | 27 => "/run/systemd/resolve/resolv.conf"
   | 28 => "/etc/resolv.conf"
   | 29 => "mkdir -p /home/runner/work/r/r /home/runner/work/_temp"
+  | 31 => "zig-runner native store 2"
+  | 32 => "zig-runner native store 1"
   | n => s!"atom{n}"
 
 /-- The model's stable-env filter for these atoms, as `Store.stableEnv` has it: `GITHUB_RUN_ID` and
@@ -90,7 +92,7 @@ def scriptText : Script → String
 
 def path : Binding := (0, 10)
 def home : Binding := (2, 14)
-def below0 : Below := ⟨23, 25, 1900000000, [⟨27, 28, true, true⟩]⟩
+def below0 : Below := ⟨31, 23, 25, 1900000000, [⟨27, 28, true, true⟩]⟩
 def asRoot : Extra := ⟨0, 0, 20, []⟩
 def eventFile (c : Nat) : Kept := ⟨22, c, 0o644⟩
 
@@ -118,7 +120,7 @@ def fmt : Format where
 /-- Equality of the model's values, by their fields: the derived `DecidableEq` of a structure with a
 `Bool` field does not compile to code. -/
 def bindT (b : Bind) := (b.host, b.place, b.readOnly, b.optional)
-def belowT (w : Below) := (w.fingerprint, w.userns, w.idBase, w.binds.map bindT)
+def belowT (w : Below) := (w.format, w.fingerprint, w.userns, w.idBase, w.binds.map bindT)
 def extraT (x : Extra) := (x.uid, x.gid, x.workdir, x.files.map fun k => (k.path, k.contents, k.mode))
 def baseT (b : BaseSpec) := (belowT b.below, b.script, b.env, extraT b.extra)
 
@@ -205,6 +207,7 @@ def baseVectors : List (String × (Nat × Env) × (Nat × Env)) :=
 
 def belowVectors : List (String × Below × Below) :=
   [ ("below-same", below0, below0),
+    ("below-store-format", below0, { below0 with format := 32 }),
     ("below-rootfs", below0, { below0 with fingerprint := 24 }),
     ("below-userns", below0, { below0 with userns := 26, idBase := 0 }),
     ("below-slot", below0, { below0 with idBase := 1900065536 }),
@@ -212,7 +215,7 @@ def belowVectors : List (String × Below × Below) :=
     ("below-no-binds", below0, { below0 with binds := [] }) ]
 
 def belowLine (w : Below) : String :=
-  "\t".intercalate [hex (fmt.str w.fingerprint), hex (fmt.str w.userns), toString w.idBase,
+  "\t".intercalate [hex (fmt.str w.format), hex (fmt.str w.fingerprint), hex (fmt.str w.userns), toString w.idBase,
     bindsField w.binds, hex (belowPreimage fmt w)]
 
 def baseNum : State → Nat
