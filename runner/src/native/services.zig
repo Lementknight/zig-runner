@@ -516,7 +516,7 @@ fn reachable(addr: [4]u8, port: u16) bool {
     defer _ = linux.close(fd);
     var sa: linux.sockaddr.in = .{
         .port = std.mem.nativeToBig(u16, port),
-        .addr = std.mem.readInt(u32, &addr, .little),
+        .addr = @bitCast(addr),
     };
     const c = linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in));
     if (linux.errno(c) == .SUCCESS) return true;
@@ -764,8 +764,9 @@ test "native services: postgres and redis from real images (ZIG_RUNNER_SERVICE_I
             .image = .{ .lit = "postgres:17-alpine" },
             .env = &.{.{ .name = "POSTGRES_PASSWORD", .value = .{ .lit = "postgres" } }},
             .ports = &.{.{ .lit = "5432:5432" }},
-            .options = .{ .lit = "--health-cmd pg_isready --health-interval 10s " ++
-                "--health-timeout 5s --health-retries 5" },
+            // Over TCP: the entrypoint's first, set-up server listens on its socket alone.
+            .options = .{ .lit = "--health-cmd \"pg_isready -h 127.0.0.1\" " ++
+                "--health-interval 10s --health-timeout 5s --health-retries 5" },
         },
         .{
             .name = "redis",

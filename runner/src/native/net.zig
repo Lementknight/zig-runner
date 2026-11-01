@@ -453,6 +453,9 @@ const Message = struct {
 ///   networks are not opened.
 /// - In `INPUT`, everything from `zr0` that is not a reply dropped: a job reaches no service on
 ///   the host, at the bridge's address or any other of the host's.
+/// - The other way, everything to `zr0` that is not a reply dropped, from the host's own
+///   processes (`OUTPUT`) and from anything it routes (`FORWARD`, whatever its policy): nothing
+///   reaches a job that the job did not ask for, its services' ports included (phase 6).
 ///
 /// Made with `iptables`, which every Docker host has and which puts them in the same tables as
 /// Docker's (debt: phase 5 makes them over netlink). Each rule is added once. On failure, what
@@ -489,10 +492,16 @@ pub fn natRules(
         "-i", bridge, "-m", "conntrack", "!", "--ctstate", "RELATED,ESTABLISHED", "-j", "DROP",
     };
     if (try ensureRule(arena, io, "filter", "INPUT", &not_reply)) |why| return why;
+    const not_asked = [_][]const u8{
+        "-o", bridge, "-m", "conntrack", "!", "--ctstate", "RELATED,ESTABLISHED", "-j", "DROP",
+    };
+    if (try ensureRule(arena, io, "filter", "OUTPUT", &not_asked)) |why| return why;
 
     // Each goes in at the chain's head, so the last is first: jobs to jobs dropped, then the
-    // uplinks, then the replies.
+    // uplinks, then the replies, then what is not a reply into a job (disjoint from the replies,
+    // so its place does not matter).
     var forward: std.ArrayList([]const []const u8) = .empty;
+    try forward.append(arena, &not_asked);
     try forward.append(arena, &(.{ "-o", bridge } ++ established ++ .{ "-j", "ACCEPT" }));
     for (ups) |up| {
         const out = [_][]const u8{ "-i", bridge, "-o", up, "-j", "ACCEPT" };
