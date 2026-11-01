@@ -42,6 +42,8 @@ store: []const u8 = "",
 actions: std.StringHashMapUnmanaged(Exec.LoadResult) = .empty,
 /// The JavaScript runtime JavaScript actions run with (`Options.js_runtime`, `actions.preload`).
 js_runtime: config.JsRuntime = .bun,
+/// Local actions read so far before the job (`actions.readOwn`), naming their files.
+preflights: u32 = 0,
 /// Why the last Dockerfile could not be planned or built, for the step's message.
 build_reason: []const u8 = "",
 binds: []const sandbox.Spec.Bind,
@@ -770,7 +772,7 @@ pub fn execScript(
     const layer = try b.layerPath(b.layers.items.len - 1);
     // The helper removes it; when it was stopped before it could, the runner does, so no later
     // step's layers hold the secret.
-    for (files.items) |f| sandbox.unlinkIn(arena, layer, f.path);
+    for (files.items) |f| if (!f.keep) sandbox.unlinkIn(arena, layer, f.path);
     // Every line is in: the pipe is closed only once every process of the step has ended.
     demux.flushPartial();
     x.sh.ended[num - 1].store(true, .release);
