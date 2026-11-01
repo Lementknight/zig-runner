@@ -932,7 +932,8 @@ fn toolTreesKey(
     return try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/tool-trees/{s}{s}", .{
         job.github.repository,
         scope,
-        job_image,
+        // The tool cache's own key drops the digest (`imageName`); its lists follow the same volume.
+        imageName(job_image),
         if (as_runner) "/" ++ runner_user else "",
     });
 }
