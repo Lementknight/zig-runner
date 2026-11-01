@@ -197,10 +197,11 @@ as the image has it (root's files root's). It is not yet exported by the runner 
 startup: the direct engine session (`engine.zig`) implements the client's side of file sync for
 reads only, and an export needs its receiving side, which is as much work as P3's pull it would be
 thrown away for. Until P3, an operator makes it once, for example with Docker on a machine that may
-use it:
+use it (`zig-runner --provision-script` prints the script; CI's end-to-end job does this,
+`.github/scripts/e2e.sh rootfs`):
 
 ```
-docker run --name zr-rootfs ubuntu:24.04 sh -c '<set_up.provision_runner_script>'
+docker run --name zr-rootfs ubuntu:24.04 sh -c "$(zig-runner --provision-script)"
 mkdir -p /var/lib/zig-runner/rootfs
 docker export zr-rootfs | tar -x -C /var/lib/zig-runner/rootfs
 ```
