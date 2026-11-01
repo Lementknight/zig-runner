@@ -9,11 +9,14 @@ docs/native-backend.md, P2. Under Dagger, BuildKit and then DagQL computed the k
 store, and the model only had to say what they keyed on. Natively the runner does both, so what the
 engine discharged becomes the runner's obligation, and each one is stated and proved here:
 
-* **The key is computed from exactly what the model says.** `stepPreimage` is what the store hashes
-  for a step: the parent's key, the script text, the stable environment, each length-prefixed, and a
-  tag that keeps a step's key apart from an output-keyed container's (`encState`). `encKey_injective`
-  says no two model keys share bytes, so sha256 of them collides only when sha256 does
-  (`native_key_iff`); the mounts, the volatile variables and the event payload are no argument of it
+* **The key is computed from exactly what the model says.** `keyPreimage` is what P2's store hashes
+  (`Store.KeyHasher`, `Backend.keyFor`): a tag, the parent's key, the script text, the stable
+  environment, then the uid, gid, working directory and kept files, each length-prefixed. A base has
+  the digest below it (`Backend.below`: rootfs, id mapping, slot, binds) in its parent's place. The
+  extras are no new input: a base's are part of what the model's base is (`BaseSpec`), and a step's
+  are its base's (`Format.stepExtra`), so determined by its key's parent. `encKey_injective` says no
+  two model keys share bytes, so sha256 of them collides only when sha256 does (`native_key_iff`);
+  the mounts, the volatile variables and the event payload are no argument of it
   (`native_mounts_invisible`, `native_volatile_invisible`, `native_event_invisible`). `Ambiguous`
   is the job where plain concatenation, without the lengths, hands one step another's answer.
 
@@ -43,7 +46,7 @@ The hash is modelled as the identity on its preimage, as `Key` is a projection i
 collisions stay out of scope, and what is left is the runner's own part, that the preimage is
 unambiguous. The byte format is a parameter (`Format`), so the proofs hold of any word size and any
 spelling of atoms, scripts and digests that satisfy `Format.Sound`; `KeyOracle.lean` instantiates it
-with the format P8 specifies (u64 little-endian lengths) and writes the vectors that
+with P2's format (u64 little-endian words, UTF-8) and writes the vectors that
 runner/src/native/key_vectors.zig checks the Zig key against.
 -/
 
@@ -56,30 +59,97 @@ open Runner Runner.Build
 /-- A byte string: what sha256 is given. A number per byte, as everything in the model is. -/
 abbrev Bytes := List Nat
 
-/-- How the store spells things: a fixed-width word for lengths, counts and tags; the bytes of an
-atom (a variable's name or value, a base's or a digest's bytes); and a script's text, which
-`scripts.stepScriptFc` builds and both backends hash. -/
+/-- A file written for an exec that stays in its layer (`sandbox.Spec.File` with `keep`): its path,
+its contents and its mode. Only a base has one, the event file when the payload is too large for a
+variable; a step with a file to write (a script holding a secret) has no key at all. -/
+structure Kept where
+  path : Nat
+  contents : Nat
+  mode : Nat
+  deriving DecidableEq, Repr
+
+/-- What the store hashes after the model's core (`Backend.keyFor`): the ids the exec runs as, its
+working directory, and the files kept. -/
+structure Extra where
+  uid : Nat
+  gid : Nat
+  workdir : Nat
+  files : List Kept
+  deriving DecidableEq, Repr
+
+/-- A bind into every step (`Backend.binds`): where from, where to, and how. Where, not what: a
+mount's content is in no key. -/
+structure Bind where
+  host : Nat
+  place : Nat
+  readOnly : Bool
+  optional : Bool
+  deriving DecidableEq, Repr
+
+/-- What every layer of a job depends on below its base (`Backend.below`): the rootfs's fingerprint
+(`Store.rootfsFingerprint`), how ids are mapped (the userns mode's name), the slot's first id on a
+root runner (0 otherwise), and the binds. -/
+structure Below where
+  fingerprint : Nat
+  userns : Nat
+  idBase : Nat
+  binds : List Bind
+  deriving DecidableEq, Repr
+
+/-- A job's base as the store keys it (`Backend.base`): what lies below it, the script that makes the
+workspace, the base's stable environment and its `Extra` (root, `/`, and the event file when the
+payload is not a variable). The model's `State.base b` is this, named by `b`. -/
+structure BaseSpec where
+  below : Below
+  script : Nat
+  env : Env
+  extra : Extra
+  deriving DecidableEq, Repr
+
+/-- How the store spells things: a fixed-width word for lengths, counts, tags and numbers; the
+bytes of an atom (a variable's name or value, a path, a digest); a script's text, which
+`scripts.stepScriptFc` builds and both backends hash; the label of the digest below a base
+(`plain("below a base")`); what each base of the model is (`base`); and the `Extra` of the steps
+above a base (`stepExtra`): a step runs as the job's user in the job's workspace, both set with the
+base (`Backend.baseEnv`), and keeps no file. -/
 structure Format where
   word : Nat → Bytes
   width : Nat
   str : Nat → Bytes
   text : Script → Bytes
+  label : Bytes
+  base : Nat → BaseSpec
+  stepExtra : Nat → Extra
 
 /-- What the proofs need of the spelling. `text_inj` is the one hypothesis the Dagger mapping has
 too, unstated there: two scripts the model tells apart have different texts (the step's number and
-file-command paths, and the always-run line with its nonce, are written into the text). For a
-u64 word, `word_inj` holds below 2^64, which is the size of the largest script considered. -/
+file-command paths, and the always-run line with its nonce, are written into the text). `base_inj`
+says the model's bases are the store's: two bases the model tells apart differ in something the
+store hashes. For a u64 word, `word_inj` holds below 2^64, which is the size of the largest script
+considered. -/
 structure Format.Sound (f : Format) : Prop where
   word_width : ∀ n, (f.word n).length = f.width
   word_inj : ∀ {n m}, f.word n = f.word m → n = m
   str_inj : ∀ {a b}, f.str a = f.str b → a = b
   text_inj : ∀ {s s'}, f.text s = f.text s' → s = s'
+  base_inj : ∀ {b b'}, f.base b = f.base b' → b = b'
+
+/-- The base a container's chain starts from. -/
+def root : State → Nat
+  | .base b => b
+  | .afterExec s _ _ => root s
+  | .afterCopy s _ => root s
 
 section
 variable (f : Format)
 
 /-- A length-prefixed field: no field is a prefix of another, so fields concatenate unambiguously. -/
 def lp (bs : Bytes) : Bytes := f.word bs.length ++ bs
+
+/-- A list's items one after another (its count goes before it). -/
+def encList {α : Type} (g : α → Bytes) : List α → Bytes
+  | [] => []
+  | a :: as => g a ++ encList g as
 
 def encBinding (b : Binding) : Bytes := lp f (f.str b.1) ++ lp f (f.str b.2)
 
@@ -91,14 +161,39 @@ def encBindings : Env → Bytes
 is the order the step sees in its environment. -/
 def encEnv (e : Env) : Bytes := f.word e.length ++ encBindings f e
 
-/-- A container's key, as the store spells it before hashing: a tag, then its fields. The base is
-the rootfs's key (P3: the image and the provisioning); a step's container is its parent's key, its
-script and its stable environment; an output-keyed container is its parent's key and the digest of
-the layer copied in. Each parent's key is a field of its own, where the real store has the 32 bytes
-of the parent's sha256 (`stepPreimage`). -/
+def encBool (x : Bool) : Bytes := f.word (if x then 1 else 0)
+
+def encKept (k : Kept) : Bytes := lp f (f.str k.path) ++ (lp f (f.str k.contents) ++ f.word k.mode)
+
+/-- `keyFor`'s tail: uid, gid, the working directory, then the count of kept files and each one's
+path, contents and mode. -/
+def encExtra (x : Extra) : Bytes :=
+  f.word x.uid ++ (f.word x.gid ++ (lp f (f.str x.workdir) ++
+    (f.word x.files.length ++ encList (encKept f) x.files)))
+
+def encBind (b : Bind) : Bytes :=
+  lp f (f.str b.host) ++ (lp f (f.str b.place) ++ (encBool f b.readOnly ++ encBool f b.optional))
+
+/-- **The digest below a base** (`Backend.below`), untagged (`KeyHasher.plain`): the label, the
+rootfs's fingerprint, the userns mode, the slot's first id, and the binds, counted. -/
+def belowPreimage (w : Below) : Bytes :=
+  lp f f.label ++ (lp f (f.str w.fingerprint) ++ (lp f (f.str w.userns) ++
+    (f.word w.idBase ++ (f.word w.binds.length ++ encList (encBind f) w.binds))))
+
+/-- **What the store hashes for a key** (`KeyHasher.init(tag)`, `core`, then `keyFor`'s tail): the
+tag, the parent's key, the script's text, the stable environment, then the `Extra`. -/
+def keyPreimage (tag : Nat) (parent script : Bytes) (e : Env) (x : Extra) : Bytes :=
+  f.word tag ++ (lp f parent ++ (lp f script ++ (encEnv f e ++ encExtra f x)))
+
+/-- A container's key, as the store spells it before hashing. A base is tag 0, over the digest below
+it in the parent's place; a step's container (a `run:` step's exec or a checkout's fetch) is tag 1,
+its parent's key, its script, its stable environment and its base's `stepExtra`; an output-keyed
+container is tag 2, its parent's key and the digest of the layer copied in. Each parent's key is a
+field of its own, where the real store has the 32 bytes of the parent's sha256 (`stepPreimage`). -/
 def encState : State → Bytes
-  | .base b => f.word 0 ++ lp f (f.str b)
-  | .afterExec s sc e => f.word 1 ++ (lp f (encState s) ++ (lp f (f.text sc) ++ encEnv f e))
+  | .base b => keyPreimage f 0 (belowPreimage f (f.base b).below) (f.str (f.base b).script)
+      (f.base b).env (f.base b).extra
+  | .afterExec s sc e => keyPreimage f 1 (encState s) (f.text sc) e (f.stepExtra (root s))
   | .afterCopy s c => f.word 2 ++ (lp f (encState s) ++ lp f (f.str c))
 
 /-- A step's key is its container's: the key of the exec and the identity of what it leaves are the
@@ -107,12 +202,13 @@ def encKey (k : Key) : Bytes := encState f (stateOf k)
 
 /-- What the native store hashes for a step, given its parent's key as bytes (in the store, the
 parent's sha256). `KeyOracle.lean` and runner/src/native/key_vectors.zig compute this. -/
-def stepPreimage (parent : Bytes) (sc : Script) (e : Env) : Bytes :=
-  f.word 1 ++ (lp f parent ++ (lp f (f.text sc) ++ encEnv f e))
+def stepPreimage (parent : Bytes) (sc : Script) (e : Env) (x : Extra) : Bytes :=
+  keyPreimage f 1 parent (f.text sc) e x
 
-/-- The model's key is `stepPreimage` with the parent's preimage where the store has its hash. -/
+/-- The model's key is `stepPreimage` with the parent's preimage where the store has its hash, and
+the extras of the job's base: they are determined by the key's parent. -/
 theorem encKey_stepPreimage (k : Key) :
-    encKey f k = stepPreimage f (encState f k.kParent) k.kScript k.kEnv :=
+    encKey f k = stepPreimage f (encState f k.kParent) k.kScript k.kEnv (f.stepExtra (root k.kParent)) :=
   rfl
 
 /-- The native key of a step's input: the model's `keyOf`, spelt out. -/
@@ -134,6 +230,20 @@ theorem lp_split (h : f.Sound) {x y r s : Bytes} (e : lp f x ++ r = lp f y ++ s)
 theorem lp_inj (h : f.Sound) {x y : Bytes} (e : lp f x = lp f y) : x = y :=
   (lp_split h (r := []) (s := []) (by simpa using e)).1
 
+/-- Items that split off a stream one at a time split a list of them off, given its count. -/
+theorem list_split {α : Type} {g : α → Bytes}
+    (hg : ∀ {a a' : α} {r s : Bytes}, g a ++ r = g a' ++ s → a = a' ∧ r = s) :
+    ∀ {as as' : List α} {r s : Bytes}, as.length = as'.length →
+      encList g as ++ r = encList g as' ++ s → as = as' ∧ r = s
+  | [], [], _, _, _, eq => ⟨rfl, by simpa [encList] using eq⟩
+  | [], _ :: _, _, _, hl, _ => absurd hl.symm (Nat.succ_ne_zero _)
+  | _ :: _, [], _, _, hl, _ => absurd hl (Nat.succ_ne_zero _)
+  | _ :: _, _ :: _, _, _, hl, eq => by
+    simp only [encList, List.append_assoc] at eq
+    obtain ⟨ha, eq⟩ := hg eq
+    obtain ⟨has, hr⟩ := list_split hg (Nat.succ.inj hl) eq
+    exact ⟨by rw [ha, has], hr⟩
+
 theorem bindings_split (h : f.Sound) :
     ∀ {e e' : Env} {r s : Bytes}, e.length = e'.length →
       encBindings f e ++ r = encBindings f e' ++ s → e = e' ∧ r = s
@@ -147,34 +257,110 @@ theorem bindings_split (h : f.Sound) :
     obtain ⟨he, hr⟩ := bindings_split h (Nat.succ.inj hl) eq
     exact ⟨by rw [h.str_inj ha, h.str_inj hc, he], hr⟩
 
-theorem encEnv_inj (h : f.Sound) {e e' : Env} (eq : encEnv f e = encEnv f e') : e = e' := by
+theorem encEnv_split (h : f.Sound) {e e' : Env} {r s : Bytes}
+    (eq : encEnv f e ++ r = encEnv f e' ++ s) : e = e' ∧ r = s := by
+  simp only [encEnv, List.append_assoc] at eq
   obtain ⟨hl, eq⟩ := h.word_split eq
-  exact (bindings_split h hl (r := []) (s := []) (by simpa using eq)).1
+  exact bindings_split h hl eq
+
+theorem encEnv_inj (h : f.Sound) {e e' : Env} (eq : encEnv f e = encEnv f e') : e = e' :=
+  (encEnv_split h (r := []) (s := []) (by simpa using eq)).1
+
+theorem bool_split (h : f.Sound) {x y : Bool} {r s : Bytes}
+    (e : encBool f x ++ r = encBool f y ++ s) : x = y ∧ r = s := by
+  obtain ⟨hx, hr⟩ := h.word_split e
+  refine ⟨?_, hr⟩
+  cases x <;> cases y <;> first | rfl | exact absurd hx (by decide)
+
+theorem kept_split (h : f.Sound) {k k' : Kept} {r s : Bytes}
+    (e : encKept f k ++ r = encKept f k' ++ s) : k = k' ∧ r = s := by
+  obtain ⟨p, c, m⟩ := k
+  obtain ⟨p', c', m'⟩ := k'
+  simp only [encKept, List.append_assoc] at e
+  obtain ⟨hp, e⟩ := lp_split h e
+  obtain ⟨hc, e⟩ := lp_split h e
+  obtain ⟨hm, hr⟩ := h.word_split e
+  exact ⟨by rw [h.str_inj hp, h.str_inj hc, hm], hr⟩
+
+theorem bind_split (h : f.Sound) {b b' : Bind} {r s : Bytes}
+    (e : encBind f b ++ r = encBind f b' ++ s) : b = b' ∧ r = s := by
+  obtain ⟨o, p, ro, op⟩ := b
+  obtain ⟨o', p', ro', op'⟩ := b'
+  simp only [encBind, List.append_assoc] at e
+  obtain ⟨ho, e⟩ := lp_split h e
+  obtain ⟨hp, e⟩ := lp_split h e
+  obtain ⟨hro, e⟩ := bool_split h e
+  obtain ⟨hop, hr⟩ := bool_split h e
+  exact ⟨by rw [h.str_inj ho, h.str_inj hp, hro, hop], hr⟩
+
+theorem encExtra_inj (h : f.Sound) {x x' : Extra} (e : encExtra f x = encExtra f x') : x = x' := by
+  obtain ⟨u, g, w, fs⟩ := x
+  obtain ⟨u', g', w', fs'⟩ := x'
+  simp only [encExtra] at e
+  obtain ⟨hu, e⟩ := h.word_split e
+  obtain ⟨hg, e⟩ := h.word_split e
+  obtain ⟨hw, e⟩ := lp_split h e
+  obtain ⟨hl, e⟩ := h.word_split e
+  obtain ⟨hfs, _⟩ := list_split (kept_split h) hl (r := []) (s := []) (by simpa using e)
+  rw [hu, hg, h.str_inj hw, hfs]
+
+/-- **The digest below a base is unambiguous**: equal preimages, the same rootfs, mapping, slot and
+binds. -/
+theorem belowPreimage_inj (h : f.Sound) {w w' : Below} (e : belowPreimage f w = belowPreimage f w') :
+    w = w' := by
+  obtain ⟨fp, u, i, bs⟩ := w
+  obtain ⟨fp', u', i', bs'⟩ := w'
+  simp only [belowPreimage] at e
+  obtain ⟨_, e⟩ := lp_split h e
+  obtain ⟨hfp, e⟩ := lp_split h e
+  obtain ⟨hu, e⟩ := lp_split h e
+  obtain ⟨hi, e⟩ := h.word_split e
+  obtain ⟨hl, e⟩ := h.word_split e
+  obtain ⟨hbs, _⟩ := list_split (bind_split h) hl (r := []) (s := []) (by simpa using e)
+  rw [h.str_inj hfp, h.str_inj hu, hi, hbs]
 
 theorem tag_ne (h : f.Sound) {n m : Nat} {r s : Bytes} (ne : n ≠ m) : f.word n ++ r ≠ f.word m ++ s :=
   fun e => ne (h.word_split e).1
 
-/-- **No two containers share a key's bytes.** The tags keep the three kinds apart, and the lengths
-keep each field's bytes from running into the next's. -/
+/-- **No two containers share a key's bytes.** The tags keep the three kinds apart, the lengths
+keep each field's bytes from running into the next's, and a base's fields are its `BaseSpec`. The
+`Extra` of a step is its base's, so it adds bytes but never parts two keys the model keeps
+together. -/
 theorem encState_injective (h : f.Sound) : ∀ {s s' : State}, encState f s = encState f s' → s = s'
   | .base b, .base b', e => by
-    simp only [encState] at e
-    rw [h.str_inj (lp_inj h (h.word_split e).2)]
+    simp only [encState, keyPreimage] at e
+    obtain ⟨hw, e⟩ := lp_split h (h.word_split e).2
+    obtain ⟨hsc, e⟩ := lp_split h e
+    obtain ⟨he, e⟩ := encEnv_split h e
+    have hx := encExtra_inj h e
+    have hb : f.base b = f.base b' := by
+      revert hw hsc he hx
+      cases f.base b; cases f.base b'
+      intro hw hsc he hx
+      simp only at hw hsc he hx
+      rw [belowPreimage_inj h hw, h.str_inj hsc, he, hx]
+    rw [h.base_inj hb]
   | .afterExec s sc en, .afterExec s' sc' en', e => by
-    simp only [encState] at e
+    simp only [encState, keyPreimage] at e
     obtain ⟨hs, e⟩ := lp_split h (h.word_split e).2
     obtain ⟨hsc, e⟩ := lp_split h e
-    rw [encState_injective h hs, h.text_inj hsc, encEnv_inj h e]
+    rw [encState_injective h hs, h.text_inj hsc, (encEnv_split h e).1]
   | .afterCopy s c, .afterCopy s' c', e => by
     simp only [encState] at e
     obtain ⟨hs, e⟩ := lp_split h (h.word_split e).2
     rw [encState_injective h hs, h.str_inj (lp_inj h e)]
-  | .base _, .afterExec _ _ _, e => absurd e (tag_ne h (by decide))
-  | .base _, .afterCopy _ _, e => absurd e (tag_ne h (by decide))
-  | .afterExec _ _ _, .base _, e => absurd e (tag_ne h (by decide))
-  | .afterExec _ _ _, .afterCopy _ _, e => absurd e (tag_ne h (by decide))
-  | .afterCopy _ _, .base _, e => absurd e (tag_ne h (by decide))
-  | .afterCopy _ _, .afterExec _ _ _, e => absurd e (tag_ne h (by decide))
+  | .base _, .afterExec _ _ _, e => by
+    simp only [encState, keyPreimage] at e; exact absurd e (tag_ne h (by decide))
+  | .base _, .afterCopy _ _, e => by
+    simp only [encState, keyPreimage] at e; exact absurd e (tag_ne h (by decide))
+  | .afterExec _ _ _, .base _, e => by
+    simp only [encState, keyPreimage] at e; exact absurd e (tag_ne h (by decide))
+  | .afterExec _ _ _, .afterCopy _ _, e => by
+    simp only [encState, keyPreimage] at e; exact absurd e (tag_ne h (by decide))
+  | .afterCopy _ _, .base _, e => by
+    simp only [encState, keyPreimage] at e; exact absurd e (tag_ne h (by decide))
+  | .afterCopy _ _, .afterExec _ _ _, e => by
+    simp only [encState, keyPreimage] at e; exact absurd e (tag_ne h (by decide))
 
 theorem encKey_injective (h : f.Sound) {k k' : Key} (e : encKey f k = encKey f k') : k = k' := by
   have hs := encState_injective h e
@@ -245,9 +431,13 @@ def f : Format where
   text
     | .body b _ => [b]
     | .stamped t _ => [t]
+  label := []
+  base _ := ⟨⟨0, 0, 0, []⟩, 0, [], ⟨0, 0, 0, []⟩⟩
+  stepExtra _ := ⟨0, 0, 0, []⟩
 
 theorem apart :
-    stepPreimage f [] (.body 120 1) [(89, 49)] ≠ stepPreimage f [] (.body 5 1) [] := by decide
+    stepPreimage f [] (.body 120 1) [(89, 49)] ⟨0, 0, 0, []⟩
+      ≠ stepPreimage f [] (.body 5 1) [] ⟨0, 0, 0, []⟩ := by decide
 
 /-- And what the collision costs: a step that prints `$Y` and one that prints nothing would share an
 entry, so whichever ran second would replay the first's log. -/
