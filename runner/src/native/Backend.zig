@@ -2517,7 +2517,17 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
 
     var with_services = run_only;
     with_services.services = &.{.{ .name = "pg", .image = .{ .lit = "postgres" } }};
-    try expectReason("`services:`", unsupported(io, with_services, root, ok));
+    // Services are native on a root runner, their images pulled by P3 (before, P6 refused them
+    // without its images directory); rootless they have no network of the job's own.
+    if (std.os.linux.geteuid() == 0)
+        try std.testing.expect(unsupported(io, with_services, root, ok) == null)
+    else
+        try expectReason("`services:`", unsupported(io, with_services, root, ok));
+    // An image given by an expression is not native on a root runner either.
+    if (std.os.linux.geteuid() == 0) {
+        with_services.services = &.{.{ .name = "pg", .image = .{ .expr = "matrix.db" } }};
+        try expectReason("expression", unsupported(io, with_services, root, ok));
+    }
     // `container:` jobs and any image are pulled natively; a job container's ports, volumes and
     // options are not native yet.
     var container = run_only;
