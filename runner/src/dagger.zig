@@ -880,9 +880,10 @@ pub fn run(
 
 /// The job on the native backend (`native/Backend.zig`): no Dagger session, the same steps code.
 /// What the native backend has no counterpart for yet is off for the job: the step cache and
-/// output keys (phase 2), and the cache volumes (phase 4): package caches, Zig's local cache and
-/// seeds, and the tool cache's checked trees. They are caches, so a job's results do not depend
-/// on them.
+/// output keys (phase 2), and the tool cache's checked trees. They are caches, so a job's results
+/// do not depend on them. The cache volumes, Zig's local cache and seeds are the backend's own
+/// (`native/volumes.zig`): off here for the shared code, which would ask a Dagger session for
+/// them, and handed to the backend as they were.
 fn runNative(
     arena: Allocator,
     io: std.Io,
@@ -912,6 +913,7 @@ fn runNative(
         }),
     );
     defer b.deinit();
+    b.caches = .of(opts_in);
     // Which ids the job's steps have, as "Set up job" says (`Backend.idsNote`).
     opts.backend_note = try b.idsNote(arena);
     return runSteps(arena, io, opts, job, &sh, results, b.transport(), &b);
@@ -1841,6 +1843,7 @@ fn runSteps(
     if (plan.zig_local_note) |note| x.setUpLine(note);
     if (base.tool_trees_note) |note| x.setUpLine(note);
     if (opts.backend_note) |note| x.setUpLine(note);
+    if (native) |b| for (b.notes.items) |note| x.setUpLine(note);
 
     if (job.container != null or !no_services) {
         if (!try x.startServices()) return servicesFailed(&x, arena, sh, results);

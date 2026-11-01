@@ -112,7 +112,7 @@ fn runnerCacheDirs() []const u8 {
 
 /// Where package cache `i` is mounted for steps that run as `runner_user`: its directory under the
 /// user's home instead of root's.
-fn runnerCachePath(arena: Allocator, i: usize) ![]const u8 {
+pub fn runnerCachePath(arena: Allocator, i: usize) ![]const u8 {
     const p = package_cache_dirs[i].path;
     if (std.mem.startsWith(u8, p, "/root/"))
         return std.mem.concat(arena, u8, &.{ runner_home, p["/root".len..] });
@@ -124,14 +124,14 @@ fn runnerCachePath(arena: Allocator, i: usize) ![]const u8 {
 /// Where Zig's local cache (`.zig-cache`) is mounted with `zig_local_cache`, instead of the workspace,
 /// which goes with the job. The volume is per repository (and apart for forks' pull requests), and
 /// Zig locks its cache entries, so jobs running at once share it safely.
-fn zigLocalCacheDir(as_runner: bool) []const u8 {
+pub fn zigLocalCacheDir(as_runner: bool) []const u8 {
     return if (as_runner) runner_home ++ "/.cache/zig-local" else "/root/.cache/zig-local";
 }
 
 /// ZIG_LOCAL_CACHE_DIR with `zig_local_cache`: the volume's root, or with a limit
 /// (`zig_local_cache_max_mb`) the `current` link into its live generation (`rollZigLocal`). One
 /// value for every job either way, so it never changes a step's cache key.
-fn zigLocalCacheEnv(as_runner: bool, max_mb: u32) []const u8 {
+pub fn zigLocalCacheEnv(as_runner: bool, max_mb: u32) []const u8 {
     if (max_mb == 0) return zigLocalCacheDir(as_runner);
     return if (as_runner)
         runner_home ++ "/.cache/zig-local/current"
@@ -151,7 +151,7 @@ fn zigLocalCacheEnv(as_runner: bool, max_mb: u32) []const u8 {
 /// in place, and a running job keeps its open directory through the rename.
 /// Arguments: $1 the volume, $2 the limit in KB, $3 the owner (or empty), $4 a nonce for the
 /// temporary link (concurrent jobs' containers have the same PIDs).
-const zig_local_roll_script =
+pub const zig_local_roll_script =
     \\owner=$3 nonce=$4
     \\cd "$1" || exit 0
     \\own() { [ -z "$owner" ] || chown -h "$owner" "$@"; }
@@ -234,7 +234,7 @@ fn writeZigLocalMount(q: *Query, volume: []const u8, as_runner: bool) !void {
 /// volume). Keyed by the ref, so jobs on different branches do not reconcile one environment to
 /// their own lockfiles in turn, and concurrent jobs on one branch want the same state anyway. Never
 /// with step caching (see `uvEnvFor`).
-fn uvEnvPath(arena: Allocator, cache_path: []const u8, ref: []const u8) ![]const u8 {
+pub fn uvEnvPath(arena: Allocator, cache_path: []const u8, ref: []const u8) ![]const u8 {
     var key: std.ArrayList(u8) = .empty;
     for (if (ref.len > 0) ref else "default") |c| {
         try key.append(
@@ -1313,7 +1313,7 @@ pub const package_cache_dirs = [_]struct {
     },
     .{ .name = "go-telemetry", .path = "/root/.config/go/telemetry", .tools = &go_tools },
 };
-const zig_packages = "zig-packages";
+pub const zig_packages = "zig-packages";
 const node_tools = [_][]const u8{ "npm", "npx", "node", "nodejs" };
 const go_tools = [_][]const u8{ "go", "golang", "gofmt" };
 const rust_tools = [_][]const u8{ "cargo", "rust", "rustup", "rustc" };
@@ -1326,7 +1326,7 @@ const rust_tools = [_][]const u8{ "cargo", "rust", "rustup", "rustc" };
 /// under /opt, where the step user cannot make it, so a miss there failed the job (v0.22.0: a
 /// script file that installs into it, such as zig-runner's install-zig.sh, names it nowhere in the
 /// workflow). A step's key holds its mounts, so a job's keys change only when its mounts do.
-fn cachesUsed(job: job_mod.Job) [package_cache_dirs.len]bool {
+pub fn cachesUsed(job: job_mod.Job) [package_cache_dirs.len]bool {
     var used: [package_cache_dirs.len]bool = @splat(false);
     for (job.steps) |st| for (package_cache_dirs, &used) |d, *u| switch (st.action) {
         .script => |s| switch (s.script) {
@@ -1399,8 +1399,8 @@ pub fn packageCacheScope(
 
 /// The project the seed is built from, outside where Zig is unpacked: Zig names a file in its
 /// cache relative to the first of its directories that holds it.
-const zig_seed_project = "/zig-runner-seed";
-const zig_seed_build_zig =
+pub const zig_seed_project = "/zig-runner-seed";
+pub const zig_seed_build_zig =
     \\const std = @import("std");
     \\pub fn build(b: *std.Build) void {
     \\    _ = b;
@@ -1408,7 +1408,7 @@ const zig_seed_build_zig =
     \\
 ;
 /// Where the seed is built.
-const zig_seed_dir = "/zig-seed";
+pub const zig_seed_dir = "/zig-seed";
 
 /// The seed for this job, built or found in the engine's cache, when the runner has any (one per
 /// verified Zig release, `Options.zig_seeds`), the job has cache volumes and it runs Zig
@@ -1498,7 +1498,7 @@ fn zigSeedDocument(arena: Allocator, seed: config.ZigSeed, as_runner: bool) ![]c
 /// The exec that builds the seed: Zig for the engine host's architecture (the runner's own: they
 /// share a machine), checked against its pinned sha256 before it runs, then `zig build --help`,
 /// and the cache without `tmp/`.
-fn zigSeedScript(arena: Allocator, seed: config.ZigSeed) ![]const u8 {
+pub fn zigSeedScript(arena: Allocator, seed: config.ZigSeed) ![]const u8 {
     const tree = try std.fmt.allocPrint(
         arena,
         "zig-{s}-linux-{s}",
@@ -1524,7 +1524,7 @@ fn zigSeedScript(arena: Allocator, seed: config.ZigSeed) ![]const u8 {
 /// Whether a job looks like it runs Zig: a `run:` script or an action that names it
 /// (`mlugg/setup-zig`). A miss runs the job unseeded, as before; a false hit costs its Zig volume
 /// the seed's 60 MB.
-fn usesZig(job: job_mod.Job) bool {
+pub fn usesZig(job: job_mod.Job) bool {
     for (job.steps) |st| switch (st.action) {
         .script => |s| switch (s.script) {
             inline else => |t| if (std.ascii.findIgnoreCase(t, "zig") != null) return true,

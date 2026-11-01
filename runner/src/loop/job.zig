@@ -574,6 +574,15 @@ fn runJobSteps(
         try r.forJob(c.arena)
     else
         .{ .seeds = cfg.zig_seeds, .unverified = cfg.zig_seeds_unverified };
+    var native = try dagger.Backend.configFor(
+        c.arena,
+        c.io,
+        c.environ,
+        cfg,
+        trust.vouches(cfg.trusted_refs, cfg.trusted_events, job.github),
+    );
+    // A native job is measured in its own cgroup (`admission.Gate.native`).
+    if (native) |*n| n.gate = c.gate;
     var result = try dagger.run(c.arena, c.io, c.environ, .{
         .dagger_cmd = c.cfg.dagger_cmd,
         .image = c.cfg.image,
@@ -603,13 +612,7 @@ fn runJobSteps(
         },
         .sink_job_id = job.check_run_id,
         .runner_name = c.name,
-        .native = try dagger.Backend.configFor(
-            c.arena,
-            c.io,
-            c.environ,
-            cfg,
-            trust.vouches(cfg.trusted_refs, cfg.trusted_events, job.github),
-        ),
+        .native = native,
     }, job, log);
     // A cancel can also end the job through a query it cut short (past the grace period).
     if (cancel.requested.load(.acquire)) {
