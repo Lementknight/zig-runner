@@ -85,7 +85,7 @@ pub fn pull(
     if (ref.digest) |d| {
         const known = cwd.readFileAlloc(io, try store.refPath(arena, d, platform.name()), arena, .limited(128)) catch null;
         if (known) |m| if (registry.validDigest(m)) {
-            if (try fromStore(arena, io, store, d, m)) |img| return img;
+            if (try fromStore(arena, io, store, d, m, req.owners)) |img| return img;
         };
     }
 
@@ -120,14 +120,14 @@ pub fn pull(
         .owners = req.owners,
         .image = req.image,
     };
-    const made = store.ensure(arena, io, "oci/images", man.digest["sha256:".len..], .{
+    const made = store.ensure(arena, io, "oci/images", try imageKey(arena, man.digest, req.owners), .{
         .ptr = &unpack,
         .makeFn = Unpack.make,
     }) catch |e| {
         if (unpack.why.len > 0) why.* = unpack.why;
         return fail(arena, why, &c, e, "its layers");
     };
-    var img = (try fromStore(arena, io, store, top.digest, man.digest)) orelse {
+    var img = (try fromStore(arena, io, store, top.digest, man.digest, req.owners)) orelse {
         why.* = try std.fmt.allocPrint(arena, "{s}: the store lost the image just unpacked", .{req.image});
         return error.ImageMissing;
     };
@@ -149,9 +149,16 @@ fn fail(arena: Allocator, why: *[]const u8, c: *const registry.Client, e: anyerr
     return e;
 }
 
+/// An image's directory in the store: its manifest's digest, apart for a rootless runner, whose
+/// files are all its own instead of the image's owners'.
+fn imageKey(arena: Allocator, manifest: []const u8, owners: bool) ![]const u8 {
+    const hex = manifest["sha256:".len..];
+    return if (owners) hex else std.fmt.allocPrint(arena, "{s}.rootless", .{hex});
+}
+
 /// The image under `manifest` in the store, with its config, or null when it is not there.
-fn fromStore(arena: Allocator, io: std.Io, store: Store, digest: []const u8, manifest: []const u8) !?Image {
-    const dir = try std.fmt.allocPrint(arena, "{s}/oci/images/{s}", .{ store.root, manifest["sha256:".len..] });
+fn fromStore(arena: Allocator, io: std.Io, store: Store, digest: []const u8, manifest: []const u8, owners: bool) !?Image {
+    const dir = try std.fmt.allocPrint(arena, "{s}/oci/images/{s}", .{ store.root, try imageKey(arena, manifest, owners) });
     const cwd = std.Io.Dir.cwd();
     const raw = cwd.readFileAlloc(io, try std.fmt.allocPrint(arena, "{s}/config.json", .{dir}), arena, .limited(max_config)) catch
         return null;

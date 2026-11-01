@@ -322,5 +322,40 @@ test "native oci pull: a blob that does not match its digest is refused and not 
     defer blobs.close(io);
     var it = blobs.iterate();
     try testing.expect(try it.next(io) == null);
-    try testing.expectError(error.FileNotFound, tmp.dir.access(io, try std.fmt.allocPrint(arena, "oci/images/{s}", .{img.manifest["sha256:".len..]}), .{}));
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, try std.fmt.allocPrint(arena, "oci/images/{s}.rootless", .{img.manifest["sha256:".len..]}), .{}));
+}
+
+test "native oci pull of the default image from Docker Hub (ZIG_RUNNER_TEST_PULL=1; measures a cold pull)" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const env = try testing.environ.createMap(arena);
+    if (!std.mem.eql(u8, env.get("ZIG_RUNNER_TEST_PULL") orelse "", "1")) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    var client: std.http.Client = .{ .allocator = testing.allocator, .io = io, .write_buffer_size = 16 * 1024 };
+    defer client.deinit();
+    const store: Store = .{ .root = try tmp.dir.realPathFileAlloc(io, ".", arena) };
+    const dagger = @import("../../dagger.zig");
+    var why: []const u8 = "";
+    const t0 = std.Io.Clock.awake.now(io).toMilliseconds();
+    const got = image.pull(arena, testing.allocator, io, &client, store, .{
+        .image = env.get("ZIG_RUNNER_TEST_PULL_IMAGE") orelse dagger.default_image,
+        .owners = std.os.linux.geteuid() == 0,
+    }, &why) catch |e| {
+        std.debug.print("pull: {s}\n", .{why});
+        return e;
+    };
+    const ms = std.Io.Clock.awake.now(io).toMilliseconds() - t0;
+    std.debug.print("\ncold pull: {d} ms whole, {d} ms in the pull's own clock, {d} layers, {d} bytes, " ++
+        "{d} devices skipped; {s} -> {s}\n", .{ ms, got.pulled.?.ms, got.pulled.?.layers, got.pulled.?.bytes, got.pulled.?.devices, got.digest, got.manifest });
+    var root = try std.Io.Dir.cwd().openDir(io, got.rootfs, .{});
+    defer root.close(io);
+    const osr = try root.readFileAlloc(io, "usr/lib/os-release", arena, .limited(4096));
+    try testing.expect(std.mem.indexOf(u8, osr, "Ubuntu") != null);
+    const t1 = std.Io.Clock.awake.now(io).toMilliseconds();
+    const warm = try image.pull(arena, testing.allocator, io, &client, store, .{ .image = dagger.default_image, .owners = false }, &why);
+    std.debug.print("warm (pinned, in the store): {d} ms\n", .{std.Io.Clock.awake.now(io).toMilliseconds() - t1});
+    try testing.expect(warm.pulled == null);
 }

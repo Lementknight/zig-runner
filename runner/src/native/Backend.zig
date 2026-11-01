@@ -18,6 +18,12 @@ const config = @import("../config.zig");
 const dagger = @import("../dagger.zig");
 const sandbox = @import("sandbox.zig");
 const net = @import("net.zig");
+const oci = @import("oci/image.zig");
+const registry = @import("oci/registry.zig");
+const Store = @import("oci/Store.zig");
+const http = @import("../github/http.zig");
+const set_up = @import("../dagger/set_up.zig");
+const docker = @import("../dagger/docker.zig");
 const Exec = @import("../dagger/Exec.zig");
 const Evaluator = @import("../dagger/Evaluator.zig");
 const SpanDemux = @import("../dagger/JobLog.zig").SpanDemux;
@@ -33,7 +39,25 @@ gpa: Allocator,
 /// The job's directory under the store: its layers (`L<n>`), the overlay work directory, the
 /// mount points, its lock and its network namespace. Removed when the job ends.
 dir: []const u8,
+/// The lowest layer every step sees: the job's image, provisioned when it is the default one
+/// (`prepareRootfs`), or the operator's rootfs.
 rootfs: []const u8,
+/// `Config.rootfs`: the operator's provisioned default image, used instead of a native pull of
+/// it; "" for none.
+operator_rootfs: []const u8 = "",
+/// `Config.store`: the pulled images and provisioned rootfs live under it (`oci/Store.zig`).
+store: []const u8 = "",
+/// The job's image, once pulled (`prepareRootfs`); null with the operator's rootfs.
+image: ?oci.Image = null,
+/// The image's own env (`NAME=value`), which every step starts from.
+image_env: []const []const u8 = &.{"PATH=" ++ image_path},
+/// Who the image's `USER` is, for steps that do not run as the runner user.
+image_uid: u32 = 0,
+image_gid: u32 = 0,
+/// A `container:` job's PATH once its env is set (`dagger.Base.runtime_path`).
+runtime_path: ?[]const u8 = null,
+/// What "Set up job" says of the image and its provisioning.
+notes: std.ArrayList([]const u8) = .empty,
 binds: []const sandbox.Spec.Bind,
 /// Held while the job runs (`lock`): a directory whose lock is free is stale (`sweep`).
 lock: std.Io.File,
@@ -60,9 +84,11 @@ running: sandbox.Running = .{},
 /// What the runner configures (`RUNNER_BACKEND=native`).
 pub const Config = struct {
     /// A directory holding the default image's filesystem, provisioned (`set_up.provision_script`,
-    /// or `provision_runner_script` for the runner user); "" for none (`RUNNER_NATIVE_ROOTFS`).
+    /// or `provision_runner_script` for the runner user), used instead of pulling and provisioning
+    /// it natively; "" to pull it (`RUNNER_NATIVE_ROOTFS`).
     rootfs: []const u8 = "",
-    /// Where jobs' layers live while they run (`RUNNER_NATIVE_STORE`).
+    /// Where jobs' layers live while they run, and pulled images and provisioned rootfs
+    /// (`RUNNER_NATIVE_STORE`).
     store: []const u8 = "",
     /// This binary, which runs each step's sandbox (`sandbox.command`).
     self_exe: []const u8 = "",
@@ -124,8 +150,8 @@ pub const Launch = struct {
 /// A job's slot on a root runner: its number and the lock that holds it.
 pub const Slot = struct { n: u32, lock: std.Io.File };
 
-/// The default image's own environment (`ubuntu:24.04`'s config): P3's pull reads it from the
-/// image instead.
+/// The default image's PATH (`ubuntu:24.04`'s config), with the operator's rootfs, and BuildKit's
+/// default for an image whose config sets none.
 const image_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 /// `runner_user`'s ids in the provisioned image (`set_up.provision_runner_script`).
 const runner_uid = 1001;
@@ -137,21 +163,18 @@ const max_layers = 400;
 /// runs, for the whole job: native and Dagger never share one. What this machine can do is
 /// `usable`'s.
 pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Config) ?[]const u8 {
-    if (cfg.rootfs.len == 0) return "there is no native rootfs (RUNNER_NATIVE_ROOTFS; the " ++
-        "native image pull is phase 3)";
-    std.Io.Dir.accessAbsolute(io, cfg.rootfs, .{}) catch
+    if (cfg.rootfs.len > 0) std.Io.Dir.accessAbsolute(io, cfg.rootfs, .{}) catch
         return "the native rootfs (RUNNER_NATIVE_ROOTFS) cannot be read";
+    if (oci.hostPlatform() == null) return "there are no images for this machine's architecture";
     if (cfg.self_exe.len == 0 or cfg.store.len == 0) return "the native store is not set up";
     if (!cfg.vouched) return "native steps run only in jobs this runner vouches for " ++
         "(RUNNER_TRUSTED_REFS)";
     if (std.os.linux.geteuid() != 0 and !cfg.rootless) return "the runner is not root, and " ++
         "rootless native steps have only one id mapped (RUNNER_NATIVE_ROOTLESS=1 runs them " ++
         "anyway; subordinate ids are phase 5's)";
-    if (job.container != null) return "`container:` jobs are not native yet (phase 3)";
+    if (job.container) |jc| if (jc.ports.len > 0 or jc.volumes.len > 0 or jc.options != null)
+        return "a job container's `ports:`, `volumes:` and `options:` are not native yet (phase 6)";
     if (job.services.len > 0) return "`services:` are not native yet (phase 6)";
-    // The pinned default image (`dagger.resolveImage`), which the rootfs must be made from.
-    if (!std.mem.eql(u8, dagger.resolveImage(opts.image), dagger.default_image) or !opts.provision)
-        return "only the default image is native yet (phase 3)";
     if (opts.nesting) return "steps that use the Dagger engine (RUNNER_DAGGER_NESTING) need Dagger";
     if (usesHashFiles(job)) return "`hashFiles()` reads the job's container through Dagger";
     const as_runner = opts.step_user == .runner;
@@ -273,6 +296,14 @@ fn probe(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !?[]const u8
     }
     var b = try init(arena, io, gpa, cfg);
     defer b.deinit();
+    // Without the operator's rootfs, the default image as pulled: the probe then also says
+    // whether this machine can pull.
+    if (b.rootfs.len == 0) {
+        var why: []const u8 = "";
+        b.rootfs = (b.pull(dagger.default_image, null, &why) catch
+            return try std.fmt.allocPrint(arena, "this machine cannot pull the default image " ++
+                "natively ({s})", .{why})).rootfs;
+    }
     var out: Captured = .{ .arena = arena };
     const ended = try b.exec("true", &.{"PATH=/usr/bin:/bin"}, &.{}, 0, 0, out.output());
     if (ended.failure.len > 0 or ended.code != 0) return try std.fmt.allocPrint(
@@ -429,6 +460,8 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
         .gpa = gpa,
         .dir = dir,
         .rootfs = cfg.rootfs,
+        .operator_rootfs = cfg.rootfs,
+        .store = cfg.store,
         .binds = cfg.binds,
         .lock = lock,
         .how = how,
@@ -648,18 +681,25 @@ pub fn base(
     err_msg: *[]const u8,
 ) !void {
     const arena = b.arena;
+    try b.prepareRootfs(ev, plan, err_msg);
     try b.baseEnv(ev, plan);
 
-    // The workspace and RUNNER_TEMP, made as Dagger's base makes them: by root, in the image,
-    // owned by the step user when it is not root, from `/` (the workspace is not there yet). The
+    // The workspace and RUNNER_TEMP, made as Dagger's base makes them: in the provisioned image by
+    // root, owned by the step user when it is not root; in any other image by its own user, who
+    // may be unable to (its steps then say so). From `/`, as the workspace is not there yet. The
     // event payload goes in as `withNewFile` does.
     const chown = if (plan.as_runner) " && chown -R " ++ dagger.runner_user ++ ":" ++
         dagger.runner_user ++ " " ++ dagger.work_root else "";
-    const mk = try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}", .{
+    const mk = if (plan.provision) try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}", .{
         ev.workspace,
         ev.temp,
         chown,
+    }) else try std.fmt.allocPrint(arena, "mkdir -p {s} {s} 2>/dev/null || true", .{
+        ev.workspace,
+        ev.temp,
     });
+    const mk_uid: u32 = if (plan.provision) 0 else b.uid;
+    const mk_gid: u32 = if (plan.provision) 0 else b.gid;
     const files = [_]sandbox.Spec.File{.{
         .path = dagger.event_path,
         .contents = try ev.eventJson(),
@@ -669,7 +709,7 @@ pub fn base(
     var out: Captured = .{ .arena = arena };
     const workdir = b.workdir;
     b.workdir = "/";
-    const ended = try b.exec(mk, try b.envStrings(&.{}), &files, 0, 0, out.output());
+    const ended = try b.exec(mk, try b.envStrings(&.{}), &files, mk_uid, mk_gid, out.output());
     b.workdir = workdir;
     if (ended.failure.len > 0 or ended.code != 0) {
         err_msg.* = try std.fmt.allocPrint(arena, "could not set up the job's base: {s}{s}", .{
@@ -685,7 +725,18 @@ pub fn base(
 /// What carries a secret is a plain variable here, as a Dagger secret variable is in the
 /// process: there is no engine whose cache could keep it.
 fn baseEnv(b: *Backend, ev: *Evaluator, plan: anytype) !void {
-    try b.put("PATH", image_path);
+    // The image's env, as Dagger's `from` gives it, with BuildKit's PATH when it sets none.
+    for (b.image_env) |kv| {
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        try b.put(kv[0..eq], kv[eq + 1 ..]);
+    }
+    if (b.envValue("PATH") == null) try b.put("PATH", image_path);
+    // A `container:` job's own env, as `docker create -e` sets it; its PATH is the container's
+    // (`Exec.container_path`).
+    for (plan.container_env) |e| try b.put(e.name, e.value);
+    if (ev.job.container != null) b.runtime_path = b.envValue("PATH");
+    b.uid = b.image_uid;
+    b.gid = b.image_gid;
     if (plan.as_runner) {
         b.uid = runner_uid;
         b.gid = runner_uid;
@@ -957,6 +1008,235 @@ fn exec(
 }
 fn put(b: *Backend, name: []const u8, value: []const u8) !void {
     try Evaluator.putEnv(b.arena, &b.env, name, value);
+}
+
+fn envValue(b: *const Backend, name: []const u8) ?[]const u8 {
+    for (b.env.items) |e| if (std.mem.eql(u8, e.name, name)) return e.value;
+    return null;
+}
+
+// --- the job's image ---
+
+/// How long a pull (its manifests, blobs and unpacking) may take before the job fails: a
+/// registry that stopped answering must not hold "Set up job" for ever, and no step's timeout
+/// runs yet.
+const pull_deadline: std.Io.Duration = .fromSeconds(30 * 60);
+
+/// The rootfs the job's steps start from, made natively: the job's image pulled (or found in the
+/// store), and provisioned when it is the default one, as a native step of its own keyed like any
+/// other (`provision`). With the operator's rootfs (`Config.rootfs`), the provisioned default
+/// image is that directory instead, as in P1. Then who the image's `USER` is.
+fn prepareRootfs(b: *Backend, ev: *Evaluator, plan: anytype, err_msg: *[]const u8) !void {
+    const arena = b.arena;
+    const default = std.mem.eql(u8, plan.job_image, dagger.default_image);
+    if (b.operator_rootfs.len > 0 and default and plan.provision) {
+        b.rootfs = b.operator_rootfs;
+        return;
+    }
+    var creds: ?registry.Credentials = null;
+    if (ev.job.container) |jc| if (try docker.registryCredentials(ev, jc)) |c| {
+        creds = .{ .username = c.user, .password = c.pass };
+    };
+    var why: []const u8 = "";
+    const img = b.pull(plan.job_image, creds, &why) catch |e| {
+        err_msg.* = try std.fmt.allocPrint(arena, "could not pull {s} natively: {s}", .{
+            plan.job_image,
+            if (why.len > 0) why else @errorName(e),
+        });
+        return error.BaseContainerFailed;
+    };
+    b.image = img;
+    b.image_env = img.env;
+    try b.notes.append(arena, if (img.pulled) |p| try std.fmt.allocPrint(
+        arena,
+        "Image: pulled natively in {d} ms ({d} layers, {d} KB fetched){s}",
+        .{
+            p.ms,                                                                                                  p.layers, p.bytes / 1024,
+            if (p.devices > 0) try std.fmt.allocPrint(arena, "; {d} device nodes left out", .{p.devices}) else "",
+        },
+    ) else "Image: from the native store");
+    b.rootfs = img.rootfs;
+    if (plan.provision) b.rootfs = try b.provision(
+        img,
+        if (plan.as_runner) set_up.provision_runner_script else set_up.provision_script,
+        err_msg,
+    );
+    if (!plan.as_runner and img.user.len > 0) {
+        const ids = b.imageUser(img.user) catch |e| {
+            err_msg.* = try std.fmt.allocPrint(arena, "the image's USER {s}: {s}", .{
+                img.user,
+                switch (e) {
+                    error.UnknownUser => "not in its /etc/passwd",
+                    error.UnknownGroup => "its group is not in its /etc/group",
+                    error.Unmapped => "a rootless runner maps only root (a root runner, or an image that runs as root)",
+                    else => @errorName(e),
+                },
+            });
+            return error.BaseContainerFailed;
+        };
+        b.image_uid = ids[0];
+        b.image_gid = ids[1];
+    }
+}
+
+/// `image` pulled into the store, or found there (`oci/image.zig`), within `pull_deadline`.
+fn pull(b: *Backend, image: []const u8, creds: ?registry.Credentials, why: *[]const u8) !oci.Image {
+    var local: std.http.Client = .{
+        .allocator = b.gpa,
+        .io = b.io,
+        .write_buffer_size = http.write_buffer_size,
+    };
+    defer local.deinit();
+    const store: Store = .{ .root = b.store };
+    const req: oci.Request = .{ .image = image, .creds = creds, .owners = b.how.userns == .mapped };
+    const r = try http.within(b.io, pull_deadline, pullWithin, .{
+        b.arena, b.gpa, b.io, http.client(&local), store, req, why,
+    });
+    return (r orelse {
+        why.* = "it took longer than 30 minutes";
+        return error.Timeout;
+    });
+}
+
+fn pullWithin(
+    arena: Allocator,
+    gpa: Allocator,
+    io: std.Io,
+    client: *std.http.Client,
+    store: Store,
+    req: oci.Request,
+    why: *[]const u8,
+) anyerror!oci.Image {
+    return oci.pull(arena, gpa, io, client, store, req, why);
+}
+
+/// The default image provisioned (`set_up.provision_script`, or `provision_runner_script` when
+/// steps run as the runner user), as Dagger's base does in one cached exec: here a native step
+/// on the pulled image, its layer keyed by the image, the script and its env (`Store.layerKey`,
+/// P2's key) and flattened onto the image (`Store.flatten`), so it runs once per store. The
+/// provisioned rootfs.
+fn provision(b: *Backend, img: oci.Image, script: []const u8, err_msg: *[]const u8) ![]const u8 {
+    const arena = b.arena;
+    var env: std.ArrayList([]const u8) = .empty;
+    try env.appendSlice(arena, img.env);
+    if (for (img.env) |e| {
+        if (std.mem.startsWith(u8, e, "PATH=")) break false;
+    } else true) try env.append(arena, "PATH=" ++ image_path);
+    const parent = try std.fmt.allocPrint(arena, "oci:{s}{s}", .{
+        img.manifest,
+        if (b.how.userns == .mapped) "" else ":rootless",
+    });
+    const key = try Store.layerKey(arena, parent, script, env.items);
+    const started = std.Io.Clock.awake.now(b.io).toMilliseconds();
+    var p: Provision = .{ .b = b, .img = img, .script = script, .env = env.items };
+    const store: Store = .{ .root = b.store };
+    const made = store.ensure(arena, b.io, "layers", key, .{ .ptr = &p, .makeFn = Provision.make }) catch |e| {
+        err_msg.* = try std.fmt.allocPrint(arena, "could not provision the image natively: {s}", .{
+            if (p.why.len > 0) p.why else @errorName(e),
+        });
+        return error.BaseContainerFailed;
+    };
+    try b.notes.append(arena, if (made.made) try std.fmt.allocPrint(
+        arena,
+        "Provisioned natively in {d} ms (layer {s})",
+        .{ std.Io.Clock.awake.now(b.io).toMilliseconds() - started, key[0..12] },
+    ) else try std.fmt.allocPrint(arena, "Provisioned: the native layer {s}, made before", .{key[0..12]}));
+    return std.fmt.allocPrint(arena, "{s}/rootfs", .{made.dir});
+}
+
+/// The provisioning step, run in the job's sandbox on the pulled image and flattened into the
+/// directory `Store.ensure` publishes.
+const Provision = struct {
+    b: *Backend,
+    img: oci.Image,
+    script: []const u8,
+    env: []const []const u8,
+    why: []const u8 = "",
+
+    fn make(ptr: *anyopaque, dir: []const u8) anyerror!void {
+        const p: *Provision = @ptrCast(@alignCast(ptr));
+        const b = p.b;
+        const arena = b.arena;
+        const workdir = b.workdir;
+        b.rootfs = p.img.rootfs;
+        b.workdir = "/";
+        defer b.workdir = workdir;
+        var out: Captured = .{ .arena = arena };
+        const ended = try b.exec(p.script, p.env, &.{}, 0, 0, out.output());
+        const upper = try b.layerPath(b.layers.items.len - 1);
+        // The step's layer is consumed: the next exec of the job starts again from L0.
+        defer {
+            Store.removeTree(arena, b.io, upper);
+            b.layers.clearRetainingCapacity();
+        }
+        if (ended.failure.len > 0 or ended.code != 0) {
+            p.why = try std.fmt.allocPrint(arena, "{s}{s} (exit {d})", .{ ended.failure, out.tail(), ended.code });
+            return error.ProvisionFailed;
+        }
+        // On a root runner the layer belongs to the job's range of ids: back to the image's.
+        const shift: u32 = if (b.how.userns == .mapped) b.idBase() else 0;
+        Store.flatten(arena, b.io, p.img.rootfs, .{ .dir = upper, .id_shift = shift }, try std.fmt.allocPrint(arena, "{s}/rootfs", .{dir})) catch |e| {
+            p.why = try std.fmt.allocPrint(arena, "its layer could not be flattened: {s}", .{@errorName(e)});
+            return e;
+        };
+    }
+};
+
+/// The ids of an image's `USER`: `name`, `uid`, `name:group`, `uid:gid`, looked up in the image's
+/// own /etc/passwd and /etc/group (a uid not there has gid 0, as runc gives it).
+fn imageUser(b: *Backend, user: []const u8) ![2]u32 {
+    const arena = b.arena;
+    const colon = std.mem.indexOfScalar(u8, user, ':');
+    const u = if (colon) |c| user[0..c] else user;
+    const g: ?[]const u8 = if (colon) |c| user[c + 1 ..] else null;
+    const passwd = switch (try sandbox.readIn(arena, b.rootfs, "/etc/passwd", 1 << 20)) {
+        .text => |t| t,
+        else => "",
+    };
+    var uid: u32 = 0;
+    var gid: u32 = 0;
+    if (std.fmt.parseInt(u32, u, 10)) |n| {
+        uid = n;
+        gid = if (lookup(passwd, null, n)) |e| e[1] else 0;
+    } else |_| {
+        const e = lookup(passwd, u, null) orelse return error.UnknownUser;
+        uid = e[0];
+        gid = e[1];
+    }
+    if (g) |grp| {
+        gid = std.fmt.parseInt(u32, grp, 10) catch gid: {
+            const group = switch (try sandbox.readIn(arena, b.rootfs, "/etc/group", 1 << 20)) {
+                .text => |t| t,
+                else => "",
+            };
+            var lines = std.mem.splitScalar(u8, group, '\n');
+            while (lines.next()) |line| {
+                var f = std.mem.splitScalar(u8, line, ':');
+                const name = f.next() orelse continue;
+                _ = f.next();
+                const id = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue;
+                if (std.mem.eql(u8, name, grp)) break :gid id;
+            }
+            return error.UnknownGroup;
+        };
+    }
+    if (b.how.userns != .mapped and (uid != 0 or gid != 0)) return error.Unmapped;
+    return .{ uid, gid };
+}
+
+/// A passwd line's uid and gid, by name or by uid.
+fn lookup(passwd: []const u8, name: ?[]const u8, uid: ?u32) ?[2]u32 {
+    var lines = std.mem.splitScalar(u8, passwd, '\n');
+    while (lines.next()) |line| {
+        var f = std.mem.splitScalar(u8, line, ':');
+        const n = f.next() orelse continue;
+        _ = f.next();
+        const id = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue;
+        const g = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue;
+        if (name) |want| if (std.mem.eql(u8, n, want)) return .{ id, g };
+        if (uid) |want| if (id == want) return .{ id, g };
+    }
+    return null;
 }
 
 /// What `Exec.writePendingEnv` adds to Dagger's container before a step: the variables and PATH
@@ -1274,13 +1554,21 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     var services = run_only;
     services.services = &.{.{ .name = "pg", .image = .{ .lit = "postgres" } }};
     try expectReason("`services:`", unsupported(io, services, root, ok));
+    // `container:` jobs and any image are pulled natively; a job container's ports, volumes and
+    // options are not native yet.
     var container = run_only;
     container.container = .{ .name = "", .image = .{ .lit = "node:22" } };
-    try expectReason("`container:`", unsupported(io, container, root, ok));
-
+    try std.testing.expect(unsupported(io, container, root, ok) == null);
+    container.container.?.ports = &.{.{ .lit = "8080:80" }};
+    try expectReason("`ports:`", unsupported(io, container, root, ok));
+    container.container.?.ports = &.{};
+    container.container.?.options = .{ .lit = "--cpus 1" };
+    try expectReason("`options:`", unsupported(io, container, root, ok));
     var custom = root;
     custom.image = "alpine:3";
-    try expectReason("default image", unsupported(io, run_only, custom, ok));
+    try std.testing.expect(unsupported(io, run_only, custom, ok) == null);
+    custom.provision = false;
+    try std.testing.expect(unsupported(io, run_only, custom, ok) == null);
     var nesting = root;
     nesting.nesting = true;
     try expectReason("Dagger engine", unsupported(io, run_only, nesting, ok));
@@ -1303,9 +1591,11 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     hashed_if.condition = "hashFiles('x') != ''";
     try expectReason("hashFiles", unsupported(io, testJob(&.{hashed_if}), root, ok));
 
+    // Without the operator's rootfs the default image is pulled natively; one that is set must
+    // be there.
     var no_rootfs = ok;
     no_rootfs.rootfs = "";
-    try expectReason("RUNNER_NATIVE_ROOTFS", unsupported(io, run_only, root, no_rootfs));
+    try std.testing.expect(unsupported(io, run_only, root, no_rootfs) == null);
     no_rootfs.rootfs = "/nonexistent/rootfs";
     try expectReason("cannot be read", unsupported(io, run_only, root, no_rootfs));
 
@@ -1343,8 +1633,8 @@ test "a job that cannot be native runs on Dagger, and Set up job says why" {
         .native = .{ .vouched = true, .rootless = true },
     }, testJob(&.{testStep("echo hi")}), &log);
     try std.testing.expectEqual(dagger.Outcome.success, res.steps[0].outcome);
-    try std.testing.expect(std.mem.indexOf(u8, w.written(), "This job runs on Dagger: there " ++
-        "is no native rootfs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.written(), "This job runs on Dagger: the " ++
+        "native store is not set up") != null);
     try std.testing.expect(std.mem.indexOf(u8, w.written(), "Engine: Dagger") != null);
 }
 
@@ -1385,7 +1675,11 @@ test "parity: a native job's base has the environment of Dagger's base container
             .lock = undefined,
             .how = .{ .argv_prefix = &.{}, .userns = .mapped },
         };
-        try b.baseEnv(&ev, .{ .as_runner = user == .runner, .mark = "m4rk" });
+        try b.baseEnv(&ev, .{
+            .as_runner = user == .runner,
+            .mark = "m4rk",
+            .container_env = &[_]job_mod.EnvVar{},
+        });
         // Every variable Dagger sets is set natively, to the same value...
         var dagger_names: std.StringHashMapUnmanaged(void) = .empty;
         var rest: []const u8 = doc;
@@ -2094,4 +2388,173 @@ test "a job's directory and lock are let go once, when its set-up fails after th
     cfg.test_fail_after_lock = false;
     var b = try init(arena, io, std.testing.allocator, cfg);
     b.deinit();
+}
+
+const testregistry = @import("oci/testregistry.zig");
+const oci_layer = @import("oci/layer.zig");
+
+/// A small image for the native pull's job tests, as layers: the directories and links of the
+/// tests' rootfs (`testConfig`, whose binds bring the host's /usr), its own passwd and a marker,
+/// then a layer that removes a file of the first.
+fn testImageLayers(arena: Allocator) ![]const []const u8 {
+    var t: oci_layer.TestTar = .{ .a = arena };
+    for ([_][]const u8{ "usr/", "etc/", "etc/ssl/", "tmp/", "dev/", "proc/", "sys/", "root/", "home/", "home/app/" }) |d|
+        try t.add(.{ .path = d, .kind = .directory, .mode = if (std.mem.eql(u8, d, "tmp/")) 0o1777 else 0o755 });
+    for ([_][2][]const u8{ .{ "bin", "usr/bin" }, .{ "sbin", "usr/sbin" }, .{ "lib", "usr/lib" }, .{ "lib64", "usr/lib64" } }) |l|
+        try t.add(.{ .path = l[0], .kind = .symlink, .link = l[1] });
+    try t.add(.{ .path = "etc/passwd", .body = "root:x:0:0:root:/root:/bin/sh\napp:x:1002:1003::/home/app:/bin/sh\n" });
+    try t.add(.{ .path = "etc/group", .body = "root:x:0:\napp:x:1003:\nstaff:x:50:\n" });
+    for ([_][]const u8{ "etc/hosts", "etc/resolv.conf", "etc/ld.so.cache" }) |f| try t.add(.{ .path = f });
+    try t.add(.{ .path = "etc/marker", .body = "from the image\n" });
+    try t.add(.{ .path = "etc/gone", .body = "x" });
+    var t2: oci_layer.TestTar = .{ .a = arena };
+    try t2.add(.{ .path = "etc/.wh.gone" });
+    return arena.dupe([]const u8, &.{ try t.finish(), try t2.finish() });
+}
+
+test "a container job on the native backend: its image pulled with its credentials, its env, no Dagger" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+
+    const img = try testregistry.testImage(arena, "test/img", "1", try testImageLayers(arena), "\"PATH=/usr/bin:/bin\",\"FROM_IMAGE=yes\",\"BOTH=image\"", true);
+    var server: testregistry.Server = .{ .routes = img.routes, .private = true };
+    try server.start();
+    defer server.stop();
+
+    var job = testJob(&.{testStep("echo FROM_IMAGE=$FROM_IMAGE BOTH=$BOTH; cat /etc/marker; " ++
+        "test -e /etc/gone && echo gone-is-there || echo gone-is-gone; echo uid=$(id -u); pwd")});
+    job.container = .{
+        .name = "",
+        .image = .{ .lit = try server.image(arena, "test/img:1") },
+        .env = &.{.{ .name = "BOTH", .value = .{ .lit = "container" } }},
+        .username = .{ .lit = "user" },
+        .password = .{ .lit = "pass" },
+    };
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    const text = w.written();
+    if (!res.succeeded) std.debug.print("{s}\n", .{text});
+    try std.testing.expect(res.succeeded);
+    const expect = [_][]const u8{
+        "Engine: native",
+        "Image: pulled natively in",
+        try std.fmt.allocPrint(arena, "Digest: {s}", .{img.index}),
+        // The container's env over the image's.
+        "FROM_IMAGE=yes BOTH=container",
+        "from the image",
+        "gone-is-gone",
+        "uid=0",
+        "/__w/r/r",
+    };
+    for (expect) |e| if (std.mem.indexOf(u8, text, e) == null) {
+        std.debug.print("missing {s} in:\n{s}\n", .{ e, text });
+        return error.TestUnexpectedResult;
+    };
+
+    // A second job finds the image in the store, asking the registry only what the tag is now
+    // (the challenge, the token, the index and the platform's manifest).
+    const before = server.requests.load(.acquire);
+    var w2: std.Io.Writer.Allocating = .init(arena);
+    var log2: sink.LogSink = .{ .stdout = .{ .writer = &w2.writer } };
+    const res2 = try dagger.run(arena, std.testing.io, &env, .{ .native = cfg, .step_user = .root, .gpa = std.testing.allocator }, job, &log2);
+    try std.testing.expect(res2.succeeded);
+    try std.testing.expect(std.mem.indexOf(u8, w2.written(), "Image: from the native store") != null);
+    try std.testing.expect(server.requests.load(.acquire) - before <= 4);
+
+    // Without its credentials, the job fails in "Set up job", saying why.
+    job.container.?.password = null;
+    var w3: std.Io.Writer.Allocating = .init(arena);
+    var log3: sink.LogSink = .{ .stdout = .{ .writer = &w3.writer } };
+    const res3 = try dagger.run(arena, std.testing.io, &env, .{ .native = cfg, .step_user = .root, .gpa = std.testing.allocator }, job, &log3);
+    try std.testing.expect(!res3.succeeded);
+    try std.testing.expect(std.mem.indexOf(u8, res3.engine_error.?, "credentials") != null);
+}
+
+test "native provisioning: a step on the pulled image, flattened and kept under its key" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const img = try testregistry.testImage(arena, "test/prov", "1", try testImageLayers(arena), "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+
+    var b = try init(arena, std.testing.io, std.testing.allocator, cfg);
+    defer b.deinit();
+    var why: []const u8 = "";
+    const pulled = try b.pull(try server.image(arena, "test/prov:1"), null, &why);
+    // What overlay records in the step's layer: a removed file (a whiteout), a directory removed
+    // and made again (opaque), a new file and a changed one.
+    const script = "rm /etc/marker && mkdir -p /opt/tool && echo new > /opt/tool/f && " ++
+        "echo changed > /etc/passwd2 && rm -r /home/app && mkdir /home/app && echo fresh > /home/app/x";
+    var err_msg: []const u8 = "";
+    const rootfs = b.provision(pulled, script, &err_msg) catch |e| {
+        std.debug.print("provision: {s}\n", .{err_msg});
+        return e;
+    };
+    try std.testing.expect(std.mem.indexOf(u8, b.notes.items[0], "Provisioned natively") != null);
+    var root = try std.Io.Dir.cwd().openDir(std.testing.io, rootfs, .{});
+    defer root.close(std.testing.io);
+    const io = std.testing.io;
+    try std.testing.expectError(error.FileNotFound, root.access(io, "etc/marker", .{}));
+    try std.testing.expectEqualStrings("new\n", try root.readFileAlloc(io, "opt/tool/f", arena, .limited(64)));
+    try std.testing.expectEqualStrings("fresh\n", try root.readFileAlloc(io, "home/app/x", arena, .limited(64)));
+    try std.testing.expectEqualStrings("changed\n", try root.readFileAlloc(io, "etc/passwd2", arena, .limited(64)));
+    // The image itself is untouched, and the next job's steps start from L0 again.
+    var image_root = try std.Io.Dir.cwd().openDir(io, pulled.rootfs, .{});
+    defer image_root.close(io);
+    try std.testing.expectEqualStrings("from the image\n", try image_root.readFileAlloc(io, "etc/marker", arena, .limited(64)));
+    try std.testing.expectEqual(@as(usize, 0), b.layers.items.len);
+    // Made once: a second job reuses it.
+    _ = try b.provision(pulled, script, &err_msg);
+    try std.testing.expect(std.mem.indexOf(u8, b.notes.items[1], "made before") != null);
+    // A failing script fails with its output's last line, and leaves nothing under its key.
+    try std.testing.expectError(error.BaseContainerFailed, b.provision(pulled, "echo the reason; exit 7", &err_msg));
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "the reason (exit 7)") != null);
+}
+
+test "an image's USER: by name, by uid, with a group, and what a rootless runner cannot map" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "etc");
+    try tmp.dir.writeFile(io, .{ .sub_path = "etc/passwd", .data = "root:x:0:0::/root:/bin/sh\napp:x:1002:1003::/home/app:/bin/sh\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "etc/group", .data = "root:x:0:\nstaff:x:50:\n" });
+    var b: Backend = .{
+        .arena = arena,
+        .io = io,
+        .gpa = std.testing.allocator,
+        .dir = "",
+        .rootfs = try tmp.dir.realPathFileAlloc(io, ".", arena),
+        .binds = &.{},
+        .lock = undefined,
+        .how = .{ .argv_prefix = &.{}, .userns = .mapped },
+    };
+    try std.testing.expectEqual([2]u32{ 1002, 1003 }, try b.imageUser("app"));
+    try std.testing.expectEqual([2]u32{ 1002, 1003 }, try b.imageUser("1002"));
+    try std.testing.expectEqual([2]u32{ 4000, 0 }, try b.imageUser("4000"));
+    try std.testing.expectEqual([2]u32{ 1002, 50 }, try b.imageUser("app:staff"));
+    try std.testing.expectEqual([2]u32{ 7, 8 }, try b.imageUser("7:8"));
+    try std.testing.expectEqual([2]u32{ 0, 0 }, try b.imageUser("root"));
+    try std.testing.expectError(error.UnknownUser, b.imageUser("nobody"));
+    try std.testing.expectError(error.UnknownGroup, b.imageUser("app:wheel"));
+    b.how.userns = .self;
+    try std.testing.expectError(error.Unmapped, b.imageUser("app"));
+    try std.testing.expectEqual([2]u32{ 0, 0 }, try b.imageUser("0"));
 }
