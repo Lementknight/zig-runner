@@ -400,6 +400,16 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
         linux.CLONE.NEWUTS | linux.CLONE.NEWIPC));
     makePrivate();
     const merged = z(arena, spec.merged);
+    // The overlay bound onto itself, a mount of this namespace's own: on a root runner it was
+    // mounted in the host's root's namespace, so here it is locked, and `pivot_root` refuses a
+    // locked mount as the new root (runc binds its rootfs so for the same reason).
+    check("bind the overlay onto itself", linux.mount(
+        merged,
+        merged,
+        null,
+        linux.MS.BIND | linux.MS.REC,
+        0,
+    ));
     const dir_flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
     const root_rc = linux.open(merged, dir_flags, 0);
     check("open the overlay", root_rc);
