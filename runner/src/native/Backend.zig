@@ -7,19 +7,19 @@
 //! `scripts.stepScriptFc` writes the same `sh -c` script, `JobLog` reads the same markers and
 //! workflow commands, and `Exec.collect` applies the same file commands. What this file owns is
 //! what the engine did: the base the steps start from, the container's environment between
-//! steps, running one script, and reading its combined file commands back.
+//! steps, running one script, reading its combined file commands back, and on a root runner the
+//! job's ids and network (`net.zig`).
 
 const Backend = @This();
 
 const std = @import("std");
 const job_mod = @import("../job.zig");
-const engine = @import("../engine.zig");
 const config = @import("../config.zig");
 const dagger = @import("../dagger.zig");
 const sandbox = @import("sandbox.zig");
+const net = @import("net.zig");
 const Exec = @import("../dagger/Exec.zig");
 const Evaluator = @import("../dagger/Evaluator.zig");
-const JobLog = @import("../dagger/JobLog.zig");
 const SpanDemux = @import("../dagger/JobLog.zig").SpanDemux;
 const checkout = @import("../dagger/checkout.zig");
 const scripts = @import("../dagger/scripts.zig");
@@ -30,11 +30,13 @@ arena: Allocator,
 io: std.Io,
 /// Backs each exec's log demultiplexer (`SpanDemux`), as for a direct Dagger session.
 gpa: Allocator,
-/// The job's directory under the store: its layers (`L<n>`), the overlay work directory and the
-/// mount point. Removed when the job ends.
+/// The job's directory under the store: its layers (`L<n>`), the overlay work directory, the
+/// mount points, its lock and its network namespace. Removed when the job ends.
 dir: []const u8,
 rootfs: []const u8,
 binds: []const sandbox.Spec.Bind,
+/// Held while the job runs (`lock`): a directory whose lock is free is stale (`sweep`).
+lock: std.Io.File,
 /// Layer names in `dir`, oldest first.
 layers: std.ArrayList([]const u8) = .empty,
 /// The container's environment: what Dagger's container held between execs (the image's, the
@@ -45,6 +47,12 @@ uid: u32 = 0,
 gid: u32 = 0,
 workdir: []const u8 = "/",
 how: Launch,
+/// On a root runner: the job's slot (its range of ids and its address), held by a lock, and its
+/// network namespace's file.
+slot: ?Slot = null,
+netns: ?[]const u8 = null,
+/// `Config.subid_base`: the job's ids start at it plus its slot's offset (`idBase`).
+subid_base: u32 = default_subid_base,
 running: sandbox.Running = .{},
 
 /// What the runner configures (`RUNNER_BACKEND=native`).
@@ -56,13 +64,23 @@ pub const Config = struct {
     store: []const u8 = "",
     /// This binary, which runs each step's sandbox (`sandbox.command`).
     self_exe: []const u8 = "",
-    /// The job came from a file on this machine (`--exec-job`), not from GitHub, so who wrote it
-    /// is whoever runs the runner: the trust rule below does not apply.
-    local: bool = false,
-    /// Host directories mounted into every step. Tests bind the host's /usr into a rootfs of a
-    /// few directories; phase 4's cache volumes will be these.
+    /// The runner vouches for the job (`trust.vouches`): native steps run only in such jobs.
+    vouched: bool = false,
+    /// Rootless native steps (`RUNNER_NATIVE_ROOTLESS`): only root is mapped inside, so apt's
+    /// `_apt`, `chown` to other users and `tar` with owners fail, and steps share the host's
+    /// network. Off: a rootless runner sends every job to Dagger.
+    rootless: bool = false,
+    /// The first host id of the jobs' ranges on a root runner (`RUNNER_NATIVE_SUBID_BASE`): slot
+    /// n's 65536 ids start at `subid_base + n * 65536`.
+    subid_base: u32 = default_subid_base,
+    /// Host paths mounted into every step. Tests bind the host's /usr into a rootfs of a few
+    /// directories; phase 4's cache volumes will be these.
     binds: []const sandbox.Spec.Bind = &.{},
 };
+
+pub const default_subid_base: u32 = 1_000_000_000;
+/// The ids each job has on a root runner: 0 to 65535, as an image expects.
+pub const ids_per_slot: u32 = 65536;
 
 /// The native backend's settings from the runner's, or null when it runs steps on Dagger alone.
 pub fn configFor(
@@ -70,14 +88,16 @@ pub fn configFor(
     io: std.Io,
     environ: *const std.process.Environ.Map,
     cfg: *const config.Config,
-    local: bool,
+    vouched: bool,
 ) !?Config {
     if (cfg.backend != .native) return null;
     return .{
         .rootfs = cfg.native_rootfs,
         .store = try cfg.nativeStore(arena, environ),
         .self_exe = std.process.executablePathAlloc(io, arena) catch "",
-        .local = local,
+        .vouched = vouched,
+        .rootless = cfg.native_rootless,
+        .subid_base = cfg.native_subid_base,
     };
 }
 
@@ -86,6 +106,9 @@ pub const Launch = struct {
     argv_prefix: []const []const u8,
     userns: sandbox.Userns,
 };
+
+/// A job's slot on a root runner: its number and the lock that holds it.
+pub const Slot = struct { n: u32, lock: std.Io.File };
 
 /// The default image's own environment (`ubuntu:24.04`'s config): P3's pull reads it from the
 /// image instead.
@@ -97,20 +120,29 @@ const max_layers = 400;
 
 /// Why this job cannot run natively yet, or null when it can: the first thing it uses that the
 /// native backend does not do yet (docs/native-backend.md, "Phases"). Decided before anything
-/// runs, for the whole job: native and Dagger never share one.
+/// runs, for the whole job: native and Dagger never share one. What this machine can do is
+/// `usable`'s.
 pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Config) ?[]const u8 {
     if (cfg.rootfs.len == 0) return "there is no native rootfs (RUNNER_NATIVE_ROOTFS; the " ++
         "native image pull is phase 3)";
     std.Io.Dir.accessAbsolute(io, cfg.rootfs, .{}) catch
         return "the native rootfs (RUNNER_NATIVE_ROOTFS) cannot be read";
     if (cfg.self_exe.len == 0 or cfg.store.len == 0) return "the native store is not set up";
-    if (!opts.trusted and !cfg.local) return "native steps run only in jobs this runner vouches " ++
-        "for, until their isolation lands (phase 5)";
+    if (!cfg.vouched) return "native steps run only in jobs this runner vouches for " ++
+        "(RUNNER_TRUSTED_REFS)";
+    if (std.os.linux.geteuid() != 0 and !cfg.rootless) return "the runner is not root, and " ++
+        "rootless native steps have only one id mapped (RUNNER_NATIVE_ROOTLESS=1 runs them " ++
+        "anyway; subordinate ids are phase 5's)";
     if (job.container != null) return "`container:` jobs are not native yet (phase 3)";
     if (job.services.len > 0) return "`services:` are not native yet (phase 6)";
     if (!std.mem.eql(u8, opts.image, dagger.default_image) or !opts.provision)
         return "only the default image is native yet (phase 3)";
     if (opts.nesting) return "steps that use the Dagger engine (RUNNER_DAGGER_NESTING) need Dagger";
+    if (usesHashFiles(job)) return "`hashFiles()` reads the job's container through Dagger";
+    const as_runner = opts.step_user == .runner;
+    if (as_runner and std.os.linux.geteuid() != 0) return "steps run as the runner user need a " ++
+        "range of ids, which a rootless runner does not have (RUNNER_STEP_USER=root, or a root " ++
+        "runner)";
     for (job.steps) |step| switch (step.action) {
         .uses => return "`uses:` actions are not native yet (phase 7)",
         .docker => return "`docker://` steps are not native yet (phase 7)",
@@ -123,18 +155,119 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
             if (!std.mem.eql(u8, lit, "false")) return "a checkout with submodules is not " ++
                 "native yet";
         },
-        .script, .unsupported => {},
+        .script => |sc| if (as_runner and
+            std.mem.indexOf(u8, templateText(sc.script), "sudo") != null)
+            return "a step calls sudo, which native steps as the runner user cannot " ++
+                "(no_new_privs)",
+        .unsupported => {},
     };
-    if (opts.step_user == .runner and usernsHere(io) != .none) return "steps run as the runner " ++
-        "user need a range of user ids, which a rootless runner does not have: run the runner " ++
-        "as root, or set RUNNER_STEP_USER=root (phase 5 maps subordinate ids)";
     return null;
 }
 
-/// How to start a sandbox here: as root, the helper needs no user namespace; rootless, it makes
-/// one itself, unless the kernel lets only allow-listed programs do that (Ubuntu's
-/// `apparmor_restrict_unprivileged_userns`), where it is started under util-linux's `unshare`,
-/// which is on that list. An AppArmor profile granting `userns` to the runner would do instead.
+/// Whether any expression of the job calls `hashFiles` (function names are not case-sensitive).
+fn usesHashFiles(job: job_mod.Job) bool {
+    const call = "hashfiles(";
+    for (job.env) |e| if (std.ascii.findIgnoreCase(templateText(e.value), call) != null)
+        return true;
+    for (job.outputs) |o| if (std.ascii.findIgnoreCase(templateText(o.value), call) != null)
+        return true;
+    if (job.environment.url) |u| if (std.ascii.findIgnoreCase(templateText(u), call) != null)
+        return true;
+    for (job.steps) |step| {
+        const texts = [_][]const u8{
+            step.condition,
+            step.name_expr orelse "",
+            templateText(step.continue_on_error),
+            if (step.timeout_minutes) |t| templateText(t) else "",
+        };
+        for (texts) |t| if (std.ascii.findIgnoreCase(t, call) != null) return true;
+        for (step.env) |e| if (std.ascii.findIgnoreCase(templateText(e.value), call) != null)
+            return true;
+        switch (step.action) {
+            .script => |sc| {
+                const more = [_]?job_mod.Template{ sc.script, sc.shell, sc.working_directory };
+                for (more) |m| if (m) |t|
+                    if (std.ascii.findIgnoreCase(templateText(t), call) != null) return true;
+            },
+            .checkout => |inputs| for (inputs) |in| {
+                if (std.ascii.findIgnoreCase(templateText(in.value), call) != null) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn templateText(t: job_mod.Template) []const u8 {
+    return switch (t) {
+        .lit, .expr => |s| s,
+    };
+}
+
+/// Whether this machine can run native steps, found once per process with one sandbox; null when
+/// it can, else why not, and every native job then runs on Dagger. On a root runner, it also
+/// makes the network's NAT rules (`net.natRules`) and checks the ids against /etc/subuid.
+pub fn usable(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) ?[]const u8 {
+    probe_mu.lockUncancelable(io);
+    defer probe_mu.unlock(io);
+    if (probed) |p| return p;
+    const why = probe(arena, io, gpa, cfg) catch |e| @errorName(e);
+    // Kept for the process's life: the arena is the job's.
+    const result: ?[]const u8 = if (why) |w|
+        (std.heap.page_allocator.dupe(u8, w) catch "it failed")
+    else
+        null;
+    probed = result;
+    return result;
+}
+
+var probe_mu: std.Io.Mutex = .init;
+var probed: ??[]const u8 = null;
+
+fn probe(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !?[]const u8 {
+    if (std.os.linux.geteuid() == 0) {
+        if (try overlapsSubuid(arena, io, cfg.subid_base)) |why| return why;
+        if (try net.natRules(arena, io)) |why| return why;
+    }
+    var b = try init(arena, io, gpa, cfg);
+    defer b.deinit();
+    var out: Captured = .{ .arena = arena };
+    const ended = try b.exec("true", &.{"PATH=/usr/bin:/bin"}, &.{}, 0, 0, out.output());
+    if (ended.failure.len > 0 or ended.code != 0) return try std.fmt.allocPrint(
+        arena,
+        "this machine cannot make a native step's sandbox ({s}, exit {d})",
+        .{ ended.failure, ended.code },
+    );
+    return null;
+}
+
+/// Why the jobs' ranges of ids cannot be used, when /etc/subuid gives some of them to a user (a
+/// rootless container runtime's): two would then share host ids.
+fn overlapsSubuid(arena: Allocator, io: std.Io, first: u32) !?[]const u8 {
+    const text = std.Io.Dir.cwd().readFileAlloc(io, "/etc/subuid", arena, .limited(1 << 20)) catch
+        return null;
+    const end = @as(u64, first) + @as(u64, ids_per_slot) * net.max_slots;
+    if (end > std.math.maxInt(u32)) return "RUNNER_NATIVE_SUBID_BASE leaves no room for the " ++
+        "jobs' ids below 2^32";
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var f = std.mem.splitScalar(u8, line, ':');
+        const user = f.next() orelse continue;
+        const start = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue;
+        const count = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue;
+        if (start < end and first < start + count) return try std.fmt.allocPrint(arena, "the " ++
+            "jobs' ids ({d} onwards, RUNNER_NATIVE_SUBID_BASE) overlap {s}'s in /etc/subuid", .{
+            first,
+            user,
+        });
+    }
+    return null;
+}
+
+/// How to start a sandbox here. As root, the helper maps the job's range itself. Rootless, it
+/// makes a user namespace itself, unless the kernel lets only allow-listed programs do that
+/// (Ubuntu's `apparmor_restrict_unprivileged_userns`), where it is started under util-linux's
+/// `unshare`, which is on that list where its profile is installed.
 pub fn launch(arena: Allocator, io: std.Io, cfg: Config) !Launch {
     const self: []const []const u8 = try arena.dupe([]const u8, &.{cfg.self_exe});
     const userns = usernsHere(io);
@@ -147,7 +280,7 @@ pub fn launch(arena: Allocator, io: std.Io, cfg: Config) !Launch {
 }
 
 fn usernsHere(io: std.Io) sandbox.Userns {
-    if (std.os.linux.geteuid() == 0) return .none;
+    if (std.os.linux.geteuid() == 0) return .mapped;
     var buf: [8]u8 = undefined;
     const restricted = std.Io.Dir.cwd().readFile(
         io,
@@ -157,37 +290,191 @@ fn usernsHere(io: std.Io) sandbox.Userns {
     return if (std.mem.startsWith(u8, restricted, "1")) .inherited else .self;
 }
 
-/// A job's directory in the store, empty.
+/// A job's directory in the store, locked, and on a root runner its slot and network. Stale
+/// directories (a runner that died) are removed first (`sweep`).
 pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend {
+    sweep(arena, io, cfg.store);
     var raw: [8]u8 = undefined;
     io.random(&raw);
-    const dir = try std.fmt.allocPrint(arena, "{s}/jobs/{s}", .{
-        cfg.store,
-        &std.fmt.bytesToHex(raw, .lower),
-    });
-    try std.Io.Dir.cwd().createDirPath(io, dir);
-    for ([_][]const u8{ "W", "M" }) |d| try std.Io.Dir.cwd().createDirPath(
-        io,
-        try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, d }),
-    );
-    return .{
+    const id = std.fmt.bytesToHex(raw, .lower);
+    // Made under a name the sweep leaves alone, and renamed once it is locked.
+    const new = try std.fmt.allocPrint(arena, "{s}/jobs/.new-{s}", .{ cfg.store, &id });
+    const dir = try std.fmt.allocPrint(arena, "{s}/jobs/{s}", .{ cfg.store, &id });
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, new);
+    for ([_][]const u8{ "W", "M" }) |d|
+        try cwd.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ new, d }));
+    const lock = try lockFile(arena, io, try std.fmt.allocPrint(arena, "{s}/lock", .{new}), true);
+    errdefer lock.close(io);
+    try cwd.rename(new, cwd, dir, io);
+    var b: Backend = .{
         .arena = arena,
         .io = io,
         .gpa = gpa,
         .dir = dir,
         .rootfs = cfg.rootfs,
         .binds = cfg.binds,
+        .lock = lock,
         .how = try launch(arena, io, cfg),
+        .subid_base = cfg.subid_base,
+    };
+    errdefer b.deinit();
+    b.binds = try b.jobBinds(cfg);
+    if (b.how.userns == .mapped) try b.jobNetwork(cfg);
+    return b;
+}
+
+/// The host's resolver and hosts over the image's (over files the image has), and the
+/// configured binds. On a root runner, the job's own network cannot reach a resolver on the
+/// host's loopback (`net.resolvConf`).
+fn jobBinds(b: *Backend, cfg: Config) ![]const sandbox.Spec.Bind {
+    const resolv = if (b.how.userns == .mapped)
+        net.resolvConf(b.arena, b.io) orelse return error.NoReachableResolver
+    else
+        "/etc/resolv.conf";
+    return std.mem.concat(b.arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{
+        .{ .host = resolv, .at = "/etc/resolv.conf", .optional = true },
+        .{ .host = "/etc/hosts", .at = "/etc/hosts", .optional = true },
+    } });
+}
+
+/// A slot of its own (the first free one, held by its lock), and the job's network namespace on
+/// the runner's bridge (`net.zig`), made by a helper (`net.command`), since a thread of the
+/// runner must not change its namespace.
+fn jobNetwork(b: *Backend, cfg: Config) !void {
+    const arena = b.arena;
+    const slots = try std.fmt.allocPrint(arena, "{s}/slots", .{cfg.store});
+    try std.Io.Dir.cwd().createDirPath(b.io, slots);
+    for (0..net.max_slots) |n| {
+        const path = try std.fmt.allocPrint(arena, "{s}/{d}.lock", .{ slots, n });
+        const lock = lockFile(arena, b.io, path, false) catch continue;
+        b.slot = .{ .n = @intCast(n), .lock = lock };
+        break;
+    } else return error.NoFreeSlot;
+    const path = try std.fmt.allocPrint(arena, "{s}/netns", .{b.dir});
+    const slot = try std.fmt.allocPrint(arena, "{d}", .{b.slot.?.n});
+    var child = try std.process.spawn(b.io, .{
+        .argv = &.{ cfg.self_exe, net.command, path, slot },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .pipe,
+    });
+    var err: std.ArrayList(u8) = .empty;
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = child.stderr.?.readStreaming(b.io, &.{&buf}) catch break;
+        if (n == 0) break;
+        try err.appendSlice(arena, buf[0..n]);
+    }
+    const term = try child.wait(b.io);
+    b.netns = path;
+    if (term != .exited or term.exited != 0) {
+        std.log.warn("native: the job's network: {s}", .{std.mem.trim(u8, err.items, " \n")});
+        return error.JobNetworkFailed;
+    }
+}
+
+/// What "Set up job" says of the job's ids and network: a range of its own and a network of its
+/// own on a root runner; only root, and the host's network, rootless.
+pub fn idsNote(b: *const Backend, arena: Allocator) ![]const u8 {
+    if (b.how.userns != .mapped) return "Native steps, rootless: only root is mapped inside " ++
+        "(apt's _apt user, chown to other users and tar with owners fail), and steps share the " ++
+        "host's network.";
+    const addr = net.jobAddress(b.slot.?.n);
+    return std.fmt.allocPrint(arena, "Native steps: ids 0-65535 are host ids {d}-{d}, and the " ++
+        "job's network is its own ({d}.{d}.{d}.{d} on {s}).", .{
+        b.idBase(),
+        b.idBase() + ids_per_slot - 1,
+        addr[0],
+        addr[1],
+        addr[2],
+        addr[3],
+        net.bridge,
+    });
+}
+
+/// The first of the 65536 host ids the job's slot maps.
+fn idBase(b: *const Backend) u32 {
+    return b.subid_base + (if (b.slot) |s| s.n else 0) * ids_per_slot;
+}
+
+/// An exclusive lock on `path`: waited for (`wait`), or `error.Locked` at once.
+fn lockFile(arena: Allocator, io: std.Io, path: []const u8, wait: bool) !std.Io.File {
+    _ = arena;
+    const f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+    const lock_ex: i32 = 2;
+    const lock_nb: i32 = 4;
+    const rc = std.os.linux.flock(f.handle, lock_ex | (if (wait) 0 else lock_nb));
+    if (std.os.linux.errno(rc) != .SUCCESS) {
+        f.close(io);
+        return error.Locked;
+    }
+    return f;
+}
+
+/// The job's network taken down, its layers removed, its slot and lock let go.
+pub fn deinit(b: *Backend) void {
+    const arena = b.arena;
+    if (b.slot) |s| {
+        var sock = net.Socket.open() catch null;
+        if (sock) |*so| {
+            so.deleteVeth(s.n);
+            so.close();
+        }
+    }
+    if (b.netns) |p| detachNetns(arena, p);
+    removeTree(arena, b.io, b.dir);
+    if (b.slot) |s| s.lock.close(b.io);
+    b.lock.close(b.io);
+}
+
+fn detachNetns(arena: Allocator, path: []const u8) void {
+    const p = arena.dupeSentinel(u8, path, 0) catch return;
+    _ = std.os.linux.umount2(p, std.os.linux.MNT.DETACH);
+}
+
+/// Removes a tree a job left, even one with directories a step took every permission from (or
+/// overlay's work directory, which it leaves at mode 0): on a failure, every directory is given
+/// its owner's permissions back and it is tried again. What still fails is logged.
+fn removeTree(arena: Allocator, io: std.Io, path: []const u8) void {
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, path) catch {
+        chmodDirs(arena, io, path, 0);
+        cwd.deleteTree(io, path) catch |e|
+            std.log.warn("native: cannot remove {s}: {s}", .{ path, @errorName(e) });
     };
 }
 
-/// Removes the job's layers. Overlay leaves its work directory's `work` with no permissions at
-/// all (mode 0), which a rootless runner cannot descend into until it gives them back.
-pub fn deinit(b: *Backend) void {
-    if (std.fmt.allocPrintSentinel(b.arena, "{s}/W/work", .{b.dir}, 0)) |work| {
-        _ = std.os.linux.chmod(work, 0o700);
-    } else |_| {}
-    std.Io.Dir.cwd().deleteTree(b.io, b.dir) catch {};
+fn chmodDirs(arena: Allocator, io: std.Io, path: []const u8, depth: u32) void {
+    if (depth > 64) return;
+    const p = arena.dupeSentinel(u8, path, 0) catch return;
+    _ = std.os.linux.chmod(p, 0o700);
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind != .directory) continue;
+        const sub = std.fmt.allocPrint(arena, "{s}/{s}", .{ path, e.name }) catch return;
+        chmodDirs(arena, io, sub, depth + 1);
+    }
+}
+
+/// Removes the job directories no runner holds (their runner died), and their network
+/// namespaces' mounts. A directory still being made (`.new-`) is left alone.
+fn sweep(arena: Allocator, io: std.Io, store: []const u8) void {
+    const jobs = std.fmt.allocPrint(arena, "{s}/jobs", .{store}) catch return;
+    var dir = std.Io.Dir.cwd().openDir(io, jobs, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind != .directory or std.mem.startsWith(u8, e.name, ".new-")) continue;
+        const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ jobs, e.name }) catch return;
+        const lock = std.fmt.allocPrint(arena, "{s}/lock", .{path}) catch return;
+        const held = lockFile(arena, io, lock, false) catch continue;
+        defer held.close(io);
+        detachNetns(arena, std.fmt.allocPrint(arena, "{s}/netns", .{path}) catch return);
+        removeTree(arena, io, path);
+    }
 }
 
 /// The base every step starts from, as `set_up.baseContainerId` builds Dagger's: the image's
@@ -205,7 +492,8 @@ pub fn base(
     try b.baseEnv(ev, plan);
 
     // The workspace and RUNNER_TEMP, made as Dagger's base makes them: by root, in the image,
-    // owned by the step user when it is not root. The event payload goes in as `withNewFile` does.
+    // owned by the step user when it is not root, from `/` (the workspace is not there yet). The
+    // event payload goes in as `withNewFile` does.
     const chown = if (plan.as_runner) " && chown -R " ++ dagger.runner_user ++ ":" ++
         dagger.runner_user ++ " " ++ dagger.work_root else "";
     const mk = try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}", .{
@@ -220,7 +508,10 @@ pub fn base(
         .keep = true,
     }};
     var out: Captured = .{ .arena = arena };
+    const workdir = b.workdir;
+    b.workdir = "/";
     const ended = try b.exec(mk, try b.envStrings(&.{}), &files, 0, 0, out.output());
+    b.workdir = workdir;
     if (ended.failure.len > 0 or ended.code != 0) {
         err_msg.* = try std.fmt.allocPrint(arena, "could not set up the job's base: {s}{s}", .{
             ended.failure,
@@ -297,6 +588,10 @@ pub fn execScript(
         b.gid,
         live.output(),
     );
+    const layer = try b.layerPath(b.layers.items.len - 1);
+    // The helper removes it; when it was stopped before it could, the runner does, so no later
+    // step's layers hold the secret.
+    for (files.items) |f| sandbox.unlinkIn(arena, layer, f.path);
     // Every line is in: the pipe is closed only once every process of the step has ended.
     demux.flushPartial();
     x.sh.ended[num - 1].store(true, .release);
@@ -309,10 +604,11 @@ pub fn execScript(
         x.err_msg = "the step was stopped";
         return error.EngineFailed;
     }
-    const all = try b.readLayerFile(
-        b.layers.items[b.layers.items.len - 1],
-        try scripts.fcPath(arena, "all", fc),
-    );
+    const all_path = try scripts.fcPath(arena, "all", fc);
+    const all = switch (try sandbox.readIn(arena, layer, all_path, max_read)) {
+        .text => |t| t,
+        .missing, .whiteout => null,
+    };
     var answer: std.Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(.{
         .exitCode = ended.code,
@@ -401,34 +697,36 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
     return f;
 }
 
-/// The contents of `path` as the job's last step left it (a problem matcher's file); null when
-/// it is not there.
+/// The contents of `path` as the job's last step left it (a problem matcher's file), relative
+/// to the working directory unless absolute, as Dagger reads it from the container; null when
+/// it is not there. Read layer by layer, newest first, each inside itself and through no
+/// symlink (`sandbox.readIn`); a whiteout ends the search, as it hides the file below.
 pub fn readFile(b: *Backend, path: []const u8) ?[]const u8 {
+    const arena = b.arena;
+    const full = if (std.fs.path.isAbsolutePosix(path))
+        path
+    else
+        std.fmt.allocPrint(arena, "{s}/{s}", .{ b.workdir, path }) catch return null;
     var i = b.layers.items.len;
     while (i > 0) {
         i -= 1;
-        if (b.readLayerFile(b.layers.items[i], path) catch null) |text| return text;
+        const layer = b.layerPath(i) catch return null;
+        switch (sandbox.readIn(arena, layer, full, max_read) catch return null) {
+            .text => |t| return t,
+            .whiteout => return null,
+            .missing => {},
+        }
     }
-    const full = std.fmt.allocPrint(b.arena, "{s}/{s}", .{
-        b.rootfs,
-        std.mem.trimStart(u8, path, "/"),
-    }) catch return null;
-    return std.Io.Dir.cwd().readFileAlloc(b.io, full, b.arena, .limited(max_read)) catch null;
+    return switch (sandbox.readIn(arena, b.rootfs, full, max_read) catch return null) {
+        .text => |t| t,
+        .missing, .whiteout => null,
+    };
 }
 
 const max_read = 16 * 1024 * 1024;
 
-fn readLayerFile(b: *Backend, layer: []const u8, path: []const u8) !?[]const u8 {
-    const full = try std.fmt.allocPrint(b.arena, "{s}/{s}/{s}", .{
-        b.dir,
-        layer,
-        std.mem.trimStart(u8, path, "/"),
-    });
-    return std.Io.Dir.cwd().readFileAlloc(b.io, full, b.arena, .limited(max_read)) catch |e|
-        switch (e) {
-            error.FileNotFound, error.NotDir, error.IsDir => null,
-            else => e,
-        };
+fn layerPath(b: *Backend, i: usize) ![]const u8 {
+    return std.fmt.allocPrint(b.arena, "{s}/{s}", .{ b.dir, b.layers.items[i] });
 }
 
 /// `dagger.Transport` for the shared code: the native backend has no Dagger session, so a query
@@ -464,10 +762,16 @@ fn exec(
         .failure = "the job has more layers than overlay can stack (phase 2 flattens them)",
     };
     const upper = try std.fmt.allocPrint(arena, "L{d}", .{b.layers.items.len});
-    try std.Io.Dir.cwd().createDirPath(b.io, try std.fmt.allocPrint(arena, "{s}/{s}", .{
-        b.dir,
-        upper,
-    }));
+    const upper_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, upper });
+    try std.Io.Dir.cwd().createDirPath(b.io, upper_path);
+    const base_id = b.idBase();
+    // The upper's root is the overlay's `/`: the job's root's, as the image's `/` is, so a step
+    // as root can make files there. Rootless, the runner's own user is the job's root already.
+    if (b.how.userns == .mapped) {
+        const p = try arena.dupeSentinel(u8, upper_path, 0);
+        _ = std.os.linux.chown(p, base_id, base_id);
+        _ = std.os.linux.chmod(p, 0o755);
+    }
     const lowers = try arena.alloc([]const u8, b.layers.items.len + 1);
     for (b.layers.items, 0..) |l, i| lowers[b.layers.items.len - 1 - i] = l;
     lowers[b.layers.items.len] = b.rootfs;
@@ -485,11 +789,13 @@ fn exec(
         .files = files,
         .binds = b.binds,
         .userns = b.how.userns,
+        .id_base = base_id,
+        .id_count = ids_per_slot,
+        .netns = b.netns,
     }, &b.running, out);
     try b.layers.append(arena, upper);
     return ended;
 }
-
 fn put(b: *Backend, name: []const u8, value: []const u8) !void {
     try Evaluator.putEnv(b.arena, &b.env, name, value);
 }
@@ -598,6 +904,7 @@ const execAnswer = @import("../dagger/testing.zig").exec;
 /// cannot run one (a failure instead where `ZIG_RUNNER_REQUIRE_NATIVE=1`, as CI sets: there they
 /// must run): a rootfs of a few directories with the host's /usr bound over it, in the
 /// test's directory, and the runner binary the build copied for the tests (`ZIG_RUNNER_TEST_EXE`).
+/// Rootless unless the tests run as root, where the job gets its range of ids and its network.
 fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
     const io = std.testing.io;
     var env = try std.testing.environ.createMap(arena);
@@ -620,8 +927,9 @@ fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
         try d.symLink(io, l[0], try std.fmt.allocPrint(arena, "rootfs/{s}", .{l[1]}), .{});
     try d.writeFile(io, .{
         .sub_path = "rootfs/etc/passwd",
-        .data = "root:x:0:0:root:/root:/bin/bash\n",
+        .data = "root:x:0:0:root:/root:/bin/bash\nrunner:x:1001:1001::/home/runner:/bin/bash\n",
     });
+    try d.writeFile(io, .{ .sub_path = "rootfs/etc/group", .data = "root:x:0:\nrunner:x:1001:\n" });
     for ([_][]const u8{ "hosts", "resolv.conf", "ld.so.cache" }) |f| try d.writeFile(io, .{
         .sub_path = try std.fmt.allocPrint(arena, "rootfs/etc/{s}", .{f}),
         .data = "",
@@ -631,7 +939,8 @@ fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
         .rootfs = try std.fmt.allocPrint(arena, "{s}/rootfs", .{root}),
         .store = try std.fmt.allocPrint(arena, "{s}/store", .{root}),
         .self_exe = exe,
-        .local = true,
+        .vouched = true,
+        .rootless = true,
         .binds = &.{
             .{ .host = "/usr", .at = "/usr" },
             .{ .host = "/etc/ld.so.cache", .at = "/etc/ld.so.cache" },
@@ -666,7 +975,10 @@ test "a run-only job on the native backend: file commands, masks, exit codes and
 
     var s1 = testStep("echo hello; echo FOO=bar >> $GITHUB_ENV; echo out=42 >> $GITHUB_OUTPUT\n" ++
         "echo /opt/x >> $GITHUB_PATH; echo ::add-mask::s3cr3t-value; echo the s3cr3t-value\n" ++
-        "echo '# summary' >> $GITHUB_STEP_SUMMARY; echo to stderr >&2; whoami; pwd");
+        "echo '# summary' >> $GITHUB_STEP_SUMMARY; echo to stderr >&2; whoami; pwd\n" ++
+        // A secret written into the script: its file is written by the sandbox, not by the
+        // script's command, and removed after it (`Spec.files`), which step 2 checks.
+        ": j0b-secret-value");
     s1.context_name = "first";
     var s2 = testStep("echo FOO=$FOO; echo PATH=$PATH; echo OUT=$OUT; " ++
         "test -e /tmp/zig-runner-step-1.sh && echo leftover || echo no script left; exit 3");
@@ -678,7 +990,8 @@ test "a run-only job on the native backend: file commands, masks, exit codes and
     var s5 = testStep("exit 1");
     s5.condition = "always()";
     s5.continue_on_error = .{ .lit = "true" };
-    const job = testJob(&.{ s1, s2, s3, s4, s5 });
+    var job = testJob(&.{ s1, s2, s3, s4, s5 });
+    job.secrets = &.{"j0b-secret-value"};
 
     var env: std.process.Environ.Map = .init(arena);
     var w: std.Io.Writer.Allocating = .init(arena);
@@ -777,7 +1090,8 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
         .rootfs = "/",
         .store = "/tmp/x",
         .self_exe = "/bin/true",
-        .local = true,
+        .vouched = true,
+        .rootless = true,
     };
     const root: dagger.Options = .{ .step_user = .root };
     const run_only = testJob(&.{testStep("true")});
@@ -807,12 +1121,23 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     nesting.nesting = true;
     try expectReason("Dagger engine", unsupported(io, run_only, nesting, ok));
 
+    // A job the runner does not vouch for, from GitHub or a saved one (`--exec-job`).
     var remote = ok;
-    remote.local = false;
+    remote.vouched = false;
     try expectReason("vouches", unsupported(io, run_only, root, remote));
-    var trusted = root;
-    trusted.trusted = true;
-    try std.testing.expect(unsupported(io, run_only, trusted, remote) == null);
+    if (std.os.linux.geteuid() != 0) {
+        var rootless = ok;
+        rootless.rootless = false;
+        try expectReason("RUNNER_NATIVE_ROOTLESS", unsupported(io, run_only, root, rootless));
+    }
+
+    // `hashFiles()` anywhere in the job's expressions, in any case.
+    var hashed = testStep("true");
+    hashed.env = &.{.{ .name = "K", .value = .{ .expr = "HASHFILES('**/go.sum')" } }};
+    try expectReason("hashFiles", unsupported(io, testJob(&.{hashed}), root, ok));
+    var hashed_if = testStep("true");
+    hashed_if.condition = "hashFiles('x') != ''";
+    try expectReason("hashFiles", unsupported(io, testJob(&.{hashed_if}), root, ok));
 
     var no_rootfs = ok;
     no_rootfs.rootfs = "";
@@ -820,13 +1145,15 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     no_rootfs.rootfs = "/nonexistent/rootfs";
     try expectReason("cannot be read", unsupported(io, run_only, root, no_rootfs));
 
-    // Steps as the runner user need ids a rootless runner cannot map.
+    // Steps as the runner user need ids a rootless runner cannot map, and cannot use sudo under
+    // no_new_privs.
     const as_runner: dagger.Options = .{ .step_user = .runner };
     const why = unsupported(io, run_only, as_runner, ok);
-    if (std.os.linux.geteuid() == 0)
-        try std.testing.expect(why == null)
-    else
-        try expectReason("runner user", why);
+    if (std.os.linux.geteuid() == 0) {
+        try std.testing.expect(why == null);
+        const sudo = testJob(&.{testStep("sudo apt-get update")});
+        try expectReason("sudo", unsupported(io, sudo, as_runner, ok));
+    } else try expectReason("runner user", why);
 }
 
 fn expectReason(part: []const u8, why: ?[]const u8) !void {
@@ -849,7 +1176,7 @@ test "a job that cannot be native runs on Dagger, and Set up job says why" {
     const res = try dagger.run(arena, std.testing.io, &env, .{
         .test_session_argv = &.{ "sh", "-c", fake_child },
         .test_transport = fake.transport(),
-        .native = .{ .local = true },
+        .native = .{ .vouched = true, .rootless = true },
     }, testJob(&.{testStep("echo hi")}), &log);
     try std.testing.expectEqual(dagger.Outcome.success, res.steps[0].outcome);
     try std.testing.expect(std.mem.indexOf(u8, w.written(), "This job runs on Dagger: there " ++
@@ -891,7 +1218,8 @@ test "parity: a native job's base has the environment of Dagger's base container
             .dir = "",
             .rootfs = "",
             .binds = &.{},
-            .how = .{ .argv_prefix = &.{}, .userns = .none },
+            .lock = undefined,
+            .how = .{ .argv_prefix = &.{}, .userns = .mapped },
         };
         try b.baseEnv(&ev, .{ .as_runner = user == .runner, .mark = "m4rk" });
         // Every variable Dagger sets is set natively, to the same value...
@@ -1067,4 +1395,244 @@ fn stepLines(arena: Allocator, text: []const u8) ![]const []const u8 {
         try out.append(arena, l);
     }
     return out.items;
+}
+
+/// Runs `job` natively with `cfg` as `user`, and its log.
+fn runNativeJob(
+    arena: Allocator,
+    cfg: Config,
+    job: job_mod.Job,
+    user: config.StepUser,
+) !struct { res: dagger.Result, text: []const u8 } {
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = user,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    return .{ .res = res, .text = w.written() };
+}
+
+fn expectLines(text: []const u8, expect: []const []const u8) !void {
+    for (expect) |e| if (std.mem.indexOf(u8, text, e) == null) {
+        std.debug.print("missing {s} in:\n{s}\n", .{ e, text });
+        return error.TestUnexpectedResult;
+    };
+}
+
+test "secrets reach native steps under their aliases, in scripts and in working directories" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var s1 = testStep("echo token-length=${#TOKEN}; mkdir -p /tmp/wd-s3cr3t-token");
+    s1.env = &.{.{ .name = "TOKEN", .value = .{ .lit = "s3cr3t-token" } }};
+    var s2 = testStep("pwd");
+    s2.action.script.working_directory = .{ .lit = "/tmp/wd-s3cr3t-token" };
+    var job = testJob(&.{ s1, s2 });
+    job.secrets = &.{"s3cr3t-token"};
+    const r = try runNativeJob(arena, cfg, job, .root);
+    try std.testing.expectEqual(dagger.Outcome.success, r.res.steps[0].outcome);
+    try std.testing.expectEqual(dagger.Outcome.success, r.res.steps[1].outcome);
+    // The value arrived (its length), and the working directory holding it was entered through
+    // its alias. (Masking is the log sink's, which this test's does not do.)
+    try expectLines(r.text, &.{ "token-length=12", "stdout] /tmp/wd-s3cr3t-token" });
+}
+
+test "a native step is contained: pivot_root, masked /proc, Docker's capabilities, no_new_privs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    // A file on the host, outside the rootfs, that a step that got out would find.
+    try tmp.dir.writeFile(io, .{ .sub_path = "host-marker", .data = "on the host" });
+    const marker = try std.fmt.allocPrint(arena, "{s}/host-marker", .{
+        try tmp.dir.realPathFileAlloc(io, ".", arena),
+    });
+    const script = try std.fmt.allocPrint(arena,
+        \\echo h > /proc/sysrq-trigger 2>/dev/null && echo sysrq-written || echo sysrq-refused
+        \\test -s /proc/kcore && echo kcore-visible || echo kcore-masked
+        \\grep -E '^(CapEff|CapBnd|NoNewPrivs|Seccomp):' /proc/self/status
+        \\python3 -c 'import ctypes
+        \\print("mount", ctypes.CDLL(None).mount(b"none", b"/mnt", b"tmpfs", 0, None))'
+        \\python3 -c '
+        \\import os
+        \\os.makedirs("/tmp/jail", exist_ok=True)
+        \\try:
+        \\    os.chroot("/tmp/jail")
+        \\    for _ in range(64): os.chdir("..")
+        \\    os.chroot(".")
+        \\except OSError as e: print("chroot", e.errno)
+        \\print("host", os.path.exists("{s}"))
+        \\'
+        \\test -e {s} && echo marker-visible || echo marker-hidden
+    , .{ marker, marker });
+    const r = try runNativeJob(arena, cfg, testJob(&.{testStep(script)}), .root);
+    if (r.res.steps[0].outcome != .success) {
+        std.debug.print("{s}\n", .{r.text});
+        return error.TestUnexpectedResult;
+    }
+    try expectLines(r.text, &.{
+        "sysrq-refused",
+        "kcore-masked",
+        try std.fmt.allocPrint(arena, "CapEff:\t{x:0>16}", .{sandbox.docker_caps}),
+        "NoNewPrivs:\t1",
+        "Seccomp:\t2",
+        "mount -1",
+        "host False",
+        "marker-hidden",
+    });
+}
+
+test "a native step cannot follow a symlink it planted out to the host's files" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    try tmp.dir.createDirPath(io, "host-dir");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const host_dir = try std.fmt.allocPrint(arena, "{s}/host-dir", .{root});
+    // A problem matcher on the host the runner must not read for a step.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "host-dir/matcher.json",
+        .data = "{\"problemMatcher\":[]}",
+    });
+    // Step 1 turns /tmp into a symlink to a host directory and plants a matcher link; step 2
+    // holds a secret, so the sandbox writes its script into /tmp, inside the overlay.
+    const plant = try std.fmt.allocPrint(arena, "ln -s {s}/matcher.json /m.json; " ++
+        "rm -rf /tmp; ln -s {s} /tmp; echo ::add-matcher::/m.json", .{ host_dir, host_dir });
+    const s2 = testStep("echo s3cr3t-in-script > /dev/null; echo second");
+    var job = testJob(&.{ testStep(plant), s2 });
+    job.secrets = &.{"s3cr3t-in-script"};
+    const r = try runNativeJob(arena, cfg, job, .root);
+    try expectLines(r.text, &.{ "Could not read the problem matcher '/m.json'", "second" });
+    var dir = try tmp.dir.openDir(io, "host-dir", .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |e| try std.testing.expectEqualStrings("matcher.json", e.name);
+}
+
+/// Skips a test that needs the runner to be root (its ids and network): CI runs the native tests
+/// a second time under sudo for them.
+fn requireRoot() !void {
+    if (std.os.linux.geteuid() != 0) {
+        std.debug.print("native backend test skipped: it needs root\n", .{});
+        return error.SkipZigTest;
+    }
+}
+
+test "root runner: a job's own ids, its runner user, and sudo gaining nothing" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const script = "id -u; id -g; echo HOME=$HOME; cat /proc/self/uid_map; " ++
+        "touch \"$GITHUB_WORKSPACE/mine\" && stat -c owner=%u \"$GITHUB_WORKSPACE/mine\"; " ++
+        "sudo -n id -u 2>/dev/null && echo sudo-worked || echo sudo-refused";
+    const r = try runNativeJob(arena, cfg, testJob(&.{testStep(script)}), .runner);
+    if (r.res.steps[0].outcome != .success) {
+        std.debug.print("{s}\n", .{r.text});
+        return error.TestUnexpectedResult;
+    }
+    try expectLines(r.text, &.{
+        "stdout] 1001",
+        "HOME=/home/runner",
+        "owner=1001",
+        "sudo-refused",
+        "Native steps: ids 0-65535 are host ids",
+    });
+    // The map: 0 inside is a host id far from the host's own users.
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "         0 1000") != null or
+        std.mem.indexOf(u8, r.text, "0 1000") != null);
+}
+
+test "root runner: each job has its own network, and the host's loopback is out of reach" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+
+    // A listener on the host's 127.0.0.1, which a step must not reach.
+    const linux = std.os.linux;
+    const sock = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    try std.testing.expect(linux.errno(sock) == .SUCCESS);
+    defer _ = linux.close(@intCast(sock));
+    var addr: linux.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, 47123),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    const bound = linux.bind(@intCast(sock), @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
+    try std.testing.expect(linux.errno(bound) == .SUCCESS);
+    try std.testing.expect(linux.errno(linux.listen(@intCast(sock), 4)) == .SUCCESS);
+
+    // Two jobs at once, both serving on :5432 and on their own lo, and neither reaching the
+    // host's listener.
+    const script =
+        \\python3 - <<'EOF'
+        \\import socket, threading
+        \\s = socket.socket(); s.bind(("0.0.0.0", 5432)); s.listen(); print("bound 5432")
+        \\c = socket.create_connection(("127.0.0.1", 5432), 2); print("own lo works")
+        \\try:
+        \\    socket.create_connection(("127.0.0.1", 47123), 2); print("host loopback reached")
+        \\except OSError: print("host loopback unreachable")
+        \\import time; time.sleep(1)
+        \\EOF
+    ;
+    const Run = struct {
+        fn one(arena_: Allocator, cfg_: Config, out: *[]const u8, ok: *bool) void {
+            const r = runNativeJob(arena_, cfg_, testJob(&.{testStep(script)}), .root) catch {
+                ok.* = false;
+                return;
+            };
+            out.* = r.text;
+            ok.* = r.res.steps[0].outcome == .success;
+        }
+    };
+    var texts: [2][]const u8 = .{ "", "" };
+    var oks: [2]bool = .{ false, false };
+    var arenas: [2]std.heap.ArenaAllocator = .{
+        .init(std.testing.allocator),
+        .init(std.testing.allocator),
+    };
+    defer for (&arenas) |*x| x.deinit();
+    var first = try io.concurrent(Run.one, .{ arenas[0].allocator(), cfg, &texts[0], &oks[0] });
+    Run.one(arenas[1].allocator(), cfg, &texts[1], &oks[1]);
+    first.await(io);
+    for (texts, oks) |t, ok| {
+        if (!ok) std.debug.print("{s}\n", .{t});
+        try std.testing.expect(ok);
+        try expectLines(t, &.{ "bound 5432", "own lo works", "host loopback unreachable" });
+    }
+
+    // Out to the world, when the host itself gets there: DNS through the job's resolver, HTTP
+    // through the NAT.
+    const resolve: []const []const u8 = &.{ "getent", "hosts", "github.com" };
+    const host = std.process.run(arena, io, .{ .argv = resolve }) catch null;
+    if (host == null or host.?.term != .exited or host.?.term.exited != 0) {
+        std.debug.print("native backend test: outbound part skipped, the host cannot " ++
+            "resolve github.com\n", .{});
+        return;
+    }
+    const out = testStep("getent hosts github.com >/dev/null && echo dns-ok; " ++
+        "python3 -c 'import urllib.request; print(\"http\", " ++
+        "urllib.request.urlopen(\"https://github.com\", timeout=20).status)'");
+    const r = try runNativeJob(arena, cfg, testJob(&.{out}), .root);
+    try expectLines(r.text, &.{ "dns-ok", "http 200" });
 }

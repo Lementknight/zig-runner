@@ -1,20 +1,29 @@
-//! One step in a sandbox of its own: a fresh overlay on the job's layers, private mount, PID, UTS
-//! and IPC namespaces, a minimal /dev, chroot, and `sh -c <script>` (docs/native-backend.md, P1).
+//! One step in a sandbox of its own (docs/native-backend.md, P1): a fresh overlay on the job's
+//! layers, user, mount, PID, UTS and IPC namespaces (and the job's network namespace on a root
+//! runner), a minimal /dev, /proc with its sensitive files masked, pivot_root, Docker's default
+//! capabilities, no_new_privs, a seccomp filter, and `sh -c <script>`.
 //!
 //! The runner is multi-threaded, and a thread may not unshare a user namespace, so each step runs
-//! in a helper process: the runner's own binary started as `zig-runner native-step` (`command`),
-//! with the step's `Spec` as JSON on its stdin. `run` is the runner's side, `main` the helper's.
-//! The helper's stdout is the step's stdout and stderr, which the runner streams into the job's
-//! log as it reads it; the helper's own stderr carries only its failures, so anything there
-//! means the sandbox, not the step, failed.
+//! in a helper process: the runner's own binary started as `zig-runner native-step` (`command`).
+//! `run` is the runner's side, `main` the helper's. The helper's stdin carries the step's `Spec`
+//! as one line of JSON and then stays open as its lifeline: when it closes, because the runner
+//! stops the step (`Running.kill`) or the runner itself is gone, the helper kills the step's PID 1,
+//! and with it every process in the step's PID namespace. The helper's stdout is the step's stdout
+//! and stderr, streamed into the job's log as it is read; its stderr carries only its own failures,
+//! so anything there means the sandbox, not the step, failed.
 //!
 //! What it replaces in Dagger: BuildKit's runc executor. runc did implicitly several things a
 //! step relies on, each now explicit here: HOME from the image's /etc/passwd when the env has
-//! none, the host's /etc/resolv.conf and /etc/hosts over the image's, a /dev of a few nodes
-//! rather than the host's, /proc for the step's PID namespace, and killing every process of the
-//! step when its first one ends.
+//! none, the host's /etc/resolv.conf and /etc/hosts, a /dev of a few nodes, /proc for the step's
+//! PID namespace with runc's masked and read-only paths, the working directory made when it is
+//! missing, umask 022, Docker's default capability set and seccomp profile (its deny list), and
+//! killing every process of the step when its first one ends.
+//!
+//! Every path inside the overlay is resolved inside it (`openIn`): the layers are the steps' to
+//! write, and a symlink a step left must not send the helper to the host's files.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 
 const Allocator = std.mem.Allocator;
@@ -25,7 +34,7 @@ pub const command = "native-step";
 /// What the helper is told to run. Paths of layers are relative to `root` (the job's directory),
 /// which keeps overlay's mount options short however many layers there are.
 pub const Spec = struct {
-    /// The job's directory: holds the layers, the work directory and the mount point.
+    /// The job's directory: holds the layers, the work directory and the mount points.
     root: []const u8,
     /// Lower layers, top first; the last is the image's rootfs (absolute).
     lowers: []const []const u8,
@@ -44,12 +53,24 @@ pub const Spec = struct {
     /// Files written into the overlay before the step and removed after it, as Dagger mounts a
     /// secret file for one exec (a script holding a secret, `Resolved.run.script_mounted`).
     files: []const File = &.{},
-    /// Host directories mounted into the step (`Backend.Config.binds`).
+    /// Host paths mounted into the step (`Backend.Config.binds`, and the job's resolv.conf).
     binds: []const Bind = &.{},
-    /// How the helper gets the privilege to mount (`Userns`).
+    /// How the helper gets its user namespace (`Userns`).
     userns: Userns,
+    /// `mapped`: the first host id of the job's range; ids 0 to `id_count` - 1 inside are
+    /// `id_base` onwards outside.
+    id_base: u32 = 0,
+    id_count: u32 = 0,
+    /// The job's network namespace (a bind-mounted namespace file), when it has one.
+    netns: ?[]const u8 = null,
 
-    pub const Bind = struct { host: []const u8, at: []const u8, read_only: bool = true };
+    pub const Bind = struct {
+        host: []const u8,
+        at: []const u8,
+        read_only: bool = true,
+        /// Only over a file or directory the image has: making one would put it in the layer.
+        optional: bool = false,
+    };
 
     pub const File = struct {
         path: []const u8,
@@ -60,15 +81,16 @@ pub const Spec = struct {
     };
 };
 
-/// How the helper may mount. `self`: it makes a user namespace itself, mapping the runner's user
-/// to root. `inherited`: it was started inside one already (under `unshare -r -m`, where an LSM
-/// lets only allow-listed programs make user namespaces, as Ubuntu's AppArmor does). `none`: the
-/// runner is root, so no user namespace is needed and steps may run as any user.
-pub const Userns = enum { self, inherited, none };
+/// How the helper gets a user namespace. `mapped`: the runner is root, and the job's range of
+/// host ids (`Spec.id_base`) is mapped whole, so its root and every other user are nobody on the
+/// host. `self`: rootless, it makes one itself, mapping the runner's user to root, and only root.
+/// `inherited`: rootless, started inside one already (under `unshare -r -m`, where an LSM lets
+/// only allow-listed programs make user namespaces, as Ubuntu's AppArmor does).
+pub const Userns = enum { mapped, self, inherited };
 
 /// What a step ended with: its exit code (128 + n for signal n, as a shell reports it), and the
-/// helper's own failure, when the sandbox could not be made.
-/// `killed`: it was stopped by `Running.kill`, so its end is not the step's own.
+/// helper's own failure, when the sandbox could not be made. `killed`: it was stopped by
+/// `Running.kill`, so its end is not the step's own.
 pub const Ended = struct { code: i32, failure: []const u8, killed: bool = false };
 
 /// Starts the helper and streams the step's output to `out` (`Output.chunk`) as it arrives;
@@ -83,21 +105,35 @@ pub fn run(
     out: Output,
 ) !Ended {
     const argv = try std.mem.concat(arena, []const u8, &.{ argv_prefix, &.{command} });
+    // Nothing of the runner's environment (its tokens among it): the step's is in the spec.
+    var empty: std.process.Environ.Map = .init(arena);
     var child = try std.process.spawn(io, .{
         .argv = argv,
+        .environ_map = &empty,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
     });
-    running.begin(io, child.id.?);
-    defer running.end(io);
-    // The spec holds the step's secrets: through a pipe, never on disk or on a command line.
+    // The spec holds the step's secrets: through a pipe, never on disk or on a command line. One
+    // line (JSON's strings escape their newlines); the pipe then stays open as the lifeline.
     var json: std.Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(spec, .{}, &json.writer);
+    try json.writer.writeByte('\n');
     child.stdin.?.writeStreamingAll(io, json.written()) catch {};
-    child.stdin.?.close(io);
+    running.begin(io, child.stdin.?);
     child.stdin = null;
+    defer running.end(io);
+    return finish(arena, io, &child, running, out);
+}
 
+/// The helper's output to its end, then how it ended.
+fn finish(
+    arena: Allocator,
+    io: std.Io,
+    child: *std.process.Child,
+    running: *Running,
+    out: Output,
+) !Ended {
     var buf: [64 * 1024]u8 = undefined;
     while (true) {
         const n = child.stdout.?.readStreaming(io, &.{&buf}) catch break;
@@ -136,17 +172,16 @@ pub const Output = struct {
 };
 
 /// The helper running now, if any, for `kill` from another task (a timeout or a cancel, through
-/// `dagger.Watch`). A pidfd, so a pid reused after the helper was reaped is never signalled.
+/// `dagger.Watch`): its lifeline, the write end of its stdin.
 pub const Running = struct {
     mu: std.Io.Mutex = .init,
-    pidfd: ?linux.fd_t = null,
+    lifeline: ?std.Io.File = null,
     killed: bool = false,
 
-    fn begin(r: *Running, io: std.Io, pid: linux.pid_t) void {
-        const rc = linux.pidfd_open(pid, 0);
+    fn begin(r: *Running, io: std.Io, lifeline: std.Io.File) void {
         r.mu.lockUncancelable(io);
         defer r.mu.unlock(io);
-        r.pidfd = if (linux.errno(rc) == .SUCCESS) @intCast(rc) else null;
+        r.lifeline = lifeline;
         r.killed = false;
     }
 
@@ -159,20 +194,145 @@ pub const Running = struct {
     fn end(r: *Running, io: std.Io) void {
         r.mu.lockUncancelable(io);
         defer r.mu.unlock(io);
-        if (r.pidfd) |fd| _ = linux.close(fd);
-        r.pidfd = null;
+        if (r.lifeline) |f| f.close(io);
+        r.lifeline = null;
     }
 
-    /// Kills the running helper; its step's PID 1 dies with it (`PR_SET_PDEATHSIG`), and with
-    /// PID 1 every process in the step's namespace. False when none was running.
+    /// Stops the running step: its lifeline closes, and the helper kills the step's PID 1, and
+    /// with it every process in its PID namespace. False when none was running.
     pub fn kill(r: *Running, io: std.Io) bool {
         r.mu.lockUncancelable(io);
         defer r.mu.unlock(io);
-        const fd = r.pidfd orelse return false;
-        r.killed = linux.errno(linux.pidfd_send_signal(fd, .KILL, null, 0)) == .SUCCESS;
-        return r.killed;
+        const f = r.lifeline orelse return false;
+        f.close(io);
+        r.lifeline = null;
+        r.killed = true;
+        return true;
     }
 };
+
+// --- paths inside the overlay ---
+
+/// `struct mount_attr`, for `mount_setattr(2)`.
+const MountAttr = extern struct {
+    set: u64,
+    clr: u64 = 0,
+    propagation: u64 = 0,
+    userns_fd: u64 = 0,
+};
+
+/// `openat2(2)`'s `resolve`: every symlink and `..` is taken inside `dirfd`, as if it were `/`
+/// (`IN_ROOT`), and `/proc`'s magic links are refused.
+const resolve_in_root = 0x10;
+const resolve_no_magiclinks = 0x02;
+/// And no symlink at all: the runner reading a file a step left (`readIn`).
+const resolve_no_symlinks = 0x04;
+
+const OpenHow = extern struct { flags: u64, mode: u64, resolve: u64 };
+
+/// Opens `path` under `root`, resolved inside it (see the file's comment). A file descriptor, or
+/// the errno.
+pub fn openIn(
+    root: linux.fd_t,
+    path: [*:0]const u8,
+    flags: linux.O,
+    mode: u32,
+    resolve: u64,
+) union(enum) { fd: linux.fd_t, err: linux.E } {
+    var o = flags;
+    o.CLOEXEC = true;
+    var how: OpenHow = .{
+        .flags = @as(u32, @bitCast(o)),
+        .mode = mode,
+        .resolve = resolve | resolve_in_root | resolve_no_magiclinks,
+    };
+    const rc = linux.syscall4(
+        .openat2,
+        @as(usize, @bitCast(@as(isize, root))),
+        @intFromPtr(path),
+        @intFromPtr(&how),
+        @sizeOf(OpenHow),
+    );
+    const e = linux.errno(rc);
+    return if (e == .SUCCESS) .{ .fd = @intCast(rc) } else .{ .err = e };
+}
+
+/// The contents of `path` in a layer, read by the runner: resolved inside the layer and through no
+/// symlink. `missing` when it is not a regular file there; `whiteout` when the layer deletes it (an
+/// overlay whiteout, a character device), so lower layers must not be looked in.
+pub fn readIn(
+    arena: Allocator,
+    layer: []const u8,
+    path: []const u8,
+    limit: usize,
+) !union(enum) { text: []const u8, missing, whiteout } {
+    const dir = linux.open(try arena.dupeSentinel(u8, layer, 0), .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0);
+    if (linux.errno(dir) != .SUCCESS) return .missing;
+    defer _ = linux.close(@intCast(dir));
+    const rel = try arena.dupeSentinel(u8, std.mem.trimStart(u8, path, "/"), 0);
+    const fd = switch (openIn(@intCast(dir), rel, .{
+        .ACCMODE = .RDONLY,
+        .NONBLOCK = true,
+        .NOCTTY = true,
+    }, 0, resolve_no_symlinks)) {
+        .fd => |f| f,
+        .err => return .missing,
+    };
+    defer _ = linux.close(fd);
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &st)) != .SUCCESS)
+        return .missing;
+    const kind = st.mode & linux.S.IFMT;
+    if (kind == linux.S.IFCHR) return .whiteout;
+    if (kind != linux.S.IFREG) return .missing;
+    var out: std.ArrayList(u8) = .empty;
+    var buf: [64 * 1024]u8 = undefined;
+    while (out.items.len <= limit) {
+        const n = linux.read(fd, &buf, buf.len);
+        if (linux.errno(n) != .SUCCESS) return .missing;
+        if (n == 0) break;
+        try out.appendSlice(arena, buf[0..n]);
+    }
+    if (out.items.len > limit) return .missing;
+    return .{ .text = out.items };
+}
+
+/// Removes `path` from a layer, resolved inside it: the runner taking out a file the helper
+/// should have (a script holding a secret, when the helper was stopped before it could).
+pub fn unlinkIn(arena: Allocator, layer: []const u8, path: []const u8) void {
+    const dir = linux.open(arena.dupeSentinel(u8, layer, 0) catch return, .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0);
+    if (linux.errno(dir) != .SUCCESS) return;
+    defer _ = linux.close(@intCast(dir));
+    unlinkAt(arena, @intCast(dir), path);
+}
+
+fn unlinkAt(arena: Allocator, root: linux.fd_t, path: []const u8) void {
+    const rel = std.mem.trimStart(u8, path, "/");
+    const slash = std.mem.lastIndexOfScalar(u8, rel, '/');
+    const parent = dirIn(arena, root, if (slash) |s| rel[0..s] else "") orelse return;
+    defer _ = linux.close(parent);
+    const base = if (slash) |s| rel[s + 1 ..] else rel;
+    _ = linux.unlinkat(parent, arena.dupeSentinel(u8, base, 0) catch return, 0);
+}
+
+/// A directory under `root`, resolved inside it, for the `*at` calls; null when it is not there.
+fn dirIn(arena: Allocator, root: linux.fd_t, path: []const u8) ?linux.fd_t {
+    const rel = std.mem.trim(u8, path, "/");
+    const p = arena.dupeSentinel(u8, if (rel.len == 0) "." else rel, 0) catch return null;
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .PATH = true };
+    return switch (openIn(root, p, flags, 0, 0)) {
+        .fd => |f| f,
+        .err => null,
+    };
+}
 
 // --- the helper ---
 
@@ -183,140 +343,300 @@ pub fn main(arena: Allocator) u8 {
     return runStep(arena, spec);
 }
 
+/// The spec's one line from stdin, read a byte at a time so nothing after it is taken: what
+/// follows on the pipe is the lifeline's end.
 fn readSpec(arena: Allocator) !Spec {
     var data: std.ArrayList(u8) = .empty;
-    var buf: [64 * 1024]u8 = undefined;
     while (true) {
-        const rc = linux.read(0, &buf, buf.len);
+        var c: [1]u8 = undefined;
+        const rc = linux.read(0, &c, 1);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .INTR => continue,
             else => return error.ReadFailed,
         }
-        if (rc == 0) break;
-        try data.appendSlice(arena, buf[0..rc]);
+        if (rc == 0 or c[0] == '\n') break;
+        try data.append(arena, c[0]);
     }
     return std.json.parseFromSliceLeaky(Spec, arena, data.items, .{ .allocate = .alloc_always });
 }
 
 fn runStep(arena: Allocator, spec: Spec) u8 {
-    // The step gets no stdin, as on GitHub.
-    const devnull = linux.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
-    if (linux.errno(devnull) == .SUCCESS) _ = linux.dup2(@intCast(devnull), 0);
+    // Files a step creates get the modes they get under runc.
+    _ = linux.syscall1(.umask, 0o022);
+    check("chdir to the job directory", linux.chdir(z(arena, spec.root)));
 
-    // 1. The privilege to mount: a user namespace mapping this user to root, unless we have it.
+    // 1. The user namespace, and the overlay mounted in a mount namespace the helper owns.
+    var lowers = spec.lowers;
     switch (spec.userns) {
-        .self => enterUserns(),
-        .inherited => {},
-        .none => check("unshare(mount)", linux.unshare(linux.CLONE.NEWNS)),
+        .mapped => {
+            // As the host's root: into the job's network, then a namespace of the job's ids, the
+            // rootfs seen through it (an idmapped mount, so its root's files are the job's
+            // root's), the overlay mounted, and only then into the namespace.
+            if (spec.netns) |p| joinNetns(arena, p);
+            const userns = mappedUserns(spec.id_base, spec.id_count);
+            check("unshare(mount)", linux.unshare(linux.CLONE.NEWNS));
+            makePrivate();
+            lowers = idmapRootfs(arena, spec.lowers, userns);
+            mountOverlay(arena, spec, lowers, false);
+            check("enter the job's user namespace", linux.setns(userns, linux.CLONE.NEWUSER));
+            _ = linux.close(userns);
+        },
+        .self, .inherited => {
+            if (spec.userns == .self) enterUserns();
+            makePrivate();
+            mountOverlay(arena, spec, lowers, true);
+        },
     }
-    check("make / private", linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0));
 
-    // 2. The overlay: this step's layer over every earlier one and the rootfs.
-    const root = z(arena, spec.root);
-    check("chdir to the job directory", linux.chdir(root));
-    var opts: std.ArrayList(u8) = .empty;
-    opts.appendSlice(arena, "lowerdir=") catch oom();
-    for (spec.lowers, 0..) |l, i| {
-        if (i > 0) opts.append(arena, ':') catch oom();
-        opts.appendSlice(arena, l) catch oom();
-    }
-    opts.print(arena, ",upperdir={s},workdir={s}", .{ spec.upper, spec.work }) catch oom();
-    // Unprivileged overlay keeps its own metadata in `user.` xattrs (Linux 5.11).
-    if (spec.userns != .none) opts.appendSlice(arena, ",userxattr") catch oom();
-    opts.append(arena, 0) catch oom();
+    // 2. The step's own namespaces, owned by the user namespace; its first process is PID 1.
+    check("unshare(mount, pid, uts, ipc)", linux.unshare(linux.CLONE.NEWNS | linux.CLONE.NEWPID |
+        linux.CLONE.NEWUTS | linux.CLONE.NEWIPC));
+    makePrivate();
     const merged = z(arena, spec.merged);
-    check("mount the overlay", linux.mount(
-        "overlay",
-        merged,
-        "overlay",
-        0,
-        @intFromPtr(opts.items.ptr),
-    ));
+    const dir_flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
+    const root_rc = linux.open(merged, dir_flags, 0);
+    check("open the overlay", root_rc);
+    const root: linux.fd_t = @intCast(root_rc);
+    // As the namespace's root, so what is made here is the job's root's.
     for (spec.binds) |bd| {
-        const at = z(arena, joinRoot(arena, spec.merged, bd.at));
-        check("bind a host directory", linux.mount(
-            z(arena, bd.host),
-            at,
-            null,
-            linux.MS.BIND | linux.MS.REC,
-            0,
-        ));
-        if (bd.read_only) _ = linux.mount(
-            null,
-            at,
-            null,
-            linux.MS.REMOUNT | linux.MS.BIND | linux.MS.RDONLY,
-            0,
-        );
+        if (!bindIn(arena, root, bd.host, bd.at, !bd.optional)) continue;
+        if (bd.read_only) remountReadOnly(arena, root, bd.at);
     }
-    for (spec.files) |f| writeFile(arena, spec.merged, f);
-    // The host's resolver and hosts, as BuildKit gives every exec (it shares the host's
-    // network, so the host's resolver works).
-    for ([_][]const u8{ "/etc/resolv.conf", "/etc/hosts" }) |p| bindFile(arena, spec.merged, p);
+    for (spec.files) |f| writeFileIn(arena, root, f);
 
-    // 3. The step's own namespaces; its first process is PID 1 of the new PID namespace.
-    check("unshare(pid, uts, ipc)", linux.unshare(
-        linux.CLONE.NEWPID | linux.CLONE.NEWUTS | linux.CLONE.NEWIPC,
-    ));
+    // 3. PID 1, told by `alive` whether the helper is still there once it has re-armed its
+    // parent-death signal; then until the step ends or the lifeline closes.
     const argv = zList(arena, spec.argv);
-    const envp = zList(arena, withHome(arena, spec));
+    const envp = zList(arena, withHome(arena, root, spec));
     const workdir = z(arena, spec.workdir);
+    var alive: [2]linux.fd_t = undefined;
+    check("make a pipe", linux.pipe2(&alive, .{ .CLOEXEC = true }));
     const pid = linux.fork();
     check("fork", pid);
-    if (pid == 0) stepInit(arena, merged, workdir, spec.uid, spec.gid, argv, envp);
-
-    var status: i32 = 0;
-    while (true) {
-        const rc = linux.waitpid(@intCast(pid), &status, 0);
-        if (linux.errno(rc) == .INTR) continue;
-        check("wait for the step", rc);
-        break;
+    if (pid == 0) {
+        _ = linux.close(alive[1]);
+        stepInit(arena, root, workdir, spec.uid, spec.gid, alive[0], argv, envp);
     }
-    for (spec.files) |f| if (!f.keep) {
-        _ = linux.unlink(z(arena, joinRoot(arena, spec.merged, f.path)));
-    };
-    _ = linux.umount2(merged, linux.MNT.DETACH);
-    const st: u32 = @bitCast(status);
+    _ = linux.close(alive[0]);
+    const st = superviseStep(@intCast(pid));
+    for (spec.files) |f| if (!f.keep) unlinkAt(arena, root, f.path);
     if (linux.W.IFEXITED(st)) return linux.W.EXITSTATUS(st);
     if (linux.W.IFSIGNALED(st)) return @truncate(128 + @backingInt(linux.W.TERMSIG(st)));
     return 128;
 }
 
-/// PID 1 of the step: its /dev, /proc and /sys, then chroot, its user, and the shell. Never
-/// returns.
+fn makePrivate() void {
+    check("make / private", linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0));
+}
+
+/// Overlay's options: `lowerdir=` every lower layer, top first, then this step's upper and the
+/// work directory; `userxattr` in a user namespace, where unprivileged overlay keeps its own
+/// metadata in `user.` xattrs (Linux 5.11). Zero-terminated, for `mount`.
+fn overlayOptions(
+    arena: Allocator,
+    spec: Spec,
+    lowers: []const []const u8,
+    userxattr: bool,
+) [:0]const u8 {
+    var opts: std.ArrayList(u8) = .empty;
+    opts.appendSlice(arena, "lowerdir=") catch oom();
+    for (lowers, 0..) |l, i| {
+        if (i > 0) opts.append(arena, ':') catch oom();
+        opts.appendSlice(arena, l) catch oom();
+    }
+    opts.print(arena, ",upperdir={s},workdir={s}", .{ spec.upper, spec.work }) catch oom();
+    if (userxattr) opts.appendSlice(arena, ",userxattr") catch oom();
+    return opts.toOwnedSliceSentinel(arena, 0) catch oom();
+}
+
+fn mountOverlay(arena: Allocator, spec: Spec, lowers: []const []const u8, userxattr: bool) void {
+    check("mount the overlay", linux.mount(
+        "overlay",
+        z(arena, spec.merged),
+        "overlay",
+        0,
+        @intFromPtr(overlayOptions(arena, spec, lowers, userxattr).ptr),
+    ));
+}
+
+/// Joins the job's network namespace (its file, bind-mounted by `netUp`).
+fn joinNetns(arena: Allocator, path: []const u8) void {
+    const fd = linux.open(z(arena, path), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    check("open the job's network namespace", fd);
+    defer _ = linux.close(@intCast(fd));
+    check("enter the job's network namespace", linux.setns(@intCast(fd), linux.CLONE.NEWNET));
+}
+
+/// A user namespace with host ids `base` to `base + count - 1` as 0 to `count - 1`: made by a
+/// child, since only a process outside it may map more than its own id, and kept by its file
+/// descriptor once the child is gone.
+fn mappedUserns(base: u32, count: u32) linux.fd_t {
+    var ready: [2]linux.fd_t = undefined;
+    var hold: [2]linux.fd_t = undefined;
+    check("make a pipe", linux.pipe2(&ready, .{ .CLOEXEC = true }));
+    check("make a pipe", linux.pipe2(&hold, .{ .CLOEXEC = true }));
+    const pid = linux.fork();
+    check("fork", pid);
+    if (pid == 0) {
+        _ = linux.close(hold[1]);
+        if (linux.errno(linux.unshare(linux.CLONE.NEWUSER)) != .SUCCESS) linux.exit_group(1);
+        _ = linux.write(ready[1], "u", 1);
+        var c: [1]u8 = undefined;
+        _ = linux.read(hold[0], &c, 1);
+        linux.exit_group(0);
+    }
+    _ = linux.close(ready[1]);
+    _ = linux.close(hold[0]);
+    var c: [1]u8 = undefined;
+    if (linux.read(ready[0], &c, 1) != 1) fatal("make the job's user namespace", @as(u32, 0));
+    var buf: [128]u8 = undefined;
+    for ([_][]const u8{ "uid_map", "gid_map" }) |m| {
+        const path = std.fmt.bufPrintSentinel(&buf, "/proc/{d}/{s}", .{ pid, m }, 0) catch
+            unreachable;
+        var line: [64]u8 = undefined;
+        writeProc(path, std.fmt.bufPrint(&line, "0 {d} {d}", .{ base, count }) catch unreachable);
+    }
+    const path = std.fmt.bufPrintSentinel(&buf, "/proc/{d}/ns/user", .{pid}, 0) catch unreachable;
+    const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    check("open the job's user namespace", fd);
+    _ = linux.close(hold[1]);
+    var status: i32 = 0;
+    _ = linux.waitpid(@intCast(pid), &status, 0);
+    return @intCast(fd);
+}
+
+/// The lower layers with the rootfs (the last) replaced by `R`, the rootfs mounted there
+/// idmapped through `userns`: the host's root's files are the job's root's, its uid 1001's the
+/// job's 1001's, without a copy of the rootfs per range. Linux 5.19 lets overlay take an
+/// idmapped layer.
+fn idmapRootfs(
+    arena: Allocator,
+    lowers: []const []const u8,
+    userns: linux.fd_t,
+) []const []const u8 {
+    const rootfs = lowers[lowers.len - 1];
+    const open_tree_clone = 1;
+    const at_recursive = 0x8000;
+    const tree = linux.syscall3(
+        .open_tree,
+        @as(usize, @bitCast(@as(isize, linux.AT.FDCWD))),
+        @intFromPtr(z(arena, rootfs)),
+        open_tree_clone | at_recursive | linux.SOCK.CLOEXEC,
+    );
+    check("open the rootfs's mount", tree);
+    const idmap = 0x00100000;
+    var attr: MountAttr = .{ .set = idmap, .userns_fd = @intCast(userns) };
+    check("idmap the rootfs", linux.syscall5(
+        .mount_setattr,
+        tree,
+        @intFromPtr(""),
+        linux.AT.EMPTY_PATH | at_recursive,
+        @intFromPtr(&attr),
+        @sizeOf(MountAttr),
+    ));
+    _ = linux.mkdir("R", 0o755);
+    const move_mount_f_empty_path = 4;
+    check("mount the idmapped rootfs", linux.syscall5(
+        .move_mount,
+        tree,
+        @intFromPtr(""),
+        @as(usize, @bitCast(@as(isize, linux.AT.FDCWD))),
+        @intFromPtr("R"),
+        move_mount_f_empty_path,
+    ));
+    _ = linux.close(@intCast(tree));
+    const out = arena.dupe([]const u8, lowers) catch oom();
+    out[out.len - 1] = "R";
+    return out;
+}
+
+/// Waits for the step's PID 1, killing it when the lifeline (stdin) closes or says anything: the
+/// runner stopped the step, or is gone. Killing PID 1 kills every process of the step's PID
+/// namespace. The wait status.
+fn superviseStep(pid: linux.pid_t) u32 {
+    const pidfd_rc = linux.pidfd_open(pid, 0);
+    const pidfd: ?linux.fd_t = if (linux.errno(pidfd_rc) == .SUCCESS) @intCast(pidfd_rc) else null;
+    while (true) {
+        var fds = [_]linux.pollfd{
+            .{ .fd = 0, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = pidfd orelse -1, .events = linux.POLL.IN, .revents = 0 },
+        };
+        // Without a pidfd (Linux before 5.3), the step's end is polled for.
+        const rc = linux.poll(&fds, fds.len, if (pidfd == null) 100 else -1);
+        if (linux.errno(rc) == .INTR) continue;
+        check("wait for the step or its stop", rc);
+        if (fds[0].revents != 0) {
+            _ = linux.kill(pid, .KILL);
+            break;
+        }
+        if (fds[1].revents != 0) break;
+        if (pidfd == null) {
+            var status: i32 = 0;
+            const done = linux.waitpid(pid, &status, linux.W.NOHANG);
+            if (linux.errno(done) == .SUCCESS and done == @as(usize, @intCast(pid)))
+                return @bitCast(status);
+        }
+    }
+    var status: i32 = 0;
+    while (true) {
+        const rc = linux.waitpid(pid, &status, 0);
+        if (linux.errno(rc) == .INTR) continue;
+        check("wait for the step", rc);
+        break;
+    }
+    return @bitCast(status);
+}
+
+/// PID 1 of the step: its /dev, /proc and /sys, the overlay as its root (`pivot_root`, the host's
+/// root detached), its working directory, capabilities, user, no_new_privs and seccomp filter,
+/// then the shell. Never returns.
 fn stepInit(
     arena: Allocator,
-    merged: [*:0]const u8,
+    root: linux.fd_t,
     workdir: [*:0]const u8,
     uid: u32,
     gid: u32,
+    alive: linux.fd_t,
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
 ) noreturn {
-    // Dies with the helper: the runner stops a step by killing the helper (`Running.kill`).
-    _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(linux.SIG.KILL), 0, 0, 0);
-    const m = std.mem.span(merged);
-    makeDev(arena, m);
-    check("mount /proc", linux.mount(
-        "proc",
-        z(arena, joinRoot(arena, m, "/proc")),
-        "proc",
-        linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC,
-        0,
-    ));
-    // The host's /sys, read-only, as BuildKit mounts sysfs read-only. A new sysfs needs a
-    // network namespace of our own, which steps do not have (they share the host's, as in Dagger).
-    const sys = z(arena, joinRoot(arena, m, "/sys"));
-    if (linux.errno(linux.mount("/sys", sys, null, linux.MS.BIND | linux.MS.REC, 0)) == .SUCCESS)
-        _ = linux.mount(null, sys, null, linux.MS.REMOUNT | linux.MS.BIND | linux.MS.RDONLY, 0);
-    check("chroot", linux.chroot(merged));
-    if (linux.errno(linux.chdir(workdir)) != .SUCCESS) check("chdir /", linux.chdir("/"));
+    armParentDeath(alive);
+    makeDev(arena, root);
+    mountIn(arena, root, "/proc", "proc", "proc", linux.MS.NOSUID | linux.MS.NODEV |
+        linux.MS.NOEXEC, null);
+    // The host's /sys, read-only with every mount under it, as BuildKit mounts sysfs read-only.
+    // A new sysfs needs a network namespace the job's user namespace owns, which steps do not
+    // have.
+    bindTreeReadOnly(arena, root, "/sys");
+    maskPaths(arena, root);
+
+    // The overlay becomes `/`, and the host's root is unmounted from under it: unlike a chroot,
+    // nothing left in the namespace leads back to it.
+    check("enter the overlay", linux.fchdir(root));
+    check("pivot_root", linux.syscall2(.pivot_root, @intFromPtr("."), @intFromPtr(".")));
+    check("detach the host's root", linux.umount2(".", linux.MNT.DETACH));
+    check("chdir /", linux.chdir("/"));
+    // BuildKit makes a missing working directory; one that cannot be made fails the step.
+    _ = linux.mkdir(workdir, 0o755);
+    check("chdir to the working directory", linux.chdir(workdir));
+
+    dropCapabilities();
     if (uid != 0 or gid != 0) {
-        check("setgroups", linux.setgroups(0, @ptrFromInt(8)));
+        check("setgroups", linux.setgroups(0, no_groups));
         check("setgid", linux.setgid(gid));
         check("setuid", linux.setuid(uid));
+        // The kernel clears the parent-death signal on a change of credentials.
+        armParentDeath(alive);
     }
+    _ = linux.close(alive);
+    // No setuid program gains anything, sudo included.
+    check("no_new_privs", linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0));
+    installSeccomp();
+    // The step gets no stdin, as on GitHub.
+    const devnull = linux.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    check("open /dev/null", devnull);
+    _ = linux.dup2(@intCast(devnull), 0);
     // From here the helper's failures would be the step's output; the step's stderr is its
     // stdout, as the script's `exec 2>&1` would make it anyway.
     _ = linux.dup2(1, 2);
@@ -324,53 +644,362 @@ fn stepInit(
     fatal("exec /bin/sh", @backingInt(linux.errno(rc)));
 }
 
+/// No supplementary groups at all: `setgroups(0, NULL)`.
+const no_groups: [*]const linux.gid_t = @ptrFromInt(@alignOf(linux.gid_t));
+
+/// Dies with the helper, and exits at once if the helper is already gone (its end of `alive` then
+/// reads as hung up): the helper is how the runner stops a step.
+fn armParentDeath(alive: linux.fd_t) void {
+    _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(linux.SIG.KILL), 0, 0, 0);
+    var fds = [_]linux.pollfd{.{ .fd = alive, .events = linux.POLL.IN, .revents = 0 }};
+    if (linux.poll(&fds, 1, 0) == 1 and fds[0].revents & linux.POLL.HUP != 0) linux.exit_group(137);
+}
+
+/// runc's masked paths, hidden (files under /dev/null, directories under an empty read-only
+/// tmpfs), and its read-only ones. A path the kernel does not have is skipped.
+fn maskPaths(arena: Allocator, root: linux.fd_t) void {
+    const files = [_][]const u8{
+        "/proc/kcore",       "/proc/keys",        "/proc/latency_stats", "/proc/timer_list",
+        "/proc/timer_stats", "/proc/sched_debug",
+    };
+    for (files) |f| _ = bindIn(arena, root, "/dev/null", f, false);
+    const dirs = [_][]const u8{
+        "/proc/acpi",    "/proc/asound",                  "/proc/scsi",
+        "/sys/firmware", "/sys/devices/virtual/powercap",
+    };
+    for (dirs) |d| {
+        const fd = targetIn(arena, root, d, true) orelse continue;
+        defer _ = linux.close(fd);
+        _ = linux.mount("tmpfs", procFd(arena, fd), "tmpfs", linux.MS.RDONLY, 0);
+    }
+    const read_only = [_][]const u8{
+        "/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger",
+    };
+    for (read_only) |p| if (bindIn(arena, root, p, p, false)) remountReadOnly(arena, root, p);
+}
+
+/// Docker's default capabilities: the bounding set cut to them, so a root step has these and no
+/// more (no CAP_SYS_ADMIN, no CAP_NET_ADMIN), and the ambient set cleared.
+fn dropCapabilities() void {
+    const keep = [_]u6{ 0, 1, 3, 4, 5, 6, 7, 8, 10, 13, 18, 27, 29, 31 };
+    var cap: u6 = 0;
+    while (true) : (cap += 1) {
+        if (std.mem.indexOfScalar(u6, &keep, cap) == null) {
+            const rc = linux.prctl(@backingInt(linux.PR.CAPBSET_DROP), cap, 0, 0, 0);
+            // Past the kernel's last capability.
+            if (linux.errno(rc) == .INVAL) break;
+            check("drop a capability", rc);
+        }
+        if (cap == 63) break;
+    }
+    check("clear ambient capabilities", linux.prctl(
+        @backingInt(linux.PR.CAP_AMBIENT),
+        linux.PR.CAP_AMBIENT_CLEAR_ALL,
+        0,
+        0,
+        0,
+    ));
+}
+
+/// Docker's default capability set, as a step's root sees it in /proc/self/status (`CapEff`).
+pub const docker_caps: u64 = 0xa80425fb;
+
+/// Docker's default seccomp profile, as a deny list: what it refuses a container without
+/// CAP_SYS_ADMIN and friends fails with EPERM (module loading, kexec, keyrings, bpf, perf, mounts,
+/// namespaces, the clock, swap, reboot), `clone` making namespaces too, and `clone3` is ENOSYS so
+/// the C library falls back to `clone`. Anything else is allowed, as Docker's allow list is in
+/// effect for what a default container can do.
+fn installSeccomp() void {
+    const denied = comptime deniedSyscalls();
+    // ld arch; foreign arch: deny. ld nr; [x32: deny]; denied: deny; clone: check; clone3: ENOSYS;
+    // allow. clone: ld flags; namespace flags: deny; allow. deny: EPERM.
+    var prog: [denied.len + 16]SockFilter = undefined;
+    var n: usize = 0;
+    prog[n] = ld(4);
+    n += 1;
+    prog[n] = jeq(native_arch, 1, 0);
+    n += 1;
+    prog[n] = ret(seccomp_errno | @as(u32, @backingInt(linux.E.PERM)));
+    n += 1;
+    prog[n] = ld(0);
+    n += 1;
+    const count = denied.len + 4 + @as(usize, if (builtin.cpu.arch == .x86_64) 1 else 0);
+    // A jump from instruction `from` to `to`, counted from the one after `from`.
+    const rest = struct {
+        fn deny(from: usize, to: usize) u8 {
+            return @intCast(to - from - 1);
+        }
+    };
+    const allow_at = 4 + count - 1;
+    const clone_at = allow_at + 1;
+    const deny_at = clone_at + 3;
+    if (builtin.cpu.arch == .x86_64) {
+        prog[n] = .{ .code = bpf_jset, .jt = rest.deny(n, deny_at), .jf = 0, .k = 0x40000000 };
+        n += 1;
+    }
+    for (denied) |nr| {
+        prog[n] = jeq(nr, rest.deny(n, deny_at), 0);
+        n += 1;
+    }
+    prog[n] = jeq(@backingInt(linux.SYS.clone), rest.deny(n, clone_at), 0);
+    n += 1;
+    prog[n] = jeq(@backingInt(linux.SYS.clone3), 0, 1);
+    n += 1;
+    prog[n] = ret(seccomp_errno | @as(u32, @backingInt(linux.E.NOSYS)));
+    n += 1;
+    std.debug.assert(n == allow_at);
+    prog[n] = ret(seccomp_allow);
+    n += 1;
+    // clone's flags, its first argument's low word on a little-endian machine.
+    prog[n] = ld(16);
+    n += 1;
+    const namespaces = 0x7E020000;
+    prog[n] = .{ .code = bpf_jset, .jt = rest.deny(n, deny_at), .jf = 0, .k = namespaces };
+    n += 1;
+    prog[n] = ret(seccomp_allow);
+    n += 1;
+    std.debug.assert(n == deny_at);
+    prog[n] = ret(seccomp_errno | @as(u32, @backingInt(linux.E.PERM)));
+    n += 1;
+    const fprog: extern struct { len: u16, filter: [*]const SockFilter } = .{
+        .len = @intCast(n),
+        .filter = &prog,
+    };
+    check("install the seccomp filter", linux.prctl(
+        @backingInt(linux.PR.SET_SECCOMP),
+        linux.SECCOMP.MODE.FILTER,
+        @intFromPtr(&fprog),
+        0,
+        0,
+    ));
+}
+
+const SockFilter = extern struct { code: u16, jt: u8, jf: u8, k: u32 };
+const bpf_ld_w_abs = 0x20;
+const bpf_jeq = 0x15;
+const bpf_jset = 0x45;
+const bpf_ret = 0x06;
+const seccomp_allow = 0x7fff0000;
+const seccomp_errno = 0x00050000;
+/// `AUDIT_ARCH_X86_64` and `AUDIT_ARCH_AARCH64` (std's `AUDIT.ARCH` does not compile in 0.17).
+const native_arch: u32 = switch (builtin.cpu.arch) {
+    .x86_64 => 0xC000003E,
+    .aarch64 => 0xC00000B7,
+    else => @compileError("the native backend's seccomp filter knows x86_64 and aarch64"),
+};
+
+fn ld(offset: u32) SockFilter {
+    return .{ .code = bpf_ld_w_abs, .jt = 0, .jf = 0, .k = offset };
+}
+fn jeq(k: u32, jt: u8, jf: u8) SockFilter {
+    return .{ .code = bpf_jeq, .jt = jt, .jf = jf, .k = k };
+}
+fn ret(k: u32) SockFilter {
+    return .{ .code = bpf_ret, .jt = 0, .jf = 0, .k = k };
+}
+
+fn deniedSyscalls() []const u32 {
+    const names = [_][]const u8{
+        "acct",              "add_key",         "bpf",               "clock_adjtime",
+        "clock_settime",     "create_module",   "delete_module",     "fanotify_init",
+        "finit_module",      "fsconfig",        "fsmount",           "fsopen",
+        "fspick",            "get_kernel_syms", "get_mempolicy",     "init_module",
+        "ioperm",            "iopl",            "kcmp",              "kexec_file_load",
+        "kexec_load",        "keyctl",          "lookup_dcookie",    "mbind",
+        "mount",             "mount_setattr",   "move_mount",        "move_pages",
+        "name_to_handle_at", "nfsservctl",      "open_by_handle_at", "open_tree",
+        "perf_event_open",   "pivot_root",      "quotactl",          "quotactl_fd",
+        "reboot",            "request_key",     "set_mempolicy",     "setns",
+        "settimeofday",      "stime",           "swapoff",           "swapon",
+        "syslog",            "sysfs",           "_sysctl",           "umount",
+        "umount2",           "unshare",         "uselib",            "userfaultfd",
+        "ustat",             "vm86",            "vm86old",
+    };
+    var out: [names.len]u32 = undefined;
+    var n: usize = 0;
+    for (names) |name| if (@hasField(linux.SYS, name)) {
+        out[n] = @backingInt(@field(linux.SYS, name));
+        n += 1;
+    };
+    const final = out[0..n].*;
+    return &final;
+}
+
 /// A /dev of the nodes a step needs, bound from the host's, as runc builds one: not the host's
-/// whole /dev, which would hand a root step its disks.
-fn makeDev(arena: Allocator, m: []const u8) void {
-    const dev = joinRoot(arena, m, "/dev");
-    check("mount /dev", linux.mount(
-        "tmpfs",
-        z(arena, dev),
-        "tmpfs",
-        linux.MS.NOSUID | linux.MS.NOEXEC,
-        @intFromPtr("mode=755,size=65536k"),
-    ));
+/// whole /dev, which would hand a step its disks.
+fn makeDev(arena: Allocator, root: linux.fd_t) void {
+    const ms = linux.MS;
+    mountIn(arena, root, "/dev", "tmpfs", "tmpfs", ms.NOSUID | ms.NOEXEC, "mode=755,size=65536k");
     for ([_][]const u8{ "null", "zero", "full", "random", "urandom", "tty" }) |name| {
-        const host = z(arena, std.fmt.allocPrint(arena, "/dev/{s}", .{name}) catch oom());
-        const at = z(arena, std.fmt.allocPrint(arena, "{s}/{s}", .{ dev, name }) catch oom());
-        const fd = linux.open(at, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o666);
-        if (linux.errno(fd) == .SUCCESS) _ = linux.close(@intCast(fd));
-        check("bind a /dev node", linux.mount(host, at, null, linux.MS.BIND, 0));
+        const at = std.fmt.allocPrint(arena, "/dev/{s}", .{name}) catch oom();
+        const node: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true };
+        const fd = openIn(root, z(arena, at[1..]), node, 0o666, 0);
+        if (fd == .fd) _ = linux.close(fd.fd);
+        _ = bindIn(arena, root, at, at, true);
     }
-    for ([_][]const u8{ "pts", "shm", "mqueue" }) |d| {
-        const sub = std.fmt.allocPrint(arena, "{s}/{s}", .{ dev, d }) catch oom();
-        _ = linux.mkdir(z(arena, sub), 0o755);
-    }
-    check("mount /dev/pts", linux.mount(
-        "devpts",
-        z(arena, std.fmt.allocPrint(arena, "{s}/pts", .{dev}) catch oom()),
-        "devpts",
-        linux.MS.NOSUID | linux.MS.NOEXEC,
-        @intFromPtr("newinstance,ptmxmode=0666,mode=0620"),
-    ));
-    check("mount /dev/shm", linux.mount(
-        "shm",
-        z(arena, std.fmt.allocPrint(arena, "{s}/shm", .{dev}) catch oom()),
-        "tmpfs",
-        linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC,
-        @intFromPtr("mode=1777,size=65536k"),
-    ));
-    const links = [_][2][]const u8{
+    const dev = dirIn(arena, root, "/dev") orelse fatal("open /dev", @as(u32, 0));
+    defer _ = linux.close(dev);
+    for ([_][*:0]const u8{ "pts", "shm", "mqueue" }) |d| _ = linux.mkdirat(dev, d, 0o755);
+    mountIn(arena, root, "/dev/pts", "devpts", "devpts", ms.NOSUID | ms.NOEXEC, "newinstance," ++
+        "ptmxmode=0666,mode=0620");
+    const shm_flags = ms.NOSUID | ms.NODEV | ms.NOEXEC;
+    mountIn(arena, root, "/dev/shm", "shm", "tmpfs", shm_flags, "mode=1777,size=65536k");
+    const links = [_][2][*:0]const u8{
         .{ "pts/ptmx", "ptmx" },
         .{ "/proc/self/fd", "fd" },
         .{ "/proc/self/fd/0", "stdin" },
         .{ "/proc/self/fd/1", "stdout" },
         .{ "/proc/self/fd/2", "stderr" },
     };
-    for (links) |l| _ = linux.symlink(
-        z(arena, l[0]),
-        z(arena, std.fmt.allocPrint(arena, "{s}/{s}", .{ dev, l[1] }) catch oom()),
+    for (links) |l| _ = linux.symlinkat(l[0], dev, l[1]);
+}
+
+/// Mounts `source` at `at` inside the overlay, `at` resolved inside it, and fails the step when
+/// it cannot.
+fn mountIn(
+    arena: Allocator,
+    root: linux.fd_t,
+    at: []const u8,
+    source: [*:0]const u8,
+    fstype: [*:0]const u8,
+    flags: u32,
+    data: ?[*:0]const u8,
+) void {
+    const fd = targetIn(arena, root, at, true) orelse fatal("find a mount's target", @as(u32, 2));
+    defer _ = linux.close(fd);
+    const d: usize = if (data) |p| @intFromPtr(p) else 0;
+    check("mount", linux.mount(source, procFd(arena, fd), fstype, flags, d));
+}
+
+/// Binds the host's `host` at `at` inside the overlay, `at` resolved inside it. Whether it was
+/// made; one that is `required` fails the step when it cannot be.
+fn bindIn(
+    arena: Allocator,
+    root: linux.fd_t,
+    host: []const u8,
+    at: []const u8,
+    required: bool,
+) bool {
+    const rel = z(arena, std.mem.trimStart(u8, at, "/"));
+    const fd = switch (openIn(root, rel, .{ .ACCMODE = .RDONLY, .PATH = true }, 0, 0)) {
+        .fd => |f| f,
+        .err => |e| if (required) fatal("find a bind's target", @backingInt(e)) else return false,
+    };
+    defer _ = linux.close(fd);
+    const rc = linux.mount(z(arena, host), procFd(arena, fd), null, linux.MS.BIND, 0);
+    if (required) check("bind a host path", rc);
+    return linux.errno(rc) == .SUCCESS;
+}
+
+/// Binds the host's `path`, with every mount under it, at the same place inside, all of them
+/// read-only, nosuid, nodev and noexec, in one `mount_setattr` over the cloned tree. A bind of
+/// `path` alone is refused in a user namespace, since it would uncover what the mounts under it
+/// hide, and a remount covers one mount at a time.
+fn bindTreeReadOnly(arena: Allocator, root: linux.fd_t, path: []const u8) void {
+    const open_tree_clone = 1;
+    const at_recursive = 0x8000;
+    const tree = linux.syscall3(
+        .open_tree,
+        @as(usize, @bitCast(@as(isize, linux.AT.FDCWD))),
+        @intFromPtr(z(arena, path)),
+        open_tree_clone | at_recursive | linux.SOCK.CLOEXEC,
     );
+    check("clone a host tree", tree);
+    defer _ = linux.close(@intCast(tree));
+    var attr: MountAttr = .{ .set = 0x1 | 0x2 | 0x4 | 0x8 };
+    check("make a host tree read-only", linux.syscall5(
+        .mount_setattr,
+        tree,
+        @intFromPtr(""),
+        linux.AT.EMPTY_PATH | at_recursive,
+        @intFromPtr(&attr),
+        @sizeOf(MountAttr),
+    ));
+    const target = targetIn(arena, root, path, true) orelse
+        fatal("find a mount's target", @as(u32, 2));
+    defer _ = linux.close(target);
+    const move_mount_f_empty_path = 0x4;
+    const move_mount_t_empty_path = 0x40;
+    check("mount a host tree", linux.syscall5(
+        .move_mount,
+        tree,
+        @intFromPtr(""),
+        @as(usize, @intCast(target)),
+        @intFromPtr(""),
+        move_mount_f_empty_path | move_mount_t_empty_path,
+    ));
+}
+
+/// Makes the mount at `at` read-only, and fails the step when it cannot. The mount's own flags
+/// go with it: in a user namespace, those a more privileged one set (nosuid, nodev, noexec, the
+/// atime ones) are locked, and a remount that drops any of them is refused, as runc found.
+fn remountReadOnly(arena: Allocator, root: linux.fd_t, at: []const u8) void {
+    const fd = targetIn(arena, root, at, false) orelse
+        fatal("find a mount to remount", @as(u32, 2));
+    defer _ = linux.close(fd);
+    var st: [120]u8 align(8) = undefined;
+    check("statfs a mount", linux.syscall2(.fstatfs, @as(usize, @intCast(fd)), @intFromPtr(&st)));
+    // `struct statfs`'s `f_flags`, at the same place on x86_64 and aarch64.
+    const st_flags = std.mem.readInt(u64, st[80..88], .little);
+    var keep: u32 = 0;
+    const same = [_]u32{
+        linux.MS.NOSUID, linux.MS.NODEV, linux.MS.NOEXEC, linux.MS.NOATIME, linux.MS.NODIRATIME,
+    };
+    for (same) |f| {
+        if (st_flags & f != 0) keep |= f;
+    }
+    const st_relatime = 4096;
+    if (st_flags & st_relatime != 0) keep |= linux.MS.RELATIME;
+    check("remount read-only", linux.mount(
+        null,
+        procFd(arena, fd),
+        null,
+        linux.MS.REMOUNT | linux.MS.BIND | linux.MS.RDONLY | keep,
+        0,
+    ));
+}
+
+fn targetIn(arena: Allocator, root: linux.fd_t, at: []const u8, dir: bool) ?linux.fd_t {
+    const rel = z(arena, std.mem.trimStart(u8, at, "/"));
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .PATH = true, .DIRECTORY = dir };
+    return switch (openIn(root, rel, flags, 0, 0)) {
+        .fd => |f| f,
+        .err => null,
+    };
+}
+
+/// `/proc/self/fd/<fd>`: what mount(2) takes for a target opened by `openIn`. It follows the link
+/// to the directory or file itself, wherever a symlink a step left would have pointed.
+fn procFd(arena: Allocator, fd: linux.fd_t) [*:0]const u8 {
+    return z(arena, std.fmt.allocPrint(arena, "/proc/self/fd/{d}", .{fd}) catch oom());
+}
+
+/// Writes `f` into the overlay, `f.path` resolved inside it, its missing parents made as
+/// `withNewFile` makes them (root's, 0755).
+fn writeFileIn(arena: Allocator, root: linux.fd_t, f: Spec.File) void {
+    const rel = std.mem.trimStart(u8, f.path, "/");
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, rel, i, '/')) |slash| : (i = slash + 1) {
+        const parent = dirIn(arena, root, rel[0..i]) orelse continue;
+        defer _ = linux.close(parent);
+        _ = linux.mkdirat(parent, z(arena, rel[i..slash]), 0o755);
+    }
+    const fd = switch (openIn(root, z(arena, rel), .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .TRUNC = true,
+        .NOFOLLOW = true,
+    }, f.mode, 0)) {
+        .fd => |fd| fd,
+        .err => |e| fatal("write a file for the step", @backingInt(e)),
+    };
+    defer _ = linux.close(fd);
+    var done: usize = 0;
+    while (done < f.contents.len) {
+        const rc = linux.write(fd, f.contents[done..].ptr, f.contents.len - done);
+        check("write a file for the step", rc);
+        done += rc;
+    }
 }
 
 fn enterUserns() void {
@@ -384,7 +1013,7 @@ fn enterUserns() void {
 }
 
 fn writeProc(path: [*:0]const u8, text: []const u8) void {
-    const fd = linux.open(path, .{ .ACCMODE = .WRONLY }, 0);
+    const fd = linux.open(path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
     check("open a user namespace map", fd);
     defer _ = linux.close(@intCast(fd));
     check("write a user namespace map", linux.write(@intCast(fd), text.ptr, text.len));
@@ -392,21 +1021,22 @@ fn writeProc(path: [*:0]const u8, text: []const u8) void {
 
 /// The env, with HOME from the image's /etc/passwd when it has none: runc sets it so, and every
 /// step under Dagger saw it.
-fn withHome(arena: Allocator, spec: Spec) []const []const u8 {
+fn withHome(arena: Allocator, root: linux.fd_t, spec: Spec) []const []const u8 {
     for (spec.env) |e| if (std.mem.startsWith(u8, e, "HOME=")) return spec.env;
-    const home = passwdHome(arena, spec, spec.uid) orelse "/";
+    const home = passwdHome(arena, root, spec.uid) orelse "/";
     const extra = std.fmt.allocPrint(arena, "HOME={s}", .{home}) catch oom();
     return std.mem.concat(arena, []const u8, &.{ spec.env, &.{extra} }) catch oom();
 }
 
 /// The home directory of `uid` in /etc/passwd as the step sees it.
-fn passwdHome(arena: Allocator, spec: Spec, uid: u32) ?[]const u8 {
-    const path = z(arena, joinRoot(arena, spec.merged, "/etc/passwd"));
-    const fd = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
-    if (linux.errno(fd) != .SUCCESS) return null;
-    defer _ = linux.close(@intCast(fd));
-    var buf: [64 * 1024]u8 = undefined;
-    const n = linux.read(@intCast(fd), &buf, buf.len);
+fn passwdHome(arena: Allocator, root: linux.fd_t, uid: u32) ?[]const u8 {
+    const fd = switch (openIn(root, "etc/passwd", .{ .ACCMODE = .RDONLY }, 0, 0)) {
+        .fd => |f| f,
+        .err => return null,
+    };
+    defer _ = linux.close(fd);
+    const buf = arena.alloc(u8, 256 * 1024) catch return null;
+    const n = linux.read(fd, buf.ptr, buf.len);
     if (linux.errno(n) != .SUCCESS) return null;
     return homeOf(buf[0..n], uid);
 }
@@ -427,38 +1057,6 @@ pub fn homeOf(passwd: []const u8, uid: u32) ?[]const u8 {
         if (id == uid) return f[5];
     }
     return null;
-}
-
-/// Writes `f` into the overlay, its missing parents made as `withNewFile` makes them (root's,
-/// 0755).
-fn writeFile(arena: Allocator, merged: []const u8, f: Spec.File) void {
-    const full = joinRoot(arena, merged, f.path);
-    var i: usize = merged.len + 1;
-    while (std.mem.indexOfScalarPos(u8, full, i, '/')) |slash| : (i = slash + 1)
-        _ = linux.mkdir(z(arena, full[0..slash]), 0o755);
-    const path = z(arena, full);
-    const fd = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, f.mode);
-    check("write a file for the step", fd);
-    defer _ = linux.close(@intCast(fd));
-    var done: usize = 0;
-    while (done < f.contents.len) {
-        const rc = linux.write(@intCast(fd), f.contents[done..].ptr, f.contents.len - done);
-        check("write a file for the step", rc);
-        done += rc;
-    }
-}
-
-/// Binds the host's file over the image's, when the image has one to bind onto: creating it
-/// would put a file in the step's layer, which Dagger's exec does not.
-fn bindFile(arena: Allocator, merged: []const u8, path: []const u8) void {
-    const at = z(arena, joinRoot(arena, merged, path));
-    if (linux.errno(linux.access(at, linux.F_OK)) != .SUCCESS) return;
-    _ = linux.mount(z(arena, path), at, null, linux.MS.BIND, 0);
-}
-
-fn joinRoot(arena: Allocator, root: []const u8, path: []const u8) []const u8 {
-    return std.fmt.allocPrint(arena, "{s}/{s}", .{ root, std.mem.trimStart(u8, path, "/") }) catch
-        oom();
 }
 
 fn z(arena: Allocator, s: []const u8) [*:0]const u8 {
@@ -500,4 +1098,27 @@ test "homeOf reads the home directory of a uid from /etc/passwd" {
     try std.testing.expectEqualStrings("/home/runner", homeOf(passwd, 1001).?);
     try std.testing.expect(homeOf(passwd, 7) == null);
     try std.testing.expect(homeOf("garbage", 0) == null);
+}
+
+test "readIn reads inside a layer: no symlink is followed, and a whiteout is told apart" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "layer/github");
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside", .data = "host secret" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "layer/github/ok", .data = "fine" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const outside = try std.fmt.allocPrint(arena, "{s}/outside", .{root});
+    // A step's symlinks to the host's files, by absolute path and by `..`.
+    try tmp.dir.symLink(io, outside, "layer/github/abs", .{});
+    try tmp.dir.symLink(io, "../../outside", "layer/github/rel", .{});
+    try tmp.dir.symLink(io, "/", "layer/github/dir", .{});
+    const layer = try std.fmt.allocPrint(arena, "{s}/layer", .{root});
+    try std.testing.expectEqualStrings("fine", (try readIn(arena, layer, "/github/ok", 1024)).text);
+    for ([_][]const u8{ "/github/abs", "/github/rel", "/github/dir/outside", "/../outside" }) |p|
+        try std.testing.expect(try readIn(arena, layer, p, 1024) == .missing);
+    try std.testing.expect(try readIn(arena, layer, "/github/ok", 2) == .missing);
 }

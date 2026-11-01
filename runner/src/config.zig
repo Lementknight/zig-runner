@@ -89,6 +89,12 @@ pub const Config = struct {
     /// `nativeStore`).
     native_rootfs: []const u8 = "",
     native_store: []const u8 = "",
+    /// Native steps on a runner that is not root (`RUNNER_NATIVE_ROOTLESS`), with only root
+    /// mapped inside (`Backend.Config.rootless`); off, such a runner sends every job to Dagger.
+    native_rootless: bool = false,
+    /// The first host id of the native jobs' ranges on a root runner
+    /// (`RUNNER_NATIVE_SUBID_BASE`, `Backend.Config.subid_base`).
+    native_subid_base: u32 = 1_000_000_000,
     /// Experimental: key the steps after one that always runs on what it produced rather than on
     /// the step itself (see `dagger.Options.output_keys`).
     output_keys: bool = false,
@@ -180,6 +186,7 @@ pub const Config = struct {
         InvalidJsRuntime,
         InvalidStepUser,
         InvalidBackend,
+        InvalidNativeRootfs,
         InvalidEngine,
         InvalidBool,
         InvalidZigSeed,
@@ -195,6 +202,8 @@ pub const Config = struct {
                 "not set, so this runner would fail every job. Set it to the refs prod may run " ++
                 "(RUNNER_TRUSTED_REFS=refs/heads/main,refs/tags/v*), or to * to trust every ref " ++
                 "(README, \"Environments\").",
+            error.InvalidNativeRootfs => "RUNNER_NATIVE_ROOTFS is a directory's absolute path: " ++
+                "overlay takes it as a layer from the job's directory.",
             error.InvalidZigSeed => "RUNNER_ZIG_SEED is <version>=<sha256>: a Zig version and " ++
                 "the sha256 of its Linux tarball for this machine's architecture, from " ++
                 "https://ziglang.org/download/index.json.",
@@ -228,6 +237,8 @@ pub const Config = struct {
             }
             try c.applyFlag(key, val, &creds);
         }
+        if (c.native_rootfs.len > 0 and !std.fs.path.isAbsolutePosix(c.native_rootfs))
+            return error.InvalidNativeRootfs;
 
         if (c.exec_job != null or c.db_check) {
             // Offline mode: no GitHub credentials needed.
@@ -273,6 +284,8 @@ pub const Config = struct {
         if (environ.get("RUNNER_BACKEND")) |v| c.backend = try stepBackend(v);
         if (environ.get("RUNNER_NATIVE_ROOTFS")) |v| c.native_rootfs = v;
         if (environ.get("RUNNER_NATIVE_STORE")) |v| c.native_store = v;
+        if (environ.get("RUNNER_NATIVE_ROOTLESS")) |v| c.native_rootless = try boolean(v);
+        if (environ.get("RUNNER_NATIVE_SUBID_BASE")) |v| c.native_subid_base = try num(u32, v);
         if (environ.get("RUNNER_OUTPUT_KEYS")) |v| c.output_keys = try boolean(v);
         if (environ.get("RUNNER_ENFORCE_VOLATILE")) |v| c.enforce_volatile = try boolean(v);
         if (environ.get("RUNNER_LOG_SPOOL_DIR")) |v| c.log_spool_dir = v;
@@ -340,6 +353,8 @@ pub const Config = struct {
         else if (eq(key, "backend")) c.backend = try stepBackend(val) //
         else if (eq(key, "native-rootfs")) c.native_rootfs = val //
         else if (eq(key, "native-store")) c.native_store = val //
+        else if (eq(key, "native-rootless")) c.native_rootless = try boolean(val) //
+        else if (eq(key, "native-subid-base")) c.native_subid_base = try num(u32, val) //
         else if (eq(key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache")) c.zig_local_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache-max-mb")) c.zig_local_cache_max_mb = try num(u32, val) //

@@ -596,7 +596,13 @@ fn runJobSteps(
         },
         .sink_job_id = job.check_run_id,
         .runner_name = c.name,
-        .native = try dagger.Backend.configFor(c.arena, c.io, c.environ, cfg, false),
+        .native = try dagger.Backend.configFor(
+            c.arena,
+            c.io,
+            c.environ,
+            cfg,
+            trust.vouches(cfg.trusted_refs, cfg.trusted_events, job.github),
+        ),
     }, job, log);
     // A cancel can also end the job through a query it cut short (past the grace period).
     if (cancel.requested.load(.acquire)) {

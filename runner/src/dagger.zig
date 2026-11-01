@@ -790,9 +790,12 @@ pub fn run(
 ) !Result {
     var opts = opts_in;
     if (opts.native) |cfg| {
-        if (Backend.unsupported(io, job, opts, cfg)) |why| {
+        // What the job uses, then what this machine can do (found once per process).
+        const why = Backend.unsupported(io, job, opts, cfg) orelse
+            Backend.usable(arena, io, opts.gpa, cfg);
+        if (why) |w| {
             opts.backend_note = try std.fmt.allocPrint(arena, "This job runs on Dagger: {s}.", .{
-                why,
+                w,
             });
         } else return runNative(arena, io, opts, cfg, job, log);
     }
@@ -875,6 +878,8 @@ fn runNative(
         }),
     );
     defer b.deinit();
+    // Which ids the job's steps have, as "Set up job" says (`Backend.idsNote`).
+    opts.backend_note = try b.idsNote(arena);
     return runSteps(arena, io, opts, job, &sh, results, b.transport(), &b);
 }
 

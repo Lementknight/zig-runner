@@ -1055,7 +1055,7 @@ pub fn logSetUp(x: *Exec, opts: Options) !void {
     x.setUpLine("##[group]Runner Image");
     x.setUpLine(try std.fmt.allocPrint(arena, "Image: {s}", .{x.job_image}));
     x.setUpLine(if (x.native != null)
-        "Engine: native (namespaces, overlayfs and chroot in the runner)"
+        "Engine: native (namespaces, overlayfs and pivot_root in the runner)"
     else if (opts.engine) |ep|
         try std.fmt.allocPrint(
             arena,
