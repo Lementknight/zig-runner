@@ -5,6 +5,7 @@ const inspect = @import("inspect.zig");
 const dagger = @import("dagger.zig");
 const sandbox = @import("native/sandbox.zig");
 const net = @import("native/net.zig");
+const nft = @import("native/nft.zig");
 const trust = @import("trust.zig");
 const job_mod = @import("job.zig");
 const db = @import("db.zig");
@@ -30,6 +31,9 @@ comptime {
     _ = @import("native/oci/Store.zig");
     _ = @import("native/oci/image.zig");
     _ = @import("native/oci/testregistry.zig");
+
+    _ = @import("native/seccomp.zig");
+    _ = @import("native/nft.zig");
     _ = @import("redact.zig");
     _ = @import("yaml.zig");
     _ = @import("action.zig");
@@ -84,6 +88,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (args.len == 2 and std.mem.eql(u8, args[1], sandbox.command)) return sandbox.main(arena);
     if (args.len == 5 and std.mem.eql(u8, args[1], net.command))
         return net.upMain(arena, args[2], args[3], args[4]);
+    if (args.len >= 3 and std.mem.eql(u8, args[1], nft.command)) return nft.main(args[2..]);
     if (try printVersionIfAsked(io, args)) return @backingInt(Exit.done);
 
     var cfg = Config.load(init.environ_map, args) catch |e| {
