@@ -40,6 +40,8 @@ images: []const u8 = "",
 store: []const u8 = "",
 /// Remote actions fetched before "Set up job" (`actions.preload`), by `Exec.loadAction`'s key.
 actions: std.StringHashMapUnmanaged(Exec.LoadResult) = .empty,
+/// The JavaScript runtime JavaScript actions run with (`Options.js_runtime`, `actions.preload`).
+js_runtime: config.JsRuntime = .bun,
 /// Why the last Dockerfile could not be planned or built, for the step's message.
 build_reason: []const u8 = "",
 binds: []const sandbox.Spec.Bind,
@@ -724,9 +726,12 @@ pub fn execScript(
     resolved_in: dagger.Resolved,
     action_name: []const u8,
     secret_env_in: []const dagger.SecretRef,
+    mounts: []const dagger.Mount,
 ) !Exec.Out {
     const arena = b.arena;
     try b.applyPendingEnv(x);
+    var files: std.ArrayList(sandbox.Spec.File) = .empty;
+    try b.applyMounts(mounts, &files);
     const step_run = try x.resolveRunStep(resolved_in, secret_env_in, null);
     const resolved = step_run.resolved;
     const script = try scripts.stepScriptFc(arena, num, fc, resolved, action_name);
@@ -740,7 +745,6 @@ pub fn execScript(
         .value = plaintext(x, s.id),
     });
     // A script holding a secret is a file the sandbox writes and removes, as Dagger mounts it.
-    var files: std.ArrayList(sandbox.Spec.File) = .empty;
     if (step_run.script_secret != null) try files.append(arena, .{
         .path = try scripts.scriptPath(arena, fc, resolved.run.shell),
         .contents = resolved.run.script,
@@ -794,6 +798,45 @@ pub fn execScript(
     x.loadPendingMatchers(num);
     return out;
 }
+
+/// Dagger's mounts for a step, as the native backend has them (`Exec.execScript`). A new file
+/// (a shim) is written into the step's layer, as `withNewFile` leaves it. A file or directory
+/// whose id is a host path (`host_id`: the JavaScript runtime from the image store, `js.zig`) is
+/// bound read-only from then on, into this step and every later one, as Dagger's copy stays in
+/// the container; its mount point is made first, by a step of its own. Other ids are trees the
+/// native backend has in the job's layers already (a fetched action, a checkout): nothing to do.
+fn applyMounts(b: *Backend, mounts: []const dagger.Mount, files: *std.ArrayList(sandbox.Spec.File)) !void {
+    const arena = b.arena;
+    var binds: std.ArrayList(sandbox.Spec.Bind) = .empty;
+    var points: std.ArrayList(sandbox.Spec.File) = .empty;
+    var dirs: std.Io.Writer.Allocating = .init(arena);
+    for (mounts) |m| switch (m) {
+        .new_file => |f| try files.append(arena, .{
+            .path = f.path,
+            .contents = f.contents,
+            .mode = f.permissions,
+            .keep = true,
+        }),
+        .file => |f| if (std.mem.startsWith(u8, f.id, host_id)) {
+            try points.append(arena, .{ .path = f.path, .contents = "", .mode = 0o755, .keep = true });
+            try binds.append(arena, .{ .host = f.id[host_id.len..], .at = f.path });
+        },
+        .dir => |d| if (std.mem.startsWith(u8, d.id, host_id)) {
+            try dirs.writer.writeAll(" ");
+            try dagger.shellQuote(&dirs.writer, d.path);
+            try binds.append(arena, .{ .host = d.id[host_id.len..], .at = d.path });
+        },
+    };
+    if (binds.items.len == 0) return;
+    var out: Captured = .{ .arena = arena };
+    const script = try std.fmt.allocPrint(arena, "mkdir -p /{s}", .{dirs.written()});
+    const ended = try b.exec(script, &.{"PATH=" ++ image_path}, points.items, 0, 0, out.output());
+    if (ended.failure.len > 0 or ended.code != 0) return error.MountPointsFailed;
+    b.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ b.binds, binds.items });
+}
+
+/// A mount's id that names a host path (`applyMounts`): `host:<absolute path>`.
+pub const host_id = "host:";
 
 /// The built-in checkout on this backend: the repository fetched by git in the job's image, as
 /// actions/checkout fetches it, into the tree Dagger's `git` gives (`checkout.query`): the commit

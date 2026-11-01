@@ -918,7 +918,7 @@ fn runNative(
     defer b.deinit();
     // What its `uses:` actions are is known once they are fetched: one native cannot run yet
     // sends the job to Dagger before anything is logged (`native/actions.zig`).
-    if (try native_actions.preload(&b, job)) |why| {
+    if (try native_actions.preload(&b, job, opts.js_runtime)) |why| {
         dagger_note.* = try std.fmt.allocPrint(arena, "This job runs on Dagger: {s}.", .{why});
         return null;
     }

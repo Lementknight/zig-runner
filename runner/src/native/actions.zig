@@ -26,6 +26,8 @@ const sandbox = @import("sandbox.zig");
 const images = @import("images.zig");
 const docker_action = @import("docker_action.zig");
 const Exec = @import("../dagger/Exec.zig");
+const js = @import("../dagger/js.zig");
+const config = @import("../config.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -37,7 +39,8 @@ pub fn key(arena: Allocator, u: job_mod.Uses) ![]const u8 {
 /// Fetches and reads every remote action of `job` into `b.actions`, and says why the job cannot
 /// run natively, or null. An action that cannot be fetched or read is not a reason: native
 /// "Set up job" fails with it, as Dagger's would.
-pub fn preload(b: *Backend, job: job_mod.Job) !?[]const u8 {
+pub fn preload(b: *Backend, job: job_mod.Job, js_runtime: config.JsRuntime) !?[]const u8 {
+    b.js_runtime = js_runtime;
     for (job.steps) |step| switch (step.action) {
         .uses => |u| if (try reasonFor(b, job, u, 0)) |why| return why,
         else => {},
@@ -64,8 +67,15 @@ fn reasonFor(b: *Backend, job: job_mod.Job, u: job_mod.Uses, depth: u32) anyerro
         .failed, .unresolved => return null,
     };
     switch (act.meta.runs) {
-        .node => return try std.fmt.allocPrint(arena, "{s} is a JavaScript action, and native " ++
-            "steps have no JavaScript runtime yet", .{act.ref_label}),
+        // The runtime from the image store, as Dagger takes it from its image (`js.zig`).
+        .node => {
+            const rt = js.runtimes.get(b.js_runtime);
+            return switch (try images.lookup(arena, b.io, b.images, rt.image)) {
+                .image => null,
+                .missing => |why| try std.fmt.allocPrint(arena, "{s} is a JavaScript action, " ++
+                    "and its runtime is not here: {s}", .{ act.ref_label, why }),
+            };
+        },
         .docker => |dk| {
             if (std.mem.startsWith(u8, dk.image, "docker://"))
                 return imageReason(b, dk.image["docker://".len..]);
@@ -147,19 +157,19 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
     });
     // The repository was made by another user (the fetch is the job's root, a file:// source is
     // the host's): git's ownership check would refuse to read it.
-    var config: std.ArrayList([2][]const u8) = .empty;
-    try config.append(arena, .{ "safe.directory", "*" });
+    var git_config: std.ArrayList([2][]const u8) = .empty;
+    try git_config.append(arena, .{ "safe.directory", "*" });
     if (std.mem.eql(u8, repository, job.github.repository) and job.job_token.len > 0) {
         const basic = try std.fmt.allocPrint(arena, "x-access-token:{s}", .{job.job_token});
         const enc = std.base64.standard.Encoder;
         const b64 = try arena.alloc(u8, enc.calcSize(basic.len));
-        try config.append(arena, .{
+        try git_config.append(arena, .{
             try std.fmt.allocPrint(arena, "http.{s}/.extraheader", .{server}),
             try std.fmt.allocPrint(arena, "AUTHORIZATION: basic {s}", .{enc.encode(b64, basic)}),
         });
     }
-    try env.append(arena, try std.fmt.allocPrint(arena, "GIT_CONFIG_COUNT={d}", .{config.items.len}));
-    for (config.items, 0..) |c, i| {
+    try env.append(arena, try std.fmt.allocPrint(arena, "GIT_CONFIG_COUNT={d}", .{git_config.items.len}));
+    for (git_config.items, 0..) |c, i| {
         try env.append(arena, try std.fmt.allocPrint(arena, "GIT_CONFIG_KEY_{d}={s}", .{ i, c[0] }));
         try env.append(arena, try std.fmt.allocPrint(arena, "GIT_CONFIG_VALUE_{d}={s}", .{ i, c[1] }));
     }
@@ -396,10 +406,85 @@ test "preload: a JavaScript action, a local one, or an image not in the store se
         job.github.server_url = "file:///srv/git";
         var b = try Backend.init(arena, std.testing.io, std.testing.allocator, cfg);
         defer b.deinit();
-        const why = try preload(&b, job);
+        const why = try preload(&b, job, .bun);
         if (c.why) |want| {
             errdefer std.debug.print("got: {?s}\n", .{why});
             try std.testing.expect(std.mem.indexOf(u8, why orelse "", want) != null);
         } else try std.testing.expect(why == null);
     }
+}
+
+test "JavaScript actions natively: pre, main and post with their inputs, state, outputs and post-if" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testActions(arena, &tmp);
+    // The runtime's image, as `js.runtimes` names it, with a stand-in for Bun that runs the
+    // "JavaScript" as a shell script: what is tested is everything around the runtime.
+    const rt = js.runtimes.get(.bun);
+    cfg.images = try docker_action.testImage(arena, &tmp, rt.image, "{}");
+    const bin = try std.fmt.allocPrint(arena, "images/{s}/rootfs{s}", .{ try images.key(arena, rt.image), rt.binary });
+    try tmp.dir.createDirPath(io, std.fs.path.dirnamePosix(bin).?);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = bin,
+        .data = "#!/bin/sh\nexec /bin/sh \"$@\"\n",
+        .flags = .{ .permissions = .fromMode(0o755) },
+    });
+    try testRepo(arena, &tmp, "js", &.{
+        .{
+            "action.yml",
+            \\inputs:
+            \\  who:
+            \\    default: nobody
+            \\runs:
+            \\  using: node24
+            \\  pre: pre.js
+            \\  main: main.js
+            \\  post: post.js
+            \\  post-if: success()
+        },
+        .{ "pre.js", "echo \"pre $INPUT_WHO\"; echo phase=pre >> \"$GITHUB_STATE\"\n" },
+        .{ "main.js", "echo \"main $INPUT_WHO state=$STATE_phase repo=$GITHUB_ACTION_REPOSITORY " ++
+            "node=$(command -v node) npx=$(command -v npx)\"\n" ++
+            "echo out=42 >> \"$GITHUB_OUTPUT\"; echo phase=main >> \"$GITHUB_STATE\"\n" },
+        .{ "post.js", "echo \"post state=$STATE_phase\"\n" },
+    });
+    try testRepo(arena, &tmp, "jsno", &.{
+        .{ "action.yml", "runs:\n  using: node20\n  main: main.js\n  post: post.js\n  post-if: failure()\n" },
+        .{ "main.js", "echo second main\n" },
+        .{ "post.js", "echo never\n" },
+    });
+    const who = [_]job_mod.Input{.{ .name = "who", .value = .{ .lit = "world" } }};
+    var s2 = testStep("echo OUT=$OUT");
+    s2.env = &.{.{ .name = "OUT", .value = .{ .expr = "steps.js.outputs.out" } }};
+    var job = testJob(&.{ usesStep("js", "o", "js", "v1", &who), s2, usesStep("no", "o", "jsno", "v1", &.{}) });
+    job.github.server_url = "file:///srv/git";
+
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    const text = w.written();
+    errdefer std.debug.print("{s}\n", .{text});
+    try std.testing.expect(res.succeeded);
+    const expect = [_][]const u8{
+        "Engine: native",
+        "pre world",
+        "main world state=pre repo=o/js node=/github/_runtime/bin/node npx=/github/_runtime/bin/npx",
+        "OUT=42",
+        "second main",
+        "post state=main",
+    };
+    for (expect) |e| if (std.mem.indexOf(u8, text, e) == null) {
+        std.debug.print("missing {s}\n", .{e});
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(std.mem.indexOf(u8, text, "never") == null);
 }
