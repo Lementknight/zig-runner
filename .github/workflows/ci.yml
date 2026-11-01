@@ -87,6 +87,21 @@ jobs:
             sleep $((attempt * 15))
           done
 
+      # The default job image (runner/src/dagger.zig), the shared base of every job, pinned by
+      # digest: checked to be a multi-arch index (amd64 and arm64) whose bytes hash to the pin, so
+      # a Renovate ubuntu pull request, or a re-wrapped literal, fails here, not on a runner. Asked
+      # of Docker Hub's registry API anonymously, with curl: only a fetch that fails (exit 75) is
+      # tried again, twice, after a pause, as for busybox.
+      - name: ubuntu's pin
+        run: |
+          for attempt in 1 2 3; do
+            status=0
+            .github/scripts/ubuntu-pin.sh || status=$?
+            ((status == 75 && attempt < 3)) || exit "$status"
+            echo "::warning::ubuntu-pin.sh could not reach Docker Hub (attempt $attempt of 3): trying again"
+            sleep $((attempt * 15))
+          done
+
       # zizmor's online audits ask GitHub (its advisories, the pinned commits). A request that fails
       # makes zizmor exit 1, the code for its own failure, which once took a pull request out of
       # the merge queue (#194). Only that is tried again, twice, after a pause: findings (exit 10

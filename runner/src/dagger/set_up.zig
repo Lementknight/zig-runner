@@ -31,6 +31,8 @@ const isVolatile = @import("../dagger.zig").isVolatile;
 const logSteps = @import("../dagger.zig").logSteps;
 const finish = @import("../dagger.zig").finish;
 const default_image = @import("../dagger.zig").default_image;
+const resolveImage = @import("../dagger.zig").resolveImage;
+const imageName = @import("../dagger.zig").imageName;
 const jobWorkspace = @import("../dagger.zig").jobWorkspace;
 const work_root = @import("../dagger.zig").work_root;
 const runner_user = @import("../dagger.zig").runner_user;
@@ -54,12 +56,19 @@ const braceBalanced = @import("testing.zig").braceBalanced;
 
 const Allocator = std.mem.Allocator;
 
-/// What the default image (`ubuntu:24.04`) gets before a job: what workflows written for GitHub's
+/// What the default image (`ubuntu:24.04`, pinned by digest) gets before a job: what workflows written for GitHub's
 /// `ubuntu-latest` most often assume without a setup action. `sudo` (steps run as `runner_user`, as
 /// on GitHub, and many call `sudo apt-get`), compilers and `make`, Python with pip and venv (and
 /// `python`), `psql` for a Postgres service, archive and transfer tools, and what composite actions
 /// often use (`jq`, `curl`). Installed once per engine: Dagger caches this exec, and the pre-warm
 /// (`warm`) builds it before the first job.
+///
+/// The packages are not pinned: they come from the archive on the day the engine builds this exec,
+/// so the seed is "image-pinned, packages from the archive on build date". Pinning `pkg=version`
+/// breaks provisioning within weeks, as noble-updates and noble-security list only their latest
+/// versions; snapshot.ubuntu.com serves amd64 only (not ubuntu-ports, which arm64 installs from).
+/// The pre-warm logs a fingerprint of what got installed (`package_fingerprint_script`), so a
+/// seed is identifiable.
 pub const provision_packages = [_][]const u8{
     "git",            "git-lfs",     "ca-certificates", "curl",              "wget",
     "xz-utils",       "bzip2",       "zstd",            "zip",               "unzip",
@@ -72,6 +81,10 @@ pub const provision_packages = [_][]const u8{
 pub const provision_script = "apt-get update -qq && DEBIAN_FRONTEND=noninteractive " ++
     "apt-get install -y -qq --no-install-recommends " ++ packageList() ++
     " >/dev/null && rm -rf /var/lib/apt/lists/*";
+
+/// Every installed package and version, hashed: the pre-warm's line names the provisioned seed by it.
+pub const package_fingerprint_script =
+    "dpkg-query -W -f '${Package}=${Version}\\n' | sha256sum | cut -c1-12";
 
 const chown_runner = " && chown -R " ++ runner_user ++ ":" ++ runner_user ++ " " ++ work_root;
 
@@ -683,10 +696,11 @@ pub fn basePlan(
     err_msg: *[]const u8,
 ) !BasePlan {
     // `container:` replaces the image every step runs in.
-    const job_image: []const u8 = if (job.container) |jc| (ev.render(
+    // The default image's bare name (`container: ubuntu:24.04`) is the pinned default.
+    const job_image: []const u8 = resolveImage(if (job.container) |jc| (ev.render(
         jc.image,
         try ev.scope(&.{}),
-    ) catch "") else opts.image;
+    ) catch "") else opts.image);
     if (job_image.len == 0) {
         err_msg.* = try std.fmt.allocPrint(arena, "container: has no image: {s}", .{ev.diag});
         return error.BaseContainerFailed;
@@ -948,7 +962,8 @@ fn toolTreesKey(
     return try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/tool-trees/{s}{s}", .{
         job.github.repository,
         scope,
-        job_image,
+        // The tool cache's own key drops the digest (`imageName`); its lists follow the same volume.
+        imageName(job_image),
         if (as_runner) "/" ++ runner_user else "",
     });
 }
@@ -977,12 +992,13 @@ fn writeCacheVolumes(
     }
     for (package_cache_dirs, 0..) |d, i| {
         // The tool cache holds binaries built for one image (glibc or musl, its libraries), so
-        // each image has its own.
+        // each image has its own: by name, as a rebuild of the same release (a new digest) runs
+        // them alike, and a digest update keeps the volume.
         const key = if (std.mem.eql(u8, d.name, "toolcache"))
             try std.fmt.allocPrint(
                 arena,
                 "zig-runner/{s}/{s}/{s}/{s}",
-                .{ job.github.repository, scope, d.name, job_image },
+                .{ job.github.repository, scope, d.name, imageName(job_image) },
             )
         else
             try std.fmt.allocPrint(
@@ -1516,41 +1532,57 @@ fn usesZig(job: job_mod.Job) bool {
 
 /// The pre-warm's documents: the base container's prefix as `basePlan` derives it for a job with
 /// cache volumes, evaluated (`sync`); what its image resolves to; and the Zig seed when a Zig job
-/// would get one.
+/// would get one (one per verified seed); and the provisioned packages' fingerprint, on top of
+/// the base, when provisioned.
 pub const WarmDocuments = struct {
     base: []const u8,
     image_ref: []const u8,
     seeds: []const []const u8,
+    packages: ?[]const u8,
 };
 
 pub fn warmDocuments(arena: Allocator, opts: Options) !WarmDocuments {
-    const provision = opts.provision and std.mem.eql(u8, opts.image, default_image);
+    const image = resolveImage(opts.image);
+    const provision = opts.provision and std.mem.eql(u8, image, default_image);
     const as_runner = provision and opts.step_user == .runner;
-    var q: Query = .init(arena);
-    try q.open("container");
-    try writeFrom(
-        &q,
-        opts.image,
-        if (opts.package_caches and opts.zig_local_cache)
-            zigLocalCacheEnv(as_runner, opts.zig_local_cache_max_mb)
-        else
-            null,
-    );
-    if (provision) try writeProvision(&q, as_runner);
-    try q.leaf("sync");
+    var docs: [2][]const u8 = undefined;
+    for (&docs, [_][]const u8{ "sync", "stdout" }) |*doc, leaf| {
+        var q: Query = .init(arena);
+        try q.open("container");
+        try writeFrom(
+            &q,
+            image,
+            if (opts.package_caches and opts.zig_local_cache)
+                zigLocalCacheEnv(as_runner, opts.zig_local_cache_max_mb)
+            else
+                null,
+        );
+        if (provision) try writeProvision(&q, as_runner);
+        if (std.mem.eql(u8, leaf, "stdout")) try q.call("withExec", .{
+            .args = &[_][]const u8{ "sh", "-c", package_fingerprint_script },
+        });
+        try q.leaf(leaf);
+        doc.* = try q.finish();
+    }
     var ref: Query = .init(arena);
     try ref.open("container");
-    try ref.call("from", .{ .address = opts.image });
+    try ref.call("from", .{ .address = image });
     try ref.leaf("imageRef");
     const seeds = try arena.alloc([]const u8, if (opts.package_caches) opts.zig_seeds.len else 0);
     for (seeds, opts.zig_seeds[0..seeds.len]) |*doc, z|
         doc.* = try zigSeedDocument(arena, z, opts.step_user == .runner);
-    return .{ .base = try q.finish(), .image_ref = try ref.finish(), .seeds = seeds };
+    return .{
+        .base = docs[0],
+        .image_ref = try ref.finish(),
+        .seeds = seeds,
+        .packages = if (provision) docs[1] else null,
+    };
 }
 
 /// What the pre-warm built: the image as the engine resolved it (with its digest when the
-/// registry gave one, as services do for a job's images), and whether the seed was built too.
-pub const Warmed = struct { image: []const u8, seeded: bool };
+/// registry gave one, as services do for a job's images), whether the seed was built too, and the
+/// provisioned packages' fingerprint (`package_fingerprint_script`) when there is one.
+pub const Warmed = struct { image: []const u8, seeded: bool, packages: ?[]const u8 = null };
 
 /// Sends the pre-warm's documents, the base container first. On failure the message is in
 /// `err_msg`.
@@ -1559,10 +1591,18 @@ pub fn warm(arena: Allocator, transport: Transport, opts: Options, err_msg: *[]c
     _ = gql(arena, transport, docs.base, err_msg) catch return error.BaseContainerFailed;
     const ref = gql(arena, transport, docs.image_ref, err_msg) catch
         return error.BaseContainerFailed;
-    const image = jsonFindString(ref, "imageRef") orelse opts.image;
+    const image = jsonFindString(ref, "imageRef") orelse resolveImage(opts.image);
+    // Only a name for the log: a fingerprint that cannot be read leaves it out.
+    var packages: ?[]const u8 = null;
+    if (docs.packages) |doc| {
+        var ignored: []const u8 = "";
+        if (gql(arena, transport, doc, &ignored)) |r| {
+            if (jsonFindString(r, "stdout")) |out| packages = std.mem.trim(u8, out, " \n");
+        } else |_| {}
+    }
     for (docs.seeds) |seed| _ = gql(arena, transport, seed, err_msg) catch
         return error.ZigSeedFailed;
-    return .{ .image = image, .seeded = docs.seeds.len > 0 };
+    return .{ .image = image, .seeded = docs.seeds.len > 0, .packages = packages };
 }
 
 test "the default image is provisioned with git; a custom image is left alone" {
@@ -1585,6 +1625,47 @@ test "the default image is provisioned with git; a custom image is left alone" {
         try std.testing.expect(braceBalanced(base));
         try std.testing.expectEqual(case.expect_provision, std.mem.indexOf(u8, base, "apt-get install") != null);
         try std.testing.expect(std.mem.indexOf(u8, base, case.image) != null);
+    }
+}
+
+test "a job without container:, or with the default's bare name, gets the pinned, provisioned default" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("true")};
+    var vols: std.Io.Writer.Allocating = .init(arena);
+    try vols.writer.writeAll("{\"data\":{");
+    for (package_cache_dirs, 0..) |_, i| try vols.writer.print("{s}\"c{d}\":{{\"id\":\"V{d}\"}}", .{ if (i == 0) "" else ",", i, i });
+    try vols.writer.writeAll("}}");
+    const other_digest = "ubuntu:24.04@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    for ([_]struct { container: ?[]const u8, config: []const u8, image: []const u8, provision: bool }{
+        .{ .container = null, .config = default_image, .image = default_image, .provision = true },
+        // An older config that names the image keeps getting the default.
+        .{ .container = null, .config = "ubuntu:24.04", .image = default_image, .provision = true },
+        .{ .container = "ubuntu:24.04", .config = default_image, .image = default_image, .provision = true },
+        // Another digest is the user's own image: used as is, not provisioned.
+        .{ .container = other_digest, .config = default_image, .image = other_digest, .provision = false },
+    }) |case| {
+        var job = testJob(&steps);
+        if (case.container) |c| job.container = .{ .name = "", .image = .{ .lit = c }, .env = &.{} };
+        const answers = [_][]const u8{ vols.written(), base_answer };
+        var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        // Only the base container matters here: the job stops when the answers run out.
+        _ = try run(arena, std.testing.io, &env, .{ .image = case.config, .package_caches = true, .step_user = .runner, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+        const base = fake.seen.items[1];
+        const from = try std.fmt.allocPrint(arena, "from(address:\"{s}\")", .{case.image});
+        try std.testing.expect(std.mem.indexOf(u8, base, from) != null);
+        // sudo, the runner user and git, as on GitHub (steps run as the runner user, the config's
+        // default).
+        for ([_][]const u8{ "apt-get install", " sudo ", " git ", "useradd", "/etc/sudoers.d/runner" }) |part|
+            try std.testing.expectEqual(case.provision, std.mem.indexOf(u8, base, part) != null);
+        // One tool cache for the release, whichever digest.
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "/toolcache/ubuntu:24.04/runner\")") != null or
+            std.mem.indexOf(u8, fake.seen.items[0], "/toolcache/ubuntu:24.04\")") != null);
     }
 }
 
@@ -1791,7 +1872,9 @@ test "package caches: one volume per tool, keyed by repository, shared only by v
         try std.testing.expect(res.succeeded);
         const scope = case.scope;
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "c1: cacheVolume(key:\"zig-runner/o/r/{s}/npm\")", .{scope})) != null);
-        // The tool cache is also keyed by the job's image (its binaries are built for it).
+        // The tool cache is also keyed by the job's image (its binaries are built for it), by
+        // name: the pinned default's key is the one it had before the pin, and a digest update
+        // keeps it.
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "c0: cacheVolume(key:\"zig-runner/o/r/{s}/toolcache/ubuntu:24.04\")", .{scope})) != null);
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "cacheVolume(key:\"zig-runner/o/r/{s}/zig-packages\")", .{scope})) != null);
         // Asked for by key alone: a `source:` seed would put a Directory ID into every step's
@@ -2025,7 +2108,7 @@ test "the Zig cache seed: built from pinned, runner-written inputs, the same for
         // The inputs: the default image's provisioning, the tarball by URL and pinned sha256,
         // checked before Zig runs, and the runner's own build.zig.
         const url = "https://ziglang.org/download/0.17.0/zig-" ++ @tagName(builtin.cpu.arch) ++ "-linux-0.17.0.tar.xz";
-        try std.testing.expect(std.mem.startsWith(u8, seed_q, "{ container { from(address:\"ubuntu:24.04\") { withExec(args:[\"sh\",\"-c\",\"apt-get update"));
+        try std.testing.expect(std.mem.startsWith(u8, seed_q, "{ container { from(address:\"" ++ default_image ++ "\") { withExec(args:[\"sh\",\"-c\",\"apt-get update"));
         try std.testing.expect(std.mem.indexOf(u8, seed_q, url) != null);
         const check = std.mem.indexOf(u8, seed_q, "echo '" ++ test_zig_seed.sha256 ++ "  zig.tar.xz' | sha256sum -c --quiet").?;
         const build = std.mem.indexOf(u8, seed_q, "ZIG_GLOBAL_CACHE_DIR=/zig-seed /tmp/zig-").?;
@@ -2296,6 +2379,7 @@ test "the pre-warm sends a Zig job's own seed and base documents, and fails with
         const answers = [_][]const u8{
             "{\"data\":{\"container\":{\"from\":{\"withExec\":{\"sync\":\"C0\"}}}}}",
             "{\"data\":{\"container\":{\"from\":{\"imageRef\":\"docker.io/library/ubuntu:24.04@sha256:abc\"}}}}",
+            "{\"data\":{\"container\":{\"from\":{\"withExec\":{\"withExec\":{\"stdout\":\"0123456789ab\\n\"}}}}}}",
             seed_answer,
         };
         var fake: FakeSession = .{ .answers = &answers, .arena = arena };
@@ -2303,12 +2387,22 @@ test "the pre-warm sends a Zig job's own seed and base documents, and fails with
         const w = try warm(arena, fake.transport(), opts, &msg);
         try std.testing.expectEqualStrings("docker.io/library/ubuntu:24.04@sha256:abc", w.image);
         try std.testing.expect(w.seeded);
+        try std.testing.expectEqualStrings("0123456789ab", w.packages.?);
         try std.testing.expectEqualStrings(docs.base, fake.seen.items[0]);
-        try std.testing.expectEqualStrings(docs.seeds[0], fake.seen.items[2]);
+        // The fingerprint runs on top of the provisioned base, so the engine reuses it.
+        try std.testing.expectEqualStrings(docs.packages.?, fake.seen.items[2]);
+        try std.testing.expect(std.mem.startsWith(u8, docs.packages.?, prefix));
+        try std.testing.expect(std.mem.indexOf(u8, docs.packages.?, "dpkg-query") != null);
+        try std.testing.expectEqualStrings(docs.seeds[0], fake.seen.items[3]);
     }
     // No seed without package caches, as a job gets none; a pull that fails says why.
     const off = try warmDocuments(arena, .{ .zig_seeds = &.{test_zig_seed} });
     try std.testing.expect(off.seeds.len == 0);
+    // A custom image is not provisioned, so it has no fingerprint; the bare default name is the pin.
+    try std.testing.expect((try warmDocuments(arena, .{ .image = "custom/image:1" })).packages == null);
+    const bare = try warmDocuments(arena, .{ .image = "ubuntu:24.04" });
+    try std.testing.expectEqualStrings((try warmDocuments(arena, .{})).base, bare.base);
+    try std.testing.expect(std.mem.indexOf(u8, bare.base, default_image) != null);
     const denied = [_][]const u8{"{\"errors\":[{\"message\":\"pull access denied\"}]}"};
     var fake: FakeSession = .{ .answers = &denied, .arena = arena };
     var msg: []const u8 = "";
