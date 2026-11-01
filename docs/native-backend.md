@@ -106,8 +106,8 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   does not vouch for (`trust.vouches`, for `--exec-job` too), a rootless runner unless
   `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:` or `options:`, `services:`
   on a rootless runner or with an image given by an expression (native since P6, below, their
-  images pulled by P3), JavaScript and local `uses:` actions (P7, `actions.preload`), any remote `uses:` action without
-  the operator's provisioned default image (the fetch comes before P3's pull), `docker://` images
+  images pulled by P3), JavaScript and local `uses:` actions (P7, `actions.preload`), remote `uses:` actions in an
+  image with no git to fetch them with, `docker://` images
   that cannot be pulled or run as a non-root `USER` (P7), Dagger in steps
   (`RUNNER_DAGGER_NESTING`), `hashFiles()`
   anywhere in the job (it reads the container through Dagger), a checkout with submodules, and a
@@ -897,7 +897,10 @@ build's new layer in the store (`Backend.execBuild`: the job gets no layer). Wha
 the job's host ids; they are shifted back to the image's own afterwards (`unshift`), so a stored
 layer is the same whichever job's range built it and can be idmapped into any job, as the
 `COPY` layers the runner writes are. The built image runs as a `docker://` one does, with its
-layers as the container's lowers. Layers live under `RUNNER_NATIVE_STORE/layers`.
+layers as the container's lowers. Layers live under `RUNNER_NATIVE_STORE/layers`, in P2's store,
+each under the builder's key hashed with the store's format and the job's trust scope
+(`layers.Store.key`): a job the runner does not vouch for, or a vouched fork's pull request,
+builds its own layers and never leaves one a trusted job takes.
 
 **The action loader** (`runner/src/native/actions.zig`). The backend stays chosen per job, never
 per step (a switch would need the native layers exported into Dagger). What a `uses:` action is
@@ -905,8 +908,13 @@ is in its `action.yml`, so before "Set up job", with nothing logged, `preload` f
 remote action of the job, composite actions' nested ones too, by git in the job's image into
 the job's layers at the path Dagger mounts them (`/github/_actions/<owner>/<repo>/<ref>`): only
 the commit, the job's token for its own repository and none for others, as Dagger's `git` does.
-If one is something native cannot run yet (below), the job goes to Dagger with the reason, and
-Dagger fetches again; otherwise "Set up job" takes them from the Backend (`Exec.loadAction`) and
+It runs in the base (`Backend.base`), once the job's image is pulled and provisioned and before
+the base's own layer, so any image fetches with its own git (an image with none sends the job to
+Dagger, whose git is its own). Each fetched tree is keyed by its repository, place and resolved
+commit (`Backend.keyFetched`), not by when it was fetched: under step caching it is stored or
+taken from the store like a step's layer, and the base and the steps above it keep their keys
+from job to job. If one is something native cannot run yet (below), the job goes to Dagger with
+the reason (`error.NativeToDagger`), and Dagger fetches again; otherwise "Set up job" takes them from the Backend (`Exec.loadAction`) and
 logs "Download action repository ... (SHA:...)" as on Dagger. An action that cannot be fetched
 is not a reason: native "Set up job" fails with it, as Dagger's does. Native runs Docker actions
 (a `docker://` image, or built from the Dockerfile in the fetched tree, the context opened

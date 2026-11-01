@@ -377,7 +377,12 @@ fn buildImage(b: *Backend, bd: Build) !Built {
         else => e,
     };
     // P2's layer store: published there, held for the job, evicted under its cap.
-    const store: layers.Store = .{ .dir = b.dir, .store = b.store_cfg, .held = &b.held };
+    const store: layers.Store = .{
+        .dir = b.dir,
+        .store = b.store_cfg,
+        .held = &b.held,
+        .scope = b.scope,
+    };
     var runner: BuildRunner = .{ .b = b };
     return switch (try dockerfile.build(arena, b.io, p, base.rootfs, ctx.path, store, runner.runner())) {
         .ok => |built| .{ .image = .{ .lowers = built.lowers, .config = built.config } },

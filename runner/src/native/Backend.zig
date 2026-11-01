@@ -29,6 +29,7 @@ const volumes = @import("volumes.zig");
 const admission = @import("../admission.zig");
 const services = @import("services.zig");
 const images = @import("images.zig");
+const native_actions = @import("actions.zig");
 const Exec = @import("../dagger/Exec.zig");
 const Evaluator = @import("../dagger/Evaluator.zig");
 const SpanDemux = @import("../dagger/JobLog.zig").SpanDemux;
@@ -67,6 +68,9 @@ notes: std.ArrayList([]const u8) = .empty,
 actions: std.StringHashMapUnmanaged(Exec.LoadResult) = .empty,
 /// Why the last Dockerfile could not be planned or built, for the step's message.
 build_reason: []const u8 = "",
+/// Why the job runs on Dagger after all, found in `base` (`error.NativeToDagger`): one of its
+/// actions is something native steps cannot run yet (`actions.preload`).
+to_dagger: []const u8 = "",
 binds: []const sandbox.Spec.Bind,
 /// The host's resolver and hosts file over the image's (`jobBinds`), in `binds` too; services get
 /// these and `service_binds` (`serviceBinds`).
@@ -983,6 +987,21 @@ pub fn base(
     if (event_in_env) try b.put(dagger.event_env, event);
     if (plan.step_cache) try b.put(dagger.ran_env, plan.ran_marker);
 
+    // The job's remote actions, fetched by git in its image now that the image is pulled and
+    // provisioned, below the base's layer, each keyed by its commit (`actions.preload`,
+    // `keyFetched`). One that native steps cannot run sends the job to Dagger
+    // (`error.NativeToDagger`), before "Set up job" has said anything. From `/`, as the
+    // workspace is not there yet.
+    {
+        const workdir = b.workdir;
+        b.workdir = "/";
+        defer b.workdir = workdir;
+        if (try native_actions.preload(b, ev.job.*)) |why| {
+            b.to_dagger = why;
+            return error.NativeToDagger;
+        }
+    }
+
     // The workspace and RUNNER_TEMP, made as Dagger's base makes them: in the provisioned image by
     // root, owned by the step user when it is not root; in any other image by its own user, who
     // may be unable to (its steps then say so). From `/`, as the workspace is not there yet. The
@@ -1842,6 +1861,40 @@ fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) 
     };
     b.held.appendAssumeCapacity(layer.lock);
     top.* = .{ .name = name, .path = layer.fs, .key = key };
+}
+
+/// The stack's top layer, a tree git fetched at a commit (an action's, `actions.fetch`), keyed by
+/// what it holds rather than by how it was made: `what` names the repository, where it is and the
+/// commit, as Dagger's `git` keys a tree. Under step caching the store's layer under that key
+/// takes its place (the same tree), or it is published under it, so the base and the steps above
+/// it are keyed and replayed as above any other layer. Unkeyed, it would leave every later key
+/// null, and every step of a job with an action uncached (finding 1 of the trial integration,
+/// #275). Without the store, or with nothing keyed below it, the layer stays the job's own.
+pub fn keyFetched(b: *Backend, what: []const u8) !void {
+    if (b.store == null) return;
+    const fetched = b.layers.pop() orelse return;
+    const parent = if (b.layers.items.len > 0)
+        b.layers.items[b.layers.items.len - 1].key
+    else
+        b.below();
+    const p = parent orelse {
+        b.layers.appendAssumeCapacity(fetched);
+        return;
+    };
+    var h: Store.KeyHasher = .init(.step);
+    h.core(p, what, &[_]job_mod.EnvVar{});
+    const claim = b.claimKey(h.final()) catch |e| {
+        b.layers.appendAssumeCapacity(fetched);
+        return e;
+    };
+    defer claim.release(b.io);
+    if (claim.hit != null) {
+        // The stored tree is linked on the stack in its place (`claimKey`): this one goes.
+        Store.removeTree(b.arena, b.io, fetched.path);
+        return;
+    }
+    b.layers.appendAssumeCapacity(fetched);
+    if (claim.key) |k| b.publishTop(k, .fetch, .{ .log = "", .fc = "" });
 }
 
 /// The job's stack merged into one layer (`Store.flatten`), before overlay's limits on layers and

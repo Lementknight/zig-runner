@@ -878,7 +878,7 @@ test "build: COPY into its layer, RUN through the runner, and a second build tak
     try @import("Store.zig").prepare(arena, io, store_dir);
     var held: std.ArrayList(std.Io.File) = .empty;
     defer for (held.items) |f| f.close(io);
-    const store: layers.Store = .{ .dir = store_dir, .store = .{ .root = store_dir }, .held = &held };
+    const store: layers.Store = .{ .dir = store_dir, .store = .{ .root = store_dir }, .held = &held, .scope = "repo" };
     const rootfs = try std.fmt.allocPrint(arena, "{s}/rootfs", .{root});
     const text =
         \\FROM alpine:3.22
