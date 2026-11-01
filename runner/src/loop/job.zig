@@ -583,7 +583,8 @@ fn runJobSteps(
         .uv_env_in_cache = c.cfg.uv_env_in_cache,
         .zig_local_cache = c.cfg.zig_local_cache,
         .zig_local_cache_max_mb = c.cfg.zig_local_cache_max_mb,
-        .zig_seed = c.cfg.zig_seed,
+        .zig_seeds = c.cfg.zig_seeds,
+        .zig_seeds_unverified = c.cfg.zig_seeds_unverified,
         .step_cache = c.cfg.step_cache,
         .step_user = c.cfg.step_user,
         // Skipped for a repository whose jobs spend too long on them (see `SlowOutputs`).

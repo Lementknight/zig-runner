@@ -9,6 +9,7 @@ const pg = @import("pg.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
 const http = @import("github/http.zig");
+const zig_release = @import("zig_release.zig");
 const broker = @import("github/broker.zig");
 const jitconfig = @import("github/jitconfig.zig");
 const engine = @import("engine.zig");
@@ -42,6 +43,8 @@ comptime {
     _ = @import("context.zig");
     _ = @import("commands.zig");
     _ = @import("regex.zig");
+    _ = @import("minisign.zig");
+    _ = @import("zig_release.zig");
     _ = @import("matcher.zig");
     _ = @import("fuzz.zig");
     _ = @import("pg.zig");
@@ -110,6 +113,14 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer client.deinit();
     http.shared.store(&client, .release);
+    // The seeds' tarballs are checked here, once, outside any job (`zig_release.zig`).
+    if (cfg.zig_seed) |*s| {
+        cfg.zig_seeds = s[0..1];
+    } else if (cfg.package_caches) {
+        const r = try zig_release.resolve(arena, init.gpa, &client, cfg.zig_seed_versions);
+        cfg.zig_seeds = r.seeds;
+        cfg.zig_seeds_unverified = r.unverified;
+    }
     const stale = try settleRegistrations(arena, io, &cfg, log);
     installStopSignals();
     // Removed while the runners start, not before: that wait was 60 s every restart that found any.
@@ -360,7 +371,7 @@ fn execJobFile(
         .uv_env_in_cache = cfg.uv_env_in_cache,
         .zig_local_cache = cfg.zig_local_cache,
         .zig_local_cache_max_mb = cfg.zig_local_cache_max_mb,
-        .zig_seed = cfg.zig_seed,
+        .zig_seeds = if (cfg.zig_seed) |*s| s[0..1] else &.{},
         .step_cache = cfg.step_cache,
         .step_user = cfg.step_user,
         .output_keys = cfg.output_keys,

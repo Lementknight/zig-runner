@@ -507,9 +507,11 @@ pub const Options = struct {
     /// `Config.zig_local_cache_max_mb`: past it, Zig's local cache starts over in a new generation
     /// (`set_up.rollZigLocal`). 0, the default here, keeps it in the volume's root, unbounded.
     zig_local_cache_max_mb: u32 = 0,
-    /// `Config.zig_seed`: the Zig release Zig jobs' global cache is seeded from (see
-    /// `set_up.zigSeedFor`); null for none.
-    zig_seed: ?config.ZigSeed = null,
+    /// `Config.zig_seeds`: the verified Zig releases Zig jobs' global cache is seeded from (see
+    /// `set_up.zigSeedFor`); empty for none.
+    zig_seeds: []const config.ZigSeed = &.{},
+    /// `Config.zig_seeds_unverified`: releases left unseeded because they did not verify.
+    zig_seeds_unverified: []const []const u8 = &.{},
     /// Stored outputs not produced again for this many days are removed
     /// (`RUNNER_OUTPUT_KEYS_DAYS`).
     output_keys_days: u32 = 7,
@@ -1722,6 +1724,7 @@ fn runSteps(
 
     if (try setUpJob(&x, opts, results)) |failed| return failed;
     if (plan.zig_seed_note) |note| x.setUpLine(note);
+    if (plan.zig_local_note) |note| x.setUpLine(note);
 
     if (job.container != null or !no_services) {
         if (!try x.startServices()) return servicesFailed(&x, arena, sh, results);
