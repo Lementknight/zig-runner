@@ -197,7 +197,9 @@ jobs:
         working-directory: runner
         run: |
           if [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
-            ../.github/scripts/zig-test.sh
+            # GitHub's runner can make the native backend's sandboxes, so its tests must run here,
+            # not skip (src/native/Backend.zig, `testConfig`).
+            ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/zig-test.sh
           elif [ "$RUNNER_ARCH" = ARM64 ]; then
             zig build test -j1 --summary all
           else

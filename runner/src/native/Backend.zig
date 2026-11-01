@@ -595,15 +595,17 @@ const base_answer = @import("../dagger/testing.zig").base_answer;
 const execAnswer = @import("../dagger/testing.zig").exec;
 
 /// A native backend for tests, or `error.SkipZigTest` with the reason printed when this machine
-/// cannot run one: a rootfs of a few directories with the host's /usr bound over it, in the
+/// cannot run one (a failure instead where `ZIG_RUNNER_REQUIRE_NATIVE=1`, as CI sets: there they
+/// must run): a rootfs of a few directories with the host's /usr bound over it, in the
 /// test's directory, and the runner binary the build copied for the tests (`ZIG_RUNNER_TEST_EXE`).
 fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
     const io = std.testing.io;
     var env = try std.testing.environ.createMap(arena);
+    const required = std.mem.eql(u8, env.get("ZIG_RUNNER_REQUIRE_NATIVE") orelse "", "1");
     const exe_rel = env.get("ZIG_RUNNER_TEST_EXE") orelse
-        return skip("ZIG_RUNNER_TEST_EXE is not set (`zig build test` sets it)");
+        return skip(required, "ZIG_RUNNER_TEST_EXE is not set (`zig build test` sets it)");
     const exe = std.Io.Dir.cwd().realPathFileAlloc(io, exe_rel, arena) catch
-        return skip("the runner binary for native steps is not built");
+        return skip(required, "the runner binary for native steps is not built");
     const d = tmp.dir;
     const dirs = [_][]const u8{
         "rootfs/etc", "rootfs/usr",  "rootfs/tmp",  "rootfs/dev", "rootfs/proc",
@@ -641,14 +643,17 @@ fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
     var out: Captured = .{ .arena = arena };
     const ended = try b.exec("true", &.{"PATH=/usr/bin"}, &.{}, 0, 0, out.output());
     if (ended.failure.len > 0 or ended.code != 0)
-        return skip(try std.fmt.allocPrint(arena, "this machine cannot make a native step's " ++
-            "sandbox ({s}, exit {d})", .{ ended.failure, ended.code }));
+        return skip(required, try std.fmt.allocPrint(arena, "this machine cannot make a " ++
+            "native step's sandbox ({s}, exit {d})", .{ ended.failure, ended.code }));
     return cfg;
 }
 
-fn skip(why: []const u8) error{SkipZigTest} {
-    std.debug.print("native backend test skipped: {s}\n", .{why});
-    return error.SkipZigTest;
+fn skip(required: bool, why: []const u8) error{ SkipZigTest, NativeTestsRequired } {
+    std.debug.print("native backend test {s}: {s}\n", .{
+        if (required) "failed (ZIG_RUNNER_REQUIRE_NATIVE=1)" else "skipped",
+        why,
+    });
+    return if (required) error.NativeTestsRequired else error.SkipZigTest;
 }
 
 test "a run-only job on the native backend: file commands, masks, exit codes and conditions" {
@@ -935,9 +940,9 @@ test "the native checkout: the commit, its .git, and the checkout's fixed time" 
         "git -c user.name=t -c user.email=t@t commit -q -m first; " ++
         "git push -q ../o/r.git HEAD:refs/heads/main", .{root});
     const made = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", make } }) catch
-        return skip("git is not installed");
+        return skip(false, "git is not installed");
     if (made.term != .exited or made.term.exited != 0)
-        return skip("git could not make a repository");
+        return skip(false, "git could not make a repository");
     try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "rootfs/{s}", .{root}));
     cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{
         cfg.binds,

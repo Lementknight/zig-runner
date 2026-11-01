@@ -33,10 +33,22 @@ run=()
 if [[ ${ZIG_TEST_WAIT_FOR_DB:-} == 1 ]]; then
 	# shellcheck disable=SC2016 # expanded by that bash, not this one
 	run=(--test-cmd bash --test-cmd -c --test-cmd '"$0" wait && exec "$@"'
-		--test-cmd "$(realpath ../.github/scripts/ci-database.sh)" --test-cmd-bin)
+		--test-cmd "$(realpath ../.github/scripts/ci-database.sh)")
 fi
 
-zig build-exe "${plain[@]}" --name runner -femit-bin="$scratch/runner" &
+# The native backend's tests run steps through the runner binary (`zig-runner native-step`), as
+# build.zig's test step gives it to them. It compiles beside the tests; they start once it is
+# there, or once its compile failed (the tests then fail on the missing binary).
+export ZIG_RUNNER_TEST_EXE="$scratch/runner"
+(
+	rc=0
+	zig build-exe "${plain[@]}" --name runner -femit-bin="$scratch/runner" || rc=$?
+	echo "$rc" >"$scratch/runner.rc"
+) &
 exe=$!
+# shellcheck disable=SC2016 # expanded by that bash, not this one
+run+=(--test-cmd bash --test-cmd -c --test-cmd 'until [ -e "$0" ]; do sleep 0.2; done; exec "$@"'
+	--test-cmd "$scratch/runner.rc" --test-cmd-bin)
 zig test "${tests[@]}" "${run[@]}"
 wait "$exe"
+exit "$(cat "$scratch/runner.rc")"
