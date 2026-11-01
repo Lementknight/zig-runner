@@ -7,6 +7,8 @@ const engine = @import("engine.zig");
 const admission = @import("admission.zig");
 const trust = @import("trust.zig");
 const app = @import("github/app.zig");
+const NativeBackend = @import("native/Backend.zig");
+const native_net = @import("native/net.zig");
 
 pub const Scope = union(enum) {
     repo: struct { owner: []const u8, name: []const u8 },
@@ -33,6 +35,9 @@ pub const JsRuntime = enum { bun, node };
 pub const StepUser = enum { runner, root };
 /// How jobs reach the Dagger engine: directly (`engine.zig`), or through a `dagger run` child.
 pub const EngineMode = enum { direct, cli };
+/// What runs a job's steps: the Dagger engine, or the runner itself where it can
+/// (docs/native-backend.md), each job it cannot run going to Dagger.
+pub const StepBackend = enum { dagger, native };
 /// The Zig release a Zig global-cache seed is built with (`RUNNER_ZIG_SEED=<version>=<sha256>`):
 /// its version and the sha256 of its tarball for the engine host's architecture, from
 /// https://ziglang.org/download/index.json.
@@ -114,6 +119,23 @@ pub const Config = struct {
     step_cache: bool = true,
     /// Who steps run as in the default image (`RUNNER_STEP_USER`).
     step_user: StepUser = .runner,
+    /// What runs steps (`RUNNER_BACKEND`): Dagger, or the native backend with Dagger for the jobs
+    /// it cannot run yet.
+    backend: StepBackend = .dagger,
+    /// The native backend's rootfs, the default image provisioned (`RUNNER_NATIVE_ROOTFS`), and
+    /// where jobs' layers go while they run (`RUNNER_NATIVE_STORE`; "" for the default,
+    /// `nativeStore`).
+    native_rootfs: []const u8 = "",
+    native_store: []const u8 = "",
+    /// Native steps on a runner that is not root (`RUNNER_NATIVE_ROOTLESS`), with only root
+    /// mapped inside (`Backend.Config.rootless`); off, such a runner sends every job to Dagger.
+    native_rootless: bool = false,
+    /// The first host id of the native jobs' ranges on a root runner
+    /// (`RUNNER_NATIVE_SUBID_BASE`, `Backend.Config.subid_base`): at least
+    /// `NativeBackend.min_subid_base`.
+    native_subid_base: u32 = NativeBackend.default_subid_base,
+    /// The native jobs' network on a root runner (`RUNNER_NATIVE_SUBNET`, `net.Subnet.parse`).
+    native_subnet: []const u8 = native_net.Subnet.default_text,
     /// Experimental: key the steps after one that always runs on what it produced rather than on
     /// the step itself (see `dagger.Options.output_keys`).
     output_keys: bool = false,
@@ -221,6 +243,10 @@ pub const Config = struct {
         InvalidNumber,
         InvalidJsRuntime,
         InvalidStepUser,
+        InvalidBackend,
+        InvalidNativeRootfs,
+        InvalidNativeSubnet,
+        InvalidNativeSubidBase,
         InvalidEngine,
         InvalidBool,
         InvalidZigSeed,
@@ -236,6 +262,13 @@ pub const Config = struct {
                 "not set, so this runner would fail every job. Set it to the refs prod may run " ++
                 "(RUNNER_TRUSTED_REFS=refs/heads/main,refs/tags/v*), or to * to trust every ref " ++
                 "(README, \"Environments\").",
+            error.InvalidNativeRootfs => "RUNNER_NATIVE_ROOTFS is a directory's absolute path: " ++
+                "overlay takes it as a layer from the job's directory.",
+            error.InvalidNativeSubnet => "RUNNER_NATIVE_SUBNET is an IPv4 network a.b.c.d/p " ++
+                "with no host bits set and a prefix of 8 to 23 bits (room for every job's " ++
+                "address), by default " ++ native_net.Subnet.default_text ++ ".",
+            error.InvalidNativeSubidBase => "RUNNER_NATIVE_SUBID_BASE is at least 100000, " ++
+                "above every id a host's users and groups have.",
             error.MissingGhToken => "No GitHub credentials: set GH_TOKEN, or a GitHub App with " ++
                 "GH_APP_ID and GH_APP_PRIVATE_KEY_FILE (or GH_APP_PRIVATE_KEY) " ++
                 "(deploy/runner.env.example).",
@@ -282,6 +315,10 @@ pub const Config = struct {
             }
             try c.applyFlag(key, val, &creds);
         }
+        if (c.native_rootfs.len > 0 and !std.fs.path.isAbsolutePosix(c.native_rootfs))
+            return error.InvalidNativeRootfs;
+        _ = try native_net.Subnet.parse(c.native_subnet);
+        if (c.native_subid_base < NativeBackend.min_subid_base) return error.InvalidNativeSubidBase;
 
         if (c.exec_job != null or c.db_check) {
             // Offline mode: no GitHub credentials needed.
@@ -353,6 +390,12 @@ pub const Config = struct {
         if (environ.get("RUNNER_TOOL_TREES")) |v| c.tool_trees = try boolean(v);
         if (environ.get("RUNNER_STEP_CACHE")) |v| c.step_cache = try boolean(v);
         if (environ.get("RUNNER_STEP_USER")) |v| c.step_user = try stepUser(v);
+        if (environ.get("RUNNER_BACKEND")) |v| c.backend = try stepBackend(v);
+        if (environ.get("RUNNER_NATIVE_ROOTFS")) |v| c.native_rootfs = v;
+        if (environ.get("RUNNER_NATIVE_STORE")) |v| c.native_store = v;
+        if (environ.get("RUNNER_NATIVE_ROOTLESS")) |v| c.native_rootless = try boolean(v);
+        if (environ.get("RUNNER_NATIVE_SUBID_BASE")) |v| c.native_subid_base = try num(u32, v);
+        if (environ.get("RUNNER_NATIVE_SUBNET")) |v| c.native_subnet = v;
         if (environ.get("RUNNER_OUTPUT_KEYS")) |v| c.output_keys = try boolean(v);
         if (environ.get("RUNNER_ENFORCE_VOLATILE")) |v| c.enforce_volatile = try boolean(v);
         if (environ.get("RUNNER_LOG_SPOOL_DIR")) |v| c.log_spool_dir = v;
@@ -419,6 +462,12 @@ pub const Config = struct {
         else if (eq(key, "tool-trees")) c.tool_trees = try boolean(val) //
         else if (eq(key, "step-cache")) c.step_cache = try boolean(val) //
         else if (eq(key, "step-user")) c.step_user = try stepUser(val) //
+        else if (eq(key, "backend")) c.backend = try stepBackend(val) //
+        else if (eq(key, "native-rootfs")) c.native_rootfs = val //
+        else if (eq(key, "native-store")) c.native_store = val //
+        else if (eq(key, "native-rootless")) c.native_rootless = try boolean(val) //
+        else if (eq(key, "native-subid-base")) c.native_subid_base = try num(u32, val) //
+        else if (eq(key, "native-subnet")) c.native_subnet = val //
         else if (eq(key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache")) c.zig_local_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache-max-mb")) c.zig_local_cache_max_mb = try num(u32, val) //
@@ -472,6 +521,25 @@ pub const Config = struct {
 
     fn stepUser(s: []const u8) error{InvalidStepUser}!StepUser {
         return std.meta.stringToEnum(StepUser, s) orelse error.InvalidStepUser;
+    }
+
+    fn stepBackend(s: []const u8) error{InvalidBackend}!StepBackend {
+        return std.meta.stringToEnum(StepBackend, s) orelse error.InvalidBackend;
+    }
+
+    /// Where the native backend keeps jobs' layers: `native_store`, else under /var/lib for root
+    /// and the user's cache directory otherwise.
+    pub fn nativeStore(
+        c: *const Config,
+        arena: std.mem.Allocator,
+        environ: *const std.process.Environ.Map,
+    ) ![]const u8 {
+        if (c.native_store.len > 0) return c.native_store;
+        if (std.os.linux.geteuid() == 0) return "/var/lib/zig-runner/native";
+        if (environ.get("XDG_CACHE_HOME")) |d| if (d.len > 0)
+            return std.fmt.allocPrint(arena, "{s}/zig-runner/native", .{d});
+        const home = environ.get("HOME") orelse "/tmp";
+        return std.fmt.allocPrint(arena, "{s}/.cache/zig-runner/native", .{home});
     }
 
     /// `<version>=<sha256>`, or empty for none. Both go into a URL and a shell script, so only a
@@ -694,6 +762,27 @@ test "dagger nesting is off by default and can be turned on" {
     try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--dagger-nesting=false" })).dagger_nesting);
     try env.put("RUNNER_DAGGER_NESTING", "maybe");
     try std.testing.expectError(error.InvalidBool, Config.load(&env, &.{"runner"}));
+}
+
+test "the native subnet and ids: defaults, and values that are refused" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    const c = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqualStrings("10.211.0.0/16", c.native_subnet);
+    try std.testing.expectEqual(NativeBackend.default_subid_base, c.native_subid_base);
+    try env.put("RUNNER_NATIVE_SUBNET", "10.88.0.0/24");
+    try std.testing.expectError(error.InvalidNativeSubnet, Config.load(&env, &.{"runner"}));
+    try std.testing.expectEqualStrings("172.30.0.0/20", (try Config.load(&env, &.{
+        "runner",
+        "--native-subnet=172.30.0.0/20",
+    })).native_subnet);
+    _ = env.swapRemove("RUNNER_NATIVE_SUBNET");
+    try env.put("RUNNER_NATIVE_SUBID_BASE", "99999");
+    try std.testing.expectError(error.InvalidNativeSubidBase, Config.load(&env, &.{"runner"}));
+    try env.put("RUNNER_NATIVE_SUBID_BASE", "100000");
+    try std.testing.expectEqual(@as(u32, 100000), (try Config.load(&env, &.{"runner"})).native_subid_base);
 }
 
 test "the pre-warm is on by default and can be turned off" {

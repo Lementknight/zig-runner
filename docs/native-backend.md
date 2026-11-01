@@ -82,8 +82,201 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   log lines; existing tests pass unchanged.
 - Measure: wall time per cold trivial step, against Dagger's ~224 ms on the laptop.
 
+**Status: landed (behind the knob), reviewed, and hardened.** What it covers, as built:
+
+- `runner/src/native/Backend.zig` is the job side: the fallback decision (`unsupported`), the
+  machine's capability (`usable`, probed once, and again five minutes after a failure), the job's
+  directory, slot, ids and network, the base, the container's env between steps, `execScript`, and
+  the checkout. `runner/src/native/sandbox.zig` is one step's sandbox: the runner's own binary
+  started as `zig-runner native-step`, reading the step's spec as one line of JSON on stdin (never
+  on a command line: it holds the step's secrets), with stdin kept open as its lifeline.
+  `runner/src/native/net.zig` is a job's network, over rtnetlink.
+- The boundary in the shared code is three lines: `dagger.run` sends a job native can run to
+  `runNative`; `runSteps` asks the native backend for the base instead of `baseContainerId`; and
+  `Exec.execScript` hands each exec to `Backend.execScript`. The Dagger path is unchanged, and so
+  are its tests.
+- Covered: `run:` steps with any shell, `defaults.run`, step and job `env:`, expressions, `if:`,
+  `continue-on-error`, `timeout-minutes` and cancellation (the same `Watch`; the helper kills the
+  step's PID 1 when told), every file command, `::add-mask::` and the other workflow commands,
+  problem matchers (read from the layers, relative to the working directory), step summaries,
+  `id-token: write`, secrets in env, in scripts and in working directories, and the built-in
+  checkout without submodules (git in the job's image, then the same step script Dagger's
+  checkout runs).
+- Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": no rootfs
+  configured, a job the runner does not vouch for (`trust.vouches`, for `--exec-job` too), a
+  rootless runner unless `RUNNER_NATIVE_ROOTLESS=1`, `container:`, `services:`, `uses:` actions,
+  `docker://` steps, a custom image, Dagger in steps (`RUNNER_DAGGER_NESTING`), `hashFiles()`
+  anywhere in the job (it reads the container through Dagger), a checkout with submodules, and a
+  machine whose probe fails (no user namespaces, `iptables` missing, no default route, the jobs'
+  ids taken on the host, the jobs' subnet overlapping a route of the host's). A failed probe is
+  tried again after five minutes, not kept for the process's life.
+- Off on native, as caches: the step cache and output keys (P2), the package caches, uv's
+  environment in its cache, and Zig's local cache and seed (P4). Results do not depend on them.
+- "Set up job" says what the job got: "Native steps: ids 0-65535 are host ids N-N+65535, and the
+  job's network is its own (10.211.1.x on zr0)", or the rootless warning.
+
+#### Isolation: what P1 provides, and what it does not
+
+On a root runner, each step runs:
+
+- in a **user namespace of the job's own**, ids 0-65535 mapped to a range of host ids no host user
+  has (`RUNNER_NATIVE_SUBID_BASE`, by default 1,900,000,000 plus 65,536 per slot). The default
+  lies past systemd's container range (systemd-nspawn's private users and nsresourced's,
+  524288-1879048191) and the last slot's ids (up to 1,916,383,999) stay below its foreign range
+  (from 2,147,352,576) and below 2^31, which some tools take as signed. The probe refuses a base
+  below 100,000, a range past 2^32, and a range that overlaps one in /etc/subuid or /etc/subgid
+  or holds an id from /etc/passwd or /etc/group (users only a directory service knows are not
+  seen; the 100,000 floor is above their usual ranges). The step's root and its uid 1001 are
+  nobody on the host: a breakout, sudo or a setuid program gains no host privilege. A full range
+  is mapped, so apt's `_apt`, `chown` and `tar` with owners work. The rootfs is seen through an
+  idmapped mount (Linux 5.19), not copied per range.
+- in a **network namespace of the job's own** (all its steps share it): its own `lo` and port space,
+  a veth on the runner's bridge `zr0` (`RUNNER_NATIVE_SUBNET`, by default 10.211.0.0/16 with the
+  bridge at 10.211.0.1 and slot n's job at 10.211.1.(n+2); not podman's 10.88.0.0/16 or Docker's
+  ranges, and refused when it overlaps a route of the host's), a default route out through NAT. Two
+  jobs can both listen on :5432. The job reaches nothing on the host: not its 127.0.0.1, and not a
+  service on any of its addresses (the bridge's included), since `INPUT` drops whatever comes from
+  `zr0` and is not a reply. Jobs cannot reach each other: each veth is an isolated bridge port
+  (`IFLA_BRPORT_ISOLATED`), and `FORWARD` drops traffic from `zr0` back to `zr0`. IPv6 is off on the
+  job's `eth0` and on the bridge, so no link-local address slips past those IPv4 rules (`lo` keeps
+  its ::1). Ports below 1024 and ping work without capabilities on the host's
+  (`ip_unprivileged_port_start=0`, `ping_group_range`, set in the job's namespace only). Its
+  resolver is the host's upstream servers (`/run/systemd/resolve/resolv.conf`, or the host's
+  resolv.conf when it names no loopback server), since systemd-resolved's 127.0.0.53 is the host's
+  loopback; a resolver on one of the host's own addresses is out of reach too.
+- in **mount, PID, UTS and IPC namespaces** of its own, with the overlay as `/` by `pivot_root`
+  and the host's root detached (no chroot to climb out of), a /dev of six nodes plus devpts, shm
+  and mqueue, /proc with runc's masked paths (`kcore`, `keys`, `timer_list`, `sched_debug`,
+  `interrupts`, ...) and read-only ones (`/proc/sys`, `sysrq-trigger`, `irq`, `bus`, `fs`),
+  cloned from the step's own /proc with every mount under them, and /sys read-only with every
+  mount under it. A mask or a read-only path the kernel has but that cannot be applied fails the
+  step's set-up; only a path the kernel does not have is skipped.
+- with **Docker's default capabilities** (the bounding set cut to them, ambient cleared),
+  **no_new_privs** for root steps and rootless ones (not for the runner user on a root runner,
+  whose sudo works as on GitHub and reaches only the job's own root, within the same capabilities
+  and filter), and a **seccomp filter** that refuses Docker's default profile's dangerous
+  calls (module loading, kexec, keyrings, bpf, perf, mount and the new mount API, namespaces,
+  clone with namespace flags, the clock, swap, reboot, `open_by_handle_at`, and io_uring, as
+  Docker has since moby 25), and allows `personality` only with Docker's values (Linux, 32-bit
+  Linux, a 2.6 uname, and the query).
+- with a script that holds a secret written to a **tmpfs of the step's own** and bound at its
+  path over an empty file, so the secret never reaches the store's disk (the empty file goes
+  when the step ends).
+- with every path inside the overlay resolved inside it (`openat2(RESOLVE_IN_ROOT)`), by the
+  helper and by the runner, so a symlink a step plants never leads them to the host's files.
+
+What it does not provide yet:
+
+- **Resource limits.** No cgroup per job and no pids limit: a fork bomb or a memory hog reaches
+  the host's limits. Debt, recorded under phase 4 beside the gate's cgroup memory accounting.
+- **The seccomp filter is Docker's deny list, not its allow list.** Calls Docker refuses by
+  omission are allowed here.
+- **Rootless runners.** Only one id is mapped and steps share the host's network: off unless
+  `RUNNER_NATIVE_ROOTLESS=1`, for tests and the laptop. A rootless job network needs a userspace
+  stack (a Zig port of the parts of pasta or slirp4netns it needs), and full ids need
+  `newuidmap`.
+- **Kernel attack surface.** Steps run on the host's kernel, as containers do; a kernel bug is a
+  breakout.
+
+#### Running it
+
+```
+RUNNER_BACKEND=native              # default dagger
+RUNNER_NATIVE_ROOTFS=/var/lib/zig-runner/rootfs   # absolute; checked at startup
+RUNNER_NATIVE_STORE=/var/lib/zig-runner/native    # default as root
+RUNNER_NATIVE_SUBID_BASE=1900000000               # default; at least 100000
+RUNNER_NATIVE_SUBNET=10.211.0.0/16                # default; a prefix of 8 to 23 bits
+RUNNER_NATIVE_ROOTLESS=0                          # default; 1 for a rootless runner
+```
+
+**The rootfs.** P1 takes a directory holding `ubuntu:24.04` with the runner's provisioning applied
+(`set_up.provision_script`, or `provision_runner_script` when steps run as the runner user), owned
+as the image has it (root's files root's). It is not yet exported by the runner through Dagger at
+startup: the direct engine session (`engine.zig`) implements the client's side of file sync for
+reads only, and an export needs its receiving side, which is as much work as P3's pull it would be
+thrown away for. Until P3, an operator makes it once, for example with Docker on a machine that may
+use it:
+
+```
+docker run --name zr-rootfs ubuntu:24.04 sh -c '<set_up.provision_runner_script>'
+mkdir -p /var/lib/zig-runner/rootfs
+docker export zr-rootfs | tar -x -C /var/lib/zig-runner/rootfs
+```
+
+**What the runner needs.** As root (the supported mode): `CAP_SYS_ADMIN` (namespaces, mounts,
+idmapped mounts, `pivot_root`), `CAP_NET_ADMIN` (the bridge, veths, addresses, routes, NAT),
+`CAP_SETUID`/`CAP_SETGID` (writing the job's id maps), Linux 5.19 or later (idmapped overlay
+layers), `iptables` on the host (the rules, below), a default route, a free
+`RUNNER_NATIVE_SUBNET`, and a writable `/run/zig-runner`. The runner makes `zr0` and its rules
+itself on its first native job, and removes each job's namespace when the job ends, or at the
+next start after a crash (`sweep`, by the jobs' locks).
+
+What it changes on the host, which is shared by every runner on it:
+
+- **Slots.** A job's slot names the veth `zrh<n>`, its address and its range of ids, all of them
+  the host's, so slots are locked host-wide: an flock on `/run/zig-runner/slots/<n>.lock`, in a
+  directory only root may enter, never under a runner's store. Two runners with different
+  `RUNNER_NATIVE_STORE`s on one host take different slots, and a slot's veth is removed (a dead
+  job's) only by the runner that now holds its lock. Every runner on a host must use the same
+  `RUNNER_NATIVE_SUBNET`, since `zr0` is one bridge.
+- **IPv4 forwarding** (`net.ipv4.ip_forward`) is turned on if it is off, and stays on: other
+  runners' jobs need it, and turning it off under them would cut their network. The runner logs
+  a warning when it turns it on, and another when the FORWARD policy is ACCEPT, since the host
+  would then route for any neighbour; set that policy to DROP (Docker does).
+- **iptables rules**, each added once at the head of its chain: `nat POSTROUTING` masquerades
+  the subnet; `filter INPUT` drops what comes from `zr0` and is not a reply; `filter FORWARD`, and
+  `DOCKER-USER` on a Docker host, drop `zr0` to `zr0`, accept `zr0` out through each uplink (the
+  interfaces of the default routes; a job adds the rules for a new one, a laptop moving from
+  cable to Wi-Fi), and accept replies back to `zr0`. Nothing else from `zr0` is accepted, so
+  Docker's containers and other bridges stay closed to jobs and ufw's forward policy decides the
+  rest. The rules stay when the runner stops.
+
+- Under `deploy/compose.yaml` (not changed by P1): the runner image is `FROM scratch` and runs as
+  root. It needs `privileged: true` (as the engine service has), or `cap_add: [SYS_ADMIN,
+  NET_ADMIN]` with `security_opt: [seccomp=unconfined, apparmor=unconfined,
+  systempaths=unconfined]`, and `network_mode: host` for the bridge to be the host's. The store
+  must be a volume, not the container's own overlay filesystem (overlayfs cannot take an upper
+  directory on overlayfs), and the rootfs another volume. The slots' locks must be the host's:
+  bind `/run/zig-runner:/run/zig-runner` from the host into every runner container (the
+  container's own /run would give each its own slot 0 on the shared bridge). The image has no
+  `iptables`, so P1's NAT needs the host's rules made outside it, or P5's netlink rules.
+- Under `deploy/zig-runner.service` on razorbill (not changed by P1): the unit runs as root with
+  `ProtectSystem=strict`, which makes the store's default and `/run` read-only. It needs
+  `StateDirectory=zig-runner` (or `ReadWritePaths=/var/lib/zig-runner`) for the store, and
+  `RuntimeDirectory=zig-runner` with `RuntimeDirectoryPreserve=yes` for the slots' locks.
+  Preserve matters when several units share the directory: without it, systemd removes
+  `/run/zig-runner` when any one of them stops, the others' locks go with their files, and the
+  next runner would take a slot a live job holds. `NoNewPrivileges` and `PrivateTmp` are
+  compatible; a `RestrictNamespaces=`, a capability bounding set without `CAP_SYS_ADMIN` and
+  `CAP_NET_ADMIN`, or `PrivateNetwork=` would not be.
+- Rootless (tests, the laptop): a user namespace mapping the runner's user to root, with overlay's
+  `userxattr` (Linux 5.11). Where AppArmor restricts unprivileged user namespaces
+  (`kernel.apparmor_restrict_unprivileged_userns=1`), the sandbox is started under util-linux's
+  `unshare` where its profile allows it (the laptop), and needs the restriction lifted where it
+  does not (GitHub's hosted runner).
+
+#### Measured (laptop "cowbird", balanced profile, 2026-10-31, another agent benchmarking)
+
+The runner binary built `ReleaseSafe`, `--exec-job` on a run-only job of 50 trivial steps (`true`)
+and on a job of one, rootless (under `unshare`), the rootfs plain `ubuntu:24.04`. Per step is
+(50-step job − 1-step job) / 49, which leaves out process start and "Set up job".
+
+| | native | Dagger |
+|---|---|---|
+| cold trivial step, first cut (chroot, no hardening), median of 7 | 18.1 ms | ~224 ms |
+| cold trivial step, hardened, median of 5 | **32.7 ms** | ~224 ms |
+| 1-step job, whole, hardened (with the once-per-process probe) | 58–80 ms | |
+
+That is the whole runner path, not the backend alone. The hardened figure was taken under more
+load (3.2 against 2.4) and pays, per step, a second mount namespace and about 20 mounts (/dev and
+its nodes, /proc and its masks, /sys's tree, the binds, `pivot_root`), besides the 6 ms of making a
+user namespace that the first cut already paid. Both are per step only because the helper is: P2's
+per-job helper makes the namespaces and the static mounts once.
+
 ### P2: the layer store, cache, replay and GC
 
+- First, from P1: one sandbox helper per job instead of per step. The helper makes the namespaces,
+  /dev, /proc and its masks once and takes steps over a pipe: about 15 ms a step on the laptop.
 - A content-addressed layer store: key `sha256(parent key, script, stable env)`, the model's
   `Key = parent · script · stable env`, without `volatile_env`.
 - Replay of stored logs and file commands, so a replayed step costs well under a millisecond.
@@ -114,20 +307,27 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
 - A cgroup v2 per job: `memory.max`, `memory.peak`, `memory.events`, `pids.max`. The admission
   gate (`admission.zig`) reads per-job working sets instead of the engine's cgroup. Rootless, this
   needs systemd delegation (`Delegate=yes`, or `systemd-run --user --scope`).
+- **Debt from P1, paid here:** P1 has no per-job cgroup and no pids limit, so one native job's
+  fork bomb or memory hog reaches the host's limits and every other job's. The same cgroup that
+  gives the gate its accounting gives each job its `pids.max` and `memory.max`.
 - Exit: a runaway job is OOM-killed in its own cgroup without touching its neighbours. Measure:
   gate accuracy against the engine-wide reading.
 
 ### P5: isolation for untrusted jobs
 
-- Decisions to make and record: subuid mapping through `newuidmap` versus a privileged runner;
-  a network namespace per job with a userspace stack (a Zig port of the needed parts of pasta or
-  slirp4netns, or a veth pair when root); `no_new_privs`, dropped capabilities, and a seccomp
-  filter (which syscalls, and whether Docker's default profile is the reference).
-- `trust.zig` is unchanged: it decides before any step. What changes is the blast radius: native
-  steps run on the host kernel in the runner's namespaces, not inside the engine's container.
-- Until P5 lands, native runs only jobs the runner vouches for (`trust.vouches`); others fall back.
-- Exit: the hostile-job tests (fork bomb, mount escape attempts, network to the host's services)
-  are contained.
+P1 already gives each job on a root runner its own ids, its own network, pivot_root, masked
+/proc, Docker's capabilities, no_new_privs and a seccomp deny list ("Isolation" under P1). What
+remains before native steps may run jobs the runner does not vouch for:
+
+- Resource limits come with phase 4's cgroups; until then, no untrusted job.
+- Seccomp as Docker's allow list rather than its deny list.
+- The NAT and forwarding rules over nftables netlink instead of `iptables` (P1's debt).
+- Rootless: a userspace network stack for the job's network (the parts of pasta or slirp4netns it
+  needs, ported) and subordinate ids through `newuidmap`.
+- `trust.zig` is unchanged: it decides before any step. Until P5 lands, native runs only jobs the
+  runner vouches for (`trust.vouches`); others fall back.
+- Exit: the hostile-job tests (fork bomb, memory hog, mount escape attempts, network to the host's
+  services, a kernel-interface sweep) are contained.
 
 ### P6: services
 
@@ -197,3 +397,190 @@ surprised us, and the measured gains against Dagger.
   cache metadata (#101, #102). Natively there is no engine to leak into, but the step cache of P2
   will be: the same rule (secret-bearing values never in a key or a stored log) has to be kept
   explicitly by the native store.
+
+### P1: run-only jobs
+
+What Dagger (BuildKit and runc under it) did implicitly, now explicit in `native/`:
+
+- **HOME.** runc sets HOME from the image's `/etc/passwd` when the env has none, so every root step
+  under Dagger had `HOME=/root` without the runner ever setting it. The sandbox now reads it
+  (`sandbox.homeOf`).
+- **The resolver.** BuildKit puts the host's `/etc/resolv.conf` and `/etc/hosts` into every exec.
+  Without them a step in the image's filesystem has no DNS. The sandbox binds them, only over
+  files the image already has, since making the file would put it in the step's layer.
+- **/dev, /proc, /sys.** runc builds a `/dev` of a few nodes, mounts `/proc` for the exec's PID
+  namespace and `/sys` read-only. Binding the host's `/dev` (as the prototype did) would hand a
+  root step the host's disks; the sandbox builds the small one.
+- **Killing a step.** A BuildKit exec's processes die with it. Natively that comes from the step's
+  first process being PID 1 of its own PID namespace, with `PR_SET_PDEATHSIG` tying it to the
+  helper: killing the helper (through a pidfd, so a reused pid is never hit) takes everything the
+  step started with it, background processes included, and closes the output pipe. The cancel test
+  checks this with a backgrounded `sleep 60`.
+- **Secrets out of command lines.** Under Dagger the reason for `withSecretVariable` and secret
+  mounts was the engine's cache metadata. Natively the same discipline matters for another reason:
+  `/proc/<pid>/cmdline` is readable by every user on the host. Keeping the identical script
+  (aliases in `$ZIG_SECRET_<n>`, a script holding a secret written as a file, the spec over a pipe)
+  keeps secrets out of every command line.
+- **The container's env between steps.** Dagger's container carried `GITHUB_ENV` and `GITHUB_PATH`
+  forward, with `$PATH` expanded by the engine (`withEnvVariable(expand: true)`). That state is
+  now the backend's (`applyPendingEnv`), and the parity test checks the base env against Dagger's
+  base query, variable by variable.
+- **Overlay's work directory.** Overlay leaves `work/work` with mode 0; rootless, nothing can
+  delete it until the runner gives the permissions back. Every leftover job directory in the first
+  runs was this.
+
+Surprises:
+
+- The boundary was smaller than planned: three call sites in the shared code, plus `Secrets.local`
+  (secrets named without a session) and an optional field on `Fetched` for the checkout's log line.
+  No Dagger code path changed behaviour, and no existing test changed.
+- Making a user namespace is the cost that matters. `unshare -r -m true` costs 6.3 ms on the
+  laptop, a third of a native step. The prototype paid it once per job by re-executing itself under
+  `unshare`; P1 pays it per step. P2 starts by keeping one helper per job.
+- Ubuntu's AppArmor restriction on unprivileged user namespaces means a rootless runner cannot make
+  a usable one itself: the namespace is created, but writing its uid and gid maps is refused
+  (EPERM, checked on the laptop), so the runner's user never becomes root inside and owns none of
+  the image's files. Borrowing `unshare` works because of the stock profiles; a profile of our own
+  is the clean answer and a deploy decision.
+- Tests needed the runner binary, because the sandbox is the runner started as a helper, and Zig's
+  test runner refuses arguments of ours. The build copies the binary to a fixed place for the tests
+  (`ZIG_RUNNER_TEST_EXE`), and the tests build a rootfs of a few directories with the host's `/usr`
+  bound in, so CI needs no image.
+- The engine's direct session cannot export a container's filesystem: it implements file sync for
+  reads only. That is why P1's rootfs is made by the operator, and it is a reason to move P3 (the
+  native pull) before the cache-volume work.
+
+Measured against Dagger: a cold trivial step 18.1 ms against ~224 ms, about 12 times faster, about
+206 ms saved per step, through the whole runner. Replays come in P2.
+
+### P1, after review: what the first cut got wrong, and the hardening
+
+An independent review of the first cut found two merge blockers and a dozen smaller faults; the
+user then pulled the job's ids, its network and the sandbox hardening into P1. What it taught:
+
+- **The kernel clears the parent-death signal on a change of credentials.** The first cut set
+  `PR_SET_PDEATHSIG` in the step's PID 1 and then called `setuid`: on a root runner with the runner
+  user, a timeout killed the helper and left the step running on the host, holding the log pipe,
+  so the job hung. The fix is not to depend on it: the helper itself kills PID 1 when its lifeline
+  (stdin) closes, which also covers the runner dying (M6), and PID 1 re-arms the signal after
+  `setuid` and checks, through a pipe, that the helper is still there. Lesson: a death signal is a
+  backstop, never the mechanism.
+- **Root on the host is the wrong default for a step.** Running steps as host root (in a chroot)
+  or as host uid 1001 made every escape a host privilege. A dedicated range per job, as Docker's
+  userns-remap does, makes the step's root nobody outside; the cost was learning that only a
+  process outside a user namespace may write a map wider than its own id (a child unshares, the
+  parent maps it, the namespace is kept by its file descriptor).
+- **Idmapped mounts beat a copy per range.** Each slot's range needs the rootfs owned by that
+  range. A shifted copy would be 600 MB per slot; an idmapped mount of the rootfs (Linux 5.19 lets
+  overlay take one as a layer) costs nothing, with the overlay mounted as the host's root and the
+  helper entering the job's namespace afterwards. Mounting the overlay inside the namespace instead
+  would have needed the files owned by the range.
+- **Locked mounts.** In a user namespace, a read-only remount must keep the flags a more
+  privileged namespace set (nosuid, nodev, noexec, the atime ones), or it is refused; and a bind
+  of a mount without its submounts is refused, since it would uncover what they hide. /sys is
+  therefore cloned whole (`open_tree`) and made read-only in one recursive `mount_setattr`.
+  Neither shows up until the remount's result is checked, which the first cut did not do.
+- **Every host path a step can influence must be resolved inside the step's root.** The runner,
+  as root, read file commands and matcher files from the layers by plain path, and the helper wrote
+  the event file and secret scripts the same way: a symlink a step planted could point them at the
+  host's files. `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)`, with mounts aimed at
+  `/proc/self/fd/N` of the opened target, closes that for the helper; the runner also refuses
+  symlinks outright and respects whiteouts (a character device in an upper hides the layers
+  below).
+- **What a namespace's owner decides.** The job's network namespace is made by the host's root, so
+  the job's root has no `CAP_NET_BIND_SERVICE` there: ports below 1024 and ping need the
+  namespace's own sysctls (`ip_unprivileged_port_start`, `ping_group_range`). Owning the namespace
+  from the job's user namespace would avoid that, at the price of a namespace made per job inside
+  it.
+- **The resolver Dagger got for free.** BuildKit's CNI network hands each exec a working
+  resolv.conf. A job's own namespace cannot reach systemd-resolved on the host's 127.0.0.53; the
+  runner binds the upstream list systemd-resolved keeps (`/run/systemd/resolve/resolv.conf`).
+- **NAT on a Docker host.** Docker sets the FORWARD policy to drop; a rule in another table cannot
+  overturn it, only `DOCKER-USER` can. P1 makes its NAT and forwarding rules with `iptables` (debt:
+  links, addresses and routes are rtnetlink already; nftables over netlink is phase 5's), not
+  `nft`: the hosted runner has no `nft`, and `iptables` writes into the same tables as Docker's
+  own rules, whichever backend the host uses.
+- **Smaller ones.** `hashFiles()` reads the container through Dagger, so it routes a job to Dagger
+  until it is native. `--exec-job` bypassed the trusted refs; it no longer does. Overlay's
+  work directory and a step's `chmod 000` both defeat a plain recursive delete, so removal gives
+  directories their permissions back and logs what still fails, and a sweep at each job's start
+  removes the directories of runners that died (each job holds a lock on its own). A step killed
+  before the helper removed a secret script's file left it in the layer for later steps; the runner
+  removes it too. BuildKit makes a missing working directory, so the sandbox does; the helper's
+  environment is empty, not the runner's; files get umask 022.
+- **Tests that cannot run are not coverage.** The first CI run skipped every native test (the
+  test runner was never told where the runner binary was), and nothing failed. CI now sets
+  `ZIG_RUNNER_REQUIRE_NATIVE=1`, which turns a native test's skip into a failure. GitHub's hosted
+  runner, unlike the laptop, refuses even util-linux's `unshare` a user namespace's id maps, so CI
+  lifts AppArmor's restriction on its throwaway VM.
+
+Measured: hardened, a cold trivial step costs 32.7 ms on the laptop (rootless, busier than for the
+first cut's 18.1 ms), still about 7 times faster than Dagger's ~224 ms. The difference is per-step
+setup that P2's per-job helper does once.
+- **no_new_privs and sudo, decided.** With no_new_privs on, sudo as the runner user did nothing,
+  and jobs that call it (most that install packages) had to go to Dagger. Once each job has its
+  own range of ids, sudo can only become the job's own root, which is nobody on the host and is
+  still held to Docker's capabilities and the seccomp filter: the user dropped no_new_privs for
+  the runner user on a root runner, and kept it for root steps and rootless ones. The catch was
+  ordering: without no_new_privs, installing a seccomp filter takes CAP_SYS_ADMIN, so the filter
+  now goes in while PID 1 is still the namespace's root, before `setuid`. The root test checks
+  that sudo gives uid 0 inside and nothing outside: a host-only file stays unreadable, the
+  capabilities stay Docker's, and the uid map stays the job's.
+- **The root pass's first runs, one kernel rule each.** Four bugs no rootless run could show:
+  a link looked up by name through a socket opened after `unshare(NEWNET)` was looked up in the
+  job's namespace, not the host's (a socket stays in the namespace it was made in, so each
+  netlink socket now keeps its own lookup socket); joining a user namespace with `setns` changes
+  no ids, so the helper was still the host's root, unmapped there, and what it made belonged to no
+  one (EOVERFLOW: it now becomes the namespace's root, as runc does); the overlay, mounted in the
+  host's root's mount namespace, is locked in the job's, and `pivot_root` refuses a locked new
+  root (EINVAL: it is bound onto itself first, as runc does); and the hosted runner has no `nft`.
+  Also a file descriptor closed twice on `init`'s error path, which Zig's I/O caught.
+
+### P1, after the re-review: what is the host's, what the firewall already says, what fails quietly
+
+An independent re-review of the hardened P1 found one major fault and several gaps. What it
+taught:
+
+- **A resource named on the host must be locked on the host.** The slots were locked under the
+  runner's store, but what a slot names is the host's: the veth `zrh<n>`, the address, the range
+  of ids. Two runners with different `RUNNER_NATIVE_STORE`s both took slot 0, and the second's
+  set-up deleted the first's veth as a dead job's, cutting a running job's network; both jobs
+  also got one address and one range of ids. The locks now live at a fixed host path
+  (`/run/zig-runner/slots`), and only the slot's holder removes its veth. The rule for every
+  later phase: before keying anything by the store (the layer store, cache volumes, cgroups),
+  ask whether the kernel object it names is per store or per host. It also reaches the deploy:
+  systemd's `RuntimeDirectory=` removes the directory when any unit sharing it stops unless
+  `RuntimeDirectoryPreserve=yes`, which would quietly free a live job's slot, and a container
+  needs the host's `/run/zig-runner` bound in, not its own.
+- **iptables rules land among others'.** An `ACCEPT` for "anything from `zr0`" at the head of
+  `FORWARD` and `DOCKER-USER` got the jobs out, and also opened Docker's unpublished container ports
+  and every other network the host routes to, and overrode ufw's forward policy: the first matching
+  rule wins whoever wrote it. The rules now say exactly the traffic they are for (from `zr0` out
+  through an uplink, replies back) and leave the rest to the host's policy. `INPUT` was never
+  considered: a job had its own loopback, but the host's services on the bridge's address (and every
+  other address of the host's) were one hop away. Isolation between jobs needed two layers, since
+  one does not imply the other: the bridge forwards between ports unless they are isolated, and the
+  host routes between jobs through the gateway unless `FORWARD` drops it. IPv6 link-local addresses
+  come up on every interface by themselves and pass every IPv4 rule; IPv6 is now off on the bridge
+  and on the jobs' `eth0`. Host-wide sysctls (`ip_forward`) cannot be restored by one runner of
+  several, so they are checked, logged and documented instead.
+- **A mount that fails quietly is a hole with a passing test.** `/proc/sys` was made read-only by
+  binding the helper's `/proc/sys` (the host's, with `binfmt_misc` mounted under it on GitHub's
+  runner and many hosts) without its submounts, which a user namespace refuses; the call's result
+  was ignored, so steps ran with `/proc/sys` writable and nothing said so. The masks had the same
+  shape. Now each read-only path is cloned from the step's own /proc with its submounts and made
+  read-only in one `mount_setattr`, as /sys already was, and a mask or read-only path the kernel
+  has but cannot apply fails the set-up. The tests check the result from inside the step (a write
+  refused, `ro` in mountinfo), not the call. Same lesson as the remounts in the first review:
+  check every mount's result, and test what the step sees.
+- **Smaller ones.** A script holding a secret was written into the step's layer, on the store's
+  disk, and unlinked afterwards, which leaves it in free blocks: it is now on a tmpfs of the
+  step's own, bound at its path. io_uring bypasses seccomp for the calls it runs and Docker has
+  refused it since moby 25; `personality` can turn off ASLR (`ADDR_NO_RANDOMIZE`) and Docker
+  allows only four values. The default id range sat inside systemd-nspawn's private-users range,
+  and the checks read /etc/subuid only, not /etc/subgid or the host's own users and groups. The
+  default subnet was podman's. A failed capability probe turned native off until the runner
+  restarted; it is now tried again after five minutes. And one the root pass found at once: /proc
+  reports its files' sizes as 0, so a read sized by `stat` (Zig's `readFileAlloc`) returns
+  nothing, and `/proc/net/route` looked like a host with no default route; /proc files are now
+  read to their end (`net.readProc`).

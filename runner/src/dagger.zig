@@ -37,6 +37,8 @@ const engine = @import("engine.zig");
 const Query = @import("dagger/query.zig").Query;
 const basePlan = @import("dagger/set_up.zig").basePlan;
 const baseContainerId = @import("dagger/set_up.zig").baseContainerId;
+const Base = @import("dagger/set_up.zig").Base;
+pub const Backend = @import("native/Backend.zig");
 const execFor = @import("dagger/set_up.zig").execFor;
 const setUpJob = @import("dagger/set_up.zig").setUpJob;
 const package_cache_dirs = @import("dagger/set_up.zig").package_cache_dirs;
@@ -169,6 +171,9 @@ pub const Fetched = struct {
     want: []const u8 = "",
     depth: u32 = 1,
     tags: bool = false,
+    /// What fetched it, for the step's log: Dagger's git, or git in the image on the native
+    /// backend (`Backend.fetchCheckout`).
+    fetched_with: []const u8 = "Dagger's git support",
 };
 
 /// A step with its expressions evaluated, ready to become a script.
@@ -545,6 +550,11 @@ pub const Options = struct {
     output_keys_days: u32 = 7,
     /// Set by the runner when GitHub cancels the job.
     cancel: ?*Cancel = null,
+    /// `RUNNER_BACKEND=native`: run the job on the native backend when it can
+    /// (`Backend.unsupported`), else on Dagger with "Set up job" saying why.
+    native: ?Backend.Config = null,
+    /// Why a job that could have been native runs on Dagger, for "Set up job" (set by `run`).
+    backend_note: ?[]const u8 = null,
     /// Talk to the Dagger engine directly (`engine.zig`) instead of through a `dagger run` child.
     engine: ?engine.Endpoint = null,
     /// Backs the direct session's long-lived buffers and tasks; must be thread-safe.
@@ -680,6 +690,9 @@ pub const Secrets = struct {
     /// Secrets registered so far, for their names (`zig-secret-<n>`).
     counter: u32 = 0,
     ids: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// The native backend's: values get their names without a session, and the native backend
+    /// hands each step the value its name stands for (`Backend.execScript`).
+    local: bool = false,
 
     /// The values in `plaintexts` not registered yet, each once.
     pub fn missing(s: *const Secrets, arena: Allocator, plaintexts: []const []const u8) ![]const []const u8 {
@@ -729,6 +742,15 @@ pub const Secrets = struct {
     ) !void {
         const pending = try s.missing(arena, plaintexts);
         if (pending.len == 0) return;
+        if (s.local) {
+            for (pending) |p| {
+                s.counter += 1;
+                try s.ids.put(arena, p, try std.fmt.allocPrint(arena, "zig-secret-{d}", .{
+                    s.counter,
+                }));
+            }
+            return;
+        }
         var q: Query = .init(arena);
         try s.write(arena, &q, pending);
         const data = try gql(arena, t, try q.finish(), err_msg);
@@ -792,10 +814,21 @@ pub fn run(
     arena: Allocator,
     io: std.Io,
     environ: *const std.process.Environ.Map,
-    opts: Options,
+    opts_in: Options,
     job: job_mod.Job,
     log: *sink.LogSink,
 ) !Result {
+    var opts = opts_in;
+    if (opts.native) |cfg| {
+        // What the job uses, then what this machine can do (found once per process).
+        const why = Backend.unsupported(io, job, opts, cfg) orelse
+            Backend.usable(arena, io, opts.gpa, cfg);
+        if (why) |w| {
+            opts.backend_note = try std.fmt.allocPrint(arena, "This job runs on Dagger: {s}.", .{
+                w,
+            });
+        } else return runNative(arena, io, opts, cfg, job, log);
+    }
     var env = try environ.clone(arena);
     try env.put("NO_COLOR", "1");
     try env.put("DAGGER_NO_NAG", "1");
@@ -842,7 +875,46 @@ pub fn run(
     };
     const transport: Transport = opts.test_transport orelse
         .{ .ptr = &http, .sendFn = HttpTransport.send };
-    return runSteps(arena, io, opts, job, &sh, results, transport);
+    return runSteps(arena, io, opts, job, &sh, results, transport, null);
+}
+
+/// The job on the native backend (`native/Backend.zig`): no Dagger session, the same steps code.
+/// What the native backend has no counterpart for yet is off for the job: the step cache and
+/// output keys (phase 2), and the cache volumes (phase 4): package caches, Zig's local cache and
+/// seeds, and the tool cache's checked trees. They are caches, so a job's results do not depend
+/// on them.
+fn runNative(
+    arena: Allocator,
+    io: std.Io,
+    opts_in: Options,
+    cfg: Backend.Config,
+    job: job_mod.Job,
+    log: *sink.LogSink,
+) !Result {
+    var opts = opts_in;
+    opts.step_cache = false;
+    opts.output_keys = false;
+    opts.package_caches = false;
+    opts.zig_local_cache = false;
+    opts.zig_seeds = &.{};
+    opts.zig_seeds_unverified = &.{};
+    opts.zig_seed_registry = null;
+    opts.tool_trees = false;
+    const results = try arena.alloc(StepResult, job.steps.len);
+    @memset(results, .{});
+    var sh = try jobLogFor(arena, io, opts, job, log);
+    defer sh.flush();
+    var b = Backend.init(arena, io, opts.gpa, cfg) catch |e| return fail(
+        &sh,
+        results,
+        try std.fmt.allocPrint(arena, "could not make the job's native store: {s}", .{
+            @errorName(e),
+        }),
+    );
+    defer b.deinit();
+    // Which ids the job's steps have, as "Set up job" says (`Backend.idsNote`).
+    opts.backend_note = try b.idsNote(arena);
+    return runSteps(arena, io, opts, job, &sh, results, b.transport(), &b);
 }
 
 /// What every task of a job shares: the log, and one slot per log step — the job's steps, then
@@ -969,6 +1041,7 @@ fn runDirect(
         sh,
         results,
         .{ .ptr = &st, .sendFn = SessionTransport.send, .abortFn = SessionTransport.abort },
+        null,
     );
     res.engine_waited = waited;
     return res;
@@ -1330,7 +1403,10 @@ fn prepareCheckout(
             return null;
         },
     };
-    const f = try checkout.fetch(arena, x.transport, x.job.*, co, x.gitAuth());
+    const f = if (x.native) |b|
+        try b.fetchCheckout(x, co)
+    else
+        try checkout.fetch(arena, x.transport, x.job.*, co, x.gitAuth());
     if (f.result == .failed) {
         try failStep(ev, sh, x.observer, step, res, num, f.result.failed, coe);
         return null;
@@ -1707,6 +1783,9 @@ fn runSteps(
     sh: *JobLog,
     results: []StepResult,
     transport: Transport,
+    /// The job runs on the native backend (`runNative`): the base is made there, and each exec
+    /// goes there (`Exec.execScript`).
+    native: ?*Backend,
 ) !Result {
     var ev = try Evaluator.init(arena, &job);
     ev.runner_name = opts.runner_name;
@@ -1716,7 +1795,7 @@ fn runSteps(
     // leaves a fresh database empty), so a job with services runs every step.
     const no_services = job.services.len == 0;
     const step_cache = opts.step_cache and !optsOutOfStepCache(ev.job_env.items) and no_services;
-    var secrets: Secrets = .{};
+    var secrets: Secrets = .{ .local = native != null };
     const plan = basePlan(
         arena,
         io,
@@ -1732,13 +1811,20 @@ fn runSteps(
         error.BaseContainerFailed => return fail(sh, results, err_msg),
         else => return e,
     };
-    const base = baseContainerId(arena, transport, &ev, job, plan, &secrets, &err_msg) catch |e|
+    const base: Base = if (native) |b| base: {
+        b.base(&ev, plan, &err_msg) catch |e| switch (e) {
+            error.BaseContainerFailed => return fail(sh, results, err_msg),
+            else => return e,
+        };
+        break :base .{ .id = "native", .runtime_path = null };
+    } else baseContainerId(arena, transport, &ev, job, plan, &secrets, &err_msg) catch |e|
         switch (e) {
             error.BaseContainerFailed => return fail(sh, results, err_msg),
             else => return e,
         };
     var x = try execFor(arena, io, transport, sh, &ev, &job, opts, plan, base.id, secrets, step_cache);
     x.container_path = base.runtime_path;
+    x.native = native;
     x.tool_trees = base.tool_trees;
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
 
@@ -1754,6 +1840,7 @@ fn runSteps(
     if (plan.zig_seed_note) |note| x.setUpLine(note);
     if (plan.zig_local_note) |note| x.setUpLine(note);
     if (base.tool_trees_note) |note| x.setUpLine(note);
+    if (opts.backend_note) |note| x.setUpLine(note);
 
     if (job.container != null or !no_services) {
         if (!try x.startServices()) return servicesFailed(&x, arena, sh, results);

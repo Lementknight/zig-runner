@@ -3,6 +3,9 @@ const Config = @import("config.zig").Config;
 const loop = @import("loop.zig");
 const inspect = @import("inspect.zig");
 const dagger = @import("dagger.zig");
+const sandbox = @import("native/sandbox.zig");
+const net = @import("native/net.zig");
+const trust = @import("trust.zig");
 const job_mod = @import("job.zig");
 const db = @import("db.zig");
 const pg = @import("pg.zig");
@@ -18,6 +21,9 @@ const build_version = @import("version.zig");
 
 comptime {
     _ = @import("sink.zig");
+    _ = @import("native/Backend.zig");
+    _ = @import("native/sandbox.zig");
+    _ = @import("native/net.zig");
     _ = @import("redact.zig");
     _ = @import("yaml.zig");
     _ = @import("action.zig");
@@ -67,6 +73,11 @@ pub fn main(init: std.process.Init) !u8 {
     defer err.flush() catch {};
 
     const args = try init.minimal.args.toSlice(arena);
+    // A native step's sandbox (`native/sandbox.zig`): before anything else, so nothing has
+    // started a thread when it makes its namespaces.
+    if (args.len == 2 and std.mem.eql(u8, args[1], sandbox.command)) return sandbox.main(arena);
+    if (args.len == 5 and std.mem.eql(u8, args[1], net.command))
+        return net.upMain(arena, args[2], args[3], args[4]);
     if (try printVersionIfAsked(io, args)) return @backingInt(Exit.done);
 
     var cfg = Config.load(init.environ_map, args) catch |e| {
@@ -437,6 +448,15 @@ fn execJobFile(
         .enforce_volatile = cfg.enforce_volatile,
         .output_keys_days = cfg.output_keys_days,
         .sink_job_id = job.check_run_id,
+        // A saved job is held to the same rule as one from GitHub: native steps only where the
+        // runner's trusted refs vouch for it.
+        .native = try dagger.Backend.configFor(
+            arena,
+            io,
+            init.environ_map,
+            cfg,
+            trust.vouches(cfg.trusted_refs, cfg.trusted_events, job.github),
+        ),
     }, job, log);
     for (res.steps, job.steps, 1..) |r, st, n| {
         try err.print(

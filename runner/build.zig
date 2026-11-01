@@ -43,6 +43,14 @@ pub fn build(b: *std.Build) void {
     // Which tests run depends on the environment (PG*, ZIG_TEST_PG_URL, ZIG_TEST_REQUIRE_DB), which
     // the cache does not see: a run without a database would otherwise be replayed as the run with.
     run_tests.has_side_effects = true;
+    // The native backend's tests run steps in sandboxes, which the runner binary makes
+    // (`native/sandbox.zig`, `zig-runner native-step`): they are told where it is installed.
+    // The test runner takes no arguments of ours and the install prefix is not known here, so
+    // the binary is copied to a fixed place under the build's cache directory.
+    const native_exe = b.addUpdateSourceFiles();
+    native_exe.addCopyFileToSource(exe.getEmittedBin(), ".zig-cache/native-step/runner");
+    run_tests.step.dependOn(&native_exe.step);
+    run_tests.setEnvironmentVariable("ZIG_RUNNER_TEST_EXE", ".zig-cache/native-step/runner");
     test_step.dependOn(&run_tests.step);
     // The runner itself too. Zig compiles only what is reached, and the tests never reach the
     // runner's main loop (`loop.cycle`): a type error there passed `zig build test`, and CI with

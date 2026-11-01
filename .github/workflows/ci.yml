@@ -218,7 +218,13 @@ jobs:
         working-directory: runner
         run: |
           if [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
-            ../.github/scripts/zig-test.sh
+            # GitHub's runner can make the native backend's sandboxes, so its tests must run here,
+            # not skip (src/native/Backend.zig, `testConfig`): rootless, then as root, the path
+            # with each job's own ids and network (nft makes its NAT).
+            # Ubuntu 24.04 AppArmor blocks unprivileged user namespaces; lift it on this throwaway VM.
+            sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+            ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/zig-test.sh
+            ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_TEST_NATIVE_AS_ROOT=1 ../.github/scripts/zig-test.sh
           elif [ "$RUNNER_ARCH" = ARM64 ]; then
             zig build test -j1 --summary all
           else
