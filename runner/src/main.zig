@@ -22,6 +22,7 @@ const build_version = @import("version.zig");
 comptime {
     _ = @import("sink.zig");
     _ = @import("native/Backend.zig");
+    _ = @import("native/Store.zig");
     _ = @import("native/sandbox.zig");
     _ = @import("native/net.zig");
     _ = @import("native/key_vectors.zig");

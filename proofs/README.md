@@ -270,9 +270,9 @@ ones about what a cache can answer (`Clean`, `no_cutoff_without_keys`), only a m
 miss is proved natively (`Native.marked_misses`). An unmarked step after it, whose parent names the
 job, is still published, though no other job can ask for that key: P2 may skip it, as a saving.
 
-The right-hand column names P2's code as of draft #268 (commit `ede9244`, `runner/src/native/`),
-whose key format is the one proved here; P2 is not merged yet, so the names are checked again when
-it is.
+The right-hand column names P2's code (`runner/src/native/`, merged in #268, with its review fixes
+on feature/native-backend-p2 at `ede9244`, which add `Store.store_format` to `Backend.below`), whose
+key format is the one proved here.
 
 | In the model | In the native runner (P2) |
 |---|---|
@@ -311,9 +311,9 @@ are equal, so which writer wins does not matter, and the lock only saves running
 model's verdict (equal or not: `Build.K` for steps, the `BaseSpec` for bases, the `Below` itself)
 and the preimages (`keyPreimage`, `belowPreimage`; u64 little-endian words, UTF-8).
 `.github/scripts/key-vectors.sh` checks the file is its output, and
-`runner/src/native/key_vectors.zig` checks the Zig preimages and the relation against it. Until P2
-merges, it checks a reference that follows P2's `KeyHasher`, `stableEnv`, `keyFor` and `below`
-line for line; then P2's own take its place.
+`runner/src/native/key_vectors.zig` checks the Zig preimages and the relation against it: keys
+through P2's own `Store.KeyHasher` and `Store.stableEnv`, the digest below a base through a reference
+of `Backend.below` until P2's review fixes merge.
 
 ## Why the regex matcher terminates
 

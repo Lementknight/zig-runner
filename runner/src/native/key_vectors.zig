@@ -6,20 +6,21 @@
 //! a base's key (`Store.KeyHasher.init(tag)`, `core`, then `Backend.keyFor`'s tail), `below` lines
 //! for the digest below a base (`Backend.below`). Two checks:
 //!
-//! - the preimage: `Hasher` below spells keys as P2's `Store.KeyHasher` does, and must give the
-//!   model's bytes;
+//! - the preimage: a key's bytes as P2's `Store.KeyHasher` writes them, and the digest below a
+//!   base's, must be the model's;
 //! - the relation: a key function must give equal keys exactly where the model does. This half
 //!   holds of any sound spelling (`Native.native_key_iff`), so it applies to the store's key
 //!   whatever bytes it hashes.
 //!
-//! P2's store (draft #268) is not on this branch, so both run against the reference here, which
-//! follows P2's code at ede9244 line for line (`KeyHasher`, `stableEnv`, `keyFor`, `below`).
-//! **When P2 merges:** point `stableEnv` at `Store.stableEnv`, and replace `Hasher` with
-//! `Store.KeyHasher`, whose `bytes` writer gives the preimage: `referenceKey` and `referenceBelow`
-//! become thin adapters over P2's, and the first test then checks P2's bytes.
+//! Keys go through P2's own `Store.KeyHasher` (`init`, `core`, its `bytes` writer) and
+//! `Store.stableEnv`; `keyFor`'s tail, which needs a `Backend`, is written out here as `keyFor`
+//! writes it. The digest below a base is still a reference (`belowPreimage`), following P2's
+//! review fixes (feature/native-backend-p2 at ede9244: `Store.store_format` after the label), which
+//! main does not have yet. **When they merge:** write `Backend.below`'s hashing as a function of
+//! its inputs, call it from `storeBelow`, and drop the reference.
 
 const std = @import("std");
-const dagger = @import("../dagger.zig");
+const Store = @import("Store.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
@@ -56,16 +57,7 @@ pub const BelowInput = struct {
 pub const KeyFn = fn (Allocator, KeyInput) anyerror![32]u8;
 pub const BelowFn = fn (Allocator, BelowInput) anyerror![32]u8;
 
-/// `Store.stableEnv` at P2's ede9244: not the volatile names, nor the runner's own per-job values,
-/// nor the secret aliases.
-fn stableEnv(name: []const u8) bool {
-    if (dagger.isVolatile(name)) return false;
-    for ([_][]const u8{ dagger.event_env, dagger.ran_env, dagger.mark_env }) |n|
-        if (std.mem.eql(u8, name, n)) return false;
-    return !std.mem.startsWith(u8, name, "ZIG_SECRET_");
-}
-
-/// `Store.KeyHasher` at P2's ede9244, keeping the preimage.
+/// A field and a number as `Store.KeyHasher` writes them, for the digest below a base.
 const Hasher = struct {
     out: std.ArrayList(u8) = .empty,
     gpa: Allocator,
@@ -80,37 +72,37 @@ const Hasher = struct {
         try k.int(b.len);
         try k.out.appendSlice(k.gpa, b);
     }
-
-    fn core(k: *Hasher, parent: [32]u8, script: []const u8, env: []const Binding) !void {
-        try k.field(&parent);
-        try k.field(script);
-        var stable: u64 = 0;
-        for (env) |e| stable += @intFromBool(stableEnv(e.name));
-        try k.int(stable);
-        for (env) |e| if (stableEnv(e.name)) {
-            try k.field(e.name);
-            try k.field(e.value);
-        };
-    }
 };
 
-/// A key's preimage, as `Backend.keyFor` builds it: the tag, the core, then uid, gid, the working
-/// directory, the count of kept files and each one's path, contents and mode.
+/// A key's preimage, through P2's `Store.KeyHasher`: the tag, `core` (parent, script, the env
+/// through `Store.stableEnv`), then `Backend.keyFor`'s tail: uid, gid, the working directory, the
+/// count of kept files and each one's path, contents and mode.
 pub fn keyPreimage(gpa: Allocator, in: KeyInput) ![]u8 {
-    var h: Hasher = .{ .gpa = gpa };
-    errdefer h.out.deinit(gpa);
-    try h.int(in.tag);
-    try h.core(in.parent, in.script, in.env);
-    try h.int(in.uid);
-    try h.int(in.gid);
-    try h.field(in.workdir);
-    try h.int(in.files.len);
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    var h: Store.KeyHasher = .init(@fromBackingInt(@intCast(in.tag)));
+    h.bytes = &w.writer;
+    // `init` wrote the tag before `bytes` was set.
+    var tag: [8]u8 = undefined;
+    std.mem.writeInt(u64, &tag, in.tag, .little);
+    try w.writer.writeAll(&tag);
+    h.core(in.parent, in.script, in.env);
+    h.int(in.uid);
+    h.int(in.gid);
+    h.field(in.workdir);
+    h.int(in.files.len);
     for (in.files) |f| {
-        try h.field(f.path);
-        try h.field(f.contents);
-        try h.int(f.mode);
+        h.field(f.path);
+        h.field(f.contents);
+        h.int(f.mode);
     }
-    return h.out.toOwnedSlice(gpa);
+    const key = h.final();
+    const bytes = try w.toOwnedSlice();
+    // The digest P2 computes is the digest of these bytes.
+    var check: [32]u8 = undefined;
+    Sha256.hash(bytes, &check, .{});
+    std.debug.assert(std.mem.eql(u8, &check, &key));
+    return bytes;
 }
 
 /// The digest below a base's preimage, as `Backend.below` builds it: untagged
@@ -141,7 +133,8 @@ fn sha(gpa: Allocator, bytes: []u8) [32]u8 {
     return key;
 }
 
-pub fn referenceKey(gpa: Allocator, in: KeyInput) ![32]u8 {
+/// The key P2 gives, through `Store.KeyHasher`.
+pub fn storeKey(gpa: Allocator, in: KeyInput) ![32]u8 {
     return sha(gpa, try keyPreimage(gpa, in));
 }
 
@@ -295,6 +288,6 @@ test "the native key's preimage is the model's" {
 }
 
 test "native keys are equal exactly where the model's are" {
-    try checkRelation(referenceKey, referenceBelow);
-    // When P2 merges: try checkRelation(<adapter over Store.KeyHasher>, <adapter over below>);
+    try checkRelation(storeKey, referenceBelow);
+    // When P2's review fixes merge: referenceBelow becomes storeBelow, over `Backend.below`'s hashing.
 }
