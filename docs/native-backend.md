@@ -111,9 +111,9 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   ids taken on the host, the jobs' subnet overlapping a route of the host's). A failed probe is
   tried again after five minutes, not kept for the process's life. (Until P3 also: no rootfs
   configured, `container:` and a custom image.)
-- Off on native, as caches: output keys, the package caches, uv's environment in its cache, and
-  Zig's local cache and seed (P4). Results do not depend on them. (The step cache was off in P1;
-  P2's layer store gives it.)
+- Off on native, as caches: output keys. Results do not depend on them. (The step cache was off
+  in P1; P2's layer store gives it. The package caches, uv's environment in its cache, and Zig's
+  local cache and seed came with P4.)
 - "Set up job" says what the job got: "Native steps: ids 0-65535 are host ids N-N+65535, and the
   job's network is its own (10.211.1.x on zr0)", or the rootless warning.
 
@@ -124,8 +124,9 @@ On a root runner, each step runs:
 - in a **user namespace of the job's own**, ids 0-65535 mapped to a range of host ids no host user
   has (`RUNNER_NATIVE_SUBID_BASE`, by default 1,900,000,000 plus 65,536 per slot). The default
   lies past systemd's container range (systemd-nspawn's private users and nsresourced's,
-  524288-1879048191) and the last slot's ids (up to 1,916,383,999) stay below its foreign range
-  (from 2,147,352,576) and below 2^31, which some tools take as signed. The probe refuses a base
+  524288-1879048191) and the last slot's ids (up to 1,916,383,999), and the cache volumes' range
+  after them (P4, up to 1,916,449,535), stay below its foreign range (from 2,147,352,576) and
+  below 2^31, which some tools take as signed. The probe refuses a base
   below 100,000, a range past 2^32, and a range that overlaps one in /etc/subuid or /etc/subgid
   or holds an id from /etc/passwd or /etc/group (users only a directory service knows are not
   seen; the 100,000 floor is above their usual ranges). The step's root and its uid 1001 are
@@ -167,10 +168,14 @@ On a root runner, each step runs:
 - with every path inside the overlay resolved inside it (`openat2(RESOLVE_IN_ROOT)`), by the
   helper and by the runner, so a symlink a step plants never leads them to the host's files.
 
+- in a **cgroup v2 of the job's own** (since P4) with `memory.max` and `pids.max`, where the runner
+  is root or has a cgroup delegated to it ("P4" below).
+
 What it does not provide yet:
 
-- **Resource limits.** No cgroup per job and no pids limit: a fork bomb or a memory hog reaches
-  the host's limits. Debt, recorded under phase 4 beside the gate's cgroup memory accounting.
+- **Resource limits on a rootless runner without delegation.** P4's cgroup needs root or a
+  delegated cgroup (`RUNNER_NATIVE_CGROUP=self`); without one a job runs as P1 did, and "Set up
+  job" says so.
 - **The seccomp filter is Docker's deny list, not its allow list.** Calls Docker refuses by
   omission are allowed here.
 - **Rootless runners.** Only one id is mapped and steps share the host's network: off unless
@@ -190,6 +195,10 @@ RUNNER_NATIVE_SUBID_BASE=1900000000               # default; at least 100000
 RUNNER_NATIVE_SUBNET=10.211.0.0/16                # default; a prefix of 8 to 23 bits
 RUNNER_NATIVE_STORE_MAX_MB=10240                  # default; the layer store's cap (P2)
 RUNNER_NATIVE_ROOTLESS=0                          # default; 1 for a rootless runner
+RUNNER_NATIVE_CGROUP=                             # default: /sys/fs/cgroup/zig-runner as root,
+                                                  # none rootless; `self`, `none`, or a path
+RUNNER_NATIVE_MEMORY_MAX_MB=                      # default 3/4 of MemTotal; 0 for no limit
+RUNNER_NATIVE_PIDS_MAX=8192                       # default; 0 for no limit
 ```
 
 **The rootfs.** Since P3 the runner pulls and provisions the image itself (see P3), and this
@@ -224,6 +233,11 @@ What it changes on the host, which is shared by every runner on it:
   `RUNNER_NATIVE_STORE`s on one host take different slots, and a slot's veth is removed (a dead
   job's) only by the runner that now holds its lock. Every runner on a host must use the same
   `RUNNER_NATIVE_SUBNET`, since `zr0` is one bridge.
+- **Cgroups.** As root, by default, the jobs' cgroups go under `/sys/fs/cgroup/zig-runner` (made
+  on the first job, with the memory and pids controllers for its children, as Docker's cgroupfs
+  driver makes `/sys/fs/cgroup/docker`). It is the host's, like the slots: each job's cgroup is
+  named by its directory, and only the runner holding a job's lock removes it. Under a unit with
+  `Delegate=yes`, `RUNNER_NATIVE_CGROUP=self` keeps them in the unit's own tree instead.
 - **IPv4 forwarding** (`net.ipv4.ip_forward`) is turned on if it is off, and stays on: other
   runners' jobs need it, and turning it off under them would cut their network. The runner logs
   a warning when it turns it on, and another when the FORWARD policy is ACCEPT, since the host
@@ -244,7 +258,9 @@ What it changes on the host, which is shared by every runner on it:
   directory on overlayfs), and the rootfs another volume. The slots' locks must be the host's:
   bind `/run/zig-runner:/run/zig-runner` from the host into every runner container (the
   container's own /run would give each its own slot 0 on the shared bridge). The image has no
-  `iptables`, so P1's NAT needs the host's rules made outside it, or P5's netlink rules.
+  `iptables`, so P1's NAT needs the host's rules made outside it, or P5's netlink rules. For the
+  jobs' cgroups, `cgroup: private` (the default on cgroup v2) with `RUNNER_NATIVE_CGROUP=self`:
+  the container's root is then its own cgroup, and the runner moves itself into a leaf of it.
 - Under `deploy/zig-runner.service` on razorbill (not changed by P1): the unit runs as root with
   `ProtectSystem=strict`, which makes the store's default and `/run` read-only. It needs
   `StateDirectory=zig-runner` (or `ReadWritePaths=/var/lib/zig-runner`) for the store, and
@@ -253,9 +269,11 @@ What it changes on the host, which is shared by every runner on it:
   `/run/zig-runner` when any one of them stops, the others' locks go with their files, and the
   next runner would take a slot a live job holds. `NoNewPrivileges` and `PrivateTmp` are
   compatible; a `RestrictNamespaces=`, a capability bounding set without `CAP_SYS_ADMIN` and
-  `CAP_NET_ADMIN`, or `PrivateNetwork=` would not be.
+  `CAP_NET_ADMIN`, or `PrivateNetwork=` would not be. The jobs' cgroups need `/sys/fs/cgroup`
+  writable (`ProtectControlGroups=` off), or `Delegate=yes` with `RUNNER_NATIVE_CGROUP=self`.
 - Rootless (tests, the laptop): a user namespace mapping the runner's user to root, with overlay's
-  `userxattr` (Linux 5.11). Where AppArmor restricts unprivileged user namespaces
+  `userxattr` (Linux 5.11). Per-job cgroups need the runner started in a delegated cgroup:
+  `systemd-run --user --scope -p Delegate=yes zig-runner ...` with `RUNNER_NATIVE_CGROUP=self`. Where AppArmor restricts unprivileged user namespaces
   (`kernel.apparmor_restrict_unprivileged_userns=1`), the sandbox is started under util-linux's
   `unshare` where its profile allows it (the laptop), and needs the restriction lifted where it
   does not (GitHub's hosted runner).
@@ -498,13 +516,68 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
 - Exit: a runaway job is OOM-killed in its own cgroup without touching its neighbours. Measure:
   gate accuracy against the engine-wide reading.
 
+**Status: landed (behind the knob).** What it covers, as built:
+
+- `runner/src/native/volumes.zig` is the job's caches. The volumes are the Dagger backend's by
+  name, path and rule (`set_up.cachesUsed`: one per package manager the job names, the tool cache
+  always, Zig's package tarballs as `p/` under its global cache, Zig's local cache in `repo` only,
+  uv's environment inside uv's volume), as directories under the store at
+  `volumes/<owner>/<repository>/<scope>/<name>[/<image>][/runner]`, each part sanitized to a name
+  of its own. They are bound into every step and are never in a layer. The `repo` and `untrusted`
+  scopes (`set_up.packageCacheScope`) are separate trees. Each volume has an flock beside it
+  (`<volume>.lock`), held for the job: shared (Dagger's default, every volume's here), locked
+  (exclusive, jobs take turns) or private (exclusive when free, else a fresh copy of the job's
+  own, removed after it).
+- On a root runner a volume's files are owned on disk by a range of ids of their own, the one just
+  past the last slot's (`Backend.volumeIdBase`, which `idsClash` checks with the slots'), and each
+  step sees them as its own ids through an idmapped mount (`sandbox.bindVolumeIn`, a userns
+  mapping that range onto the job's), nosuid and nodev. A volume filled by one slot's job is the
+  next slot's, and a setuid file a job leaves in one is nobody's on the host. A missing mount point
+  is made owned by the job's root, as Dagger makes a cache mount's missing parents.
+- Zig's local cache rolls its generations with the Dagger backend's own script
+  (`set_up.zig_local_roll_script`), run in a sandbox of its own whose layer is dropped.
+- The Zig cache seed (minisign-verified releases, `Options.zig_seeds`) is built once per release,
+  architecture and step user, with the Dagger backend's script (the tarball checked against its
+  pinned sha256 before it runs), under a lock, in a sandbox without the job's volumes; its cache
+  is moved into `seeds/<arch>-<version>-<user>` with the directories above it as the rootfs has
+  them, its files owned as the image's files are and no setuid bit, and published by rename. It is an image layer
+  between the rootfs and the job's layers, seen through the job's ids as the rootfs is
+  (`sandbox.idmapLowers`), so a job's own writes to its global cache stay in its layers.
+- `runner/src/native/cgroup.zig` is the job's cgroup: `memory.max` (`RUNNER_NATIVE_MEMORY_MAX_MB`,
+  three quarters of `MemTotal` by default), `pids.max` (`RUNNER_NATIVE_PIDS_MAX`, 8192), and
+  `memory.peak`, `memory.events` and `pids.events` read back. Each step's helper joins it before
+  anything else (`sandbox.joinCgroup`), so every process of the step is born in it and the runner
+  never is. It is kept, empty, between steps, and killed (`cgroup.kill`) and removed when the job
+  ends, or by the sweep after a crash. When a step's processes were OOM-killed or refused a fork,
+  its log says so in an error line. Where it goes: `/sys/fs/cgroup/zig-runner` as root; the
+  runner's own delegated cgroup with `self` (the runner moves its processes into a `runner` leaf and
+  makes the jobs' under `jobs`, systemd's rule for delegation); a path; or none, rootless without
+  `self`, where the job runs as in P1 and "Set up job" says why.
+- The memory gate (`admission.zig`) is told of a native job's cgroup (`Gate.native`) and measures
+  the job there, from nothing, with the engine's own definition of a working set
+  (`workingSetMb`: `memory.current` less `inactive_file` and `slab_reclaimable`), so what it
+  learns of a job means the same on either backend. A native job is never measured beside another
+  (its cgroup is its own), its last sample is taken just before its cgroup goes
+  (`Gate.nativeDone`), and its reservation is left out of the engine's cap
+  (`Reservation.native_mb`). A native job without a cgroup is not measured, as a job without an
+  engine signal is not.
+- Debt: volumes are never evicted (the engine's GC prunes Dagger's; P2's LRU eviction under a byte
+  cap should take the volumes' locks exclusively and cover them too). The tool cache's checked
+  trees (`set_up.verifyToolTrees`) and the seed registry's discovery from them are off natively:
+  steps check the trees they use themselves, as on Dagger without the check (P2, with replay's
+  `Exec.tool_cache`). A Dagger job that overlapped only native jobs is still learned as "beside
+  others", an upper bound (small; the gate's overlap marks are set before a job is known to be
+  native). Rootless runners without delegation have no limits (P5 must refuse untrusted jobs
+  there).
+
 ### P5: isolation for untrusted jobs
 
 P1 already gives each job on a root runner its own ids, its own network, pivot_root, masked
 /proc, Docker's capabilities, no_new_privs and a seccomp deny list ("Isolation" under P1). What
 remains before native steps may run jobs the runner does not vouch for:
 
-- Resource limits come with phase 4's cgroups; until then, no untrusted job.
+- Resource limits came with phase 4's cgroups; P5 must refuse an untrusted job on a runner where
+  the job would get no cgroup (a rootless runner without delegation, `RUNNER_NATIVE_CGROUP=none`).
 - Seccomp as Docker's allow list rather than its deny list.
 - The NAT and forwarding rules over nftables netlink instead of `iptables` (P1's debt).
 - Rootless: a userspace network stack for the job's network (the parts of pasta or slirp4netns it
@@ -853,3 +926,54 @@ Surprises:
 
 Measured against Dagger: a cold pull of `ubuntu:24.04` 2.1-2.5 s against 4.5-4.7 s, about twice as
 fast; warm, a pinned image costs nothing.
+
+### P4: cache volumes, trust scopes and cgroup memory accounting
+
+What Dagger did implicitly, now explicit in `native/`:
+
+- **A cache volume is not the job's ids.** The engine owned its volumes and gave each mount the
+  owner it was asked for; natively, each job's ids are its slot's, so a directory filled by slot 0
+  is nobody's to slot 1. The volumes are owned by a range of their own and seen through an
+  idmapped mount per step, the same mechanism as the rootfs with a different map (`inside` ids
+  starting at the volumes' range, outside the job's). Host ids would have been simpler and wrong:
+  a setuid-root file a job left in a volume would have been a real one on the host.
+- **The seed's isolation came from the engine's recipe cache.** Dagger built the seed by its recipe
+  and mounted it as a directory whose writes went with the container. Natively that is a layer:
+  built by trusted inputs only, its owners rewritten to the image's and setuid bits cleared before
+  it is published, and stacked under the job's layers so the job's writes copy up into its own.
+- **Dagger's mount points.** BuildKit makes a cache mount's missing parents as root. The sandbox
+  does the same, owned by the job's root (the helper is still the host's root when it binds, so it
+  chowns what it makes).
+- **The engine's one cgroup was the gate's only view.** It charged every job running for all of
+  them; per-job cgroups give each job its own working set, and the gate reads a native job's with
+  the same definition, so learned estimates mean the same across backends.
+
+Surprises:
+
+- **The cgroup is the host's, like the slots.** P1's rule ("ask whether the kernel object is per
+  store or per host") applied at once: the jobs' cgroups live in one host-wide tree, named by the
+  job's random directory, and removed only by the runner that holds the job's lock.
+- **Delegation cannot be detected reliably.** systemd marks delegated cgroups with a
+  `trusted.delegate` xattr, but the user manager does not (Ubuntu 24.04's systemd: no xattr on a
+  `Delegate=yes` user scope), and a rootless runner can write its whole user@ subtree whether it
+  was delegated or not. So delegation is opt-in (`RUNNER_NATIVE_CGROUP=self`), not guessed:
+  guessing would have moved, for example, an editor's every process into a leaf of its scope.
+- **A cgroup that gives its children controllers holds no process.** `self` has to move the
+  runner (and whatever else shares its cgroup) into a leaf before enabling the memory and pids
+  controllers: the same dance systemd documents and Docker-in-Docker does at a container's root.
+- **`zig build test` does not pass the environment to the tests.** A variable the tests read
+  (`ZIG_RUNNER_TEST_CGROUP`) reaches them through `.github/scripts/zig-test.sh` (the compiler
+  directly), not through the build system, which is how CI already runs them.
+- **Bash's `-e`** ends a step at the OOM-killed command, so a test that wants to see the exit code
+  says `|| echo exit=$?`; the step's log carries the runner's own line about the limit either way.
+
+Measured (laptop "cowbird", rootless in a delegated `systemd-run --user --scope`): two overlapping
+native jobs each holding 300 MB, the second starting 3 s into the first. The gate learned **304
+MB and 305 MB** from each job's own cgroup; the engine-wide reading (the jobs' parent cgroup, read
+as the engine's is) charged the first job **610 MB**, both jobs' memory, and the second 306 MB. That
+is razorbill's soak in miniature (1.7 GB learned for a job that takes about 0.9 GB alone). CI's
+root pass (GitHub's hosted runner, `/sys/fs/cgroup/zig-runner-test`) measured the same: 304 and 304
+MB own, 609 and 304 MB engine-wide. A runaway job capped at 256 MB was OOM-killed (exit 137) in its
+own cgroup while its neighbour held 200 MB untouched, and a fork bomb capped at 64 processes was
+refused 125 forks there and the job went on. A cap near the size of the step's own shell and helper
+is a trap: at 64 MB the root pass's kernel killed the shell with the hog.
