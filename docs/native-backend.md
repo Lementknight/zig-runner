@@ -356,6 +356,47 @@ remains before native steps may run jobs the runner does not vouch for:
 - `Input.mounts` absent from the key holds by construction.
 - Exit: `proofs/README.md` and the Lean files name native functions where they named Dagger's.
 
+**Status: proved against P2's specification; to be checked against P2's code when it lands.**
+`proofs/Runner/Native.lean` is the native backend's refinement of the model, beside Dagger's rather
+than replacing it, since both backends ship (proofs/README.md, "On the native backend"):
+
+- **The key.** A step's key is sha256 of `stepPreimage`: the u64 tag 1, then the parent's key, the
+  script's text and the count and bindings of the stable environment in the container's order, each
+  field prefixed with its length as a u64 little-endian. A base is tag 0, an output-keyed container
+  tag 2 (the parent's key and the layer's digest). `encKey_injective` and `native_key_iff`: the
+  spelling keeps exactly what the model's key keeps, so P2 and P3 hold of it; mounts and the event
+  payload are no argument of it. `Ambiguous` is what plain concatenation would cost.
+- **Replay.** The store records a success of an unmarked step and nothing else. Then every hit is
+  honest, succeeded and unmarked by construction, and `native_replay_eq_run` is P1 under
+  `Disciplined` alone: no `Numbered`, no `Ahead`, whatever other runners publish or evict between
+  steps, and whichever reads fail. `native_eq_dagger`: the two backends give the same answers.
+- **Concurrency.** Whole-entry operations in any order keep the store honest (`ops_keep_honest`);
+  which of two racing writers wins does not matter (`race_irrelevant`), so the flock per key is
+  about cost; an entry is read whole or is a miss (`readWhole_agrees`, `Torn`).
+- **Layer digests.** A sorted walk of what a later step can see, nothing that differs between runs:
+  `digest_deterministic` and `digest_injective`, which are what output keys need.
+- **Logs.** A store that records the one pipe the step writes to replays the run without
+  `exec 2>&1` (`Logs.native_replay`). The scripts keep it: one script for both backends.
+- **The tie to the code.** `keyoracle` (`proofs/KeyOracle.lean`) writes
+  `runner/src/native/testdata/step_keys.tsv`, `.github/scripts/key-vectors.sh` checks in the proofs
+  workflow that it is the model's, and `runner/src/native/key_vectors.zig` checks the preimage and
+  the equal/differ relation against it, with the real `dagger.volatile_env`.
+
+**When P2 lands**, in this order:
+
+1. Add `try checkRelation(store.stepKey)` in `key_vectors.zig` (the interface is `StepKey` there:
+   parent key, script, the whole env in the container's order; it drops the volatile names itself).
+   This half holds of any sound spelling.
+2. If P2 hashes `stepPreimage`'s bytes, check them in the first test of `key_vectors.zig`. If it
+   spells keys another way, change `Native.encState`, `stepPreimage` and `KeyOracle.lean` to match,
+   keep `Format.Sound` proved, and regenerate the vectors (`key-vectors.sh --write`). A spelling
+   that sorts the environment, or drops a length or a tag, fails the vectors on purpose.
+3. Check each obligation in proofs/README.md's native table against the code: only successes of
+   unmarked steps published; publish by one `RENAME_NOREPLACE` rename; a part missing or short
+   read as a miss; the layer walk's fields (ids as the job's namespace sees them, whiteouts, no
+   times, inodes or host ids). Then rename the table's right-hand column from "as specified" to the
+   functions that do it.
+
 ### P9: Pi validation, then the decision
 
 - Run the full pool on the Pi (aarch64) and the laptop on native for a soak period: real workloads,
@@ -584,3 +625,38 @@ taught:
   reports its files' sizes as 0, so a read sized by `stat` (Zig's `readFileAlloc`) returns
   nothing, and `/proc/net/route` looked like a host with no default route; /proc files are now
   read to their end (`net.readProc`).
+
+### P8: remapping the proofs
+
+Written against P2's specification while P2 was being built, so what it taught is about the
+specification:
+
+- **What BuildKit discharged is three obligations, not one.** "The key is computed from exactly
+  what the model says" splits into: the preimage is unambiguous (every field length-prefixed, a
+  count before the environment, a tag per kind of container), the environment keeps the order the
+  step sees, and the script text tells apart the scripts the model does. The last was always
+  assumed under Dagger too, and unstated; the first is new, and plain concatenation fails it with a
+  four-byte example (`Ambiguous`: script `x` with `Y=1`, and script `xY=1` with nothing).
+- **Not storing what cannot be replayed removes the model's bookkeeping.** `Build` needs `Numbered`
+  and `Ahead` because the engine records marked steps and failures, and the proof has to show
+  nothing ever finds them. A store that publishes only successes of unmarked steps never holds
+  them, so native P1 needs `Disciplined` and nothing else. It also keeps a marked step's log, which
+  may hold a secret, off the store's disk, which P0 asked for.
+- **The flock is for cost, not correctness.** Two honest entries for one unmarked key are equal
+  under `Disciplined`, so which racing writer wins does not matter. What correctness needs is that
+  the store changes by whole entries (one rename) and that a reader treats a missing or short part
+  as a miss: either one alone closes torn reads, and an eviction part-way is the same case as a
+  write part-way.
+- **A miss is always safe, and the proof says why in one line**: every invariant is "every entry
+  that is there is honest", which removing entries or failing a read cannot break. LRU eviction and
+  a read cut short need no argument of their own.
+- **The layer digest must hash namespace ids, not host ids.** P1 gives each slot its own range of
+  host ids, so the same layer written in two slots has different owners on the host. Hashing those
+  would make the digest, which is part of a step's output, differ between runs: no early cutoff,
+  and `Disciplined` false in letter. The same holds of times and inodes, and of the order readdir
+  returns. Whiteouts must be in the walk, or a layer that deletes a file has the digest of one that
+  does not.
+- **`exec 2>&1` is now Dagger's need only.** The native helper already gives the step one pipe for
+  both streams (`dup2(1, 2)` before `execve` in `sandbox.zig`), so a store that records that pipe
+  replays the run without merging. The script keeps the line because both backends run the same
+  script, and its text is in the key.

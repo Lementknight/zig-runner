@@ -11,7 +11,7 @@ cd proofs && lake build
 ```
 
 That checks two libraries: `Runner` (the step cache and the regex matcher's loops) and `Glob` (the
-`hashFiles()` walk), plus the `globoracle` executable. They use Lean core only — no Mathlib, no
+`hashFiles()` walk), plus the `globoracle` and `keyoracle` executables. They use Lean core only — no Mathlib, no
 Batteries — and the toolchain is pinned by `lean-toolchain`. Nothing in `Runner/` uses `sorry`,
 `axiom`, `native_decide`, `unsafe` or `partial`; `#print axioms` on the main theorems shows at most
 `propext` and `Quot.sound`. A clean build is the whole claim.
@@ -33,6 +33,7 @@ lists where the encoding differs.
 | `Runner/Enforce.lean` | the volatile clause of `Disciplined`, discharged, and P1 under enforcement |
 | `Runner/Counterexamples.lean` | twelve computing jobs |
 | `Runner/Logs.lean` | why a replayed log needs one output stream |
+| `Runner/Native.lean` | the native backend's store as a refinement of the model: the key's bytes, replay, concurrency, eviction, layer digests |
 | `Runner/Regex.lean` | why the regex matcher's loops terminate |
 | `Glob/Match.lean`, `Glob/Walk.lean` | the `hashFiles()` matcher and walk |
 
@@ -90,6 +91,10 @@ All names are under `Runner.`; `Build.`, `OutputKeys.` and so on are the modules
 | **P6** minimality | `Build.hit_keeps_ran`, `warm_runs_nothing`, `recorded_not_run`, `step_runs_at_most_once` | `Runner/Build.lean` |
 | early cutoff | `OutputKeys.cutoff`, `cutoff_needs_only_the_digest` (both for a marked step that succeeded), `no_cutoff_without_keys`, `failure_is_a_wall`, `different_bytes_different_container` | `Runner/OutputKeys.lean` |
 | pruning is safe | `Build.coherent_subset`, `ahead_subset`: both of P1's hypotheses survive dropping entries, so pruning can only cause misses | `Runner/Build.lean` |
+| **P1 on the native backend** | `Native.native_replay_eq_run`, and `native_eq_dagger`: both backends give what the job gives with the cache off | `Runner/Native.lean` |
+| the native key keeps what `Key` keeps | `Native.encKey_injective`, `native_key_iff`, `native_mounts_invisible`, `native_volatile_invisible`, `native_event_invisible`; `Native.Ambiguous` without the lengths | `Runner/Native.lean` |
+| native concurrency and eviction | `Native.ops_keep_honest`, `race_irrelevant`, `readWhole_agrees`, `Native.Torn`; a lost read in `nbuild` | `Runner/Native.lean` |
+| native layer digests | `Native.digest_deterministic`, `digest_injective`, `same_layer_same_container`, `different_layer_different_container` | `Runner/Native.lean` |
 | a shared cache is safe | `Build.elsewhere_ahead`: no other job can write under this job's nonce, which is why a pool may share one cache | `Runner/Build.lean` |
 | **the volatile clause, discharged** | `Enforce.input_determined_by_key`, `volatile_clause_discharged`, `nothing_volatile_survives`, `no_payload_survives`, `enforced_disciplined` | `Runner/Enforce.lean` |
 
@@ -217,7 +222,9 @@ passing, something has changed.
 
 Not proof of anything about: hash collisions (the key is a projection, so two different recipes never
 collide here); the *interleaving* of concurrent jobs, only the shared cache they end up with
-(`Elsewhere`) — the store's first-writer-wins `mv -T` is not modelled; anything bash does; and every
+(`Elsewhere`), and for the native store whole-entry operations in any order (`Native.Op`), which
+atomic publish is what justifies — Dagger's output store's first-writer-wins `mv -T` is not
+modelled; anything bash does; and every
 question of *cost* — nothing here says a replay is faster, only that it is right. Experiment 5's +28%
 and +85% are why `Runner.Declared`'s mechanism is shelved, and no theorem in it argues otherwise.
 
@@ -249,6 +256,54 @@ does not do what the model assumes:
 
 `Enforce` is composed with `Build` since #89: `Enforce.replay_eq_run_enforced` is P1 for `exec`
 instantiated with the withheld input.
+
+### On the native backend (P8)
+
+The native backend (docs/native-backend.md) keeps its own step store, so the obligations the engine
+discharged under Dagger are the runner's, and `Runner/Native.lean` states and proves each one. The
+model above is unchanged; `Build` and its theorems describe both backends, and `Native` is the
+second refinement of it: `native_replay_eq_run` is P1 against the same `uncached`, and
+`native_eq_dagger` says the two backends give the same answers. Every theorem of `OutputKeys` holds
+natively as it stands, because the native job hands on the same `nextState` and `nextEnv`.
+
+The store is P2's, specified and not yet merged, so the right-hand column names what P2 specifies;
+when it lands, each row is checked against its code and the names updated.
+
+| In the model | In the native runner (P2, as specified) |
+|---|---|
+| `State`: a container *is* the recipe that built it | the native key chain: a step's key is sha256 of `Native.stepPreimage` (tag, parent's key, script, stable env), and the key of what it leaves is the same bytes (`encKey`) |
+| `Key = parent · script · stable env` | `store.stepKey(parent, script, env)`, which drops `dagger.volatile_env` itself; the mounts and the event payload are no argument of it, so `Input.mounts` and `Input.event` absent from the key hold by construction |
+| `State.afterCopy before digest` | an output-keyed container: tag 2, the parent's key and the layer's digest |
+| `Output.digest` | the layer digest: sha256 of `Native.layerPreimage`, the layer's entries sorted by path |
+| `Output.log`, `Logs` | the step's output as one pipe recorded it, so a replay is the run without `exec 2>&1` (`Logs.native_replay`); the script keeps it, since both backends run one script |
+| `Cache`, `look` | the store, one directory per key's sha256 (`Native.Store`, `slook`) |
+| `replayable` | `Native.record`: a failure is never stored, so every hit is a success (`hit_succeeds`) |
+| `mark st = .everyRun` | never stored either (`record`): its key names the job, and its log may hold a secret |
+| `Subset` | LRU eviction under a byte cap (`Native.evict`), and a read that fails (`lost`) |
+| `Elsewhere` | the store a pool's runners share: what they do between steps is `Native.Op`s (`ops_keep_honest`) |
+
+What the proofs need of the code, each a hypothesis or a definition the code has to match:
+
+| Obligation | Where in the model | Why |
+|---|---|---|
+| The key's bytes are unambiguous: a fixed-width length before every field and a count before the environment, a tag per kind of container, a format version in the tag | `Format.Sound`, `encState` | without it two keys share bytes and one step replays another's entry (`Native.Ambiguous`) |
+| The environment is spelt in the container's order, not sorted | `encEnv`, the `env-order` vector | sorting would identify keys the model keeps apart; it would need `Disciplined` restated over the coarser key |
+| The script text tells apart the scripts the model tells apart | `Format.Sound.text_inj` | the same hypothesis the Dagger mapping relies on, unstated there |
+| Only successes of unmarked steps are published | `record` | it is what makes `SHonest` hold by construction, with no `Numbered` or `Ahead` |
+| A publish is one rename (renameat2 `RENAME_NOREPLACE`) of a complete entry | `Op`, `publish` | then any interleaving of runners is a sequence of whole-entry operations |
+| A reader takes an entry whole or misses: a missing or short part is a miss, never empty | `readWhole`, `readWhole_agrees`, `Native.Torn` | a writer or an eviction part-way otherwise replays an entry without its file commands |
+| The layer digest hashes the sorted walk of what a later step can see (path, type, mode, ids inside the job's namespace, xattrs, symlink target, whiteouts, content) and nothing else (times, inodes, host ids, readdir order) | `layerPreimage`, `digest_deterministic`, `digest_injective` | early cutoff needs equal layers to have equal digests; soundness needs different layers, deletions included, to have different ones |
+
+The flock per key is not among them: `race_irrelevant` shows two honest entries for an unmarked key
+are equal, so which writer wins does not matter, and the lock only saves running a key twice.
+
+`keyoracle` (`KeyOracle.lean`) ties the model to the Zig code as `globoracle` does for
+`hashFiles()`: it writes `runner/src/native/testdata/step_keys.tsv`, pairs of step inputs with
+the model's verdict (equal or not, from `Build.K`) and the preimages (`stepPreimage`, u64
+little-endian words, UTF-8). `.github/scripts/key-vectors.sh` checks the file is its output, and
+`runner/src/native/key_vectors.zig` checks the Zig preimage and the relation against it, with
+`dagger.volatile_env` as the volatile names. Until P2 lands, it checks a reference key there; P2's
+`store.stepKey` takes its place.
 
 ## Why the regex matcher terminates
 
