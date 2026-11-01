@@ -34,6 +34,11 @@ named:
   is how the flakiness question (docs/RELATED.md) shows up as a hypothesis rather than as an
   oversight.
 
+The code named above is the Dagger backend's. The native backend (docs/native-backend.md) keeps
+its own store, and `Runner.Native` is its refinement of this model: it spells `Key` out as the
+bytes the store hashes, proves the spelling keeps exactly what `Key` keeps, and proves P1 for the
+store as P2 specifies it.
+
 The Agda module's decidable-equality functions (`_≟Script_`, `_≟State_`, `_≟Env_`, `_≟Key_`) are
 derived `DecidableEq` instances here; `look` decides key equality with `if k = e.1`, and the
 counterexamples compute through those instances with `decide` and `rfl`.

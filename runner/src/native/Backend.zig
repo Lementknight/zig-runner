@@ -1661,11 +1661,28 @@ fn keyFor(
         b.layers.items[b.layers.items.len - 1].key orelse return null
     else
         b.below() orelse return null;
+    return stepKey(tag, parent, script, b.env.items, uid, gid, b.workdir, files);
+}
+
+/// `keyFor` as a function of its inputs (P8 checks it against the model's vectors,
+/// `key_vectors.zig`): P8's core (`Store.KeyHasher`: tag, parent, script, the stable env in the
+/// container's order), then who runs it, where, and the files kept. Null when a file is not kept
+/// (a secret's): such an exec is never keyed.
+pub fn stepKey(
+    tag: Store.Tag,
+    parent: Store.Key,
+    script: []const u8,
+    env: anytype,
+    uid: u64,
+    gid: u64,
+    workdir: []const u8,
+    files: []const sandbox.Spec.File,
+) ?Store.Key {
     var h: Store.KeyHasher = .init(tag);
-    h.core(parent, script, b.env.items);
+    h.core(parent, script, env);
     h.int(uid);
     h.int(gid);
-    h.field(b.workdir);
+    h.field(workdir);
     h.int(files.len);
     for (files) |f| {
         if (!f.keep) return null;
