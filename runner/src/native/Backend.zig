@@ -1177,7 +1177,8 @@ const Provision = struct {
             b.layers.clearRetainingCapacity();
         }
         if (ended.failure.len > 0 or ended.code != 0) {
-            p.why = try std.fmt.allocPrint(arena, "{s}{s} (exit {d})", .{ ended.failure, out.tail(), ended.code });
+            // Its last lines: apt's own last line ("dpkg returned an error code") says little.
+            p.why = try std.fmt.allocPrint(arena, "{s}{s} (exit {d})", .{ ended.failure, out.tailLines(8), ended.code });
             return error.ProvisionFailed;
         }
         // On a root runner the layer belongs to the job's range of ids: back to the image's.
@@ -1327,6 +1328,19 @@ const Captured = struct {
         c.text.appendSlice(c.arena, bytes) catch return;
         if (c.text.items.len > 2 * keep)
             c.text.replaceRangeAssumeCapacity(0, c.text.items.len - keep, &.{});
+    }
+
+    /// The last `n` lines, joined by " | ".
+    fn tailLines(c: *const Captured, n: usize) []const u8 {
+        const t = std.mem.trim(u8, c.text.items, " \n");
+        var start = t.len;
+        var seen: usize = 0;
+        while (start > 0 and seen < n) {
+            start = std.mem.lastIndexOfScalar(u8, t[0..start], '\n') orelse 0;
+            seen += 1;
+        }
+        const lines = std.mem.trimStart(u8, t[start..], "\n");
+        return std.mem.replaceOwned(u8, c.arena, lines, "\n", " | ") catch lines;
     }
 
     fn tail(c: *const Captured) []const u8 {
