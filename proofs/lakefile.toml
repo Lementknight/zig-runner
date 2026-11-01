@@ -1,5 +1,5 @@
 name = "proofs"
-defaultTargets = ["Glob", "globoracle", "Runner"]
+defaultTargets = ["Glob", "globoracle", "Runner", "keyoracle"]
 
 [[lean_lib]]
 name = "Glob"
@@ -10,3 +10,7 @@ name = "Runner"
 [[lean_exe]]
 name = "globoracle"
 root = "Oracle"
+
+[[lean_exe]]
+name = "keyoracle"
+root = "KeyOracle"
