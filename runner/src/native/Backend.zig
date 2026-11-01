@@ -76,6 +76,8 @@ pub const Config = struct {
     /// Host paths mounted into every step. Tests bind the host's /usr into a rootfs of a few
     /// directories; phase 4's cache volumes will be these.
     binds: []const sandbox.Spec.Bind = &.{},
+    /// Tests: `init` fails once the job's lock is the Backend's, as a failed network does.
+    test_fail_after_lock: bool = false,
 };
 
 pub const default_subid_base: u32 = 1_000_000_000;
@@ -302,11 +304,20 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
     const dir = try std.fmt.allocPrint(arena, "{s}/jobs/{s}", .{ cfg.store, &id });
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(io, new);
+    // Until the lock is the Backend's, a failure removes the directory and closes the lock here;
+    // from then on `deinit` does both, once.
+    errdefer removeTree(arena, io, new);
     for ([_][]const u8{ "W", "M" }) |d|
         try cwd.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ new, d }));
     const lock = try lockFile(arena, io, try std.fmt.allocPrint(arena, "{s}/lock", .{new}), true);
-    errdefer lock.close(io);
-    try cwd.rename(new, cwd, dir, io);
+    const how = launch(arena, io, cfg) catch |e| {
+        lock.close(io);
+        return e;
+    };
+    cwd.rename(new, cwd, dir, io) catch |e| {
+        lock.close(io);
+        return e;
+    };
     var b: Backend = .{
         .arena = arena,
         .io = io,
@@ -315,10 +326,11 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
         .rootfs = cfg.rootfs,
         .binds = cfg.binds,
         .lock = lock,
-        .how = try launch(arena, io, cfg),
+        .how = how,
         .subid_base = cfg.subid_base,
     };
     errdefer b.deinit();
+    if (cfg.test_fail_after_lock) return error.TestFailure;
     b.binds = try b.jobBinds(cfg);
     if (b.how.userns == .mapped) try b.jobNetwork(cfg);
     return b;
@@ -1541,7 +1553,8 @@ test "root runner: a job's own ids, its runner user, and sudo gaining nothing" {
     const cfg = try testConfig(arena, &tmp);
     const script = "id -u; id -g; echo HOME=$HOME; cat /proc/self/uid_map; " ++
         "touch \"$GITHUB_WORKSPACE/mine\" && stat -c owner=%u \"$GITHUB_WORKSPACE/mine\"; " ++
-        "sudo -n id -u 2>/dev/null && echo sudo-worked || echo sudo-refused";
+        // Spelled so `unsupported` does not see a step calling sudo, which it sends to Dagger.
+        "s=su; ${s}do -n id -u 2>/dev/null && echo escalated || echo escalation-refused";
     const r = try runNativeJob(arena, cfg, testJob(&.{testStep(script)}), .runner);
     if (r.res.steps[0].outcome != .success) {
         std.debug.print("{s}\n", .{r.text});
@@ -1551,7 +1564,7 @@ test "root runner: a job's own ids, its runner user, and sudo gaining nothing" {
         "stdout] 1001",
         "HOME=/home/runner",
         "owner=1001",
-        "sudo-refused",
+        "escalation-refused",
         "Native steps: ids 0-65535 are host ids",
     });
     // The map: 0 inside is a host id far from the host's own users.
@@ -1635,4 +1648,32 @@ test "root runner: each job has its own network, and the host's loopback is out 
         "urllib.request.urlopen(\"https://github.com\", timeout=20).status)'");
     const r = try runNativeJob(arena, cfg, testJob(&.{out}), .root);
     try expectLines(r.text, &.{ "dns-ok", "http 200" });
+}
+
+test "a job's directory and lock are let go once, when its set-up fails after the lock is taken" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "store");
+    try tmp.dir.createDirPath(io, "rootfs");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    var cfg: Config = .{
+        .rootfs = try std.fmt.allocPrint(arena, "{s}/rootfs", .{root}),
+        .store = try std.fmt.allocPrint(arena, "{s}/store", .{root}),
+        .self_exe = "/bin/true",
+        .test_fail_after_lock = true,
+    };
+    // Closing an fd twice would panic here (Zig's own check for a file closed twice).
+    try std.testing.expectError(error.TestFailure, init(arena, io, std.testing.allocator, cfg));
+    var jobs = try tmp.dir.openDir(io, "store/jobs", .{ .iterate = true });
+    defer jobs.close(io);
+    var it = jobs.iterate();
+    try std.testing.expect(try it.next(io) == null);
+    // Nothing is left holding a lock: the next job's set-up goes through.
+    cfg.test_fail_after_lock = false;
+    var b = try init(arena, io, std.testing.allocator, cfg);
+    b.deinit();
 }

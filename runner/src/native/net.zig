@@ -89,19 +89,29 @@ fn z(arena: Allocator, s: []const u8) [*:0]const u8 {
     return out.ptr;
 }
 
-/// An rtnetlink socket in the network namespace the calling thread is in.
+/// An rtnetlink socket in the network namespace the calling thread was in when it was opened,
+/// with a datagram socket of that namespace for looking links up by name (`index`). A socket stays
+/// in the namespace it was made in, whichever the thread moves to: `upMain` holds one for the
+/// host's and one for the job's.
 pub const Socket = struct {
     fd: linux.fd_t,
+    ioctl_fd: linux.fd_t,
     seq: u32 = 1,
 
     pub fn open() !Socket {
         const rc = linux.socket(linux.AF.NETLINK, linux.SOCK.RAW | linux.SOCK.CLOEXEC, 0);
         if (linux.errno(rc) != .SUCCESS) return error.NetlinkSocket;
-        return .{ .fd = @intCast(rc) };
+        const dgram = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+        if (linux.errno(dgram) != .SUCCESS) {
+            _ = linux.close(@intCast(rc));
+            return error.NetlinkSocket;
+        }
+        return .{ .fd = @intCast(rc), .ioctl_fd = @intCast(dgram) };
     }
 
     pub fn close(s: *Socket) void {
         _ = linux.close(s.fd);
+        _ = linux.close(s.ioctl_fd);
     }
 
     /// Sends one request and reads its acknowledgement: the kernel's errno, `.SUCCESS` for none.
@@ -130,20 +140,16 @@ pub const Socket = struct {
         }
     }
 
-    /// A link's index, or null when there is none of that name.
+    /// A link's index in the socket's namespace, or null when there is none of that name.
     pub fn index(s: *Socket, name: []const u8) ?i32 {
-        _ = s;
         var req: extern struct { name: [16]u8, index: i32, pad: [20]u8 } = .{
             .name = @splat(0),
             .index = 0,
             .pad = @splat(0),
         };
         @memcpy(req.name[0..name.len], name);
-        const sock = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
-        if (linux.errno(sock) != .SUCCESS) return null;
-        defer _ = linux.close(@intCast(sock));
         const siocgifindex = 0x8933;
-        if (linux.errno(linux.ioctl(@intCast(sock), siocgifindex, @intFromPtr(&req))) != .SUCCESS)
+        if (linux.errno(linux.ioctl(s.ioctl_fd, siocgifindex, @intFromPtr(&req))) != .SUCCESS)
             return null;
         return req.index;
     }
