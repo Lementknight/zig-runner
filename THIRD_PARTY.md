@@ -48,6 +48,7 @@ A fourth, `runner/tools/regexdiff` (run by `.github/scripts/regex-diff.sh`), run
 Two more, `runner/tools/hpackdiff` and `runner/tools/rsadiff` (Go, run by `.github/scripts/hpack-diff.sh` and `rsa-diff.sh`), compare `runner/src/hpack.zig` with [golang.org/x/net/http2/hpack](https://pkg.go.dev/golang.org/x/net/http2/hpack) (BSD-3-Clause, Copyright The Go Authors), pinned in its `go.mod`, and `runner/src/github/rsa_sign.zig` with Go's standard library `crypto/rsa` (BSD-3-Clause).
 
 CI runs these six weekly (`.github/workflows/compare.yml`); none of them is in any build.
+
 ## actions/runner's license
 
 ```

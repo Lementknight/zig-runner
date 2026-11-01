@@ -105,8 +105,8 @@ repository:
   proposes updates a week after their release. The exceptions are the Dagger engine in
   `deploy/compose.yaml`, pinned by tag and held there on purpose: the runner speaks one engine
   version's protocol, and a new engine starts with an empty cache; and, still by tag, the
-  JavaScript runtimes for actions (`oven/bun` and `node`, `runner/src/dagger/js.zig`), tracked in
-  #107. The job base image `ubuntu:24.04` (`RUNNER_IMAGE`) is pinned by its multi-arch index digest
+  JavaScript runtimes for actions (`oven/bun` and `node`, `runner/src/dagger/js.zig`), not yet
+  pinned. The job base image `ubuntu:24.04` (`RUNNER_IMAGE`) is pinned by its multi-arch index digest
   (`runner/src/dagger.zig`, checked by `.github/scripts/ubuntu-pin.sh`); the packages provisioning
   installs into it come from the Ubuntu archive on the day the engine builds them, and the pre-warm
   logs their fingerprint. tls.zig and GitHub's expression
@@ -144,8 +144,9 @@ repository:
 - **No pull request code with secrets.** The one workflow on `pull_request_target`, `automerge`,
   runs `main`'s copy and checks out and runs nothing of the pull request; its app key only turns on
   auto-merge. The release starts from `version`, `main`'s workflow on a schedule or by hand, and
-  waits for the maintainer's approval. Merges themselves are not reviewed: what reaches `main` is
-  what passed CI, and approving the release is the human check.
+  waits for the maintainer's approval. No person reviews a merge: for now each pull request has an
+  automated review by the assistant, what reaches `main` is what passed CI, and approving the
+  release is the human check (#104).
 
 ### Code style
 
