@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A step replayed from the cache right after another replayed step is one query instead of two: its recorded output is asked for in the exec''s own query, where it used to be sent again for it. A replayed step cost 97 ms on the laptop, largely that second round trip. The output shown is still exactly what was recorded; one past 4 MiB is still not read, and a step that turns out to run shows only its live log.'
+time: 2026-10-31T22:30:02.000000-04:00

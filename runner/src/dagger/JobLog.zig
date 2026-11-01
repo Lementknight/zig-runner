@@ -31,6 +31,10 @@ stream_ended: std.atomic.Value(bool) = .init(false),
 /// Once a step's lines are arriving, how long it may go without one (`live_stall_ms`); tests
 /// shorten it.
 stall_ms: u32 = live_stall_ms,
+/// Bumped on every live line, `end` marker and the stream's end (`advance`), and the futex
+/// `awaitLive` sleeps on while `waiters` says it does.
+progress: std.atomic.Value(u32) = .init(0),
+waiters: std.atomic.Value(u32) = .init(0),
 /// The step whose live output said Bun refused to load the program (`bun_load_errors`), 0 for
 /// none: an exec's recorded output, where this was looked for, is no longer read back unless
 /// it is replayed (`Exec.Recorded`). Cleared as each exec begins.
@@ -605,8 +609,10 @@ fn isOwn(sh: *JobLog, sc: Scan, in_step: ?u32) bool {
 }
 
 fn emitLive(sh: *JobLog, step: u32, text: []const u8) void {
-    if (step >= 1 and step <= sh.live_lines.len)
+    if (step >= 1 and step <= sh.live_lines.len) {
         _ = sh.live_lines[step - 1].fetchAdd(1, .monotonic);
+        sh.advance();
+    }
     for (bun_load_errors) |e| if (std.mem.indexOf(u8, text, e) != null)
         sh.bun_refused.store(step, .release);
     if (sh.swallowIfReplayed(step, text)) return;
@@ -778,6 +784,7 @@ const Demux = struct {
                 .end => |n| {
                     if (n >= 1 and n <= d.sh.ended.len) d.sh.ended[n - 1].store(true, .release);
                     d.sh.flush();
+                    d.sh.advance();
                     d.span_step = null;
                 },
                 .service => {},
@@ -791,7 +798,10 @@ const Demux = struct {
 };
 
 pub fn readLogs(io: std.Io, sh: *JobLog, file: std.Io.File) void {
-    defer sh.stream_ended.store(true, .release);
+    defer {
+        sh.stream_ended.store(true, .release);
+        sh.advance();
+    }
     var demux: Demux = .{ .sh = sh };
     var rbuf: [64 * 1024]u8 = undefined;
     var fr = file.readerStreaming(io, &rbuf);
@@ -874,6 +884,7 @@ pub const SpanDemux = struct {
                 .end => |n| {
                     if (n >= 1 and n <= d.sh.ended.len) d.sh.ended[n - 1].store(true, .release);
                     d.sh.flush();
+                    d.sh.advance();
                     span.step = null;
                 },
                 .service => |n| span.service = n,
@@ -946,32 +957,54 @@ const live_drain_ms = 120_000;
 /// commands as it reads it, so a late `::add-matcher::` or `::add-mask::` then applies before the
 /// step's result is collected and the next step starts, and the next step's lines follow this
 /// step's in the job's log (#140).
+///
+/// It sleeps until the reader's next line or marker (`advance`) or the next bound, whichever is
+/// first: it used to look every 10 ms, which cost a step 5 ms on average after its marker came.
 pub fn awaitLive(io: std.Io, sh: *JobLog, step: u32) bool {
     const idx = step - 1;
-    var waited: u32 = 0;
-    var since_line: u32 = 0;
+    _ = sh.waiters.fetchAdd(1, .seq_cst);
+    const start = std.Io.Clock.awake.now(io).toMilliseconds();
+    var line_at = start;
     var seen: u32 = 0;
-    while (!sh.ended[idx].load(.acquire)) : ({
-        waited += 10;
-        since_line += 10;
-    }) {
+    while (true) {
+        // Read before the conditions: whatever changes them after this ends the sleep below.
+        const progress = sh.progress.load(.seq_cst);
+        if (sh.ended[idx].load(.acquire)) break;
         // Read before the count, which then holds every line the stream delivered.
         const stream_ended = sh.stream_ended.load(.acquire);
         const lines = sh.live_lines[idx].load(.monotonic);
+        const now = std.Io.Clock.awake.now(io).toMilliseconds();
         if (lines != seen) {
             seen = lines;
-            since_line = 0;
+            line_at = now;
         }
-        if (lines == 0 and (stream_ended or waited >= live_grace_ms)) break;
-        if (lines > 0 and (since_line >= sh.stall_ms or waited >= live_drain_ms)) {
-            sh.append(step, "##[warning]This step's last output had not arrived when it " ++
-                "ended: any that arrives later is logged after this, and its workflow commands " ++
-                "may come too late to apply.");
+        if (lines == 0 and stream_ended) break;
+        const until = if (lines == 0)
+            start + live_grace_ms
+        else
+            @min(line_at + sh.stall_ms, start + live_drain_ms);
+        if (now >= until) {
+            if (lines > 0) sh.append(step, "##[warning]This step's last output had not " ++
+                "arrived when it ended: any that arrives later is logged after this, and its " ++
+                "workflow commands may come too late to apply.");
             break;
         }
-        io.sleep(.fromMilliseconds(10), .awake) catch {};
+        const wait: std.Io.Timeout = .{ .duration = .{
+            .raw = .fromMilliseconds(until - now),
+            .clock = .awake,
+        } };
+        io.futexWaitTimeout(u32, &sh.progress.raw, progress, wait) catch {};
     }
+    // Not in a `defer`: with one, this returned false whatever the count (Zig 0.17, Debug).
+    _ = sh.waiters.fetchSub(1, .seq_cst);
     return sh.live_lines[idx].load(.monotonic) > 0;
+}
+
+/// Wakes `awaitLive` after the reader counted a line, saw an `end` marker or reached the stream's
+/// end; a wake only when it waits, so a step that floods costs no system call per line.
+fn advance(sh: *JobLog) void {
+    _ = sh.progress.fetchAdd(1, .seq_cst);
+    if (sh.waiters.load(.seq_cst) > 0) sh.io.futexWake(u32, &sh.progress.raw, std.math.maxInt(u32));
 }
 
 /// Whether a step none of whose lines arrived live was served from the cache: its marker says it
@@ -1136,6 +1169,39 @@ test "once the log stream has ended, a step with no live lines is not waited for
     readLogs(std.testing.io, &sh, file);
     try std.testing.expect(sh.stream_ended.load(.acquire));
     try std.testing.expect(!awaitLive(std.testing.io, &sh, 1));
+}
+
+test "awaitLive wakes when the end marker arrives, not at its next look or bound" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    // A line has arrived, so only the marker or the 5 s stall bound ends the wait.
+    var live = [_]std.atomic.Value(u32){.init(1)};
+    var ended = [_]std.atomic.Value(bool){.init(false)};
+    var sh: JobLog = .{
+        .io = std.testing.io,
+        .arena = a.allocator(),
+        .log = &log,
+        .sink_job_id = 0,
+        .live_lines = &live,
+        .ended = &ended,
+    };
+    const reader = struct {
+        fn endLater(s: *JobLog) void {
+            s.io.sleep(.fromMilliseconds(20), .awake) catch {};
+            s.ended[0].store(true, .release);
+            s.advance();
+        }
+    };
+    const io = std.testing.io;
+    const start = std.Io.Clock.awake.now(io).toMilliseconds();
+    var task = try io.concurrent(reader.endLater, .{&sh});
+    defer task.await(io);
+    try std.testing.expect(awaitLive(io, &sh, 1));
+    try std.testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - start < live_stall_ms);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "had not arrived") == null);
 }
 
 test "a live line that arrives after its step was replayed is dropped, not logged twice" {
