@@ -218,7 +218,7 @@ fn templateText(t: job_mod.Template) []const u8 {
 /// Whether this machine can run native steps, found with one sandbox; null when it can, else
 /// why not, and every native job then runs on Dagger. A success holds for the process's life; a
 /// failure is tried again once `probe_backoff_ms` have passed, so a machine that was not ready
-/// (iptables locked, a module not loaded yet) does not keep native off until a restart. On a root
+/// (nftables busy, a module not loaded yet) does not keep native off until a restart. On a root
 /// runner, it also makes the network's NAT rules (`net.natRules`) and checks the jobs' ids and
 /// subnet against the host's.
 pub fn usable(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) ?[]const u8 {
@@ -295,7 +295,7 @@ fn natRulesFor(arena: Allocator, io: std.Io, subnet: net.Subnet, probing: bool) 
     defer rules_mu.unlock(io);
     if (ups.len > 0 and std.mem.eql(u8, joined, rules_for[0..rules_len])) return null;
     if (try net.natRules(arena, io, subnet, ups)) |why| return why;
-    // Too long to keep: the rules are checked again (`iptables -C`) next time.
+    // Too long to keep: the rules are made again next time.
     rules_len = if (joined.len <= rules_for.len) joined.len else 0;
     @memcpy(rules_for[0..rules_len], joined[0..rules_len]);
     return null;
