@@ -25,6 +25,10 @@ comptime {
     _ = @import("native/sandbox.zig");
     _ = @import("native/net.zig");
     _ = @import("native/oci/layer.zig");
+    _ = @import("native/oci/registry.zig");
+    _ = @import("native/oci/Store.zig");
+    _ = @import("native/oci/image.zig");
+    _ = @import("native/oci/testregistry.zig");
     _ = @import("redact.zig");
     _ = @import("yaml.zig");
     _ = @import("action.zig");
