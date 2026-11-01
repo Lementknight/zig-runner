@@ -1740,6 +1740,7 @@ fn runSteps(
         };
     var x = try execFor(arena, io, transport, sh, &ev, &job, opts, plan, base.id, secrets, step_cache);
     x.container_path = base.runtime_path;
+    x.tool_trees = base.tool_trees;
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
 
     var watch: Watch = .{ .io = io, .transport = transport, .cancel = opts.cancel };

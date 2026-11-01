@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'Step caching: a replayed step whose $GITHUB_PATH entry or $GITHUB_ENV value names a directory in the tool cache that "Set up job" found no tree holding (the volume was pruned or wiped since the recorded run, or the trees were not checked) runs again instead of pointing PATH at a directory that may be gone (`protoc: not found`). A replay whose directory lies in a tree "Set up job" checked still stands (#229).'
+time: 2026-11-01T01:37:42.000000-04:00

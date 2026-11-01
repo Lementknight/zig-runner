@@ -109,6 +109,11 @@ nesting: bool,
 nesting_withheld: bool = false,
 /// Unchanged steps may be reused across runs (see `Options.step_cache`).
 step_cache: bool,
+/// Where the tool cache is mounted, when it is a cache volume (`set_up.package_cache_dirs`), and
+/// the trees "Set up job" found in it (`ZIG_RUNNER_TOOL_TREES`), when it checked them: a replayed
+/// step that names a directory in it that no tree holds runs again (`toolDirNotHeld`, #229).
+tool_cache: ?[]const u8 = null,
+tool_trees: ?[]const u8 = null,
 /// See `Options.enforce_volatile`.
 enforce_volatile: bool,
 /// With `Options.output_keys`: the key of the cache volume that stores steps' changes by digest
@@ -350,6 +355,16 @@ pub fn execScript(
             rerun = "its earlier run failed, and a failure is not replayed";
             continue;
         }
+        // Likewise an earlier run's answer that names a directory of the tool cache, a volume in
+        // no key, that "Set up job" found no tree holding: the volume may have lost it since,
+        // and replayed, the step would point PATH at nothing (#229).
+        if (rerun == null and x.step_cache) if (try x.toolDirNotHeld(data)) |dir| {
+            if (failedEarlier(x.io, x.sh, num, x.ranThisRun(data))) {
+                rerun = try std.fmt.allocPrint(arena, "its record names {s} in the tool " ++
+                    "cache, where \"Set up job\" found no tree holding it", .{dir});
+                continue;
+            }
+        };
         if (jsonFindString(data, "id")) |id| x.container_id = id;
         const out = try x.collect(num, data, recorded);
         // Any `::add-matcher::` this step emitted: read the files from the container it just
@@ -907,7 +922,44 @@ pub const nesting_withheld_note = "This step names Dagger, but steps do not get 
     "engine in jobs this runner does not vouch for (README, \"Environments\"): a step's own " ++
     "Dagger client could open the cache volumes of the jobs it does vouch for.";
 
-/// Whether a failed answer is one the cache kept from an earlier run (#69), given its marker
+/// The first directory of the tool cache that an answer's $GITHUB_PATH entries or $GITHUB_ENV
+/// values name and no tree "Set up job" checked holds (`tool_trees`); null when the tool cache
+/// is not a volume, whose content then goes with the container like any other (#229).
+fn toolDirNotHeld(x: *Exec, data: std.json.Value) !?[]const u8 {
+    const cache = x.tool_cache orelse return null;
+    const arena = x.arena;
+    var dirs: std.ArrayList([]const u8) = .empty;
+    if (fileCommand(data, "fc_path")) |text|
+        try dirs.appendSlice(arena, try commands.parsePaths(arena, text));
+    // A value may be a list of directories (`PATH`-like) as well as one.
+    if (fileCommand(data, "fc_env")) |text| {
+        for ((try commands.parseKeyValues(arena, text)).pairs) |e| {
+            var parts = std.mem.splitScalar(u8, e.value, ':');
+            while (parts.next()) |p| try dirs.append(arena, p);
+        }
+    }
+    for (dirs.items) |dir| {
+        if (!std.mem.startsWith(u8, dir, cache) or dir.len == cache.len) continue;
+        if (dir[cache.len] != '/') continue;
+        if (!treeHolds(x.tool_trees orelse "", dir)) return dir;
+    }
+    return null;
+}
+
+/// Whether one of `trees` (`DIGEST TREE` lines, `set_up.verifyToolTrees`) holds `dir`: is it or
+/// is under it, through no `..`.
+fn treeHolds(trees: []const u8, dir: []const u8) bool {
+    if (std.mem.indexOf(u8, dir, "/..") != null) return false;
+    var lines = std.mem.tokenizeScalar(u8, trees, '\n');
+    while (lines.next()) |line| {
+        const tree = line[(std.mem.indexOfScalar(u8, line, ' ') orelse continue) + 1 ..];
+        if (!std.mem.startsWith(u8, dir, tree)) continue;
+        if (dir.len == tree.len or dir[tree.len] == '/') return true;
+    }
+    return false;
+}
+
+/// Whether an answer is one the cache kept from an earlier run (#69), given its marker
 /// (`ranThisRun`). Without one (its file commands cut short by a full disk, or never written
 /// because the step's own `trap 'kill 0' EXIT` killed the shell first), it is an earlier run's
 /// unless the step showed it ran in this job, with a live line or its end marker: a cached
