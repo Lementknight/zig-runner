@@ -707,7 +707,7 @@ pub fn base(
     if (claim.hit != null) return;
     const ended = try b.exec(mk, try b.envStrings(&.{}), files, 0, 0, out.output());
     if (ended.failure.len == 0 and ended.code == 0) {
-        if (claim.key) |k| b.publishTop(k, .{ .log = "", .fc = "" });
+        if (claim.key) |k| b.publishTop(k, .base, .{ .log = "", .fc = "" });
     } else {
         err_msg.* = try std.fmt.allocPrint(arena, "could not set up the job's base: {s}{s}", .{
             ended.failure,
@@ -844,7 +844,7 @@ pub fn execScript(
     const out = try x.collect(num, data, .{ .doc = "", .at = 0 });
     x.loadPendingMatchers(num);
     if (claim.key) |k| if (ended.code == 0 and out.code == 0) if (live.record) |r|
-        b.publishTop(k, .{ .log = r.items, .fc = all orelse "" });
+        b.publishTop(k, .step, .{ .log = r.items, .fc = all orelse "" });
     return out;
 }
 
@@ -949,7 +949,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
         out.output(),
     );
     if (ended.code == 0 and ended.failure.len == 0 and !ended.killed) {
-        if (claim.key) |k| b.publishTop(k, .{ .log = "", .fc = "" });
+        if (claim.key) |k| b.publishTop(k, .fetch, .{ .log = "", .fc = "" });
         f.result = .{ .dir = "native" };
         return f;
     }
@@ -1181,30 +1181,43 @@ fn claimKey(b: *Backend, key: ?Store.Key) error{ Stopped, OutOfMemory }!Claim {
         return .{};
     };
     b.waiting.store(false, .release);
-    const layer = (s.open(arena, b.io, k) catch null) orelse return .{ .key = k, .lock = lock };
-    const fail: ?[]const u8 = fail: {
-        const rec = s.record(arena, b.io, k) catch |e| break :fail @errorName(e);
-        const name = try b.layerName('l');
-        const link = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, name });
-        std.Io.Dir.cwd().symLink(b.io, layer.fs, link, .{}) catch |e| break :fail @errorName(e);
-        try b.held.append(arena, layer.lock);
-        try b.layers.append(arena, .{ .name = name, .path = layer.fs, .key = k });
-        return .{ .key = k, .lock = lock, .hit = rec };
+    // A stored entry another job holds, but that cannot be replayed: run, and keep nothing.
+    const hit = (s.open(arena, b.io, k) catch |e| {
+        std.log.warn("native: a stored layer cannot be replayed ({s}); the step runs", .{
+            @errorName(e),
+        });
+        lock.close(b.io);
+        return .{};
+    }) orelse return .{ .key = k, .lock = lock };
+    errdefer hit.layer.lock.close(b.io);
+    errdefer lock.close(b.io);
+    try b.layers.ensureUnusedCapacity(arena, 1);
+    try b.held.ensureUnusedCapacity(arena, 1);
+    const name = try b.layerName('l');
+    const link = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, name });
+    std.Io.Dir.cwd().symLink(b.io, hit.layer.fs, link, .{}) catch |e| {
+        std.log.warn("native: a stored layer cannot be linked ({s}); the step runs", .{
+            @errorName(e),
+        });
+        hit.layer.lock.close(b.io);
+        lock.close(b.io);
+        return .{};
     };
-    std.log.warn("native: a stored layer cannot be replayed ({s}); the step runs", .{fail.?});
-    layer.lock.close(b.io);
-    lock.close(b.io);
-    return .{};
+    b.held.appendAssumeCapacity(hit.layer.lock);
+    b.layers.appendAssumeCapacity(.{ .name = name, .path = hit.layer.fs, .key = k });
+    return .{ .key = k, .lock = lock, .hit = hit.rec };
 }
 
 /// The stack's top layer, which an exec under `key` just left, moved into the store
 /// (`Store.publish`) with its record, and the job's stack then links to it. Its parent is in the
 /// store (`keyFor`). A failure leaves the layer the job's own, and is logged: the job goes on,
 /// uncached from here.
-fn publishTop(b: *Backend, key: Store.Key, rec: Store.Record) void {
+fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) void {
     const s = b.store orelse return;
     const arena = b.arena;
     if (rec.log.len > Store.max_record_bytes) return;
+    // Room first: once the layer has moved, the job must hold it and point at it.
+    b.held.ensureUnusedCapacity(arena, 1) catch return;
     const top = &b.layers.items[b.layers.items.len - 1];
     const name = b.layerName('l') catch return;
     const link = std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, name }) catch return;
@@ -1218,15 +1231,12 @@ fn publishTop(b: *Backend, key: Store.Key, rec: Store.Record) void {
         std.log.warn("native: cannot link a layer into the store: {s}", .{@errorName(e)});
         return;
     };
-    const layer = s.publish(arena, b.io, key, top.path, rec) catch |e| {
+    const layer = s.publish(arena, b.io, key, kind, top.path, rec) catch |e| {
         std.log.warn("native: cannot publish a layer to the store: {s}", .{@errorName(e)});
         cwd.deleteFile(b.io, link) catch {};
         return;
     };
-    b.held.append(arena, layer.lock) catch {
-        layer.lock.close(b.io);
-        return;
-    };
+    b.held.appendAssumeCapacity(layer.lock);
     top.* = .{ .name = name, .path = layer.fs, .key = key };
 }
 

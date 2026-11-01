@@ -180,72 +180,172 @@ pub const Layer = struct {
     lock: std.Io.File,
 };
 
-/// The layer stored under `key`, held (`Layer`) and its last use now; null when there is none.
-pub fn open(s: Store, arena: Allocator, io: std.Io, key: Key) !?Layer {
+/// What made a layer, which says what its record must hold: a step's file commands end with its
+/// ran marker; a base's and a checkout's fetch's are empty.
+pub const Kind = enum { base, step, fetch };
+
+/// A stored layer found: held, with its record.
+pub const Hit = struct { layer: Layer, rec: Record };
+
+/// The layer stored under `key`, held (`Layer`), checked whole (`readEntry`) and its last use now;
+/// null when there is none. An entry that cannot be replayed (a part missing or cut short, a disk
+/// that filled, a hand that changed it) is evicted, and then is a miss too; `error.Invalid` when
+/// another job holds it, so it can be neither replayed nor replaced now.
+pub fn open(s: Store, arena: Allocator, io: std.Io, key: Key) !?Hit {
     const dir = try s.layerDir(arena, key);
-    const lock_path = try std.fmt.allocPrint(arena, "{s}/lock", .{dir});
+    const lock_path = try join(arena, dir, "lock");
     const f = std.Io.Dir.cwd().openFile(io, lock_path, .{}) catch return null;
-    // Waits out an eviction under way, which then leaves the path naming nothing. An entry with
-    // a part missing (a disk that filled, a hand that removed one) is a miss.
-    if (!flock(f, lock_sh) or !sameFile(arena, f, lock_path) or !s.whole(arena, dir)) {
+    // Waits out an eviction under way, which then leaves the path naming nothing.
+    if (!flock(f, lock_sh) or !sameFile(arena, f, lock_path)) {
         f.close(io);
         return null;
     }
+    const rec = readEntry(arena, io, dir) catch {
+        f.close(io);
+        if (s.evict(arena, io, &hex(key))) return null;
+        return error.Invalid;
+    };
+    // Only a whole entry counts as used, so a broken one ages out.
     _ = linux.utimensat(f.handle, null, null, 0);
-    return .{ .fs = try std.fmt.allocPrint(arena, "{s}/fs", .{dir}), .lock = f };
-}
-
-/// Whether every part of the entry in `dir` is there: its tree, its record and its size.
-fn whole(s: Store, arena: Allocator, dir: []const u8) bool {
-    _ = s;
-    for ([_][]const u8{ "fs", "log", "fc", "size" }) |part| {
-        const p = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ dir, part }, 0) catch
-            return false;
-        var st: linux.Statx = undefined;
-        const nofollow = linux.AT.SYMLINK_NOFOLLOW;
-        const rc = linux.statx(linux.AT.FDCWD, p, nofollow, .{ .TYPE = true }, &st);
-        if (linux.errno(rc) != .SUCCESS) return false;
-        const want: u32 = if (part[0] == 'f' and part[1] == 's') linux.S.IFDIR else linux.S.IFREG;
-        if (st.mode & linux.S.IFMT != want) return false;
-    }
-    return true;
+    return .{ .layer = .{ .fs = try join(arena, dir, "fs"), .lock = f }, .rec = rec };
 }
 
 /// What replaying a stored step needs: its output as printed, and its file commands.
 pub const Record = struct { log: []const u8, fc: []const u8 };
 
-pub fn record(s: Store, arena: Allocator, io: std.Io, key: Key) !Record {
-    const dir = try s.layerDir(arena, key);
+/// A step that printed more than this is not published: its replay would hold it all in memory.
+/// Dagger's limit on a recorded output (`dagger.max_recorded_bytes`).
+pub const max_record_bytes = dagger.max_recorded_bytes;
+
+const fc_ran = @import("../dagger/scripts.zig").fc_marker ++ "ran\n";
+
+/// Why a record cannot be stored or replayed as a `kind`'s, or null when it can.
+fn recordFault(kind: Kind, rec: Record) ?anyerror {
+    if (rec.log.len > max_record_bytes or rec.fc.len > max_record_bytes)
+        return error.RecordTooLarge;
+    return switch (kind) {
+        // Its file commands end with its ran marker (`scripts.writeCombinedFileCommands`):
+        // without it, they were cut short.
+        .step => if (std.mem.indexOf(u8, rec.fc, fc_ran) == null) error.ShortRecord else null,
+        .base, .fetch => if (rec.fc.len > 0) error.ShortRecord else null,
+    };
+}
+
+/// An entry's `meta`: the store's format, what made it, its bytes on disk, and its record's
+/// files' lengths and sha256s, so a part cut short or changed is told from a whole one.
+const Meta = struct {
+    kind: Kind,
+    bytes: u64,
+    log_len: u64,
+    fc_len: u64,
+    log_sha: Key,
+    fc_sha: Key,
+
+    fn write(m: Meta, arena: Allocator) ![]const u8 {
+        return std.fmt.allocPrint(arena, "format {s}\nkind {t}\nbytes {d}\nlog {d} {s}\n" ++
+            "fc {d} {s}\n", .{
+            store_format, m.kind,         m.bytes, m.log_len, &hex(m.log_sha),
+            m.fc_len,     &hex(m.fc_sha),
+        });
+    }
+
+    fn parse(text: []const u8) !Meta {
+        var m: Meta = undefined;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        const want = [_][]const u8{ "format", "kind", "bytes", "log", "fc" };
+        for (want) |name| {
+            const line = lines.next() orelse return error.BadMeta;
+            var f = std.mem.splitScalar(u8, line, ' ');
+            if (!std.mem.eql(u8, f.next() orelse "", name)) return error.BadMeta;
+            const v = f.rest();
+            switch (name[0]) {
+                'f' => if (name.len == 2) {
+                    try parseFile(v, &m.fc_len, &m.fc_sha);
+                } else if (!std.mem.eql(u8, v, store_format)) return error.BadMeta,
+                'k' => m.kind = std.meta.stringToEnum(Kind, v) orelse return error.BadMeta,
+                'b' => m.bytes = try std.fmt.parseInt(u64, v, 10),
+                'l' => try parseFile(v, &m.log_len, &m.log_sha),
+                else => unreachable,
+            }
+        }
+        return m;
+    }
+
+    fn parseFile(v: []const u8, len: *u64, sha: *Key) !void {
+        var f = std.mem.splitScalar(u8, v, ' ');
+        len.* = try std.fmt.parseInt(u64, f.next() orelse return error.BadMeta, 10);
+        _ = try std.fmt.hexToBytes(sha, f.next() orelse return error.BadMeta);
+    }
+};
+
+/// The entry in `dir` read and checked whole: its tree there, its `meta` this format's, its
+/// record's files of the lengths and sha256s it says, and the record one its kind may have.
+fn readEntry(arena: Allocator, io: std.Io, dir: []const u8) !Record {
+    const m = try metaOf(arena, io, dir);
+    if (!isDir(arena, try join(arena, dir, "fs"))) return error.NoTree;
     const cwd = std.Io.Dir.cwd();
     const limit: std.Io.Limit = .limited(max_record_bytes + 1);
     const rec: Record = .{
         .log = try cwd.readFileAlloc(io, try join(arena, dir, "log"), arena, limit),
         .fc = try cwd.readFileAlloc(io, try join(arena, dir, "fc"), arena, limit),
     };
-    // A step's file commands end with its ran marker (`scripts.writeCombinedFileCommands`):
-    // without it, the record was cut short. The base's and a fetch's are empty.
-    if (rec.fc.len > 0 and std.mem.indexOf(u8, rec.fc, fc_ran) == null) return error.ShortRecord;
+    if (rec.log.len != m.log_len or rec.fc.len != m.fc_len) return error.ShortRecord;
+    var sha: Key = undefined;
+    Sha256.hash(rec.log, &sha, .{});
+    if (!std.mem.eql(u8, &sha, &m.log_sha)) return error.ChangedRecord;
+    Sha256.hash(rec.fc, &sha, .{});
+    if (!std.mem.eql(u8, &sha, &m.fc_sha)) return error.ChangedRecord;
+    if (recordFault(m.kind, rec)) |e| return e;
     return rec;
 }
 
-const fc_ran = @import("../dagger/scripts.zig").fc_marker ++ "ran\n";
+fn metaOf(arena: Allocator, io: std.Io, dir: []const u8) !Meta {
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, try join(arena, dir, "meta"), arena, .limited(1024));
+    return Meta.parse(text);
+}
 
-/// A step that printed more than this is not published: its replay would hold it all in memory.
-/// Dagger's limit on a recorded output (`dagger.max_recorded_bytes`).
-pub const max_record_bytes = dagger.max_recorded_bytes;
+/// The cheap half of `readEntry`, for `collect`, which looks at every entry after every job: the
+/// meta, the tree, and the record's files' lengths, without reading them.
+fn entryLooksWhole(arena: Allocator, io: std.Io, dir: []const u8) ?Meta {
+    const m = metaOf(arena, io, dir) catch return null;
+    if (!isDir(arena, join(arena, dir, "fs") catch return null)) return null;
+    for ([_]struct { []const u8, u64 }{ .{ "log", m.log_len }, .{ "fc", m.fc_len } }) |part| {
+        const p = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ dir, part[0] }, 0) catch
+            return null;
+        var st: linux.Statx = undefined;
+        const mask: linux.STATX = .{ .TYPE = true, .SIZE = true };
+        if (linux.errno(linux.statx(linux.AT.FDCWD, p, linux.AT.SYMLINK_NOFOLLOW, mask, &st)) !=
+            .SUCCESS) return null;
+        if (st.mode & linux.S.IFMT != linux.S.IFREG or st.size != part[1]) return null;
+    }
+    if (m.log_len > max_record_bytes or m.fc_len > max_record_bytes) return null;
+    if (m.kind == .step and m.fc_len == 0) return null;
+    return m;
+}
 
-/// Moves a step's finished upper (`upper`, in the job's directory) into the store under `key`,
-/// with its record (`Record`), and holds it for the job. Built under a temporary name, held before
-/// it is visible (so an eviction cannot take it at once), and published by one rename. On failure
-/// the upper is back where it was.
+fn isDir(arena: Allocator, p: []const u8) bool {
+    const z = arena.dupeSentinel(u8, p, 0) catch return false;
+    var st: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, z, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &st);
+    return linux.errno(rc) == .SUCCESS and st.mode & linux.S.IFMT == linux.S.IFDIR;
+}
+
+/// Moves a finished upper (`upper`, in the job's directory) into the store under `key`, with its
+/// record (`Record`, which must be one its `kind` may have and within `max_record_bytes`), and
+/// holds it for the job. Built under a temporary name, written to disk (`syncfs`) before it is
+/// visible, held before it is visible (so an eviction cannot take it at once), and published by
+/// one rename that never replaces. On failure the upper is back where it was, or, if it cannot be
+/// put back, left in the temporary entry and logged, never deleted.
 pub fn publish(
     s: Store,
     arena: Allocator,
     io: std.Io,
     key: Key,
+    kind: Kind,
     upper: []const u8,
     rec: Record,
 ) !Layer {
+    if (recordFault(kind, rec)) |e| return e;
     const cwd = std.Io.Dir.cwd();
     var raw: [8]u8 = undefined;
     io.random(&raw);
@@ -254,25 +354,40 @@ pub fn publish(
         &hex(key),
         &std.fmt.bytesToHex(raw, .lower),
     });
+    const fs_tmp = try join(arena, tmp, "fs");
+    var moved = false;
+    var lock: ?std.Io.File = null;
     try cwd.createDirPath(io, tmp);
-    errdefer removeTree(arena, io, tmp);
+    errdefer {
+        if (lock) |l| l.close(io);
+        const back = !moved or if (cwd.rename(fs_tmp, cwd, upper, io)) true else |e| no: {
+            std.log.warn("native: cannot put {s} back from {s}: {s}", .{ upper, fs_tmp, @errorName(e) });
+            break :no false;
+        };
+        if (back) removeTree(arena, io, tmp);
+    }
+    var m: Meta = .{
+        .kind = kind,
+        .bytes = treeBytes(arena, io, upper),
+        .log_len = rec.log.len,
+        .fc_len = rec.fc.len,
+        .log_sha = undefined,
+        .fc_sha = undefined,
+    };
+    Sha256.hash(rec.log, &m.log_sha, .{});
+    Sha256.hash(rec.fc, &m.fc_sha, .{});
     try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "log"), .data = rec.log });
     try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "fc"), .data = rec.fc });
-    const size = treeBytes(arena, io, upper);
-    try cwd.writeFile(io, .{
-        .sub_path = try join(arena, tmp, "size"),
-        .data = try std.fmt.allocPrint(arena, "{d}\n", .{size}),
-    });
-    const lock = try cwd.createFile(io, try join(arena, tmp, "lock"), .{});
-    errdefer lock.close(io);
-    if (!flock(lock, lock_sh)) return error.Locked;
-    const fs_tmp = try join(arena, tmp, "fs");
+    try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "meta"), .data = try m.write(arena) });
+    lock = try cwd.createFile(io, try join(arena, tmp, "lock"), .{});
+    if (!flock(lock.?, lock_sh)) return error.Locked;
     try cwd.rename(upper, cwd, fs_tmp, io);
-    errdefer cwd.rename(fs_tmp, cwd, upper, io) catch |e|
-        std.log.warn("native: cannot put {s} back: {s}", .{ upper, @errorName(e) });
+    moved = true;
+    // On disk before it is visible: a crash after the rename must not leave a whole-looking
+    // entry whose files are empty or short.
+    if (linux.errno(linux.syncfs(lock.?.handle)) != .SUCCESS) return error.Sync;
     const dir = try s.layerDir(arena, key);
-    // One rename that never replaces: a layer published meanwhile (or a broken one left there)
-    // stays, and this one is not published.
+    // One rename that never replaces: a layer published meanwhile stays, and this one is not.
     const rc = linux.renameat2(
         linux.AT.FDCWD,
         try arena.dupeSentinel(u8, tmp, 0),
@@ -281,7 +396,7 @@ pub fn publish(
         .{ .NOREPLACE = true },
     );
     if (linux.errno(rc) != .SUCCESS) return error.Publish;
-    return .{ .fs = try join(arena, dir, "fs"), .lock = lock };
+    return .{ .fs = try join(arena, dir, "fs"), .lock = lock.? };
 }
 
 fn join(arena: Allocator, dir: []const u8, name: []const u8) ![]const u8 {
@@ -324,13 +439,12 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
             if (flock(kl, lock_ex | lock_nb)) removeTree(arena, io, full);
             continue;
         }
-        if (!s.whole(arena, full)) {
+        // An entry that cannot be replayed would only take room (`open` evicts it too).
+        const meta = entryLooksWhole(arena, io, full) orelse {
             _ = s.evict(arena, io, e.name);
             continue;
-        }
-        const size_path = join(arena, full, "size") catch return;
-        const size_text = cwd.readFileAlloc(io, size_path, arena, .limited(64)) catch "0";
-        const bytes = std.fmt.parseInt(u64, std.mem.trim(u8, size_text, " \n"), 10) catch 0;
+        };
+        const bytes = meta.bytes;
         var st: linux.Statx = undefined;
         const lock_z = arena.dupeSentinel(u8, join(arena, full, "lock") catch return, 0) catch
             return;
@@ -365,10 +479,11 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
 fn evict(s: Store, arena: Allocator, io: std.Io, name: []const u8) bool {
     const cwd = std.Io.Dir.cwd();
     const full = std.fmt.allocPrint(arena, "{s}/layers/{s}", .{ s.root, name }) catch return false;
-    const lock = cwd.openFile(io, join(arena, full, "lock") catch return false, .{}) catch
-        return false;
-    defer lock.close(io);
-    if (!flock(lock, lock_ex | lock_nb)) return false;
+    // An entry without its lock file (a broken one) no job can hold.
+    const lock: ?std.Io.File = cwd.openFile(io, join(arena, full, "lock") catch return false, .{}) catch |e|
+        if (e == error.FileNotFound) null else return false;
+    defer if (lock) |l| l.close(io);
+    if (lock) |l| if (!flock(l, lock_ex | lock_nb)) return false;
     var raw: [8]u8 = undefined;
     io.random(&raw);
     const dead = std.fmt.allocPrint(arena, "{s}/layers/.dead-{s}", .{
@@ -1045,19 +1160,20 @@ test "native store: a published layer is found and held; eviction keeps under th
         var never: std.atomic.Value(bool) = .init(false);
         const kl = try s.lockKey(arena, io, k.*, &never);
         defer kl.close(io);
-        const l = try s.publish(arena, io, k.*, upper, .{ .log = "the log\n", .fc = "::zig-file-command::ran\nj1\n" });
+        const l = try s.publish(arena, io, k.*, .step, upper, .{ .log = "the log\n", .fc = "::zig-file-command::ran\nj1\n" });
         // The upper moved in.
         try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, try std.fmt.allocPrint(arena, "up{d}", .{i}), .{}));
         held[i] = l;
-        const rec = try s.record(arena, io, k.*);
-        try std.testing.expectEqualStrings("the log\n", rec.log);
-        try std.testing.expectEqualStrings("::zig-file-command::ran\nj1\n", rec.fc);
+        const hit = (try s.open(arena, io, k.*)).?;
+        hit.layer.lock.close(io);
+        try std.testing.expectEqualStrings("the log\n", hit.rec.log);
+        try std.testing.expectEqualStrings("::zig-file-command::ran\nj1\n", hit.rec.fc);
     }
     // Over the cap (0), but every layer is held: nothing goes.
     s.collect(arena, io);
     for (keys) |k| {
-        const l = (try s.open(arena, io, k)).?;
-        l.lock.close(io);
+        const h = (try s.open(arena, io, k)).?;
+        h.layer.lock.close(io);
     }
     // Let the first two go: they are evicted, the held one stays, and a new open misses.
     for (held[0..2]) |*h| {
@@ -1067,7 +1183,7 @@ test "native store: a published layer is found and held; eviction keeps under th
     s.collect(arena, io);
     try std.testing.expect(try s.open(arena, io, keys[0]) == null);
     try std.testing.expect(try s.open(arena, io, keys[1]) == null);
-    const kept = (try s.open(arena, io, keys[2])).?;
+    const kept = (try s.open(arena, io, keys[2])).?.layer;
     kept.lock.close(io);
     // Its digest, kept once computed, is the tree's.
     const d1 = try s.layerDigest(arena, io, keys[2], .host);
@@ -1162,4 +1278,59 @@ test "native store: the rootfs's fingerprint changes when the rootfs is changed 
     fp_len = 0;
     const third = try rootfsFingerprint(arena, io, rootfs);
     try std.testing.expect(!std.mem.eql(u8, &second, &third));
+}
+
+test "native store: a record that cannot be replayed is refused, and a broken entry is evicted" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const s: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}) };
+    try prepare(arena, io, s.root);
+    try tmp.dir.createDirPath(io, "up");
+    const upper = try std.fmt.allocPrint(arena, "{s}/up", .{root});
+    var kh: KeyHasher = .plain("test");
+    const k = kh.final();
+    const ran = "::zig-file-command::ran\nj1\n";
+    // Refused, and the upper left where it was: a step's file commands without their ran marker
+    // or empty, a base's with any, and file commands past the limit.
+    const big = try arena.alloc(u8, max_record_bytes + 1);
+    @memset(big, 'x');
+    const refused = [_]struct { Kind, Record }{
+        .{ .step, .{ .log = "", .fc = "::zig-file-command::env\n" } },
+        .{ .step, .{ .log = "", .fc = "" } },
+        .{ .base, .{ .log = "", .fc = ran } },
+        .{ .step, .{ .log = "", .fc = big } },
+    };
+    for (refused) |r| {
+        try std.testing.expect(std.meta.isError(s.publish(arena, io, k, r[0], upper, r[1])));
+        try tmp.dir.access(io, "up", .{});
+    }
+    // A base's empty record is whole.
+    const base = try s.publish(arena, io, k, .base, upper, .{ .log = "", .fc = "" });
+    base.lock.close(io);
+    (try s.open(arena, io, k)).?.layer.lock.close(io);
+
+    // A step's entry whose log was cut short afterwards: a miss, and evicted, so it can be
+    // published again.
+    var kh2: KeyHasher = .plain("test 2");
+    const k2 = kh2.final();
+    try tmp.dir.createDirPath(io, "up2");
+    const up2 = try std.fmt.allocPrint(arena, "{s}/up2", .{root});
+    const l = try s.publish(arena, io, k2, .step, up2, .{ .log = "a whole log\n", .fc = ran });
+    l.lock.close(io);
+    const log_path = try std.fmt.allocPrint(arena, "store/layers/{s}/log", .{&hex(k2)});
+    try tmp.dir.writeFile(io, .{ .sub_path = log_path, .data = "a who" });
+    try std.testing.expect(try s.open(arena, io, k2) == null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, log_path, .{}));
+    // `collect` removes one too, by its lengths, without reading it.
+    try tmp.dir.createDirPath(io, "up3");
+    const up3 = try std.fmt.allocPrint(arena, "{s}/up3", .{root});
+    (try s.publish(arena, io, k2, .step, up3, .{ .log = "a whole log\n", .fc = ran })).lock.close(io);
+    try tmp.dir.writeFile(io, .{ .sub_path = log_path, .data = "a who" });
+    s.collect(arena, io);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, log_path, .{}));
 }
