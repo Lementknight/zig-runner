@@ -19,7 +19,12 @@
 //!   /keep        200 "kept", and the connection kept alive; the next request on it is never
 //!                answered, as on a kept-alive connection GitHub dropped silently while idle
 //!   /keep-close  200 "kept", the connection kept alive as far as the client knows, then closed
-//!   anything else 404
+//!   /repos/o/r/installation, /orgs/acme/installation  200, installation 42 or 43, for a
+//!                request with a JWT (`Bearer eyJ...`); 401 without one
+//!   /app/installations/<id>/access_tokens  201, installation token `ghs_<n>` (n counts them, in
+//!                `Server.app_tokens`) expiring at 2030-01-01T00:00:00Z, for a JWT
+//!   /app-token/<token>  200 "ok" with `Authorization: Bearer <token>`, else 401
+//!   anything else 404, with GitHub's `{"message":"Not Found"}`
 //!
 //! Every connection accepted is counted in `Server.accepts`.
 const std = @import("std");
@@ -33,6 +38,8 @@ pub const Server = struct {
     polls: std.atomic.Value(u32),
     /// Connections accepted so far.
     accepts: std.atomic.Value(u32),
+    /// Installation tokens minted so far (/app/installations/...).
+    app_tokens: std.atomic.Value(u32),
     /// Requests to /silent-once/... so far.
     silent_once: u32,
     /// Connections left unanswered (/silent, /keep), closed by `stop`; used by the thread only.
@@ -47,6 +54,7 @@ pub const Server = struct {
         s.port = s.listener.socket.address.getPort();
         s.polls = .init(0);
         s.accepts = .init(0);
+        s.app_tokens = .init(0);
         s.silent_once = 0;
         s.held_len = 0;
         s.thread = try std.Thread.spawn(.{}, serve, .{s});
@@ -114,7 +122,7 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
     var path_buf: [256]u8 = undefined;
     const path = copy(&path_buf, parts.next() orelse return .close);
 
-    var auth_buf: [512]u8 = undefined;
+    var auth_buf: [1024]u8 = undefined;
     var auth: []const u8 = "-";
     var body_len: usize = 0;
     while (true) {
@@ -141,7 +149,7 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
     const out = &w.interface;
     var loc_buf: [128]u8 = undefined;
     if (std.mem.eql(u8, path, "/echo")) {
-        var body_buf: [600]u8 = undefined;
+        var body_buf: [1100]u8 = undefined;
         const body = std.fmt.bufPrint(&body_buf, "{s} {s}", .{ method, auth }) catch return .close;
         respond(out, "200 OK", null, body);
     } else if (std.mem.eql(u8, path, "/same")) {
@@ -172,8 +180,36 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
         out.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nkept") catch {};
         out.flush() catch {};
         return if (std.mem.eql(u8, path, "/keep")) .hold else .close;
+    } else if (std.mem.eql(u8, path, "/repos/o/r/installation") or
+        std.mem.eql(u8, path, "/orgs/acme/installation"))
+    {
+        if (!std.mem.startsWith(u8, auth, "Bearer eyJ")) {
+            respond(out, "401 Unauthorized", null, "");
+        } else {
+            const repo = std.mem.startsWith(u8, path, "/repos/");
+            respond(out, "200 OK", null, if (repo) "{\"id\":42}" else "{\"id\":43}");
+        }
+    } else if (std.mem.startsWith(u8, path, "/app/installations/") and
+        std.mem.endsWith(u8, path, "/access_tokens"))
+    {
+        if (!std.mem.startsWith(u8, auth, "Bearer eyJ")) {
+            respond(out, "401 Unauthorized", null, "");
+        } else {
+            const n = s.app_tokens.fetchAdd(1, .acq_rel) + 1;
+            var body_buf: [128]u8 = undefined;
+            const body = std.fmt.bufPrint(
+                &body_buf,
+                "{{\"token\":\"ghs_{d}\",\"expires_at\":\"2030-01-01T00:00:00Z\"}}",
+                .{n},
+            ) catch return .close;
+            respond(out, "201 Created", null, body);
+        }
+    } else if (std.mem.startsWith(u8, path, "/app-token/")) {
+        const want = path["/app-token/".len..];
+        const ok = std.mem.startsWith(u8, auth, "Bearer ") and std.mem.eql(u8, auth[7..], want);
+        if (ok) respond(out, "200 OK", null, "ok") else respond(out, "401 Unauthorized", null, "");
     } else {
-        respond(out, "404 Not Found", null, "");
+        respond(out, "404 Not Found", null, "{\"message\":\"Not Found\"}");
     }
     out.flush() catch {};
     return .close;

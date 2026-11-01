@@ -16,11 +16,18 @@ Build and run, with Zig 0.17 and Docker on the machine:
 ```sh
 cd runner
 zig build -Doptimize=ReleaseSafe
-cp ../deploy/runner.env.example /etc/zig-runner.env   # then fill in GH_TOKEN and GH_SCOPE
+cp ../deploy/runner.env.example /etc/zig-runner.env   # then fill in GH_TOKEN (or a GitHub App) and GH_SCOPE
 zig-out/bin/runner
 ```
 
 Or install `deploy/zig-runner.service` and run it under systemd, or `docker compose -f deploy/compose.yaml up`.
+
+Instead of `GH_TOKEN`, the runner can manage its registrations as a GitHub App, which reaches only
+the repositories it is installed on: `GH_APP_ID` (the App's ID or Client ID) and
+`GH_APP_PRIVATE_KEY_FILE` (or `GH_APP_PRIVATE_KEY`), with the permission "Administration: read and
+write" for a repository ("Self-hosted runners: read and write" for an organization). It mints
+installation tokens itself and refreshes them before they expire. `deploy/runner.env.example` has
+the details, including mounting the key under Compose.
 
 ## Versioning
 
