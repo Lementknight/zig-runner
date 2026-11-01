@@ -48,7 +48,15 @@ export ZIG_RUNNER_TEST_EXE="$scratch/runner"
 exe=$!
 # shellcheck disable=SC2016 # expanded by that bash, not this one
 run+=(--test-cmd bash --test-cmd -c --test-cmd 'until [ -e "$0" ]; do sleep 0.2; done; exec "$@"'
-	--test-cmd "$scratch/runner.rc" --test-cmd-bin)
-zig test "${tests[@]}" "${run[@]}"
+	--test-cmd "$scratch/runner.rc")
+# ZIG_TEST_NATIVE_AS_ROOT=1: only the native backend's tests, as root (sudo), where they take the
+# root runner's path: each job its own range of ids and its own network.
+filter=()
+if [[ ${ZIG_TEST_NATIVE_AS_ROOT:-} == 1 ]]; then
+	filter=(--test-filter native)
+	run+=(--test-cmd sudo --test-cmd --preserve-env=ZIG_RUNNER_TEST_EXE,ZIG_RUNNER_REQUIRE_NATIVE)
+fi
+run+=(--test-cmd-bin)
+zig test "${tests[@]}" "${filter[@]}" "${run[@]}"
 wait "$exe"
 exit "$(cat "$scratch/runner.rc")"
