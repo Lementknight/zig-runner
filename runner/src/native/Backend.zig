@@ -976,7 +976,9 @@ pub fn base(
     // On the job's image (the seed's build and the roll run on `b.rootfs`).
     try b.setUpCaches(ev, plan);
     try b.baseEnv(ev, plan);
-    if (plan.step_cache) b.store = b.store_cfg;
+    // Not with services (P6): what a step got from a service (its image, its env, its data) is
+    // in no key, so a replay could stand for a run against another service.
+    if (plan.step_cache and ev.job.services.len == 0) b.store = b.store_cfg;
     b.repository = ev.job.github.repository;
     b.scope = try set_up.packageCacheScope(arena, ev, b.repository, b.vouched);
     const event = try ev.eventJson();
