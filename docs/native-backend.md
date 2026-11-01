@@ -102,14 +102,15 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   `id-token: write`, secrets in env, in scripts and in working directories, and the built-in
   checkout without submodules (git in the job's image, then the same step script Dagger's
   checkout runs).
-- Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": no rootfs
-  configured, a job the runner does not vouch for (`trust.vouches`, for `--exec-job` too), a
-  rootless runner unless `RUNNER_NATIVE_ROOTLESS=1`, `container:`, `services:`, `uses:` actions,
-  `docker://` steps, a custom image, Dagger in steps (`RUNNER_DAGGER_NESTING`), `hashFiles()`
+- Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": a job the runner
+  does not vouch for (`trust.vouches`, for `--exec-job` too), a rootless runner unless
+  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:` or `options:`, `services:`,
+  `uses:` actions, `docker://` steps, Dagger in steps (`RUNNER_DAGGER_NESTING`), `hashFiles()`
   anywhere in the job (it reads the container through Dagger), a checkout with submodules, and a
   machine whose probe fails (no user namespaces, `iptables` missing, no default route, the jobs'
   ids taken on the host, the jobs' subnet overlapping a route of the host's). A failed probe is
-  tried again after five minutes, not kept for the process's life.
+  tried again after five minutes, not kept for the process's life. (Until P3 also: no rootfs
+  configured, `container:` and a custom image.)
 - Off on native, as caches: the step cache and output keys (P2), the package caches, uv's
   environment in its cache, and Zig's local cache and seed (P4). Results do not depend on them.
 - "Set up job" says what the job got: "Native steps: ids 0-65535 are host ids N-N+65535, and the
@@ -182,14 +183,16 @@ What it does not provide yet:
 
 ```
 RUNNER_BACKEND=native              # default dagger
-RUNNER_NATIVE_ROOTFS=/var/lib/zig-runner/rootfs   # absolute; checked at startup
+RUNNER_NATIVE_ROOTFS=/var/lib/zig-runner/rootfs   # optional since P3; absolute
 RUNNER_NATIVE_STORE=/var/lib/zig-runner/native    # default as root
 RUNNER_NATIVE_SUBID_BASE=1900000000               # default; at least 100000
 RUNNER_NATIVE_SUBNET=10.211.0.0/16                # default; a prefix of 8 to 23 bits
 RUNNER_NATIVE_ROOTLESS=0                          # default; 1 for a rootless runner
 ```
 
-**The rootfs.** P1 takes a directory holding `ubuntu:24.04` with the runner's provisioning applied
+**The rootfs.** Since P3 the runner pulls and provisions the image itself (see P3), and this
+directory is an optional override for the provisioned default image. P1 took a directory holding
+`ubuntu:24.04` with the runner's provisioning applied
 (`set_up.provision_script`, or `provision_runner_script` when steps run as the runner user), owned
 as the image has it (root's files root's). It is not yet exported by the runner through Dagger at
 startup: the direct engine session (`engine.zig`) implements the client's side of file sync for
@@ -297,6 +300,101 @@ per-job helper makes the namespaces and the static mounts once.
 - `container:` jobs move to native.
 - Exit: no Dagger session is needed to make the rootfs. Measure: cold pull of `ubuntu:24.04`
   against Dagger's.
+
+**Status: landed (behind the knob).** What it covers, as built:
+
+- `runner/src/native/oci/registry.zig`: image references normalized as Docker's (`ubuntu:24.04` is
+  `docker.io/library/ubuntu:24.04` at `registry-1.docker.io`; anything that is not a reference is
+  refused, since its parts go into URLs); manifests and blobs over the distribution API; token
+  auth answered once per pull (a `401` naming a Bearer realm, or Basic), with a `container:` job's
+  `credentials:` (`docker.registryCredentials`, as the Dagger path hands them to
+  `withRegistryAuth`). Plain HTTP only to a registry on the loopback, as Docker allows; a token
+  realm elsewhere must be HTTPS. The token goes to the registry's own origin only, never where a
+  redirect leads (a blob's CDN).
+- `runner/src/native/oci/image.zig`: an index narrowed to linux/amd64, or linux/arm64 (`v8` first,
+  then no variant) on the Pi; attestations never match. The platform's manifest and config, each
+  blob checked against its digest and size as it arrives, then kept content-addressed; the
+  layers applied in order into one directory, flattened, kept under the manifest's digest. A
+  digest-pinned reference seen before (the default image) needs no request at all; a tag is
+  resolved at the registry each time, as Dagger does.
+- `runner/src/native/oci/layer.zig`: one layer applied safely (gzip, zstd or plain by the blob's
+  first bytes; ustar, GNU long names, PAX; whiteouts and opaque directories; the diff id
+  checked). See its comment for the rules: no `..`, parents resolved inside the rootfs
+  (`openat2(RESOLVE_IN_ROOT)`, so `/bin -> usr/bin` works and `etc -> /etc` stays inside), the last
+  component never followed, hard links from a descriptor and never to a directory, device nodes
+  left out, xattrs only `security.capability` (root) and non-overlay `user.*`, size and entry caps.
+- `runner/src/native/oci/Store.zig`: the stand-in for P2's layer store (below) and `flatten`.
+- `runner/src/native/Backend.zig`: `prepareRootfs` pulls the job's image, or takes the operator's
+  rootfs for the provisioned default image (`RUNNER_NATIVE_ROOTFS`, now optional). `provision`
+  runs `set_up.provision_script` (or `provision_runner_script`) as a native step on the pulled
+  image, in the job's sandbox and network, its layer keyed by `Store.layerKey("oci:<manifest>",
+  script, env)` and flattened onto a hard-linked clone of the image, so it runs once per store
+  and a later job starts from it at once. `container:` jobs are native, with the image's env and
+  `USER` (looked up in the image's own `/etc/passwd` and `/etc/group`), the container's `env:`
+  over it, its PATH as `Exec.container_path`, and "Initialize containers" showing the digest. Any
+  image may be native. Without the operator's rootfs, the probe pulls the default image (so it
+  also says whether this machine can pull).
+- "Set up job" says what the job got: "Image: pulled natively in N ms (L layers, K KB fetched)" or
+  "Image: from the native store", and "Provisioned natively in N ms (layer <key>)" or "...made
+  before".
+- Falls back to Dagger: a job container's `ports:`, `volumes:` and `options:` (phase 6 brings the
+  network that ports and volumes need).
+
+The store, under `RUNNER_NATIVE_STORE`, each directory only the runner's (mode 0700: a rootfs
+holds the image's set-uid files with the image's owners, the host's root's on a root runner):
+
+```
+oci/blobs/sha256/<hex>                a blob, renamed into place once its digest checked
+oci/refs/<hex>.<platform>             which manifest a pinned index gives this platform
+oci/images/<hex>[.rootless]/          rootfs/ and config.json, by the manifest's digest
+layers/<key>/rootfs/                  a rootfs a native step made (provisioning)
+```
+
+A rootless runner's images are kept apart (`.rootless`, and `:rootless` in a layer's parent key):
+its files are all its own, not the image's owners'.
+
+**For P2: what to swap.** `Store.ensure` ("the directory under key K, made by `make` once, under
+K's lock, published by rename"), `Store.layerKey` (the model's key) and `Store.flatten` (an
+upper merged onto a hard-linked clone of its lower) are the narrowest interface P3 needed, with
+the simplest implementation. P2's store replaces them: `ensure` by its keyed publish and flock,
+`layerKey` by its key function, and `flatten` by stacking the provisioning layer as a lower on
+the image's layer once the sandbox can idmap more than one lower (today only the last lower,
+the rootfs, is idmapped, which is why provisioning is flattened). `Backend.provision` then
+becomes an ordinary keyed step; `Backend.prepareRootfs` and `oci/` do not change.
+
+What it does not do yet (debt, with the phase that pays it):
+
+- **No eviction.** Blobs, images and provisioned rootfs are kept for ever. P2's LRU under a byte
+  cap covers these directories too.
+- **Each image is flattened whole.** Two images that share layers share their blobs on disk but
+  not their unpacked files. P2's stacked layers could keep layers apart.
+- **Layers are fetched one at a time**, and a broken download starts over. Parallel fetches are a
+  measured optimisation for later (P9's real workloads); ubuntu has one layer.
+- **zstd frame checksums are not checked** (std's streaming zstd cannot yet); the blob's digest is
+  checked before and the diff id after, which covers it.
+- **Rootless** (tests, the laptop): only root is mapped, so every file is the runner's,
+  directories keep their owner's write bit, apt downloads as root (`APT::Sandbox::User "root"`,
+  written into the rootless provisioning layer), and an image whose `USER` is not root cannot
+  run. Phase 5's subordinate ids pay this.
+- **The image's `WorkingDir` and `Entrypoint`** are not used: steps start in the workspace, as on
+  Dagger. Docker actions (phase 7) need the entrypoint.
+
+#### Measured (laptop "cowbird", balanced profile, 2026-11-01)
+
+A cold pull of the pinned `ubuntu:24.04` (one layer, 29.8 MB), ReleaseSafe, into an empty store,
+from Docker Hub over the same connection, three runs each. Native is `image.pull` (the opt-in test
+`ZIG_RUNNER_TEST_PULL=1`): the token, the index, the manifest, the config, the blob and unpacking.
+Dagger is a fresh engine container (v1.0.0-beta.21, empty cache, warmed with an unrelated
+`alpine` exec) timing `from(ubuntu:24.04@sha256:...) | withExec(true)` cold, less the same query
+warm (the CLI, the session and the exec: 0.41-0.59 s).
+
+| | native | Dagger |
+|---|---|---|
+| cold pull, whole | **2.10-2.46 s** | 4.45-4.70 s |
+| of which fetch and unpack | 1.59-1.96 s | |
+| warm (pinned, in the store) | 0-1 ms | |
+
+About twice as fast cold, and a pinned image already in the store costs no request at all.
 
 ### P4: cache volumes, trust scopes and cgroup memory accounting
 
@@ -584,3 +682,46 @@ taught:
   reports its files' sizes as 0, so a read sized by `stat` (Zig's `readFileAlloc`) returns
   nothing, and `/proc/net/route` looked like a host with no default route; /proc files are now
   read to their end (`net.readProc`).
+
+### P3: the image pull
+
+What Dagger (BuildKit and containerd under it) did implicitly, now explicit in `native/oci/`:
+
+- **The platform.** BuildKit picks the image of an index for the engine's platform without being
+  asked. Natively the pick is ours, and an index lists attestations as manifests of platform
+  `unknown/unknown`, which a careless "first linux one" could have taken for the image.
+- **Where an extracted path may land.** containerd's archive code walks every path inside the
+  rootfs. A plain tar extractor writing as root would follow `etc -> /etc` planted by one entry
+  when writing the next, and a hard link to `../../etc/shadow` would link the host's file in.
+  `RESOLVE_IN_ROOT` gave the right semantics in one flag: absolute symlinks inside the image
+  (usrmerge's `/bin -> usr/bin`) work, and nothing reaches out.
+- **Overlay's metadata in a layer used as a lower.** BuildKit's snapshotter keeps layers apart.
+  Flattening an overlay upper (provisioning) meant reading overlay's own records: whiteouts as
+  0/0 character devices, opaque directories as `trusted.overlay.opaque` (root) or
+  `user.overlay.opaque` (`userxattr`), and overlay's xattrs left on files that would mislead
+  overlay when the result is a lower. An image's own `trusted.*` and `user.overlay.*` xattrs are
+  refused for the same reason.
+- **Owners per range.** Dagger's layers belong to the engine. A root runner's provisioning layer
+  belongs to the job's range of host ids; it is shifted back to the image's ids before it is
+  shared, or the next job (another slot, another range) would see every file owned by nobody.
+
+Surprises:
+
+- **std 0.17's HTTP client never sends `privileged_headers`**, the headers meant to be dropped on
+  a redirect to another host, and keeps `headers.authorization` across such a redirect. The first
+  test against a token-auth registry failed because the token never left; using
+  `headers.authorization` instead would have sent it to the blob's CDN. Redirects are followed by
+  hand, and the token goes to the registry's own origin only; a test registry's CDN route refuses
+  any request that carries one.
+- **std's zstd decoder panics when asked to verify a frame checksum while streaming** ("TODO all
+  those bytes written needed to go through the hasher too"). The digests cover it.
+- **Zig 0.17 removed `**` array repetition**; `@splat` in a container's constant does the same at
+  compile time.
+- **Rootless apt.** With only root mapped, apt cannot drop to `_apt` to download and its methods
+  exit 112; it is told to download as root.
+- The pull is not where the time goes: cold, about 0.5 s of auth and manifests and 1.6-2 s of
+  fetch and unpack for ubuntu, against Dagger's 4.5 s. Provisioning (apt) is the minute, and it
+  now runs once per store, as Dagger's cached exec did once per engine.
+
+Measured against Dagger: a cold pull of `ubuntu:24.04` 2.1-2.5 s against 4.5-4.7 s, about twice as
+fast; warm, a pinned image costs nothing.

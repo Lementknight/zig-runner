@@ -1056,11 +1056,14 @@ fn prepareRootfs(b: *Backend, ev: *Evaluator, plan: anytype, err_msg: *[]const u
         },
     ) else "Image: from the native store");
     b.rootfs = img.rootfs;
-    if (plan.provision) b.rootfs = try b.provision(
-        img,
-        if (plan.as_runner) set_up.provision_runner_script else set_up.provision_script,
-        err_msg,
-    );
+    if (plan.provision) {
+        const script = if (plan.as_runner) set_up.provision_runner_script else set_up.provision_script;
+        const full = if (b.how.userns == .mapped)
+            script
+        else
+            try std.mem.concat(arena, u8, &.{ rootless_apt, script });
+        b.rootfs = try b.provision(img, full, err_msg);
+    }
     if (!plan.as_runner and img.user.len > 0) {
         const ids = b.imageUser(img.user) catch |e| {
             err_msg.* = try std.fmt.allocPrint(arena, "the image's USER {s}: {s}", .{
@@ -1078,6 +1081,10 @@ fn prepareRootfs(b: *Backend, ev: *Evaluator, plan: anytype, err_msg: *[]const u
         b.image_gid = ids[1];
     }
 }
+
+/// Rootless, only root is mapped, so apt cannot drop to its `_apt` user to download (its methods
+/// fail with code 112): it downloads as root instead, there and in the job's steps after.
+const rootless_apt = "echo 'APT::Sandbox::User \"root\";' > /etc/apt/apt.conf.d/00zig-runner-rootless && ";
 
 /// `image` pulled into the store, or found there (`oci/image.zig`), within `pull_deadline`.
 fn pull(b: *Backend, image: []const u8, creds: ?registry.Credentials, why: *[]const u8) !oci.Image {
@@ -2557,4 +2564,35 @@ test "an image's USER: by name, by uid, with a group, and what a rootless runner
     b.how.userns = .self;
     try std.testing.expectError(error.Unmapped, b.imageUser("app"));
     try std.testing.expectEqual([2]u32{ 0, 0 }, try b.imageUser("0"));
+}
+
+test "the default image pulled and provisioned natively, then a job in it (ZIG_RUNNER_TEST_PULL=1; needs the network)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const environ = try std.testing.environ.createMap(arena);
+    if (!std.mem.eql(u8, environ.get("ZIG_RUNNER_TEST_PULL") orelse "", "1")) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    // No operator rootfs, nor the tests' binds: the image as pulled, provisioned.
+    cfg.rootfs = "";
+    cfg.binds = &.{};
+    var job = testJob(&.{testStep("git --version; python3 --version; jq --version; " ++
+        "grep PRETTY /etc/os-release")});
+    job.github.repository = "o/r";
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    const text = w.written();
+    std.debug.print("{s}\n", .{text});
+    if (res.engine_error) |e| std.debug.print("engine error: {s}\n", .{e});
+    try std.testing.expect(res.succeeded);
+    for ([_][]const u8{ "Image: ", "Provisioned natively in", "git version", "Python 3", "jq-", "Ubuntu 24.04" }) |e|
+        try std.testing.expect(std.mem.indexOf(u8, text, e) != null);
 }

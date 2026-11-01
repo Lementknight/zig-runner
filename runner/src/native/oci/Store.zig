@@ -12,6 +12,7 @@
 //!   <store>/oci/blobs/sha256/<hex>     a blob, written only once its digest checked
 //!   <store>/oci/refs/<hex>.<platform>  a pinned index's manifest for this platform (`image.zig`)
 //!   <store>/oci/images/<hex>/          an image by its manifest's digest: `rootfs/`, `config.json`
+//!                                      (`<hex>.rootless/` for a rootless runner's, all its own)
 //!   <store>/layers/<key>/              a rootfs a native step made (provisioning): `rootfs/`
 
 const Store = @This();
