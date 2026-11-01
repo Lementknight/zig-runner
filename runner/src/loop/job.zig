@@ -10,6 +10,7 @@ const runservice = @import("../github/runservice.zig");
 const job_mod = @import("../job.zig");
 const trust = @import("../trust.zig");
 const dagger = @import("../dagger.zig");
+const zig_release = @import("../zig_release.zig");
 const db = @import("../db.zig");
 const sink = @import("../sink.zig");
 const redact = @import("../redact.zig");
@@ -569,6 +570,10 @@ fn runJobSteps(
         try log.append(job.check_run_id, 0, .stderr, why);
         return failedInSetUp(c.arena, job.steps.len);
     }
+    const zig_seeds: zig_release.Resolved = if (cfg.zig_seed_registry) |r|
+        try r.forJob(c.arena)
+    else
+        .{ .seeds = cfg.zig_seeds, .unverified = cfg.zig_seeds_unverified };
     var result = try dagger.run(c.arena, c.io, c.environ, .{
         .dagger_cmd = c.cfg.dagger_cmd,
         .image = c.cfg.image,
@@ -583,7 +588,9 @@ fn runJobSteps(
         .uv_env_in_cache = c.cfg.uv_env_in_cache,
         .zig_local_cache = c.cfg.zig_local_cache,
         .zig_local_cache_max_mb = c.cfg.zig_local_cache_max_mb,
-        .zig_seed = c.cfg.zig_seed,
+        .zig_seeds = zig_seeds.seeds,
+        .zig_seeds_unverified = zig_seeds.unverified,
+        .zig_seed_registry = cfg.zig_seed_registry,
         .step_cache = c.cfg.step_cache,
         .step_user = c.cfg.step_user,
         // Skipped for a repository whose jobs spend too long on them (see `SlowOutputs`).

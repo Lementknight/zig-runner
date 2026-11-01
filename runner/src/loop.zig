@@ -370,7 +370,7 @@ fn runnerNameBuf(buf: []u8, c: Runner) ![]const u8 {
 }
 
 /// Builds what every job builds before its first step, with no job (`set_up.warm`): the base
-/// container, and the Zig cache seed with `Config.zig_seed`. On the laptop the first job after an
+/// container, and the Zig cache seeds (`Config.zig_seeds`). On the laptop the first job after an
 /// engine wipe spent 169 s in "Set up job" on them, the next 1 s. So it warms the engine when the
 /// pool starts (a new runner, or an engine restarted while it was down), when the engine starts
 /// again (a wipe happens only then), and after a job that had to wait for the engine. A failed
@@ -500,7 +500,7 @@ pub const Warmer = struct {
             .package_caches = cfg.package_caches,
             .zig_local_cache = cfg.zig_local_cache,
             .zig_local_cache_max_mb = cfg.zig_local_cache_max_mb,
-            .zig_seed = cfg.zig_seed,
+            .zig_seeds = cfg.zig_seeds,
             .step_user = cfg.step_user,
             .cancel = &w.cancel,
         }, .{ .ptr = w, .readyFn = ready }, &msg);
@@ -1505,7 +1505,7 @@ const FakeWarm = struct {
                 s.peak_mb = 600 + mb;
             }
         }
-        return .{ .image = "docker.io/library/ubuntu:24.04@sha256:abc", .seeded = o.zig_seed != null, .packages = "0123456789ab" };
+        return .{ .image = "docker.io/library/ubuntu:24.04@sha256:abc", .seeded = o.zig_seeds.len > 0, .packages = "0123456789ab" };
     }
     fn socket(_: std.Io, _: []const u8) ?engine.SocketIdentity {
         return sockets[@min(looks, sockets.len - 1)];
@@ -1552,7 +1552,7 @@ test "the pre-warm builds the job's base container and Zig seed through the memo
         .gh_token = "",
         .scope = undefined,
         .trusted_refs = "refs/heads/main",
-        .zig_seed = .{ .version = "0.17.0", .sha256 = "00" },
+        .zig_seeds = &.{.{ .version = "0.17.0", .sha256 = "00" }},
     };
     const c = testRunner(arena, &log, &out, &cfg);
     const w = try testWarmer(c, &memory);
@@ -1577,7 +1577,7 @@ test "the pre-warm builds the job's base container and Zig seed through the memo
     try std.testing.expect(during.started_ms != std.math.minInt(i64));
     try std.testing.expectEqual(admission.jobKey("", "", Warmer.job_name), during.key.?);
     try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), slots[0].started_ms);
-    try std.testing.expectEqualStrings("0.17.0", FakeWarm.opts.zig_seed.?.version);
+    try std.testing.expectEqualStrings("0.17.0", FakeWarm.opts.zig_seeds[0].version);
     try std.testing.expect(FakeWarm.opts.cancel == &w.cancel);
     // Over: it reserves nothing, and said what it built from which image.
     try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), slots[1].started_ms);
