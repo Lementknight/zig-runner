@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Every job mounts the tool cache again. v0.22.0 mounted it only for jobs whose workflow names it or uses an action, so a step that installs into it from a script file (zig-runner''s own `install-zig.sh`) found no `/opt/hostedtoolcache` and failed: the step user cannot make it. The package managers'' caches stay mounted on demand, where a miss only costs a cold cache.'
-time: 2026-11-01T00:45:00.000000-04:00
